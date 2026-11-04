@@ -967,7 +967,24 @@ class DrawingCanvasView @JvmOverloads constructor(
         if (w <= 0 || h <= 0) return
 
         val step = backgroundDensity.toFloat().coerceIn(20f, 80f)
-        when (backgroundMode) {
+
+        // The Template (Paper Pattern) tool is the primary driver: GRID=square
+        // grid, LINES=horizontal lines, DOTTED=dot grid. It is remapped onto
+        // the legacy renderer branch numbering (1=lined, 2=grid, 3=dotted,
+        // matching the "Selectable Paper Background" setting's labels), and the
+        // legacy backgroundMode is kept as the fallback when the pattern is
+        // BLANK so existing preference setups keep rendering. When both are
+        // set (conflicting settings), paperPattern wins deterministically.
+        // The pattern is drawn in page space (this canvas is viewMatrix
+        // transformed) under the committed ink, and never baked into the
+        // saved page bitmap because only onDraw runs this.
+        val mode: Int = when (paperPattern) {
+            PaperPattern.GRID -> 2    // square grid
+            PaperPattern.LINES -> 1   // horizontal lined
+            PaperPattern.DOTTED -> 3  // dot grid
+            PaperPattern.BLANK -> backgroundMode
+        }
+        when (mode) {
             1 -> { // lined
                 var y = step
                 while (y < h) {
