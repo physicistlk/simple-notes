@@ -1,0 +1,663 @@
+package personal.notes.touch.ui.editor
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Share
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.CheckboxDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextField
+import androidx.compose.material3.TextFieldDefaults
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import personal.notes.touch.ui.theme.LocalThemeColor
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun TextEditorScreen(
+    viewModel: TextEditorViewModel,
+    onBackClick: () -> Unit
+) {
+    val themeColor = LocalThemeColor.current
+    val note by viewModel.note.collectAsState()
+    val title by viewModel.title.collectAsState()
+    val contentValue by viewModel.contentValue.collectAsState()
+    val isSaving by viewModel.isSaving.collectAsState()
+    val editorMode by viewModel.editorMode.collectAsState()
+    var showExportDialog by remember { mutableStateOf(false) }
+
+    if (showExportDialog && note != null) {
+        personal.notes.touch.ui.export.ExportDialog(
+            note = note!!,
+            repository = viewModel.repository,
+            fileStore = viewModel.fileStore,
+            currentBitmap = null,
+            currentPageIndex = 0,
+            onDismiss = { showExportDialog = false }
+        )
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                navigationIcon = {
+                    IconButton(onClick = {
+                        viewModel.saveNow { onBackClick() }
+                    }) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "Back",
+                            tint = Color.White
+                        )
+                    }
+                },
+                title = {
+                    Column {
+                        Text(
+                            text = if (title.isBlank()) "Untitled Note" else title,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 17.sp,
+                            maxLines = 1,
+                            color = Color.White
+                        )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            if (isSaving) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(10.dp),
+                                    strokeWidth = 1.5.dp,
+                                    color = Color.White.copy(alpha = 0.8f)
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    text = "Saving...",
+                                    fontSize = 11.sp,
+                                    color = Color.White.copy(alpha = 0.8f)
+                                )
+                            } else {
+                                Text(
+                                    text = "Auto-saved (1s)",
+                                    fontSize = 11.sp,
+                                    color = Color.White.copy(alpha = 0.7f)
+                                )
+                            }
+                        }
+                    }
+                },
+                actions = {
+                    // Mode Switcher: Edit, Split, Preview
+                    Row(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(20.dp))
+                            .background(Color.White.copy(alpha = 0.15f))
+                            .padding(2.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        ModeTabButton(
+                            label = "Edit",
+                            isSelected = editorMode == EditorMode.EDIT,
+                            themeColor = themeColor,
+                            onClick = { viewModel.setEditorMode(EditorMode.EDIT) }
+                        )
+                        ModeTabButton(
+                            label = "Split",
+                            isSelected = editorMode == EditorMode.SPLIT,
+                            themeColor = themeColor,
+                            onClick = { viewModel.setEditorMode(EditorMode.SPLIT) }
+                        )
+                        ModeTabButton(
+                            label = "Preview",
+                            isSelected = editorMode == EditorMode.PREVIEW,
+                            themeColor = themeColor,
+                            onClick = { viewModel.setEditorMode(EditorMode.PREVIEW) }
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.width(6.dp))
+
+                    IconButton(onClick = {
+                        viewModel.saveNow()
+                        showExportDialog = true
+                    }) {
+                        Icon(
+                            imageVector = Icons.Default.Share,
+                            contentDescription = "Export Note",
+                            tint = Color.White
+                        )
+                    }
+
+                    IconButton(onClick = { viewModel.saveNow() }) {
+                        Icon(
+                            imageVector = Icons.Default.Check,
+                            contentDescription = "Save Note",
+                            tint = Color.White
+                        )
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = themeColor
+                )
+            )
+        }
+    ) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+        ) {
+            // Formatting Toolbar (Visible in EDIT and SPLIT modes)
+            if (editorMode != EditorMode.PREVIEW) {
+                FormattingToolbar(
+                    viewModel = viewModel,
+                    themeColor = themeColor
+                )
+                HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f))
+            }
+
+            // Note Title input field
+            if (editorMode != EditorMode.PREVIEW) {
+                TextField(
+                    value = title,
+                    onValueChange = { viewModel.onTitleChange(it) },
+                    placeholder = {
+                        Text(
+                            text = "Note Title...",
+                            fontSize = 20.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f)
+                        )
+                    },
+                    textStyle = TextStyle(
+                        fontSize = 20.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 6.dp),
+                    colors = TextFieldDefaults.colors(
+                        focusedContainerColor = Color.Transparent,
+                        unfocusedContainerColor = Color.Transparent,
+                        focusedIndicatorColor = Color.Transparent,
+                        unfocusedIndicatorColor = Color.Transparent
+                    ),
+                    singleLine = true
+                )
+                HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.05f))
+            }
+
+            // Editor / Preview Body
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+            ) {
+                when (editorMode) {
+                    EditorMode.EDIT -> {
+                        EditPane(
+                            value = contentValue,
+                            onValueChange = { viewModel.onContentChange(it) },
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(16.dp)
+                        )
+                    }
+                    EditorMode.PREVIEW -> {
+                        PreviewPane(
+                            title = title,
+                            content = contentValue.text,
+                            onToggleChecklist = { lineIdx, checked ->
+                                viewModel.toggleChecklist(lineIdx, checked)
+                            },
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(16.dp)
+                        )
+                    }
+                    EditorMode.SPLIT -> {
+                        Row(modifier = Modifier.fillMaxSize()) {
+                            // Left: Editor
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .fillMaxHeight()
+                                    .padding(16.dp)
+                            ) {
+                                EditPane(
+                                    value = contentValue,
+                                    onValueChange = { viewModel.onContentChange(it) },
+                                    modifier = Modifier.fillMaxSize()
+                                )
+                            }
+
+                            // Divider
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxHeight()
+                                    .width(1.dp)
+                                    .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f))
+                            )
+
+                            // Right: Live Rich Preview
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .fillMaxHeight()
+                                    .padding(16.dp)
+                            ) {
+                                PreviewPane(
+                                    title = title,
+                                    content = contentValue.text,
+                                    onToggleChecklist = { lineIdx, checked ->
+                                        viewModel.toggleChecklist(lineIdx, checked)
+                                    },
+                                    modifier = Modifier.fillMaxSize()
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ModeTabButton(
+    label: String,
+    isSelected: Boolean,
+    themeColor: Color,
+    onClick: () -> Unit
+) {
+    Surface(
+        shape = RoundedCornerShape(16.dp),
+        color = if (isSelected) Color.White else Color.Transparent,
+        modifier = Modifier
+            .clip(RoundedCornerShape(16.dp))
+            .clickable(onClick = onClick)
+    ) {
+        Text(
+            text = label,
+            fontSize = 12.sp,
+            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+            color = if (isSelected) themeColor else Color.White,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+        )
+    }
+}
+
+@Composable
+private fun FormattingToolbar(
+    viewModel: TextEditorViewModel,
+    themeColor: Color
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState())
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        // Group 1: Text Styles
+        ToolbarButton(text = "B", bold = true, onClick = { viewModel.applyBold() })
+        ToolbarButton(text = "I", italic = true, onClick = { viewModel.applyItalic() })
+        ToolbarButton(text = "U", underline = true, onClick = { viewModel.applyUnderline() })
+        ToolbarButton(text = "S", strike = true, onClick = { viewModel.applyStrikethrough() })
+        ToolbarButton(text = "`code`", mono = true, onClick = { viewModel.applyInlineCode() })
+
+        ToolbarDivider()
+
+        // Group 2: Headings
+        ToolbarButton(text = "H1", bold = true, onClick = { viewModel.applyH1() })
+        ToolbarButton(text = "H2", bold = true, onClick = { viewModel.applyH2() })
+        ToolbarButton(text = "H3", bold = true, onClick = { viewModel.applyH3() })
+
+        ToolbarDivider()
+
+        // Group 3: Lists & Quotes
+        ToolbarButton(text = "• Bullet", onClick = { viewModel.applyBulletList() })
+        ToolbarButton(text = "1. Number", onClick = { viewModel.applyNumberedList() })
+        ToolbarButton(text = "☑ Check", onClick = { viewModel.applyChecklist() })
+        ToolbarButton(text = "❝ Quote", onClick = { viewModel.applyQuote() })
+        ToolbarButton(text = "``` Block", mono = true, onClick = { viewModel.insertCodeBlock() })
+        ToolbarButton(text = "― Line", onClick = { viewModel.insertDivider() })
+
+        ToolbarDivider()
+
+        // Group 4: Text Color Swatches
+        val colors = listOf(
+            Color(0xFF212529) to "Black",
+            Color(0xFF6C757D) to "Gray",
+            Color(0xFFD32F2F) to "Red",
+            Color(0xFF1976D2) to "Blue",
+            Color(0xFF388E3C) to "Green",
+            themeColor to "Theme"
+        )
+        colors.forEach { (color, _) ->
+            Box(
+                modifier = Modifier
+                    .size(24.dp)
+                    .clip(CircleShape)
+                    .background(color)
+                    .border(1.dp, Color.LightGray, CircleShape)
+                    .clickable { viewModel.applyColor(color) }
+            )
+        }
+    }
+}
+
+@Composable
+private fun ToolbarButton(
+    text: String,
+    bold: Boolean = false,
+    italic: Boolean = false,
+    underline: Boolean = false,
+    strike: Boolean = false,
+    mono: Boolean = false,
+    onClick: () -> Unit
+) {
+    Surface(
+        shape = RoundedCornerShape(8.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        modifier = Modifier
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(onClick = onClick)
+    ) {
+        Text(
+            text = text,
+            fontSize = 13.sp,
+            fontWeight = if (bold) FontWeight.Bold else FontWeight.Medium,
+            fontStyle = if (italic) FontStyle.Italic else FontStyle.Normal,
+            fontFamily = if (mono) FontFamily.Monospace else FontFamily.Default,
+            textDecoration = when {
+                underline -> TextDecoration.Underline
+                strike -> TextDecoration.LineThrough
+                else -> TextDecoration.None
+            },
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp)
+        )
+    }
+}
+
+@Composable
+private fun ToolbarDivider() {
+    Box(
+        modifier = Modifier
+            .height(20.dp)
+            .width(1.dp)
+            .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.15f))
+            .padding(horizontal = 2.dp)
+    )
+}
+
+@Composable
+private fun EditPane(
+    value: androidx.compose.ui.text.input.TextFieldValue,
+    onValueChange: (androidx.compose.ui.text.input.TextFieldValue) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    BasicTextField(
+        value = value,
+        onValueChange = onValueChange,
+        textStyle = TextStyle(
+            fontSize = 16.sp,
+            lineHeight = 24.sp,
+            color = MaterialTheme.colorScheme.onSurface
+        ),
+        cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+        modifier = modifier
+            .verticalScroll(rememberScrollState()),
+        decorationBox = { innerTextField ->
+            if (value.text.isEmpty()) {
+                Text(
+                    text = "Type your note here...\n\nUse the formatting toolbar above for Bold, Italic, Headings, Lists, Checklists, Quotes, and Colors.",
+                    fontSize = 15.sp,
+                    lineHeight = 22.sp,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.35f)
+                )
+            }
+            innerTextField()
+        }
+    )
+}
+
+@Composable
+private fun PreviewPane(
+    title: String,
+    content: String,
+    onToggleChecklist: (lineIndex: Int, isChecked: Boolean) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val blocks = remember(content) { RichTextParser.parseMarkdown(content) }
+    val themeColor = LocalThemeColor.current
+
+    LazyColumn(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        if (title.isNotBlank()) {
+            item {
+                Text(
+                    text = title,
+                    fontSize = 26.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.padding(bottom = 8.dp)
+                )
+                HorizontalDivider(color = themeColor.copy(alpha = 0.3f), thickness = 2.dp)
+                Spacer(modifier = Modifier.height(8.dp))
+            }
+        }
+
+        if (blocks.isEmpty() || (blocks.size == 1 && blocks[0] is RichBlock.Paragraph && (blocks[0] as RichBlock.Paragraph).text.isEmpty())) {
+            item {
+                Text(
+                    text = "Empty Note. Switch to Edit mode to write content.",
+                    fontSize = 14.sp,
+                    fontStyle = FontStyle.Italic,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f)
+                )
+            }
+        }
+
+        itemsIndexed(blocks) { _, block ->
+            when (block) {
+                is RichBlock.Header -> {
+                    val (size, weight) = when (block.level) {
+                        1 -> 22.sp to FontWeight.Bold
+                        2 -> 18.sp to FontWeight.Bold
+                        else -> 16.sp to FontWeight.SemiBold
+                    }
+                    Text(
+                        text = block.text,
+                        fontSize = size,
+                        fontWeight = weight,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.padding(top = 6.dp, bottom = 2.dp)
+                    )
+                }
+                is RichBlock.Paragraph -> {
+                    Text(
+                        text = block.text,
+                        fontSize = 15.sp,
+                        lineHeight = 22.sp,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                }
+                is RichBlock.Quote -> {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(4.dp))
+                            .background(themeColor.copy(alpha = 0.08f))
+                            .padding(vertical = 4.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .width(4.dp)
+                                .fillMaxHeight()
+                                .background(themeColor)
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text(
+                            text = block.text,
+                            fontSize = 14.sp,
+                            fontStyle = FontStyle.Italic,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.85f),
+                            modifier = Modifier.padding(vertical = 4.dp, horizontal = 4.dp)
+                        )
+                    }
+                }
+                is RichBlock.BulletItem -> {
+                    Row(
+                        verticalAlignment = Alignment.Top,
+                        modifier = Modifier.padding(start = 8.dp)
+                    ) {
+                        Text(
+                            text = "•",
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = themeColor,
+                            modifier = Modifier.padding(end = 8.dp)
+                        )
+                        Text(
+                            text = block.text,
+                            fontSize = 15.sp,
+                            lineHeight = 22.sp,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                }
+                is RichBlock.NumberedItem -> {
+                    Row(
+                        verticalAlignment = Alignment.Top,
+                        modifier = Modifier.padding(start = 8.dp)
+                    ) {
+                        Text(
+                            text = "${block.number}.",
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = themeColor,
+                            modifier = Modifier.padding(end = 8.dp)
+                        )
+                        Text(
+                            text = block.text,
+                            fontSize = 15.sp,
+                            lineHeight = 22.sp,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                }
+                is RichBlock.ChecklistItem -> {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                onToggleChecklist(block.lineIndex, !block.isChecked)
+                            }
+                            .padding(vertical = 2.dp)
+                    ) {
+                        Checkbox(
+                            checked = block.isChecked,
+                            onCheckedChange = { checked ->
+                                onToggleChecklist(block.lineIndex, checked)
+                            },
+                            colors = CheckboxDefaults.colors(
+                                checkedColor = themeColor,
+                                checkmarkColor = Color.White
+                            ),
+                            modifier = Modifier.size(28.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = block.text,
+                            fontSize = 15.sp,
+                            textDecoration = if (block.isChecked) TextDecoration.LineThrough else TextDecoration.None,
+                            color = if (block.isChecked) MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f) else MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                }
+                is RichBlock.Divider -> {
+                    HorizontalDivider(
+                        modifier = Modifier.padding(vertical = 8.dp),
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.15f)
+                    )
+                }
+                is RichBlock.CodeBlock -> {
+                    Card(
+                        shape = RoundedCornerShape(8.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = block.code,
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 13.sp,
+                            lineHeight = 18.sp,
+                            modifier = Modifier.padding(12.dp)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}

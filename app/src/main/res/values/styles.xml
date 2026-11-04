@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.TouchNotes" parent="Theme.AppCompat.Light.NoActionBar">
+        <item name="android:statusBarColor">#FFFB6443</item>
+    </style>
+</resources>

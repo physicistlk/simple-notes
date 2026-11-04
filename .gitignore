@@ -1,0 +1,14 @@
+# Large binaries
+*.mp4
+*.webp
+*.jpge
+# Build outputs
+app/build/
+app/.gradle/
+.gradle/
+# Local
+local.properties
+*.apk
+# Reference media (keep screenshots as PNG only, no videos)
+reference/screens/*.mp4
+reference/screens/*.webp

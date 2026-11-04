@@ -1,0 +1,208 @@
+--------- beginning of main
+11-03 22:41:48.336 23862 23933 E ezut    : (REDACTED) SODA speech biasing context update error for %s. %s
+11-03 22:41:48.336 23862 23933 E ezut    : io.grpc.StatusException: INTERNAL: #backgroundUpdate compatibility check failed with reason: LOCALE_LP_MISSING
+11-03 22:41:48.336 23862 23933 E ezut    : 	at hofx.b(PG:17)
+11-03 22:41:48.336 23862 23933 E ezut    : 	at ghul.b(PG:9)
+11-03 22:41:48.336 23862 23933 E ezut    : 	at hnwi.h(PG:1)
+11-03 22:41:48.336 23862 23933 E ezut    : 	at hnwf.a(PG:28)
+11-03 22:41:48.336 23862 23933 E ezut    : 	at hnww.run(PG:7)
+11-03 22:41:48.336 23862 23933 E ezut    : 	at hodt.run(PG:12)
+11-03 22:41:48.336 23862 23933 E ezut    : 	at dwko.run(PG:5)
+11-03 22:41:48.336 23862 23933 E ezut    : 	at gsbs.run(PG:46)
+11-03 22:41:48.336 23862 23933 E ezut    : 	at dwka.run(PG:81)
+11-03 22:41:48.336 23862 23933 E ezut    : 	at java.lang.Thread.run(Thread.java:1563)
+11-03 22:41:48.336 23862 23933 E ezut    : 	at dwlq.run(PG:62)
+11-03 22:41:48.336 23862 23933 I ezut    : (REDACTED) Sending speech biasing context update to SODA with locale %s. %s
+11-03 22:41:48.337 23862 23896 I fprs    : #checkAsrCompatibility inside sequencer
+11-03 22:41:48.337 23862 23930 I fpsr    : (REDACTED) #getSodaAsrUpdateRequest inserting app domain: %s
+11-03 22:41:48.337 23862 23896 W fprs    : (REDACTED) #checkAsrCompatibility no available lp for %s
+11-03 22:41:48.337 23862 23896 I fprs    : #maybeClearObsoleteSoda: Deleting idle Soda.
+11-03 22:41:48.337 23862 23896 W fqgg    : #markInactive SODA instance is already inactive.
+11-03 22:41:48.337 23862 23896 I fqgg    : #safeDelete
+11-03 22:41:48.337 23862 23896 I fqgg    : Clearing SODA instance in preloader.
+11-03 22:41:48.339 23862 23896 E fpsr    : (REDACTED) #backgroundBiasingUpdate failed: %s
+11-03 22:41:48.339 23862 23896 E fpsr    : fpsl: #backgroundUpdate compatibility check failed with reason: LOCALE_LP_MISSING
+11-03 22:41:48.339 23862 23896 E fpsr    : 	at fprx.apply(PG:1142)
+11-03 22:41:48.339 23862 23896 E fpsr    : 	at ghpk.apply(PG:17)
+11-03 22:41:48.339 23862 23896 E fpsr    : 	at gtfu.c(PG:3)
+11-03 22:41:48.339 23862 23896 E fpsr    : 	at gtfw.run(PG:45)
+11-03 22:41:48.339 23862 23896 E fpsr    : 	at dwko.run(PG:5)
+11-03 22:41:48.339 23862 23896 E fpsr    : 	at gsbs.run(PG:46)
+11-03 22:41:48.339 23862 23896 E fpsr    : 	at dwka.run(PG:81)
+11-03 22:41:48.339 23862 23896 E fpsr    : 	at java.lang.Thread.run(Thread.java:1563)
+11-03 22:41:48.339 23862 23896 E fpsr    : 	at dwlq.run(PG:62)
+11-03 22:41:48.340 23862 23934 I fhgh    : (REDACTED) AppFlow %s is about to be transmitted
+11-03 22:41:48.341 23862 23928 E ezut    : (REDACTED) SODA speech biasing context update error for %s. %s
+11-03 22:41:48.341 23862 23928 E ezut    : io.grpc.StatusException: INTERNAL: #backgroundUpdate compatibility check failed with reason: LOCALE_LP_MISSING
+11-03 22:41:48.341 23862 23928 E ezut    : 	at hofx.b(PG:17)
+11-03 22:41:48.341 23862 23928 E ezut    : 	at ghul.b(PG:9)
+11-03 22:41:48.341 23862 23928 E ezut    : 	at hnwi.h(PG:1)
+11-03 22:41:48.341 23862 23928 E ezut    : 	at hnwf.a(PG:28)
+11-03 22:41:48.341 23862 23928 E ezut    : 	at hnww.run(PG:7)
+11-03 22:41:48.341 23862 23928 E ezut    : 	at hodt.run(PG:12)
+11-03 22:41:48.341 23862 23928 E ezut    : 	at dwko.run(PG:5)
+11-03 22:41:48.341 23862 23928 E ezut    : 	at gsbs.run(PG:46)
+11-03 22:41:48.341 23862 23928 E ezut    : 	at dwka.run(PG:81)
+11-03 22:41:48.341 23862 23928 E ezut    : 	at java.lang.Thread.run(Thread.java:1563)
+11-03 22:41:48.341 23862 23928 E ezut    : 	at dwlq.run(PG:62)
+11-03 22:41:48.341 23862 23928 I ezut    : (REDACTED) SODA speech biasing context update for %s is complete. %s
+11-03 22:41:48.344 23862 23928 I ezud    : (REDACTED) Successfully scheduled context update for key: %s for %s.
+11-03 22:41:48.344 23862 23924 I fprs    : #checkAsrCompatibility inside sequencer
+11-03 22:41:48.344 23862 23924 W fprs    : (REDACTED) #checkAsrCompatibility no available lp for %s
+11-03 22:41:48.344 23862 23924 I fprs    : #maybeClearObsoleteSoda: Deleting idle Soda.
+11-03 22:41:48.344 23862 23924 W fqgg    : #markInactive SODA instance is already inactive.
+11-03 22:41:48.344 23862 23924 I fqgg    : #safeDelete
+11-03 22:41:48.344 23862 23924 I fqgg    : Clearing SODA instance in preloader.
+11-03 22:41:48.345 23862 23925 I fhgh    : (REDACTED) AppFlow %s is about to be transmitted
+11-03 22:41:48.347 23862 23924 E fpsr    : (REDACTED) #backgroundBiasingUpdate failed: %s
+11-03 22:41:48.347 23862 23924 E fpsr    : fpsl: #backgroundUpdate compatibility check failed with reason: LOCALE_LP_MISSING
+11-03 22:41:48.347 23862 23924 E fpsr    : 	at fprx.apply(PG:1142)
+11-03 22:41:48.347 23862 23924 E fpsr    : 	at ghpk.apply(PG:17)
+11-03 22:41:48.347 23862 23924 E fpsr    : 	at gtfu.c(PG:3)
+11-03 22:41:48.347 23862 23924 E fpsr    : 	at gtfw.run(PG:45)
+11-03 22:41:48.347 23862 23924 E fpsr    : 	at dwko.run(PG:5)
+11-03 22:41:48.347 23862 23924 E fpsr    : 	at gsbs.run(PG:46)
+11-03 22:41:48.347 23862 23924 E fpsr    : 	at dwka.run(PG:81)
+11-03 22:41:48.347 23862 23924 E fpsr    : 	at java.lang.Thread.run(Thread.java:1563)
+11-03 22:41:48.347 23862 23924 E fpsr    : 	at dwlq.run(PG:62)
+11-03 22:41:48.347 23862 23925 I fhgh    : (REDACTED) AppFlow %s is about to be transmitted
+11-03 22:41:48.348 23862 23928 E ezut    : (REDACTED) SODA speech biasing context update error for %s. %s
+11-03 22:41:48.348 23862 23928 E ezut    : io.grpc.StatusException: INTERNAL: #backgroundUpdate compatibility check failed with reason: LOCALE_LP_MISSING
+11-03 22:41:48.348 23862 23928 E ezut    : 	at hofx.b(PG:17)
+11-03 22:41:48.348 23862 23928 E ezut    : 	at ghul.b(PG:9)
+11-03 22:41:48.348 23862 23928 E ezut    : 	at hnwi.h(PG:1)
+11-03 22:41:48.348 23862 23928 E ezut    : 	at hnwf.a(PG:28)
+11-03 22:41:48.348 23862 23928 E ezut    : 	at hnww.run(PG:7)
+11-03 22:41:48.348 23862 23928 E ezut    : 	at hodt.run(PG:12)
+11-03 22:41:48.348 23862 23928 E ezut    : 	at dwko.run(PG:5)
+11-03 22:41:48.348 23862 23928 E ezut    : 	at gsbs.run(PG:46)
+11-03 22:41:48.348 23862 23928 E ezut    : 	at dwka.run(PG:81)
+11-03 22:41:48.348 23862 23928 E ezut    : 	at java.lang.Thread.run(Thread.java:1563)
+11-03 22:41:48.348 23862 23928 E ezut    : 	at dwlq.run(PG:62)
+11-03 22:41:48.348 23862 23928 I ezut    : (REDACTED) SODA speech biasing context update for %s is complete. %s
+11-03 22:41:48.348 23862 23928 I ezud    : (REDACTED) Successfully scheduled context update for key: %s for %s.
+11-03 22:41:48.350 23862 23896 I fhgh    : (REDACTED) AppFlow %s is about to be transmitted
+11-03 22:41:48.363 21516 15874 W CCTFlatFileLogStore: Excessive logging: 1 events, 586275 bytes from log source AGSA_APA last 0s
+11-03 22:41:48.364 21516 15874 W CCTFlatFileLogStore: Excessive logging: 2 events, 591230 bytes from log source AGSA_APA last 0s
+11-03 22:41:48.367 21516 15874 W CCTFlatFileLogStore: Excessive logging: 4 events, 601848 bytes from log source AGSA_APA last 0s
+11-03 22:41:49.485 15774 15782 V ClearcutMetricXmitter: Transmission is done.
+11-03 22:41:49.486 15774 15805 V ClearcutMetricXmitter: Transmission is done.
+--------- beginning of system
+11-03 22:41:53.192  1824  2000 D ActivityManager: freezing 15241 com.google.android.as.oss
+11-03 22:41:53.198  1824  2370 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET, states=14
+11-03 22:41:53.200  1824  2370 D InetDiagMessage: Destroyed 0 sockets, proto=IPPROTO_TCP, family=AF_INET6, states=14
+11-03 22:41:53.200  1824  2370 D InetDiagMessage: Destroyed live tcp sockets for uids={10271} in 3ms
+11-03 22:41:53.612   783 15764 I keystore2: system/security/keystore2/watchdog/src/lib.rs:371 - Watchdog thread idle -> terminating. Have a great day.
+11-03 22:41:54.640 19184 19201 I Finsky:background: [141] Stats for Executor: bgExecutor yep@8fdce64[Running, pool size = 4, active threads = 0, queued tasks = 0, completed tasks = 521]
+11-03 22:41:54.641 19184 19201 I Finsky:background: [141] Stats for Executor: LightweightExecutor yep@6e005e8[Running, pool size = 4, active threads = 0, queued tasks = 0, completed tasks = 275]
+11-03 22:41:54.643 19184 19201 I Finsky:background: [141] Stats for Executor: BlockingExecutor yep@67e1b1c[Running, pool size = 2, active threads = 0, queued tasks = 0, completed tasks = 281]
+11-03 22:41:55.158 15893 15893 W libbinder.BackendUnifiedServiceManager: Thread Pool max thread count is 0. Cannot cache binder as linkToDeath cannot be implemented. serviceName: SurfaceFlingerAIDL
+11-03 22:41:55.159 15893 15893 W libbinder.BpBinder: Linking to death on android.gui.ISurfaceComposer but there are no threads (yet?) listening to incoming transactions. See ProcessState::startThreadPool and ProcessState::setThreadPoolMaxThreadCount. Generally you should setup the binder threadpool before other initialization steps.
+11-03 22:41:55.159 15893 15893 W libbinder.ProcessState: Extra binder thread started, but 0 threads requested. Do not use *startThreadPool when zero threads are requested.
+11-03 22:41:55.213 15893 15896 I Gralloc4: Adding additional valid usage bits: 0x8202000
+11-03 22:41:55.234  3399  4049 W MediaProvider: isAppCloneUserPair failed. Users: 0 and 0
+11-03 22:41:55.234  3399  4049 W MediaProvider: isAppCloneUserPair for user 0: false
+11-03 22:41:55.655  1824  2414 D BackgroundInstallControlService: Package event received: 0
+11-03 22:41:56.845 11935 11968 E AbstractLogEventBuilder: The provided ProductIdOrigin 3 is not one of the process-level expected values: 1 or 2
+11-03 22:41:57.255  1824  2577 I ActivityManager: Broadcasting: Intent { act=android.intent.action.MEDIA_SCANNER_SCAN_FILE dat=file:///... flg=0x400000 }
+11-03 22:41:57.258  1824  2577 I ActivityManager: Enqueued broadcast Intent { act=android.intent.action.MEDIA_SCANNER_SCAN_FILE dat=file:///... flg=0x400000 }: 0
+11-03 22:41:57.263  3399  3399 I MediaServiceV2: Creating work for intent Intent { act=android.intent.action.MEDIA_SCANNER_SCAN_FILE dat=file:///... flg=0x1400010 cmp=com.android.providers.media.module/com.android.providers.media.MediaServiceV2 }
+11-03 22:41:57.270  3399  3399 I MediaServiceV2: Work enqueued for intent: Intent { act=android.intent.action.MEDIA_SCANNER_SCAN_FILE dat=file:///... flg=0x1400010 cmp=com.android.providers.media.module/com.android.providers.media.MediaServiceV2 }
+11-03 22:41:57.271  1824  1843 I ActivityManager: Broadcast completed: result=0
+11-03 22:41:57.330  3399  3644 W JobInfo : Requested important-while-foreground flag for job1825 is ignored and takes no effect
+11-03 22:41:57.330  3399  3644 D WM-SystemJobScheduler: Scheduling work ID 603272fb-9643-446d-a36f-5c127bfb902aJob ID 1825
+11-03 22:41:57.344  3399  3644 D WM-GreedyScheduler: Ignoring {WorkSpec: 43c0c8b6-8213-4b10-85c4-a22c9e8112da}. Requires device idle.
+11-03 22:41:57.344  3399  3644 D WM-GreedyScheduler: Ignoring {WorkSpec: d70485da-7303-4a19-b702-17611519b85e}. Requires device idle.
+11-03 22:41:57.344  3399  3644 D WM-GreedyScheduler: Ignoring {WorkSpec: b1a4854e-fecc-4583-9f60-9fad5e9c465a}. Requires device idle.
+11-03 22:41:57.344  3399  3644 D WM-GreedyScheduler: Starting work for 603272fb-9643-446d-a36f-5c127bfb902a
+11-03 22:41:57.346  3399  3399 D WM-SystemJobService: onStartJob for WorkGenerationalId(workSpecId=603272fb-9643-446d-a36f-5c127bfb902a, generation=0)
+11-03 22:41:57.355  3399  3634 D WM-Processor: Processor: processing WorkGenerationalId(workSpecId=603272fb-9643-446d-a36f-5c127bfb902a, generation=0)
+11-03 22:41:57.356  3399  3634 D WM-Processor: Work WorkGenerationalId(workSpecId=603272fb-9643-446d-a36f-5c127bfb902a, generation=0) is already enqueued for processing
+11-03 22:41:57.365  3399  3399 D WM-WorkerWrapper: Starting work for com.android.providers.media.MediaServiceV2
+11-03 22:41:57.366  3399 15902 I MediaServiceV2: Work initiated for action [ android.intent.action.MEDIA_SCANNER_SCAN_FILE ]
+11-03 22:41:57.429  3399 15902 I MediaServiceV2: Work ended for action [ android.intent.action.MEDIA_SCANNER_SCAN_FILE ]
+11-03 22:41:57.431  3399  3634 I WM-WorkerWrapper: Worker result SUCCESS for Work [ id=603272fb-9643-446d-a36f-5c127bfb902a, tags={ com.android.providers.media.MediaServiceV2 } ]
+11-03 22:41:57.435  3399  3399 D WM-Processor: Processor 603272fb-9643-446d-a36f-5c127bfb902a executed; reschedule = false
+11-03 22:41:57.435  3399  3399 D WM-SystemJobService: 603272fb-9643-446d-a36f-5c127bfb902a executed on JobScheduler
+11-03 22:41:57.450  3399  3634 D WM-SystemJobScheduler: Scheduling work ID 942d48e5-910f-4876-a2bf-2780d652231bJob ID 1826
+11-03 22:41:57.456  3399  3634 D WM-GreedyScheduler: Ignoring {WorkSpec: 43c0c8b6-8213-4b10-85c4-a22c9e8112da}. Requires device idle.
+11-03 22:41:57.456  3399  3634 D WM-GreedyScheduler: Ignoring {WorkSpec: d70485da-7303-4a19-b702-17611519b85e}. Requires device idle.
+11-03 22:41:57.456  3399  3634 D WM-GreedyScheduler: Ignoring {WorkSpec: b1a4854e-fecc-4583-9f60-9fad5e9c465a}. Requires device idle.
+11-03 22:41:57.457  3399  3634 D WM-GreedyScheduler: Cancelling work ID 603272fb-9643-446d-a36f-5c127bfb902a
+11-03 22:41:57.459  3399  3634 D WM-GreedyScheduler: Ignoring {WorkSpec: 43c0c8b6-8213-4b10-85c4-a22c9e8112da}. Requires device idle.
+11-03 22:41:57.459  3399  3634 D WM-GreedyScheduler: Ignoring {WorkSpec: d70485da-7303-4a19-b702-17611519b85e}. Requires device idle.
+11-03 22:41:57.459  3399  3634 D WM-GreedyScheduler: Ignoring {WorkSpec: b1a4854e-fecc-4583-9f60-9fad5e9c465a}. Requires device idle.
+11-03 22:41:57.487 21516 21516 D BoundBrokerSvc: onUnbind: Intent { act=com.google.android.gms.time.trustedtime.service.START dat=chimera-action:/... xflg=0x4 cmp=com.google.android.gms/.chimera.PersistentDirectBootAwareApiService }
+11-03 22:41:57.492 21516 21516 D BoundBrokerSvc: onUnbind: Intent { act=com.google.android.gms.time.trustedtime.singleuserapi.service.START dat=chimera-action:/... xflg=0x4 cmp=com.google.android.gms/.chimera.PersistentSingleUserInternalApiService }
+11-03 22:41:58.935  3399  3399 D WM-DelayedWorkTracker: Scheduling work 942d48e5-910f-4876-a2bf-2780d652231b
+11-03 22:41:58.936  3399  3399 D WM-GreedyScheduler: Starting tracking for 942d48e5-910f-4876-a2bf-2780d652231b
+11-03 22:41:58.944  3399  3634 D WM-ConstraintTracker: BatteryNotLowTracker: initial state = true
+11-03 22:41:58.944  3399  3634 D WM-BrdcstRcvrCnstrntTrc: BatteryNotLowTracker: registering receiver
+11-03 22:41:58.947  3399  3634 D WM-GreedyScheduler: Constraints met: Scheduling work ID WorkGenerationalId(workSpecId=942d48e5-910f-4876-a2bf-2780d652231b, generation=0)
+11-03 22:41:58.955  3399  3634 D WM-Processor: Processor: processing WorkGenerationalId(workSpecId=942d48e5-910f-4876-a2bf-2780d652231b, generation=0)
+11-03 22:41:58.964  3399  3399 D WM-SystemJobService: onStartJob for WorkGenerationalId(workSpecId=942d48e5-910f-4876-a2bf-2780d652231b, generation=0)
+11-03 22:41:58.966  3399  3399 D WM-WorkerWrapper: Starting work for com.android.providers.media.photopicker.sync.ProactiveSyncWorker
+11-03 22:41:58.968  3399  3634 D WM-Processor: Work WorkGenerationalId(workSpecId=942d48e5-910f-4876-a2bf-2780d652231b, generation=0) is already enqueued for processing
+11-03 22:41:58.969  3399 15904 I PSyncWorker: Starting proactive picker sync from sync source: 1
+11-03 22:41:58.969 19184 19184 I Finsky:background: [2] Memory trim requested to level 40
+11-03 22:41:58.970  3399 15904 I PickerSyncTracker: Created new sync future java.util.concurrent.CompletableFuture@9e139f[Not completed, 1 dependents]. Future map: {942d48e5-910f-4876-a2bf-2780d652231b=java.util.concurrent.CompletableFuture@9e139f[Not completed, 1 dependents]}
+11-03 22:41:58.971 13439 13439 I Finsky:quick_launch: [2] Memory trim requested to level 40
+11-03 22:41:58.972  3399 15904 D PickerSyncController: syncAllMediaFromProvider() LOCAL, auth=com.android.providers.media.photopicker, retry=true
+11-03 22:41:58.972  3399 15904 D PickerSyncController: getSyncRequestParams() LOCAL, auth=com.android.providers.media.photopicker
+11-03 22:41:59.066  3399 15904 D PickerSyncController:    Latest ID/Gen=456bfda842e63a0a:external_primary/45675
+11-03 22:41:59.066  3399 15904 D PickerSyncController:    Cached ID/Gen=456bfda842e63a0a:external_primary/45664
+11-03 22:41:59.066  3399 15904 D PickerSyncController:    RESULT=SyncRequestParams{type=MEDIA_INCREMENTAL, gen=45664, latest=Bundle[{last_media_sync_generation=45675, media_collection_id=456bfda842e63a0a:external_primary}], pageSize=1000}
+11-03 22:41:59.066  3399 15904 I PickerSyncController: Executing SyncAdd. isLocal: true. authority: com.android.providers.media.photopicker
+11-03 22:41:59.066  3399 15904 D PickerSyncLockManager: Trying to acquire lock com.android.providers.media.photopicker.sync.CloseableReentrantLock@e772ca3[Unlocked]. Lock Name = CLOUD_PROVIDER_LOCK. Threads that may be waiting to acquire this lock = [] with timeout.
+11-03 22:41:59.066  3399 15904 D CloseableReentrantLock: Successfully acquired lock com.android.providers.media.photopicker.sync.CloseableReentrantLock@e772ca3[Locked by thread pool-4-thread-123]. Lock Name = CLOUD_PROVIDER_LOCK. Threads that may be waiting to acquire this lock = []
+11-03 22:41:59.066  3399 15904 D CloseableReentrantLock: Successfully released lock com.android.providers.media.photopicker.sync.CloseableReentrantLock@e772ca3[Unlocked]. Lock Name = CLOUD_PROVIDER_LOCK. Threads that may be waiting to acquire this lock = []
+11-03 22:41:59.066  3399 15904 D ExternalDbFacade: Token received for queryMedia = null
+11-03 22:41:59.091  3399 15904 D PickerSyncLockManager: Trying to acquire lock com.android.providers.media.photopicker.sync.CloseableReentrantLock@e772ca3[Unlocked]. Lock Name = CLOUD_PROVIDER_LOCK. Threads that may be waiting to acquire this lock = [] with timeout.
+11-03 22:41:59.091  3399 15904 D CloseableReentrantLock: Successfully acquired lock com.android.providers.media.photopicker.sync.CloseableReentrantLock@e772ca3[Locked by thread pool-4-thread-123]. Lock Name = CLOUD_PROVIDER_LOCK. Threads that may be waiting to acquire this lock = []
+11-03 22:41:59.091  3399 15904 D PickerSyncController: Saving next page token: 1793725917000|9797 for key: local_provider:media_add:resume
+11-03 22:41:59.091  3399 15904 D CloseableReentrantLock: Successfully released lock com.android.providers.media.photopicker.sync.CloseableReentrantLock@e772ca3[Unlocked]. Lock Name = CLOUD_PROVIDER_LOCK. Threads that may be waiting to acquire this lock = []
+11-03 22:41:59.093  3399 15904 D PickerNotificationSender: Sending a notification for media update
+11-03 22:41:59.095  3399 15904 D PickerNotificationSender: Sending a notification for merged album media update Videos
+11-03 22:41:59.095  3399 15904 D PickerNotificationSender: Sending a notification for album media update Videos
+11-03 22:41:59.096  3399 15904 D PickerNotificationSender: Sending a notification for merged album media update Favorites
+11-03 22:41:59.096  3399 15904 D PickerNotificationSender: Sending a notification for album media update Favorites
+11-03 22:41:59.098  3399 15904 D ExternalDbFacade: Token received for queryMedia = 1793725917000|9797
+11-03 22:41:59.114  3399 15904 D PickerSyncLockManager: Trying to acquire lock com.android.providers.media.photopicker.sync.CloseableReentrantLock@e772ca3[Unlocked]. Lock Name = CLOUD_PROVIDER_LOCK. Threads that may be waiting to acquire this lock = [] with timeout.
+11-03 22:41:59.115  3399 15904 D CloseableReentrantLock: Successfully acquired lock com.android.providers.media.photopicker.sync.CloseableReentrantLock@e772ca3[Locked by thread pool-4-thread-123]. Lock Name = CLOUD_PROVIDER_LOCK. Threads that may be waiting to acquire this lock = []
+11-03 22:41:59.115  3399 15904 D PickerSyncController: Clearing next page token for key: local_provider:media_add:resume
+11-03 22:41:59.115  3399 15904 D CloseableReentrantLock: Successfully released lock com.android.providers.media.photopicker.sync.CloseableReentrantLock@e772ca3[Unlocked]. Lock Name = CLOUD_PROVIDER_LOCK. Threads that may be waiting to acquire this lock = []
+11-03 22:41:59.115  3399 15904 D PickerNotificationSender: Sending a notification for media update
+11-03 22:41:59.117  3399 15904 D PickerNotificationSender: Sending a notification for merged album media update Videos
+11-03 22:41:59.117  3399 15904 D PickerNotificationSender: Sending a notification for album media update Videos
+11-03 22:41:59.118  3399 15904 D PickerNotificationSender: Sending a notification for merged album media update Favorites
+11-03 22:41:59.118  3399 15904 D PickerNotificationSender: Sending a notification for album media update Favorites
+11-03 22:41:59.120  3399 15904 I PickerSyncController: Paged sync successful. QueryArgs: Bundle[{android.provider.extra.PAGE_TOKEN=1793725917000|9797, android.provider.extra.SYNC_GENERATION=45664, android.provider.extra.PAGE_SIZE=1000}] Total Rows: 1
+11-03 22:41:59.120  3399 15904 I PickerSyncController: Executing SyncRemove. isLocal: true. authority: com.android.providers.media.photopicker
+11-03 22:41:59.120  3399 15904 D PickerSyncLockManager: Trying to acquire lock com.android.providers.media.photopicker.sync.CloseableReentrantLock@e772ca3[Unlocked]. Lock Name = CLOUD_PROVIDER_LOCK. Threads that may be waiting to acquire this lock = [] with timeout.
+11-03 22:41:59.120  3399 15904 D CloseableReentrantLock: Successfully acquired lock com.android.providers.media.photopicker.sync.CloseableReentrantLock@e772ca3[Locked by thread pool-4-thread-123]. Lock Name = CLOUD_PROVIDER_LOCK. Threads that may be waiting to acquire this lock = []
+11-03 22:41:59.120  3399 15904 D CloseableReentrantLock: Successfully released lock com.android.providers.media.photopicker.sync.CloseableReentrantLock@e772ca3[Unlocked]. Lock Name = CLOUD_PROVIDER_LOCK. Threads that may be waiting to acquire this lock = []
+11-03 22:41:59.124  3399 15904 D PickerSyncLockManager: Trying to acquire lock com.android.providers.media.photopicker.sync.CloseableReentrantLock@e772ca3[Unlocked]. Lock Name = CLOUD_PROVIDER_LOCK. Threads that may be waiting to acquire this lock = [] with timeout.
+11-03 22:41:59.124  3399 15904 D CloseableReentrantLock: Successfully acquired lock com.android.providers.media.photopicker.sync.CloseableReentrantLock@e772ca3[Locked by thread pool-4-thread-123]. Lock Name = CLOUD_PROVIDER_LOCK. Threads that may be waiting to acquire this lock = []
+11-03 22:41:59.124  3399 15904 D PickerSyncController: Clearing next page token for key: local_provider:media_remove:resume
+11-03 22:41:59.124  3399 15904 D CloseableReentrantLock: Successfully released lock com.android.providers.media.photopicker.sync.CloseableReentrantLock@e772ca3[Unlocked]. Lock Name = CLOUD_PROVIDER_LOCK. Threads that may be waiting to acquire this lock = []
+11-03 22:41:59.124  3399 15904 D PickerNotificationSender: Sending a notification for media update
+11-03 22:41:59.126  3399 15904 D PickerNotificationSender: Sending a notification for merged album media update Videos
+11-03 22:41:59.126  3399 15904 D PickerNotificationSender: Sending a notification for album media update Videos
+11-03 22:41:59.128  3399 15904 D PickerNotificationSender: Sending a notification for merged album media update Favorites
+11-03 22:41:59.128  3399 15904 D PickerNotificationSender: Sending a notification for album media update Favorites
+11-03 22:41:59.129  3399 15904 I PickerSyncController: Paged sync successful. QueryArgs: Bundle[{android.provider.extra.PAGE_TOKEN=1793725917000|9797, android.provider.extra.SYNC_GENERATION=45664, android.provider.extra.PAGE_SIZE=1000}] Total Rows: 0
+11-03 22:41:59.129  3399 15904 I PickerSyncTracker: Marked sync future complete for work id: 942d48e5-910f-4876-a2bf-2780d652231b. Future map: {}
+11-03 22:41:59.129  3399 15904 I PSyncWorker: Completed picker proactive sync complete from local provider.
+11-03 22:41:59.131  3399  3634 I WM-WorkerWrapper: Worker result SUCCESS for Work [ id=942d48e5-910f-4876-a2bf-2780d652231b, tags={ com.android.providers.media.photopicker.sync.ProactiveSyncWorker } ]
+11-03 22:41:59.135  3399  3399 D WM-Processor: Processor 942d48e5-910f-4876-a2bf-2780d652231b executed; reschedule = false
+11-03 22:41:59.136  3399  3399 D WM-GreedyScheduler: Stopping tracking for WorkGenerationalId(workSpecId=942d48e5-910f-4876-a2bf-2780d652231b, generation=0)
+11-03 22:41:59.138  3399  3399 D WM-SystemJobService: 942d48e5-910f-4876-a2bf-2780d652231b executed on JobScheduler
+11-03 22:41:59.140  3399  3643 D WM-GreedyScheduler: Cancelling work ID 942d48e5-910f-4876-a2bf-2780d652231b
+11-03 22:41:59.141  1824 11721 W JobScheduler: Job didn't exist in JobStore: d1873b4 {androidx.work.systemjobscheduler} #u0a331/1826 #ProactiveSyncWorker#@androidx.work.systemjobscheduler@com.android.providers.media.module/androidx.work.impl.background.systemjob.SystemJobService
+11-03 22:41:59.141  3399  3399 D WM-SystemJobService: onStopJob for WorkGenerationalId(workSpecId=942d48e5-910f-4876-a2bf-2780d652231b, generation=0)
+11-03 22:41:59.143  3399  3643 D WM-GreedyScheduler: Ignoring {WorkSpec: 43c0c8b6-8213-4b10-85c4-a22c9e8112da}. Requires device idle.
+11-03 22:41:59.143  3399  3643 D WM-GreedyScheduler: Ignoring {WorkSpec: d70485da-7303-4a19-b702-17611519b85e}. Requires device idle.
+11-03 22:41:59.143  3399  3643 D WM-GreedyScheduler: Ignoring {WorkSpec: b1a4854e-fecc-4583-9f60-9fad5e9c465a}. Requires device idle.
+11-03 22:41:59.143  3399  3643 D WM-BrdcstRcvrCnstrntTrc: BatteryNotLowTracker: unregistering receiver
+11-03 22:42:02.197  1824  2414 D BackgroundInstallControlService: Package event received: 0
+11-03 22:42:03.274 21516 21516 D BoundBrokerSvc: onUnbind: Intent { act=com.google.android.gms.clearcut.sampler.service.START dat=chimera-action:/... xflg=0x4 cmp=com.google.android.gms/.chimera.PersistentDirectBootAwareApiService }
