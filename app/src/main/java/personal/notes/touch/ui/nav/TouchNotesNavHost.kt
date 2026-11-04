@@ -3,6 +3,10 @@ package personal.notes.touch.ui.nav
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.remember
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.ui.Modifier
 import androidx.navigation.NavHostController
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
@@ -25,10 +29,14 @@ fun TouchNotesNavHost(
 ) {
     val openNotes = remember { mutableStateListOf<String>() }
 
-    NavHost(
-        navController = navController,
-        startDestination = Screen.Splash.route
-    ) {
+    // Edge-to-edge (targetSdk 35+): every screen must clear the status bar, or app
+    // top bars collide with the battery/time/notification icons. Insets become 0
+    // automatically while the full-screen setting hides the system bars.
+    Box(modifier = Modifier.fillMaxSize().statusBarsPadding()) {
+        NavHost(
+            navController = navController,
+            startDestination = Screen.Splash.route
+        ) {
         composable(Screen.Splash.route) {
             SplashScreen(
                 onSplashFinished = {
@@ -132,6 +140,7 @@ fun TouchNotesNavHost(
                 viewModel = viewModel,
                 onBackClick = { navController.popBackStack() }
             )
+        }
         }
     }
 }

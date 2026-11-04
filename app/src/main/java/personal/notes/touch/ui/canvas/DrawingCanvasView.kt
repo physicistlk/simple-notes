@@ -65,7 +65,7 @@ class DrawingCanvasView @JvmOverloads constructor(
         set(value) { field = value.coerceIn(0.25f, 4f); updateViewMatrix() }
     var autoCenter: Boolean = true
     val viewMatrix: Matrix = Matrix()
-    val inverseMatrix: Matrix = Matrix()
+    val pageInverseMatrix: Matrix = Matrix()
 
     // gesture tracking
     private var gestureActive = false
@@ -347,7 +347,7 @@ class DrawingCanvasView @JvmOverloads constructor(
         viewMatrix.reset()
         viewMatrix.postScale(scale, scale)
         viewMatrix.postTranslate(panX, panY)
-        viewMatrix.invert(inverseMatrix)
+        viewMatrix.invert(pageInverseMatrix)
     }
 
     fun resetTransform() {
@@ -1121,7 +1121,7 @@ class DrawingCanvasView @JvmOverloads constructor(
         }
 
         val pts = floatArrayOf(event.x, event.y)
-        inverseMatrix.mapPoints(pts)
+        pageInverseMatrix.mapPoints(pts)
         val x = pts[0]
         val y = pts[1]
 
