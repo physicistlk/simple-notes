@@ -139,7 +139,9 @@ import android.os.Build
 import android.provider.MediaStore
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import personal.notes.touch.util.BitmapUtils
 import personal.notes.touch.util.PdfImportManager
 import java.text.SimpleDateFormat
@@ -189,20 +191,32 @@ fun NoteListScreen(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         uri?.let {
-            try {
-                val bitmap = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                    android.graphics.ImageDecoder.decodeBitmap(android.graphics.ImageDecoder.createSource(context.contentResolver, it))
-                } else {
-                    @Suppress("DEPRECATION")
-                    MediaStore.Images.Media.getBitmap(context.contentResolver, it)
+            scope.launch {
+                // Decode off the main thread.
+                val decoded = withContext(Dispatchers.IO) {
+                    try {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                            android.graphics.ImageDecoder.decodeBitmap(
+                                android.graphics.ImageDecoder.createSource(context.contentResolver, it)
+                            )
+                        } else {
+                            @Suppress("DEPRECATION")
+                            MediaStore.Images.Media.getBitmap(context.contentResolver, it)
+                        }
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                        null
+                    }
                 }
-                bitmap?.let { bmp ->
-                    viewModel.createNote(title = "Imported Image", pageType = "image_bg") { id ->
+                decoded?.let { bmp ->
+                    // Create the note and save the bitmap as its page
+                    // background (page_0.png) so "Imported Image" notes show
+                    // the image when opened; the source bitmap is recycled
+                    // by the ViewModel after the file is written.
+                    viewModel.createImageNote(bmp) { id ->
                         onNoteClick(id)
                     }
                 }
-            } catch (e: Exception) {
-                e.printStackTrace()
             }
         }
     }

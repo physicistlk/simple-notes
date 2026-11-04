@@ -1,5 +1,6 @@
 package personal.notes.touch.ui.notes
 
+import android.graphics.Bitmap
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -127,6 +128,36 @@ class NoteListViewModel(
         viewModelScope.launch {
             val folderId = _uiState.value.selectedFolderId
             val newNote = repository.createNote(title = title, folderId = folderId, pageType = pageType)
+            onCreated(newNote.id)
+        }
+    }
+
+    /**
+     * Create an "Imported Image" note and persist the picked bitmap as the
+     * note's page background: the PNG is written to page_0.png of the note
+     * directory — the exact same file CanvasScreen loads via
+     * [CanvasViewModel.loadCurrentPageBitmap] and sets as backgroundBitmap
+     * when the note opens. Callers supply the already-decoded bitmap; the
+     * file save runs on Dispatchers.IO (inside NoteRepository), the source
+     * bitmap is recycled after saving, and navigation happens only once the
+     * page file exists so the opened note shows the image immediately.
+     */
+    fun createImageNote(bitmap: Bitmap, onCreated: (String) -> Unit) {
+        viewModelScope.launch {
+            val folderId = _uiState.value.selectedFolderId
+            val newNote = try {
+                repository.createNote(title = "Imported Image", folderId = folderId, pageType = "image_bg")
+            } catch (e: Exception) {
+                e.printStackTrace()
+                if (!bitmap.isRecycled) bitmap.recycle()
+                return@launch
+            }
+            try {
+                repository.savePageBitmap(newNote.id, 0, bitmap)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+            if (!bitmap.isRecycled) bitmap.recycle()
             onCreated(newNote.id)
         }
     }

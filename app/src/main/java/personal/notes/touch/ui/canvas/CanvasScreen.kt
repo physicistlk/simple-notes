@@ -130,6 +130,7 @@ import kotlinx.coroutines.launch
 import personal.notes.touch.R
 import personal.notes.touch.data.db.entity.PageEntity
 import personal.notes.touch.ui.theme.OrangePrimary
+import personal.notes.touch.util.ClipboardHelper
 import personal.notes.touch.util.PdfImportManager
 
 val TouchNotesColors = listOf(
@@ -280,6 +281,70 @@ fun CanvasScreen(
                     android.widget.Toast.makeText(context, "PDF import error: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
                 }
             }
+        }
+    }
+
+    // Drag & drop + 3-finger-paste insertion: shared path with Add → Image
+    // (gallery picker). Bitmaps become centered image layers via addImageLayer;
+    // text becomes a text block layer via the existing addTextBlock API and
+    // additionally shows a toast preview. URI decoding runs on Dispatchers.IO
+    // inside ClipboardHelper — the main thread is never blocked.
+    val handleExtractedContent: (ClipboardHelper.ExtractedContent) -> Unit = { extracted ->
+        when {
+            extracted.bitmap != null -> {
+                val added = canvasViewRef?.addImageLayer(extracted.bitmap) == true
+                if (added) {
+                    scope.launch {
+                        try {
+                            canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                        }
+                    }
+                } else {
+                    android.widget.Toast.makeText(
+                        context, "Max 3 image layers", android.widget.Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+            !extracted.text.isNullOrBlank() -> {
+                val inserted = canvasViewRef?.addTextBlock(extracted.text) == true
+                if (inserted) {
+                    scope.launch {
+                        try {
+                            canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                        }
+                    }
+                }
+                val preview = extracted.text.trim().replace("\n", " ").take(60)
+                android.widget.Toast.makeText(
+                    context, "Pasted text: $preview...", android.widget.Toast.LENGTH_SHORT
+                ).show()
+            }
+            else -> android.widget.Toast.makeText(
+                context, "Nothing pasteable", android.widget.Toast.LENGTH_SHORT
+            ).show()
+        }
+    }
+
+    // ACTION_DROP from split-screen browser / Files / Photos: accepts any clip
+    // with items ("*/*" descriptions included); extraction happens on IO and
+    // resumes on the main dispatcher of [scope].
+    val handleDroppedClip: (android.content.ClipData) -> Unit = { clip ->
+        scope.launch {
+            val extracted = ClipboardHelper.extractContent(context, null, clip)
+            handleExtractedContent(extracted)
+        }
+    }
+
+    // 3-finger tap: paste the primary clipboard item through the same path.
+    val handleClipboardPaste: () -> Unit = {
+        scope.launch {
+            val item = ClipboardHelper.pasteFromClipboard(context)
+            val extracted = ClipboardHelper.extractContent(context, item)
+            handleExtractedContent(extracted)
         }
     }
 
@@ -822,6 +887,14 @@ fun CanvasScreen(
                     factory = { ctx ->
                         DrawingCanvasView(ctx).apply {
                             canvasViewRef = this
+                            // Wire the previously-dead drag & drop helper:
+                            // install once, in factory (not update).
+                            setDragDropListener(
+                                onClipDropped = { clip -> handleDroppedClip(clip) },
+                                isAccepted = { clip -> clip.itemCount > 0 }
+                            )
+                            // Wire the previously-dead 3-finger-tap paste hook.
+                            onThreeFingerTap = { handleClipboardPaste() }
                             onImageSelectionChanged = { selectedImageIndex = it }
                             onUndoRedoListener = { canUndo, canRedo ->
                                 viewModel.updateUndoRedo(canUndo, canRedo)
