@@ -1,9 +1,11 @@
 package personal.notes.touch
 
+import android.content.IntentFilter
 import android.os.Build
 import android.os.Bundle
 import android.view.View
 import android.view.WindowManager
+import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -16,11 +18,27 @@ import androidx.compose.ui.graphics.Color
 import personal.notes.touch.ui.nav.TouchNotesNavHost
 import personal.notes.touch.ui.theme.OrangePrimary
 import personal.notes.touch.ui.theme.TouchNotesTheme
+import personal.notes.touch.util.DebugGestureInjector
 
 class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val app = application as TouchNotesApp
+
+        if (BuildConfig.DEBUG) {
+            // DEBUG-only adb hook (see util/DebugGestureInjector.kt): raw
+            // /dev/input sendevent is SELinux-denied and concurrent `input
+            // swipe` calls merge into one pointer, so the shell broadcasts a
+            // synthetic two-pointer gesture that we play on the open canvas.
+            // RECEIVER_EXPORTED is required so `adb shell am broadcast` (shell
+            // uid) can reach this runtime-registered receiver.
+            ContextCompat.registerReceiver(
+                this,
+                DebugGestureInjector.receiver,
+                IntentFilter(DebugGestureInjector.ACTION_DEBUG_GESTURE),
+                ContextCompat.RECEIVER_EXPORTED
+            )
+        }
 
         setContent {
             val settings by app.settingsRepository.getSettings().collectAsState(initial = null)
@@ -60,5 +78,15 @@ class MainActivity : AppCompatActivity() {
                 TouchNotesNavHost(app = app)
             }
         }
+    }
+
+    override fun onDestroy() {
+        if (BuildConfig.DEBUG) {
+            // Mirror of the onCreate debug hook registration; runCatching only
+            // guards a never-registered lifecycle edge (registration is
+            // unconditional under DEBUG).
+            runCatching { unregisterReceiver(DebugGestureInjector.receiver) }
+        }
+        super.onDestroy()
     }
 }

@@ -15,6 +15,7 @@ import android.util.AttributeSet
 import android.view.MotionEvent
 import android.view.View
 import personal.notes.touch.util.BitmapUtils
+import personal.notes.touch.util.DebugGestureInjector
 import java.util.ArrayDeque
 
 enum class CanvasTool {
@@ -1115,7 +1116,18 @@ class DrawingCanvasView @JvmOverloads constructor(
             return false
         }
 
+        // A fresh gesture drops any stale multi-touch cancellation state.
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+            multiTouchCancelsStroke = false
+        }
+
         if (event.pointerCount >= 2) {
+            if (event.actionMasked == MotionEvent.ACTION_POINTER_DOWN) {
+                // Pinch-zoom / two-finger pan: cancel any drawing
+                // interaction started by the first finger alone so the
+                // later single-pointer UP does not commit a stray stroke.
+                cancelDrawingInteractionForMultiTouch()
+            }
             handleCanvasGesture(event)
             return true
         }
@@ -1161,6 +1173,14 @@ class DrawingCanvasView @JvmOverloads constructor(
                     return true
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    if (multiTouchCancelsStroke) {
+                        // Gesture became a canvas transform: the shape was
+                        // cancelled, commit nothing to the bitmap.
+                        multiTouchCancelsStroke = false
+                        isDrawingShape = false
+                        invalidate()
+                        return true
+                    }
                     currentTouchX = x
                     currentTouchY = y
                     isDrawingShape = false
@@ -1349,6 +1369,12 @@ class DrawingCanvasView @JvmOverloads constructor(
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
+                if (multiTouchCancelsStroke) {
+                    // Stroke was cancelled by a second pointer: keep the
+                    // in-progress path empty until the finger is lifted.
+                    invalidate()
+                    return true
+                }
                 val dx = Math.abs(x - lastTouchX)
                 val dy = Math.abs(y - lastTouchY)
                 if (dx >= 2 || dy >= 2) {
@@ -1361,6 +1387,15 @@ class DrawingCanvasView @JvmOverloads constructor(
                 return true
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (multiTouchCancelsStroke) {
+                    // Gesture became a canvas transform: the stroke was
+                    // cancelled, commit nothing to the bitmap.
+                    multiTouchCancelsStroke = false
+                    currentPath.reset()
+                    sampledPoints.clear()
+                    invalidate()
+                    return true
+                }
                 currentPath.lineTo(x, y)
                 sampledPoints.add(x to y)
                 // Commit current path to backing bitmap
@@ -1500,6 +1535,42 @@ class DrawingCanvasView @JvmOverloads constructor(
         onUndoRedoListener?.invoke(undoStack.isNotEmpty(), redoStack.isNotEmpty())
     }
 
+    // Set when a drawing interaction that began with a single pointer
+    // (stroke / shape / lasso-SELECTING) is cancelled because a second
+    // pointer arrives (pinch-zoom / two-finger pan). The interaction start
+    // pushed an undo snapshot but never wrote pixels to the backing bitmap,
+    // so that snapshot is popped and the later single-pointer UP/CANCEL
+    // commits nothing.
+    private var multiTouchCancelsStroke = false
+
+    private fun isDrawingInteractionInProgress(): Boolean {
+        return !currentPath.isEmpty ||
+            sampledPoints.isNotEmpty() ||
+            isDrawingShape ||
+            lassoState == LassoState.SELECTING
+    }
+
+    private fun cancelDrawingInteractionForMultiTouch() {
+        if (!isDrawingInteractionInProgress()) return
+        multiTouchCancelsStroke = true
+        currentPath.reset()
+        sampledPoints.clear()
+        isDrawingShape = false
+        if (lassoState == LassoState.SELECTING) {
+            lassoPath.reset()
+            lassoState = LassoState.IDLE
+        }
+        // Drop the undo entry the interaction start pushed (nothing has been
+        // committed to the bitmap yet), so undo stays enabled only for
+        // real strokes.
+        if (undoStack.isNotEmpty()) {
+            val snapshot = undoStack.removeLast()
+            if (!snapshot.isRecycled) snapshot.recycle()
+        }
+        notifyUndoRedo()
+        invalidate()
+    }
+
     /**
      * Multi-finger tap hook: invoked on a quick 3+ finger tap (≤500 ms,
      * max pointers ≥ 3) before normal gesture handling. CanvasScreen uses
@@ -1552,8 +1623,16 @@ class DrawingCanvasView @JvmOverloads constructor(
         }
     }
 
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        // DEBUG-only: feed the adb gesture injector the newest canvas instance
+        // (see util/DebugGestureInjector.kt; inert in release builds).
+        DebugGestureInjector.register(this)
+    }
+
     override fun onDetachedFromWindow() {
         super.onDetachedFromWindow()
+        DebugGestureInjector.unregister(this)
         setOnDragListener(null)
         clearRedoStack()
         while (undoStack.isNotEmpty()) {
