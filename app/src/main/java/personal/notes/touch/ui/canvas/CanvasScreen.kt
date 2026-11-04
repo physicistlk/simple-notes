@@ -126,7 +126,9 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import personal.notes.touch.R
 import personal.notes.touch.data.db.entity.PageEntity
 import personal.notes.touch.ui.theme.OrangePrimary
@@ -197,7 +199,14 @@ fun CanvasScreen(
         canvasViewRef?.setPageContent(savedBitmap)
         canvasViewRef?.backgroundBitmap = savedBitmap
         try {
-            canvasViewRef?.loadImageLayers(viewModel.fileStore, viewModel.noteId)
+            // Layer PNG decode is file I/O: read on Dispatchers.IO, apply
+            // on main via applyLoadedLayers (invalidate() included).
+            canvasViewRef?.let { view ->
+                val layers = withContext(Dispatchers.IO) {
+                    view.readLayersFromDisk(viewModel.fileStore, viewModel.noteId)
+                }
+                view.applyLoadedLayers(layers)
+            }
         } catch (e: Exception) {
             e.printStackTrace()
         }
@@ -208,27 +217,39 @@ fun CanvasScreen(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         uri?.let {
-            try {
-                val bitmap = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                    ImageDecoder.decodeBitmap(ImageDecoder.createSource(context.contentResolver, it))
-                } else {
-                    @Suppress("DEPRECATION")
-                    MediaStore.Images.Media.getBitmap(context.contentResolver, it)
-                }
-                bitmap?.let { bmp ->
-                    val added = canvasViewRef?.addImageLayer(bmp) == true
-                    if (added) {
-                        scope.launch {
-                            try {
-                                canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                            } catch (e: Exception) {
-                                e.printStackTrace()
+            scope.launch {
+                try {
+                    // Decode off the main thread (same pattern as
+                    // NoteListScreen) — ImageDecoder/MediaStore file reads
+                    // never block the UI thread.
+                    val bitmap = withContext(Dispatchers.IO) {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                            ImageDecoder.decodeBitmap(ImageDecoder.createSource(context.contentResolver, it))
+                        } else {
+                            @Suppress("DEPRECATION")
+                            MediaStore.Images.Media.getBitmap(context.contentResolver, it)
+                        }
+                    }
+                    // The decoded bitmap is applied on main and then owned by
+                    // the image layer (addImageLayer stores it as-is), so it
+                    // must not be recycled here.
+                    bitmap?.let { bmp ->
+                        val added = canvasViewRef?.addImageLayer(bmp) == true
+                        if (added) {
+                            scope.launch {
+                                try {
+                                    withContext(Dispatchers.IO) {
+                                        canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                                    }
+                                } catch (e: Exception) {
+                                    e.printStackTrace()
+                                }
                             }
                         }
                     }
+                } catch (e: Exception) {
+                    e.printStackTrace()
                 }
-            } catch (e: Exception) {
-                e.printStackTrace()
             }
         }
     }
@@ -241,39 +262,61 @@ fun CanvasScreen(
         uri?.let {
             scope.launch {
                 try {
-                    val count = PdfImportManager.getPageCount(context, it)
+                    // PdfRenderer / ContentResolver work belongs on IO.
+                    val count = withContext(Dispatchers.IO) {
+                        PdfImportManager.getPageCount(context, it)
+                    }
                     if (count <= 0) {
                         android.widget.Toast.makeText(context, "Could not open PDF", android.widget.Toast.LENGTH_SHORT).show()
                         return@launch
                     }
                     val noteId = viewModel.noteId
-                    // Add a new page for each PDF page
-                    for (i in 0 until count) {
-                        val bmp = try {
-                            PdfImportManager.renderPage(
-                                context = context,
-                                uri = it,
-                                pageIndex = i,
-                                targetWidth = 1080,
-                                targetHeight = if ((note?.pageType ?: "infinite") == "a4") 1528 else 1920
-                            )
-                        } catch (e: Exception) {
-                            e.printStackTrace()
-                            android.widget.Toast.makeText(context, "PDF import error: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
-                            null
-                        } ?: continue
-                        val newPage = viewModel.repository.addPage(noteId)
-                        val pageIdx = newPage.index
-                        // Atomic save: write temp file in files/note/<id>/tmp then rename
-                        viewModel.fileStore.writePageFileAtomically(noteId, pageIdx) { tmp ->
-                            java.io.FileOutputStream(tmp).use { out ->
-                                bmp.compress(Bitmap.CompressFormat.PNG, 100, out)
+                    // Per-page render error toast: Toast.show() must run on a
+                    // thread with a Looper, so bounce back to Main.
+                    suspend fun showPageError(msg: String) {
+                        withContext(Dispatchers.Main) {
+                            android.widget.Toast.makeText(context, msg, android.widget.Toast.LENGTH_LONG).show()
+                        }
+                    }
+                    var firstPageBitmap: Bitmap? = null
+                    // Add a new page for each PDF page. Rendering, PNG
+                    // compression and the atomic file write all run on
+                    // Dispatchers.IO; the loop no longer blocks the main
+                    // thread (no progress UI exists, so nothing is posted
+                    // per page except the error toast above).
+                    withContext(Dispatchers.IO) {
+                        for (i in 0 until count) {
+                            val bmp = try {
+                                PdfImportManager.renderPage(
+                                    context = context,
+                                    uri = it,
+                                    pageIndex = i,
+                                    targetWidth = 1080,
+                                    targetHeight = if ((note?.pageType ?: "infinite") == "a4") 1528 else 1920
+                                )
+                            } catch (e: Exception) {
+                                e.printStackTrace()
+                                showPageError("PDF import error: ${e.message}")
+                                null
+                            } ?: continue
+                            val newPage = viewModel.repository.addPage(noteId)
+                            val pageIdx = newPage.index
+                            // Atomic save: write temp file in files/note/<id>/tmp then rename
+                            viewModel.fileStore.writePageFileAtomically(noteId, pageIdx) { tmp ->
+                                java.io.FileOutputStream(tmp).use { out ->
+                                    bmp.compress(Bitmap.CompressFormat.PNG, 100, out)
+                                }
+                            }
+                            // Non-destructive: background layer only, strokes untouched.
+                            // View assignment is deferred to Main below to keep
+                            // this loop purely off-main.
+                            if (i == 0) {
+                                firstPageBitmap = bmp
                             }
                         }
-                        // Non-destructive: background layer only, strokes untouched.
-                        if (i == 0) {
-                            canvasViewRef?.backgroundBitmap = bmp
-                        }
+                    }
+                    firstPageBitmap?.let { bmp ->
+                        canvasViewRef?.backgroundBitmap = bmp
                     }
                     android.widget.Toast.makeText(context, "Imported $count PDF page(s)", android.widget.Toast.LENGTH_SHORT).show()
                 } catch (e: Exception) {
@@ -296,7 +339,9 @@ fun CanvasScreen(
                 if (added) {
                     scope.launch {
                         try {
-                            canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                            withContext(Dispatchers.IO) {
+                                canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                            }
                         } catch (e: Exception) {
                             e.printStackTrace()
                         }
@@ -312,7 +357,9 @@ fun CanvasScreen(
                 if (inserted) {
                     scope.launch {
                         try {
-                            canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                            withContext(Dispatchers.IO) {
+                                canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                            }
                         } catch (e: Exception) {
                             e.printStackTrace()
                         }
@@ -349,18 +396,25 @@ fun CanvasScreen(
     }
 
     // Save on leave helper
-    val saveAndExit = {
+    val saveAndExit: () -> Unit = {
         scope.launch {
             try {
                 canvasViewRef?.getBackingBitmap()?.let { bmp ->
                     viewModel.saveCurrentPageBitmap(bmp)
                 }
-                canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                // Layer save is disk I/O (PNG compress + JSON write):
+                // run it on Dispatchers.IO and await it, then navigate.
+                // Navigation lives inside the coroutine so the screen can
+                // not leave composition mid-save (the launcher scope is
+                // cancelled on disposal) — no lost layers on exit.
+                withContext(Dispatchers.IO) {
+                    canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                }
             } catch (e: Exception) {
                 e.printStackTrace()
             }
+            onBackClick()
         }
-        onBackClick()
     }
 
     // Dialog: "Change note name" (matches Screenshot_20261102-184531_TouchNotes.png)
@@ -474,29 +528,39 @@ fun CanvasScreen(
                     if (uri != null && idx in 0 until pendingPdfPageCount) {
                         val w = canvasViewRef?.width ?: 0
                         val h = canvasViewRef?.height ?: 0
-                        val bmp = try {
-                            PdfImportManager.renderPage(
-                                context = context,
-                                uri = uri,
-                                pageIndex = idx,
-                                targetWidth = if (w > 0) w else 1080,
-                                targetHeight = if (h > 0) h else if ((note?.pageType ?: "infinite") == "a4") 1528 else 1920
-                            )
-                        } catch (e: Exception) {
-                            e.printStackTrace()
-                            android.widget.Toast.makeText(context, "PDF import error: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
-                            null
-                        }
-                        if (bmp != null) {
-                            // Non-destructive: set background only, leave strokes alone.
-                            canvasViewRef?.let { it.backgroundBitmap = bmp }
-                        } else {
-                            android.widget.Toast.makeText(context, "Failed to render PDF page", android.widget.Toast.LENGTH_SHORT).show()
+                        scope.launch {
+                            // PdfRenderer work is file I/O: run it on
+                            // Dispatchers.IO, apply the result on main. The
+                            // dialog stays open until the page has actually
+                            // been rendered (as before), so it never closes
+                            // early.
+                            val bmp = try {
+                                withContext(Dispatchers.IO) {
+                                    PdfImportManager.renderPage(
+                                        context = context,
+                                        uri = uri,
+                                        pageIndex = idx,
+                                        targetWidth = if (w > 0) w else 1080,
+                                        targetHeight = if (h > 0) h else if ((note?.pageType ?: "infinite") == "a4") 1528 else 1920
+                                    )
+                                }
+                            } catch (e: Exception) {
+                                e.printStackTrace()
+                                android.widget.Toast.makeText(context, "PDF import error: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
+                                null
+                            }
+                            if (bmp != null) {
+                                // Non-destructive: set background only, leave strokes alone.
+                                canvasViewRef?.let { it.backgroundBitmap = bmp }
+                            } else {
+                                android.widget.Toast.makeText(context, "Failed to render PDF page", android.widget.Toast.LENGTH_SHORT).show()
+                            }
+                            showPdfPagePicker = false
                         }
                     } else {
                         android.widget.Toast.makeText(context, "Invalid page number", android.widget.Toast.LENGTH_SHORT).show()
+                        showPdfPagePicker = false
                     }
-                    showPdfPagePicker = false
                 }) { Text("Import") }
             },
             dismissButton = {
@@ -849,17 +913,23 @@ fun CanvasScreen(
                     if (uiState.volumeForPageEnabled && event.nativeKeyEvent.action == android.view.KeyEvent.ACTION_DOWN) {
                         when (event.nativeKeyEvent.keyCode) {
                             android.view.KeyEvent.KEYCODE_VOLUME_UP -> {
-                                // Save current layers and backing
+                                // Save current layers and backing; the page
+                                // switch is issued from the same coroutine
+                                // only after the awaited layer save (IO) has
+                                // landed — same save-then-switch order the
+                                // baseline's main-dispatcher queue produced.
                                 scope.launch {
                                     try {
                                         canvasViewRef?.getBackingBitmap()?.let { bmp ->
                                             viewModel.saveCurrentPageBitmap(bmp)
                                         }
-                                        canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                                        withContext(Dispatchers.IO) {
+                                            canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                                        }
                                     } catch (e: Exception) { e.printStackTrace() }
-                                }
-                                viewModel.previousPage(canvasViewRef?.getBackingBitmap()) { newBmp ->
-                                    newBmp?.let { canvasViewRef?.setPageContent(it) }
+                                    viewModel.previousPage(canvasViewRef?.getBackingBitmap()) { newBmp ->
+                                        newBmp?.let { canvasViewRef?.setPageContent(it) }
+                                    }
                                 }
                                 true
                             }
@@ -869,11 +939,13 @@ fun CanvasScreen(
                                         canvasViewRef?.getBackingBitmap()?.let { bmp ->
                                             viewModel.saveCurrentPageBitmap(bmp)
                                         }
-                                        canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                                        withContext(Dispatchers.IO) {
+                                            canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                                        }
                                     } catch (e: Exception) { e.printStackTrace() }
-                                }
-                                viewModel.nextPage(canvasViewRef?.getBackingBitmap()) { newBmp ->
-                                    newBmp?.let { canvasViewRef?.setPageContent(it) }
+                                    viewModel.nextPage(canvasViewRef?.getBackingBitmap()) { newBmp ->
+                                        newBmp?.let { canvasViewRef?.setPageContent(it) }
+                                    }
                                 }
                                 true
                             }
@@ -908,9 +980,14 @@ fun CanvasScreen(
                             scope.launch {
                                 val savedBitmap = viewModel.loadCurrentPageBitmap()
                                 setPageContent(savedBitmap)
-                                // Load image layers
+                                // Load image layers (decode on Dispatchers.IO,
+                                // apply on main — AndroidView code must not
+                                // touch the view hierarchy off main).
                                 try {
-                                    loadImageLayers(viewModel.fileStore, viewModel.noteId)
+                                    val layers = withContext(Dispatchers.IO) {
+                                        readLayersFromDisk(viewModel.fileStore, viewModel.noteId)
+                                    }
+                                    applyLoadedLayers(layers)
                                     // Load background from page file for PDF/multi-page notes
                                     if (savedBitmap != null) {
                                         backgroundBitmap = savedBitmap
@@ -1463,12 +1540,17 @@ fun CanvasScreen(
                                         canvasViewRef?.getBackingBitmap()?.let { bmp ->
                                             viewModel.saveCurrentPageBitmap(bmp)
                                         }
-                                        canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                                        // Await the layer save (IO) so nothing
+                                        // writes layers while the page switch
+                                        // below reloads them.
+                                        withContext(Dispatchers.IO) {
+                                            canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                                        }
                                     } catch (e: Exception) { e.printStackTrace() }
-                                }
-                                val currentBmp = canvasViewRef?.getBackingBitmap()
-                                viewModel.previousPage(currentBmp) { newBmp ->
-                                    canvasViewRef?.setPageContent(newBmp)
+                                    val currentBmp = canvasViewRef?.getBackingBitmap()
+                                    viewModel.previousPage(currentBmp) { newBmp ->
+                                        canvasViewRef?.setPageContent(newBmp)
+                                    }
                                 }
                             },
                             enabled = currentPageIndex > 0,
@@ -1512,12 +1594,17 @@ fun CanvasScreen(
                                         canvasViewRef?.getBackingBitmap()?.let { bmp ->
                                             viewModel.saveCurrentPageBitmap(bmp)
                                         }
-                                        canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                                        // Await the layer save (IO) so nothing
+                                        // writes layers while the page switch
+                                        // below reloads them.
+                                        withContext(Dispatchers.IO) {
+                                            canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                                        }
                                     } catch (e: Exception) { e.printStackTrace() }
-                                }
-                                val currentBmp = canvasViewRef?.getBackingBitmap()
-                                viewModel.nextPage(currentBmp) { newBmp ->
-                                    canvasViewRef?.setPageContent(newBmp)
+                                    val currentBmp = canvasViewRef?.getBackingBitmap()
+                                    viewModel.nextPage(currentBmp) { newBmp ->
+                                        canvasViewRef?.setPageContent(newBmp)
+                                    }
                                 }
                             },
                             enabled = currentPageIndex < totalPages - 1,

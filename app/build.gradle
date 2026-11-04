@@ -39,6 +39,15 @@ android {
     }
 }
 
+// Room schema export (AppDatabase exportSchema = true): kapt writes a JSON
+// schema for each database version to app/schemas/personal.notes.touch.AppDatabase.
+// See the migration policy KDoc in AppDatabase.kt / data/db/Migrations.kt.
+kapt {
+    arguments {
+        arg("room.schemaLocation", "$projectDir/schemas")
+    }
+}
+
 dependencies {
     implementation 'androidx.core:core-ktx:1.13.1'
     implementation 'androidx.appcompat:appcompat:1.7.0'

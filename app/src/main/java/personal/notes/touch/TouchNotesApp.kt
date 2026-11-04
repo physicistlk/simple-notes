@@ -8,7 +8,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import personal.notes.touch.data.db.AppDatabase
+import personal.notes.touch.data.db.APP_MIGRATIONS
 import personal.notes.touch.data.files.NoteFileStore
+import personal.notes.touch.data.repo.FlashCardRepository
 import personal.notes.touch.data.repo.NoteRepository
 import personal.notes.touch.data.repo.SettingsRepository
 
@@ -43,14 +45,24 @@ class TouchNotesApp : Application() {
             _settingsRepository ?: buildSettingsRepository().also { _settingsRepository = it }
         }
 
-    val flashCardRepository: personal.notes.touch.data.repo.FlashCardRepository by lazy {
-        personal.notes.touch.data.repo.FlashCardRepository(database.flashCardDao())
-    }
+    @Volatile
+    private var _flashCardRepository: FlashCardRepository? = null
+
+    val flashCardRepository: FlashCardRepository
+        get() = _flashCardRepository ?: synchronized(this) {
+            _flashCardRepository ?: buildFlashCardRepository().also { _flashCardRepository = it }
+        }
 
     private fun buildDatabase(): AppDatabase {
         return Room.databaseBuilder(this, AppDatabase::class.java, "touchnotes.db")
             .setJournalMode(RoomDatabase.JournalMode.WRITE_AHEAD_LOGGING)
-            .fallbackToDestructiveMigration()
+            // Destructive fallback is allowed only when migrating FROM the legacy
+            // dev schemas (versions 1-3). From schema version 4 upward a real
+            // Migration registered in data/db/Migrations.kt is mandatory:
+            // an upgrade without one will crash at open time instead of wiping
+            // user data. See the migration policy KDoc in AppDatabase.
+            .fallbackToDestructiveMigrationFrom(1, 2, 3)
+            .addMigrations(*APP_MIGRATIONS)
             .build()
     }
 
@@ -67,6 +79,10 @@ class TouchNotesApp : Application() {
         return SettingsRepository(database.settingsDao())
     }
 
+    private fun buildFlashCardRepository(): FlashCardRepository {
+        return FlashCardRepository(database.flashCardDao())
+    }
+
     fun reloadDatabase() {
         synchronized(this) {
             try {
@@ -75,6 +91,7 @@ class TouchNotesApp : Application() {
             _database = buildDatabase()
             _noteRepository = buildNoteRepository()
             _settingsRepository = buildSettingsRepository()
+            _flashCardRepository = buildFlashCardRepository()
         }
     }
 

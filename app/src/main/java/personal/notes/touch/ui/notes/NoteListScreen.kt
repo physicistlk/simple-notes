@@ -227,7 +227,10 @@ fun NoteListScreen(
         uri?.let {
             scope.launch {
                 try {
-                    val count = PdfImportManager.getPageCount(context, it)
+                    // PdfRenderer / ContentResolver work belongs on IO.
+                    val count = withContext(Dispatchers.IO) {
+                        PdfImportManager.getPageCount(context, it)
+                    }
                     if (count <= 0) {
                         android.widget.Toast.makeText(context, "Could not open PDF", android.widget.Toast.LENGTH_SHORT).show()
                         return@launch
@@ -239,25 +242,37 @@ fun NoteListScreen(
                     )
                     val noteId = note.id
                     val fileStore = viewModel.repository.fileStore
-                    // Render and save each PDF page atomically (temp file + rename)
-                    for (i in 0 until count) {
-                        val bmp = try {
-                            PdfImportManager.renderPage(
-                                context = context,
-                                uri = it,
-                                pageIndex = i,
-                                targetWidth = 1080,
-                                targetHeight = 1528
-                            )
-                        } catch (e: Exception) {
-                            e.printStackTrace()
-                            android.widget.Toast.makeText(context, "PDF import error: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
-                            null
-                        } ?: continue
-                        val pageIdx = if (i == 0) 0 else viewModel.repository.addPage(noteId).index
-                        fileStore.writePageFileAtomically(noteId, pageIdx) { tmp ->
-                            java.io.FileOutputStream(tmp).use { out ->
-                                bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out)
+                    // Per-page render error toast: Toast.show() must run on a
+                    // thread with a Looper, so bounce back to Main.
+                    suspend fun showPageError(msg: String) {
+                        withContext(Dispatchers.Main) {
+                            android.widget.Toast.makeText(context, msg, android.widget.Toast.LENGTH_LONG).show()
+                        }
+                    }
+                    // Render and save each PDF page atomically (temp file +
+                    // rename). The whole loop (render, PNG compression, file
+                    // writes) runs on Dispatchers.IO and no longer blocks
+                    // the main thread.
+                    withContext(Dispatchers.IO) {
+                        for (i in 0 until count) {
+                            val bmp = try {
+                                PdfImportManager.renderPage(
+                                    context = context,
+                                    uri = it,
+                                    pageIndex = i,
+                                    targetWidth = 1080,
+                                    targetHeight = 1528
+                                )
+                            } catch (e: Exception) {
+                                e.printStackTrace()
+                                showPageError("PDF import error: ${e.message}")
+                                null
+                            } ?: continue
+                            val pageIdx = if (i == 0) 0 else viewModel.repository.addPage(noteId).index
+                            fileStore.writePageFileAtomically(noteId, pageIdx) { tmp ->
+                                java.io.FileOutputStream(tmp).use { out ->
+                                    bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out)
+                                }
                             }
                         }
                     }

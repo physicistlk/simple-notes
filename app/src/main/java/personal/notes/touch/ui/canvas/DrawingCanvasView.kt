@@ -559,12 +559,33 @@ class DrawingCanvasView @JvmOverloads constructor(
         return addImageLayer(bmp)
     }
 
+    /**
+     * Convenience wrapper that does the whole load synchronously: the
+     * pure-I/O read plus the main-thread apply. Prefer the split API
+     * ([readLayersFromDisk] on Dispatchers.IO + [applyLoadedLayers] on main)
+     * from Compose callers so PNG decoding never blocks the UI thread.
+     */
     fun loadImageLayers(fileStore: personal.notes.touch.data.files.NoteFileStore, noteId: String) {
+        applyLoadedLayers(readLayersFromDisk(fileStore, noteId))
+    }
+
+    /**
+     * Pure-I/O part of [loadImageLayers]: reads the layer info JSON and
+     * decodes the layer PNGs. Contains no view mutation, so it is safe to
+     * call from a background thread (callers should use Dispatchers.IO).
+     *
+     * Returns `null` when the note has no layer file yet — the caller must
+     * then leave the in-memory layers untouched (same early-return the
+     * original [loadImageLayers] performed). A partially parsed list is
+     * returned on parse failure (mirrors the original behavior of keeping
+     * whatever was read); ordinary IO failures produce an empty list.
+     */
+    fun readLayersFromDisk(fileStore: personal.notes.touch.data.files.NoteFileStore, noteId: String): List<ImageLayer>? {
         val infoFile = fileStore.getLayerInfoFile(noteId)
-        if (!infoFile.exists()) return
+        if (!infoFile.exists()) return null
+        val layers = mutableListOf<ImageLayer>()
         try {
             val arr = org.json.JSONArray(infoFile.readText())
-            imageLayers.clear()
             val layersDir = fileStore.getLayersDir(noteId)
             for (i in 0 until arr.length()) {
                 val obj = arr.getJSONObject(i)
@@ -572,7 +593,7 @@ class DrawingCanvasView @JvmOverloads constructor(
                 val bitmapFile = java.io.File(layersDir, fileName)
                 val bitmap = android.graphics.BitmapFactory.decodeFile(bitmapFile.absolutePath)?.copy(android.graphics.Bitmap.Config.ARGB_8888, true)
                 if (bitmap != null) {
-                    imageLayers.add(ImageLayer(
+                    layers.add(ImageLayer(
                         bitmap = bitmap,
                         x = obj.optDouble("x", 0.0).toFloat(),
                         y = obj.optDouble("y", 0.0).toFloat(),
@@ -585,19 +606,62 @@ class DrawingCanvasView @JvmOverloads constructor(
                     ))
                 }
             }
-            selectedImageIndex = -1
-            invalidate()
         } catch (e: Exception) {
             e.printStackTrace()
         }
+        return layers
     }
 
+    /**
+     * UI-apply part of [loadImageLayers] — main thread only. Extracts the
+     * decoded data into the view state and repaints. A `null` input (no
+     * layer file for this note) leaves the current layers untouched.
+     */
+    fun applyLoadedLayers(layers: List<ImageLayer>?) {
+        if (layers == null) return
+        imageLayers.clear()
+        imageLayers.addAll(layers)
+        selectedImageIndex = -1
+        invalidate()
+    }
+
+    /** Immutable copy of one image layer's geometry + bitmap reference. */
+    private data class LayerSnapshot(
+        val bitmap: Bitmap,
+        val x: Float,
+        val y: Float,
+        val scale: Float,
+        val rotation: Float,
+        val opacity: Float,
+        val visible: Boolean,
+        val name: String
+    )
+
+    /**
+     * Disk part of the layer save (PNG compression + JSON write). Contains
+     * no view mutation or repaint, so it is safe to run entirely on
+     * Dispatchers.IO — which is what every CanvasScreen caller now does.
+     * The layer geometry is snapshotted before the (slow) compressions so
+     * concurrent main-thread edits during the save cannot skew the output.
+     */
     fun saveImageLayers(fileStore: personal.notes.touch.data.files.NoteFileStore, noteId: String) {
         val layersDir = fileStore.getLayersDir(noteId)
         val infoFile = fileStore.getLayerInfoFile(noteId)
         try {
+            val snapshot = imageLayers.map { layer ->
+                LayerSnapshot(
+                    bitmap = layer.bitmap,
+                    x = layer.x,
+                    y = layer.y,
+                    scale = layer.scale,
+                    rotation = layer.rotation,
+                    opacity = layer.opacity,
+                    visible = layer.visible,
+                    name = layer.name
+                )
+            }
             val arr = org.json.JSONArray()
-            imageLayers.forEachIndexed { index, layer ->
+            snapshot.forEachIndexed { index, layer ->
                 val fileName = "layer_$index.png"
                 val file = java.io.File(layersDir, fileName)
                 java.io.FileOutputStream(file).use { fos ->

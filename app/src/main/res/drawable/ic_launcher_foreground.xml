@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Simple Notes adaptive icon foreground: quill + ink swoosh.
+     Generated from reference/icon/SimpleNotes-icon.vectorcraft (VectorCraft export),
+     art 293x392 scaled into the 108x108dp adaptive canvas (safe zone 72dp). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group
+        android:translateX="27.09"
+        android:translateY="18"
+        android:scaleX="0.18367"
+        android:scaleY="0.18367">
+        <!-- swoosh -->
+        <path
+            android:pathData="M6.5,357 C88.5,379 208.5,377 286.5,349"
+            android:strokeColor="#FFF8F0"
+            android:strokeWidth="13"
+            android:strokeLineCap="round"/>
+        <!-- ink drop -->
+        <path
+            android:pathData="M15.5,385 a7,7 0 1,0 14,0 a7,7 0 1,0 -14,0"
+            android:fillColor="#263238"/>
+        <!-- feather shell (with barbs) -->
+        <path
+            android:pathData="M78.5,99 C126.5,41 206.5,5 260.5,1 C256.5,49 238.5,117 204.5,175 C170.5,235 124.5,285 74.5,311 C60.341,295.268 50.308,277.612 44.146,258.967 L75.4,254.1 L39.553,241.511 C37.844,232.903 36.902,224.154 36.702,215.348 L70.4,210.1 L37.227,198.379 C38.012,189.024 39.613,179.668 42.002,170.41 L78.4,163.1 L47.259,153.564 C54.317,134.346 64.816,115.842 78.5,99 Z"
+            android:fillColor="#FFF8F0"/>
+        <!-- nib -->
+        <path
+            android:pathData="M46.5,361 C56.5,345 68.5,329 80.5,319 L94.5,329 C84.5,341 74.5,355 66.5,367 Z"
+            android:fillColor="#263238"/>
+        <!-- spine -->
+        <path
+            android:pathData="M66.5,317 C124.5,239 204.5,111 260.5,5"
+            android:strokeColor="#263238"
+            android:strokeWidth="10"
+            android:strokeLineCap="round"/>
+    </group>
+</vector>

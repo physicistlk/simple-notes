@@ -4,7 +4,9 @@
     <application
         android:name=".TouchNotesApp"
         android:allowBackup="true"
-        android:label="TouchNotes Clone"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
         android:theme="@style/Theme.TouchNotes">
         <activity
             android:name=".MainActivity"
