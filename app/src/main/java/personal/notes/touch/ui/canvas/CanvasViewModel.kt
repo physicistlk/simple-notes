@@ -306,8 +306,27 @@ class CanvasViewModel(
         return BitmapUtils.loadBitmapFromFile(file)
     }
 
+    /**
+     * True when the page bitmap currently shown in the canvas view came from
+     * this session's disk load (initial open or a page flip). False means the
+     * view's backing bitmap was minted blank in this session: either a fresh
+     * note (no page file yet — saving is wanted) or a session where the disk
+     * load never applied to the view.
+     */
+    private var pageLoadedFromDisk = false
+
+    fun setPageLoadedFromDisk(loaded: Boolean) {
+        pageLoadedFromDisk = loaded
+    }
+
     fun saveCurrentPageBitmap(bitmap: Bitmap) {
         val pageIdx = _currentPageIndex.value
+        // Blank-save guard: when this session never loaded an existing page
+        // file into the view (pageLoadedFromDisk == false) while such a file
+        // is on disk, persisting the blank backing bitmap would overwrite
+        // good user content with empty pixels. Drop those writes; fresh notes
+        // (no page file yet) still save freely.
+        if (!pageLoadedFromDisk && fileStore.getPageFile(noteId, pageIdx).exists()) return
         viewModelScope.launch {
             repository.savePageBitmap(noteId, pageIdx, bitmap)
         }
@@ -324,6 +343,9 @@ class CanvasViewModel(
             }
             _currentPageIndex.value = index
             val newBitmap = repository.loadPageBitmap(noteId, index)
+            // The save above guarded the OLD page with the OLD flag state;
+            // from here on the flag describes the NEW page's load result.
+            pageLoadedFromDisk = newBitmap != null
             onBitmapLoaded(newBitmap)
         }
     }
@@ -349,6 +371,7 @@ class CanvasViewModel(
             }
             val newPage = repository.addPage(noteId)
             _currentPageIndex.value = newPage.index
+            pageLoadedFromDisk = false // new page starts blank, no disk load
             onBitmapLoaded(null) // New page starts blank
         }
     }
@@ -368,6 +391,7 @@ class CanvasViewModel(
 
                 _currentPageIndex.value = newIndex
                 val newBitmap = repository.loadPageBitmap(noteId, newIndex)
+                pageLoadedFromDisk = newBitmap != null
                 onBitmapLoaded(newBitmap)
             }
         }

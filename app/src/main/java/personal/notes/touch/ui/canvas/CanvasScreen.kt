@@ -193,11 +193,32 @@ fun CanvasScreen(
 
     val totalPages = note?.pageCount ?: pages.size.coerceAtLeast(1)
 
-    // Load/save layers on page change and initialize
+    // Load/save layers on page change. The INITIAL page/layer load lives in
+    // the AndroidView factory below, bound to the view instance it creates:
+    // a LaunchedEffect-only loader can silently no-op on an reopen composition
+    // (its canvasViewRef-guarded apply racing/cancelled in the entry's frame
+    // burst — on-device the view then stayed blank at the inited Backing size),
+    // while the factory's own coroutine always reaches its own view. This
+    // effect therefore skips its first (initial-composition) run — page 0 is
+    // applied exactly once — and only handles real page flips.
+    var pageEffectFirstRun by remember { mutableStateOf(true) }
     LaunchedEffect(currentPageIndex) {
+        if (pageEffectFirstRun) {
+            pageEffectFirstRun = false
+            return@LaunchedEffect
+        }
         val savedBitmap = viewModel.loadCurrentPageBitmap()
         canvasViewRef?.setPageContent(savedBitmap)
-        canvasViewRef?.backgroundBitmap = savedBitmap
+        // The saved page PNG is the raster ground truth of the stroke layer
+        // (applied by setPageContent above). Assigning it also to
+        // backgroundBitmap painted every baked stroke a second time on
+        // reopen — the stroke layer copy is scaled to the view while the
+        // background copy renders at native size, so the strokes showed as
+        // offset double lines whether the two loads' scales lined up or not.
+        // Keep a single layer: clear the background, which is the same
+        // result the old code produced whenever savedBitmap was null.
+        canvasViewRef?.backgroundBitmap = null
+        viewModel.setPageLoadedFromDisk(savedBitmap != null)
         try {
             // Layer PNG decode is file I/O: read on Dispatchers.IO, apply
             // on main via applyLoadedLayers (invalidate() included).
@@ -976,22 +997,26 @@ fun CanvasScreen(
                                     viewModel.saveCurrentPageBitmap(bmp)
                                 }
                             }
-                            // Load saved page bitmap
+                            // Initial load, bound to THIS view instance: the
+                            // coroutine captures `this`, so it can never miss
+                            // the view via canvasViewRef read timing (the
+                            // reopen-blank regression when loading lived only
+                            // in the LaunchedEffect). The page PNG is applied
+                            // exactly once — to the stroke layer via
+                            // setPageContent, never also as backgroundBitmap —
+                            // keeping retained strokes from rendering twice,
+                            // and the LaunchedEffect above skips its first run
+                            // so page 0 is not loaded a second time.
                             scope.launch {
-                                val savedBitmap = viewModel.loadCurrentPageBitmap()
-                                setPageContent(savedBitmap)
-                                // Load image layers (decode on Dispatchers.IO,
-                                // apply on main — AndroidView code must not
-                                // touch the view hierarchy off main).
                                 try {
+                                    val savedBitmap = viewModel.loadCurrentPageBitmap()
+                                    setPageContent(savedBitmap)
+                                    backgroundBitmap = null
+                                    viewModel.setPageLoadedFromDisk(savedBitmap != null)
                                     val layers = withContext(Dispatchers.IO) {
                                         readLayersFromDisk(viewModel.fileStore, viewModel.noteId)
                                     }
                                     applyLoadedLayers(layers)
-                                    // Load background from page file for PDF/multi-page notes
-                                    if (savedBitmap != null) {
-                                        backgroundBitmap = savedBitmap
-                                    }
                                 } catch (e: Exception) {
                                     e.printStackTrace()
                                 }
