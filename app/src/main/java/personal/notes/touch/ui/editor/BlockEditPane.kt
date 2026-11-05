@@ -1,5 +1,6 @@
 package personal.notes.touch.ui.editor
 
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -50,8 +51,10 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.isShiftPressed
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
@@ -67,6 +70,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import personal.notes.touch.ui.theme.LocalThemeColor
+import personal.notes.touch.util.ClipboardHelper
 
 /**
  * Phase-1 block editor (SiYuan flavour, touch edition).
@@ -97,6 +101,13 @@ fun BlockEditPane(
 
     val activeBlock = blocks.firstOrNull { it.id == activeId }
     val hasSelection = activeBlock != null && !activeBlock.field.selection.collapsed
+
+    var menuBlockId by remember { mutableStateOf<String?>(null) }
+    val menuBlock = blocks.firstOrNull { it.id == menuBlockId }
+    LaunchedEffect(menuBlockId, blocks) {
+        if (menuBlockId != null && blocks.none { it.id == menuBlockId }) menuBlockId = null
+    }
+    val context = LocalContext.current
 
     LaunchedEffect(pendingFocus) {
         val target = pendingFocus ?: return@LaunchedEffect
@@ -136,10 +147,38 @@ fun BlockEditPane(
                     isReadOnly = isReadOnly,
                     viewModel = viewModel,
                     themeColor = themeColor,
-                    focusRequesters = focusRequesters
+                    focusRequesters = focusRequesters,
+                    onOpenMenu = { menuBlockId = it }
                 )
             }
         }
+    }
+
+    if (menuBlock != null) {
+        BlockMenuSheet(
+            block = menuBlock,
+            onDismiss = { menuBlockId = null },
+            onTransform = { type, level ->
+                viewModel.transformBlock(menuBlock.id, type, level)
+                menuBlockId = null
+            },
+            onIndent = { viewModel.indentBlock(menuBlock.id); menuBlockId = null },
+            onOutdent = { viewModel.outdentBlock(menuBlock.id); menuBlockId = null },
+            onMoveUp = { viewModel.moveBlock(menuBlock.id, -1); menuBlockId = null },
+            onMoveDown = { viewModel.moveBlock(menuBlock.id, 1); menuBlockId = null },
+            onDuplicate = { viewModel.duplicateBlock(menuBlock.id); menuBlockId = null },
+            onCopy = {
+                val markdown = viewModel.blockMarkdown(menuBlock.id)
+                val copied = markdown != null && ClipboardHelper.copyText(context, markdown, "Block")
+                Toast.makeText(
+                    context,
+                    if (copied) "Block copied" else "Block is empty",
+                    Toast.LENGTH_SHORT
+                ).show()
+                menuBlockId = null
+            },
+            onDelete = { viewModel.deleteBlock(menuBlock.id); menuBlockId = null }
+        )
     }
 }
 
@@ -159,7 +198,8 @@ private fun BlockRow(
     isReadOnly: Boolean,
     viewModel: TextEditorViewModel,
     themeColor: Color,
-    focusRequesters: MutableMap<String, FocusRequester>
+    focusRequesters: MutableMap<String, FocusRequester>,
+    onOpenMenu: (String) -> Unit
 ) {
     val focus = remember(block.id) { FocusRequester() }
     DisposableEffect(block.id) {
@@ -179,7 +219,26 @@ private fun BlockRow(
         block.type !in slashForbiddenTypes
 
     Box(modifier = Modifier.fillMaxWidth()) {
-        when (block.type) {
+        Row(
+            verticalAlignment = Alignment.Top,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            if (!isReadOnly) {
+                Text(
+                    text = "⋮",
+                    fontSize = 16.sp,
+                    // Faint gutter at rest, clearer on the block being edited;
+                    // the space is always reserved so text never jumps.
+                    color = MaterialTheme.colorScheme.onSurface
+                        .copy(alpha = if (isActive) 0.55f else 0.22f),
+                    modifier = Modifier
+                        .width(22.dp)
+                        .clickable { onOpenMenu(block.id) }
+                        .padding(top = 1.dp)
+                )
+            }
+            Box(modifier = Modifier.weight(1f)) {
+                when (block.type) {
             BlockType.DIVIDER -> {
                 HorizontalDivider(
                     modifier = Modifier.padding(vertical = 12.dp),
@@ -260,26 +319,42 @@ private fun BlockRow(
                 }
             }
             BlockType.IMAGE -> {
-                BlockTextField(
-                    block = block,
-                    viewModel = viewModel,
-                    focusRequester = focus,
-                    onSlashArmed = { slashArmed = it },
-                    readOnly = isReadOnly,
-                    textStyle = TextStyle(
-                        fontSize = 13.sp,
-                        fontStyle = FontStyle.Italic,
-                        color = themeColor
-                    ),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .border(
-                            1.dp,
-                            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.15f),
-                            RoundedCornerShape(8.dp)
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    // Stat the file once per text change, not per recomposition.
+                    val ref = remember(block.field.text) {
+                        ImageBlockRefParser.parse(block.field.text)
+                    }
+                    val localFile = remember(ref?.target, viewModel.noteId) {
+                        ref?.let { viewModel.fileStore.getNoteAsset(viewModel.noteId, it.target) }
+                    }
+                    if (localFile != null) {
+                        NoteImage(
+                            file = localFile,
+                            contentDescription = ref?.alt?.ifBlank { "Image" } ?: "Image",
+                            modifier = Modifier.padding(bottom = 4.dp)
                         )
-                        .padding(horizontal = 10.dp, vertical = 8.dp)
-                )
+                    }
+                    BlockTextField(
+                        block = block,
+                        viewModel = viewModel,
+                        focusRequester = focus,
+                        onSlashArmed = { slashArmed = it },
+                        readOnly = isReadOnly,
+                        textStyle = TextStyle(
+                            fontSize = 13.sp,
+                            fontStyle = FontStyle.Italic,
+                            color = themeColor
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .border(
+                                1.dp,
+                                MaterialTheme.colorScheme.onSurface.copy(alpha = 0.15f),
+                                RoundedCornerShape(8.dp)
+                            )
+                            .padding(horizontal = 10.dp, vertical = 8.dp)
+                    )
+                }
             }
             BlockType.HEADING -> {
                 val (size, weight) = headingStyle(block.headingLevel)
@@ -415,6 +490,8 @@ private fun BlockRow(
                     modifier = Modifier.fillMaxWidth()
                 )
             }
+                }
+            }
         }
 
         if (slashOpen) {
@@ -475,12 +552,18 @@ private fun BlockTextField(
                 if (state.isFocused) viewModel.setActiveBlock(block.id)
             }
             .onPreviewKeyEvent { event ->
-                if (event.type == KeyEventType.KeyDown && event.key == Key.Backspace &&
-                    block.field.selection.collapsed && block.field.selection.start == 0
-                ) {
-                    viewModel.onBackspaceAtBlockStart(block.id)
-                } else {
-                    false
+                when {
+                    event.type == KeyEventType.KeyDown && event.key == Key.Tab &&
+                        BlockStructureOps.isListBlock(block.type) -> {
+                        if (event.isShiftPressed) viewModel.outdentBlock(block.id)
+                        else viewModel.indentBlock(block.id)
+                        true
+                    }
+                    event.type == KeyEventType.KeyDown && event.key == Key.Backspace &&
+                        block.field.selection.collapsed && block.field.selection.start == 0 -> {
+                        viewModel.onBackspaceAtBlockStart(block.id)
+                    }
+                    else -> false
                 }
             },
         decorationBox = { innerField ->
@@ -584,6 +667,7 @@ private fun slashGlyph(command: BlockCommand): String = when (command) {
     BlockCommand.CODE -> "{ }"
     BlockCommand.TABLE -> "⊞"
     BlockCommand.IMAGE -> "🖼"
+    BlockCommand.LINK -> "🔗"
     BlockCommand.TAG -> "#"
     BlockCommand.HIGHLIGHT -> "≡"
     BlockCommand.EMOJI -> "🙂"

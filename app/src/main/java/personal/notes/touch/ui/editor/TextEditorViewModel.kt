@@ -1,5 +1,6 @@
 package personal.notes.touch.ui.editor
 
+import android.net.Uri
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.text.TextRange
@@ -7,6 +8,7 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -21,6 +23,7 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import personal.notes.touch.data.db.entity.NoteEntity
 import personal.notes.touch.data.files.NoteFileStore
 import personal.notes.touch.data.repo.NoteRepository
@@ -124,6 +127,139 @@ class TextEditorViewModel(
 
     fun setShowEmojiSheet(show: Boolean) {
         _showEmojiSheet.value = show
+    }
+
+    // ---------------------------------------------------------------------
+    // Inline links + image attachments (cheap editor gaps)
+    // ---------------------------------------------------------------------
+
+    /** Current link-dialog request; null = dialog closed. */
+    data class LinkDraft(val blockId: String?, val label: String)
+
+    private val _linkDraft = MutableStateFlow<LinkDraft?>(null)
+    val linkDraft: StateFlow<LinkDraft?> = _linkDraft.asStateFlow()
+
+    /** Captures the active block's selection as the link label. */
+    fun openLinkDialog() {
+        // Only the block editor targets a block; Split mode formats the raw
+        // markdown selection instead, so its toolbar keeps working as before.
+        val block = if (_editorMode.value == EditorMode.EDIT) {
+            _blocks.value.firstOrNull { it.id == _activeBlockId.value }
+        } else {
+            null
+        }
+        val selection = block?.field?.selection
+        val label = if (block != null && selection != null && !selection.collapsed) {
+            block.field.text.substring(selection.min, selection.max)
+        } else {
+            ""
+        }
+        _linkDraft.value = LinkDraft(block?.id, label)
+    }
+
+    fun dismissLinkDialog() {
+        _linkDraft.value = null
+    }
+
+    /**
+     * Wraps the current selection (or inserts [label]) as `[label](url)`.
+     * Returns false for an empty/unsafe URL so the dialog can stay open and
+     * show an error. Falls back to the raw markdown surface in Split mode.
+     */
+    fun applyLink(label: String, url: String): Boolean {
+        val normalized = LinkTarget.normalize(url) ?: return false
+        val draft = _linkDraft.value
+        val blockId = draft?.blockId
+
+        if (blockId != null) {
+            val list = _blocks.value
+            val index = list.indexOfFirst { it.id == blockId }
+            if (index >= 0) {
+                val block = list[index]
+                val selection = block.field.selection
+                val selected = if (!selection.collapsed) {
+                    block.field.text.substring(selection.min, selection.max)
+                } else {
+                    ""
+                }
+                // The dialog field wins (it is prefilled from the selection),
+                // then the selection, then the URL itself.
+                val markdown = LinkMarkdown.build(label.trim().ifEmpty { selected }, normalized)
+                    ?: return false
+                val newText = block.field.text.substring(0, selection.min) + markdown +
+                    block.field.text.substring(selection.max)
+                val mutable = list.toMutableList()
+                mutable[index] = block.copy(
+                    field = TextFieldValue(newText, TextRange(selection.min + markdown.length))
+                )
+                publishBlocks(mutable, FocusTarget(block.id))
+                _linkDraft.value = null
+                return true
+            }
+        }
+
+        val current = _contentValue.value
+        val selection = current.selection
+        val selected = if (!selection.collapsed) {
+            current.text.substring(selection.min, selection.max)
+        } else {
+            ""
+        }
+        val markdown = LinkMarkdown.build(label.trim().ifEmpty { selected }, normalized)
+            ?: return false
+        val newText = current.text.substring(0, selection.min) + markdown +
+            current.text.substring(selection.max)
+        onContentChange(TextFieldValue(newText, TextRange(selection.min + markdown.length)))
+        _linkDraft.value = null
+        return true
+    }
+
+    /**
+     * Bumped when the image picker should open (toolbar button or the slash
+     * "Image" command). The screen observes it and launches GetContent.
+     */
+    private val _imagePickRequest = MutableStateFlow(0L)
+    val imagePickRequest: StateFlow<Long> = _imagePickRequest.asStateFlow()
+
+    fun requestImagePick() {
+        _imagePickRequest.value = System.nanoTime()
+    }
+
+    /** Called once the screen has launched the picker (keeps rotation cheap). */
+    fun consumeImagePickRequest() {
+        _imagePickRequest.value = 0L
+    }
+
+    /** Copies the picked image into the note dir (IO) and returns its file name. */
+    suspend fun importImage(uri: Uri): String? = withContext(Dispatchers.IO) {
+        fileStore.saveNoteImage(noteId, uri)
+    }
+
+    /** Inserts `![image](fileName)` after the active block, then a prose row. */
+    fun insertImageBlock(fileName: String) {
+        if (fileName.isBlank()) return
+        val safe = fileName.replace("]", "").replace(")", "")
+        val image = EditableBlock(
+            id = BlockPersistence.newBlockId(),
+            type = BlockType.IMAGE,
+            field = TextFieldValue("![image]($safe)")
+        )
+        val list = _blocks.value
+        val activeIndex = list.indexOfFirst { it.id == _activeBlockId.value }
+        val mutable = list.toMutableList()
+        val paragraph = freshParagraph()
+        if (activeIndex >= 0 &&
+            list[activeIndex].type == BlockType.PARAGRAPH &&
+            list[activeIndex].field.text.isEmpty()
+        ) {
+            mutable[activeIndex] = image
+            mutable.add(activeIndex + 1, paragraph)
+        } else {
+            val at = if (activeIndex >= 0) activeIndex + 1 else mutable.size
+            mutable.add(at, image)
+            mutable.add(at + 1, paragraph)
+        }
+        publishBlocks(mutable, FocusTarget(paragraph.id))
     }
 
     fun insertEmoji(emoji: String) {
@@ -438,6 +574,66 @@ class TextEditorViewModel(
             type = BlockType.PARAGRAPH
         )
 
+    // ---------------------------------------------------------------------
+    // Block menu operations (indent, duplicate, move, delete, turn into)
+    // ---------------------------------------------------------------------
+
+    fun indentActiveBlock() {
+        _activeBlockId.value?.let(::indentBlock)
+    }
+
+    fun outdentActiveBlock() {
+        _activeBlockId.value?.let(::outdentBlock)
+    }
+
+    fun indentBlock(id: String) {
+        val updated = BlockStructureOps.shiftIndent(_blocks.value, id, 1)
+        if (updated !== _blocks.value) publishBlocks(updated)
+    }
+
+    fun outdentBlock(id: String) {
+        val updated = BlockStructureOps.shiftIndent(_blocks.value, id, -1)
+        if (updated !== _blocks.value) publishBlocks(updated)
+    }
+
+    fun duplicateBlock(id: String) {
+        val before = _blocks.value
+        val updated = BlockStructureOps.duplicate(before, id) { BlockPersistence.newBlockId() }
+        if (updated === before) return
+        val copyIndex = before.indexOfFirst { it.id == id } + 1
+        val copy = updated.getOrNull(copyIndex) ?: return
+        val focus = when (copy.type) {
+            BlockType.DIVIDER, BlockType.IMAGE -> null
+            else -> FocusTarget(copy.id)
+        }
+        publishBlocks(updated, focus)
+    }
+
+    fun deleteBlock(id: String) {
+        val list = _blocks.value
+        val index = list.indexOfFirst { it.id == id }
+        if (index < 0) return
+        val updated = BlockStructureOps.delete(list, id) { BlockPersistence.newBlockId() }
+        val focusId = updated.getOrNull(index)?.id ?: updated.lastOrNull()?.id
+        publishBlocks(updated, focusId?.let { FocusTarget(it) })
+    }
+
+    fun moveBlock(id: String, delta: Int) {
+        val updated = BlockStructureOps.move(_blocks.value, id, delta)
+        if (updated !== _blocks.value) publishBlocks(updated, FocusTarget(id))
+    }
+
+    fun transformBlock(id: String, type: BlockType, headingLevel: Int = 1) {
+        val updated = BlockStructureOps.transform(_blocks.value, id, type, headingLevel)
+        if (updated !== _blocks.value) publishBlocks(updated, FocusTarget(id))
+    }
+
+    /** Markdown of one block, used by the menu's "Copy block" action. */
+    fun blockMarkdown(id: String): String? {
+        val block = _blocks.value.firstOrNull { it.id == id } ?: return null
+        return BlockModel.serializeBlockLines(block).joinToString("\n")
+    }
+
     /**
      * One command path for the slash menu AND the formatting toolbar:
      * H1-H3 / lists / quote transform the active block, Divider/Code/Table/
@@ -517,7 +713,19 @@ class TextEditorViewModel(
                 )
                 finish(mutable, FocusTarget(clean.id))
             }
-            BlockCommand.DIVIDER, BlockCommand.CODE, BlockCommand.TABLE, BlockCommand.IMAGE -> {
+            BlockCommand.IMAGE -> {
+                // The picker owns insertion now: clear the slash text, then let
+                // the screen launch GetContent; insertImageBlock() adds the row.
+                mutable[idx] = clean.copy(field = bodyField)
+                finish(mutable, FocusTarget(clean.id))
+                requestImagePick()
+            }
+            BlockCommand.LINK -> {
+                mutable[idx] = clean.copy(field = bodyField)
+                finish(mutable, FocusTarget(clean.id))
+                openLinkDialog()
+            }
+            BlockCommand.DIVIDER, BlockCommand.CODE, BlockCommand.TABLE -> {
                 val insertedId = BlockPersistence.newBlockId()
                 val inserted = when (command) {
                     BlockCommand.DIVIDER -> EditableBlock(id = insertedId, type = BlockType.DIVIDER)

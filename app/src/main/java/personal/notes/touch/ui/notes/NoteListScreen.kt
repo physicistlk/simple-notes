@@ -1680,6 +1680,7 @@ fun extractPreviewLines(rawContent: String, maxLines: Int = 8): List<String> {
             .replace(Regex("\\*(.*?)\\*"), "$1")
             .replace(Regex("`{1,3}(.*?)`{1,3}"), "$1")
             .replace(Regex("!\\[.*?\\]\\(.*?\\)"), "[Image]")
+            .replace(Regex("\\[([^\\]]+)]\\(([^)]*)\\)"), "$1")
             .trim()
         if (cleanedLine.startsWith("|") && cleanedLine.endsWith("|")) {
             cleanedLine = cleanedLine.split("|")

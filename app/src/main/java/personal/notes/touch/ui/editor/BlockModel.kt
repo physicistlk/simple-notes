@@ -310,6 +310,7 @@ enum class BlockCommand(val label: String, val groupName: String) {
     CODE("Code block", SLASH_GROUP_BASIC),
     TABLE("Table", SLASH_GROUP_RICH),
     IMAGE("Image", SLASH_GROUP_RICH),
+    LINK("Link", SLASH_GROUP_RICH),
     TAG("Tag", SLASH_GROUP_RICH),
     HIGHLIGHT("Highlight", SLASH_GROUP_RICH),
     EMOJI("Emoji", SLASH_GROUP_RICH);
@@ -323,7 +324,7 @@ enum class BlockCommand(val label: String, val groupName: String) {
         fun slashGroups(): List<Pair<String, List<BlockCommand>>> = listOf(
             GROUP_HEADINGS to listOf(H1, H2, H3, H4, H5, H6),
             GROUP_BASIC to listOf(BULLET, NUMBERED, TASK, QUOTE, DIVIDER, CODE),
-            GROUP_RICH to listOf(TABLE, IMAGE, TAG, HIGHLIGHT, EMOJI)
+            GROUP_RICH to listOf(TABLE, IMAGE, LINK, TAG, HIGHLIGHT, EMOJI)
         )
     }
 }

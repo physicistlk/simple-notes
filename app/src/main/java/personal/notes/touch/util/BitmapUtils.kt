@@ -58,6 +58,49 @@ object BitmapUtils {
         }
     }
 
+    private val imageCache: MutableMap<String, Bitmap> =
+        Collections.synchronizedMap(object : LinkedHashMap<String, Bitmap>(12, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Bitmap>?): Boolean {
+                return size > 12
+            }
+        })
+
+    fun getCachedImage(path: String, lastModified: Long): Bitmap? =
+        imageCache["$path:$lastModified"]
+
+    /**
+     * Decodes an image block attachment downsampled so its longest side is at
+     * most [maxDimension] px (RGB_565). Small bounded cache: editor rows are
+     * recycled by the LazyColumn and 12 entries cover what is on screen.
+     */
+    suspend fun loadImage(file: File, maxDimension: Int = 1024): Bitmap? = withContext(Dispatchers.IO) {
+        val cacheKey = "${file.absolutePath}:${file.lastModified()}"
+        imageCache[cacheKey]?.let { return@withContext it }
+        try {
+            if (!file.isFile) return@withContext null
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(file.absolutePath, bounds)
+            val w = bounds.outWidth
+            val h = bounds.outHeight
+            if (w <= 0 || h <= 0) return@withContext null
+
+            var sample = 1
+            val longest = maxOf(w, h)
+            while (longest / (sample * 2) >= maxDimension) sample *= 2
+
+            val opts = BitmapFactory.Options().apply {
+                inSampleSize = sample
+                inPreferredConfig = Bitmap.Config.RGB_565
+            }
+            val decoded = BitmapFactory.decodeFile(file.absolutePath, opts) ?: return@withContext null
+            imageCache[cacheKey] = decoded
+            decoded
+        } catch (e: Exception) {
+            e.printStackTrace()
+            null
+        }
+    }
+
     suspend fun saveBitmapToPng(bitmap: Bitmap, file: File): Boolean = withContext(Dispatchers.IO) {
         try {
             val parent = file.parentFile

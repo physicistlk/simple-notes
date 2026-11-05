@@ -1,5 +1,8 @@
 package personal.notes.touch.ui.editor
 
+import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -24,6 +27,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.ClickableText
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -32,7 +36,9 @@ import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CheckboxDefaults
@@ -43,15 +49,18 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -63,7 +72,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
@@ -74,6 +85,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import kotlinx.coroutines.launch
+import personal.notes.touch.data.files.NoteFileStore
 import personal.notes.touch.ui.theme.LocalThemeColor
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -97,6 +109,30 @@ fun TextEditorScreen(
     var showExportDialog by remember { mutableStateOf(false) }
     var showOutlineSheet by remember { mutableStateOf(false) }
     val coroutineScope = rememberCoroutineScope()
+    val context = LocalContext.current
+    val linkDraft by viewModel.linkDraft.collectAsState()
+    val imagePickRequest by viewModel.imagePickRequest.collectAsState()
+
+    // SAF photo picker: no storage permission, the URI carries a read grant.
+    val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri != null) {
+            coroutineScope.launch {
+                val fileName = viewModel.importImage(uri)
+                if (fileName != null) {
+                    viewModel.insertImageBlock(fileName)
+                } else {
+                    Toast.makeText(context, "Could not import image", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(imagePickRequest) {
+        if (imagePickRequest > 0L) {
+            viewModel.consumeImagePickRequest()
+            imagePicker.launch("image/*")
+        }
+    }
 
     // Lifecycle flush: the 1s debounce covers typing; ON_PAUSE/ON_STOP make a
     // hard app-kill keep the latest markdown (Phase-1 persistence contract).
@@ -243,7 +279,8 @@ fun TextEditorScreen(
                     viewModel = viewModel,
                     themeColor = themeColor,
                     blockCommandsActive = blockCommandsActive,
-                    onOutlineClick = { showOutlineSheet = true }
+                    onOutlineClick = { showOutlineSheet = true },
+                    onPickImage = { viewModel.requestImagePick() }
                 )
                 HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f))
             }
@@ -300,6 +337,8 @@ fun TextEditorScreen(
                         PreviewPane(
                             title = title,
                             content = contentValue.text,
+                            noteId = viewModel.noteId,
+                            fileStore = viewModel.fileStore,
                             onToggleChecklist = { lineIdx, checked ->
                                 viewModel.toggleChecklist(lineIdx, checked)
                             },
@@ -342,6 +381,8 @@ fun TextEditorScreen(
                                 PreviewPane(
                                     title = title,
                                     content = contentValue.text,
+                                    noteId = viewModel.noteId,
+                                    fileStore = viewModel.fileStore,
                                     onToggleChecklist = { lineIdx, checked ->
                                         viewModel.toggleChecklist(lineIdx, checked)
                                     },
@@ -377,6 +418,15 @@ fun TextEditorScreen(
             onDismiss = { viewModel.setShowEmojiSheet(false) }
         )
     }
+
+    val draft = linkDraft
+    if (draft != null) {
+        LinkDialog(
+            initialLabel = draft.label,
+            onConfirm = { label, url -> viewModel.applyLink(label, url) },
+            onDismiss = { viewModel.dismissLinkDialog() }
+        )
+    }
 }
 
 @Composable
@@ -408,7 +458,8 @@ private fun FormattingToolbar(
     viewModel: TextEditorViewModel,
     themeColor: Color,
     blockCommandsActive: Boolean,
-    onOutlineClick: () -> Unit
+    onOutlineClick: () -> Unit,
+    onPickImage: () -> Unit
 ) {
     Row(
         modifier = Modifier
@@ -442,6 +493,10 @@ private fun FormattingToolbar(
         ToolbarButton(
             text = "`code`", mono = true,
             onClick = { viewModel.applyInlineToActiveBlock("`") }
+        )
+        ToolbarButton(
+            text = "🔗 Link",
+            onClick = { viewModel.openLinkDialog() }
         )
 
         ToolbarDivider()
@@ -478,6 +533,8 @@ private fun FormattingToolbar(
         ToolbarButton(text = "☑ Check", onClick = {
             if (blockCommandsActive) viewModel.applyBlockCommand(BlockCommand.TASK) else viewModel.applyChecklist()
         })
+        ToolbarButton(text = "⇤", onClick = { viewModel.outdentActiveBlock() })
+        ToolbarButton(text = "⇥", onClick = { viewModel.indentActiveBlock() })
         ToolbarButton(text = "❝ Quote", onClick = {
             if (blockCommandsActive) viewModel.applyBlockCommand(BlockCommand.QUOTE) else viewModel.applyQuote()
         })
@@ -490,9 +547,7 @@ private fun FormattingToolbar(
         ToolbarButton(text = "⊞ Table", onClick = {
             viewModel.applyBlockCommand(BlockCommand.TABLE)
         })
-        ToolbarButton(text = "🖼 Image", onClick = {
-            viewModel.applyBlockCommand(BlockCommand.IMAGE)
-        })
+        ToolbarButton(text = "🖼 Image", onClick = onPickImage)
         ToolbarButton(text = "# Tag", onClick = {
             viewModel.applyBlockCommand(BlockCommand.TAG)
         })
@@ -609,11 +664,15 @@ private fun EditPane(
 private fun PreviewPane(
     title: String,
     content: String,
+    noteId: String,
+    fileStore: NoteFileStore,
     onToggleChecklist: (lineIndex: Int, isChecked: Boolean) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val blocks = remember(content) { RichTextParser.parseMarkdown(content) }
     val themeColor = LocalThemeColor.current
+    val context = LocalContext.current
+    val onLinkClick: (String) -> Unit = { url -> LinkTarget.open(context, url) }
 
     LazyColumn(
         modifier = modifier,
@@ -655,20 +714,26 @@ private fun PreviewPane(
                         5 -> 14 to FontWeight.Medium
                         else -> 13 to FontWeight.Medium
                     }
-                    Text(
+                    RichTextBlock(
                         text = block.text,
-                        fontSize = size.sp,
-                        fontWeight = weight,
-                        color = MaterialTheme.colorScheme.onSurface,
-                        modifier = Modifier.padding(top = 6.dp, bottom = 2.dp)
+                        style = TextStyle(
+                            fontSize = size.sp,
+                            fontWeight = weight,
+                            color = MaterialTheme.colorScheme.onSurface
+                        ),
+                        modifier = Modifier.padding(top = 6.dp, bottom = 2.dp),
+                        onLinkClick = onLinkClick
                     )
                 }
                 is RichBlock.Paragraph -> {
-                    Text(
+                    RichTextBlock(
                         text = block.text,
-                        fontSize = 15.sp,
-                        lineHeight = 22.sp,
-                        color = MaterialTheme.colorScheme.onSurface
+                        style = TextStyle(
+                            fontSize = 15.sp,
+                            lineHeight = 22.sp,
+                            color = MaterialTheme.colorScheme.onSurface
+                        ),
+                        onLinkClick = onLinkClick
                     )
                 }
                 is RichBlock.Quote -> {
@@ -685,12 +750,15 @@ private fun PreviewPane(
                                 .background(themeColor)
                         )
                         Spacer(modifier = Modifier.width(10.dp))
-                        Text(
+                        RichTextBlock(
                             text = block.text,
-                            fontSize = 14.sp,
-                            fontStyle = FontStyle.Italic,
-                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.85f),
-                            modifier = Modifier.padding(vertical = 4.dp, horizontal = 4.dp)
+                            style = TextStyle(
+                                fontSize = 14.sp,
+                                fontStyle = FontStyle.Italic,
+                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.85f)
+                            ),
+                            modifier = Modifier.padding(vertical = 4.dp, horizontal = 4.dp),
+                            onLinkClick = onLinkClick
                         )
                     }
                 }
@@ -706,11 +774,14 @@ private fun PreviewPane(
                             color = themeColor,
                             modifier = Modifier.padding(end = 8.dp)
                         )
-                        Text(
+                        RichTextBlock(
                             text = block.text,
-                            fontSize = 15.sp,
-                            lineHeight = 22.sp,
-                            color = MaterialTheme.colorScheme.onSurface
+                            style = TextStyle(
+                                fontSize = 15.sp,
+                                lineHeight = 22.sp,
+                                color = MaterialTheme.colorScheme.onSurface
+                            ),
+                            onLinkClick = onLinkClick
                         )
                     }
                 }
@@ -726,11 +797,14 @@ private fun PreviewPane(
                             color = themeColor,
                             modifier = Modifier.padding(end = 8.dp)
                         )
-                        Text(
+                        RichTextBlock(
                             text = block.text,
-                            fontSize = 15.sp,
-                            lineHeight = 22.sp,
-                            color = MaterialTheme.colorScheme.onSurface
+                            style = TextStyle(
+                                fontSize = 15.sp,
+                                lineHeight = 22.sp,
+                                color = MaterialTheme.colorScheme.onSurface
+                            ),
+                            onLinkClick = onLinkClick
                         )
                     }
                 }
@@ -756,11 +830,14 @@ private fun PreviewPane(
                             modifier = Modifier.size(28.dp)
                         )
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text(
+                        RichTextBlock(
                             text = block.text,
-                            fontSize = 15.sp,
-                            textDecoration = if (block.isChecked) TextDecoration.LineThrough else TextDecoration.None,
-                            color = if (block.isChecked) MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f) else MaterialTheme.colorScheme.onSurface
+                            style = TextStyle(
+                                fontSize = 15.sp,
+                                textDecoration = if (block.isChecked) TextDecoration.LineThrough else TextDecoration.None,
+                                color = if (block.isChecked) MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f) else MaterialTheme.colorScheme.onSurface
+                            ),
+                            onLinkClick = onLinkClick
                         )
                     }
                 }
@@ -768,40 +845,62 @@ private fun PreviewPane(
                     BorderedEditorTable(rows = block.rows, themeColor = themeColor)
                 }
                 is RichBlock.Image -> {
-                    Card(
-                        shape = RoundedCornerShape(8.dp),
-                        colors = CardDefaults.cardColors(
-                            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f)
-                        ),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 4.dp)
-                    ) {
+                    val localFile = remember(block.url, noteId) {
+                        fileStore.getNoteAsset(noteId, block.url)
+                    }
+                    if (localFile != null) {
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(12.dp),
+                                .padding(vertical = 4.dp),
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
-                            Icon(
-                                imageVector = Icons.Default.Image,
-                                contentDescription = block.alt,
-                                tint = themeColor,
-                                modifier = Modifier.size(36.dp)
-                            )
-                            Spacer(modifier = Modifier.height(4.dp))
-                            Text(
-                                text = block.alt.ifBlank { "Image" },
-                                fontSize = 13.sp,
-                                fontWeight = FontWeight.Medium,
-                                color = MaterialTheme.colorScheme.onSurface
-                            )
-                            if (block.url.isNotBlank()) {
+                            NoteImage(file = localFile, contentDescription = block.alt.ifBlank { "Image" })
+                            if (block.alt.isNotBlank()) {
                                 Text(
-                                    text = block.url,
-                                    fontSize = 11.sp,
-                                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
+                                    text = block.alt,
+                                    fontSize = 12.sp,
+                                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+                                    modifier = Modifier.padding(top = 4.dp)
                                 )
+                            }
+                        }
+                    } else {
+                        Card(
+                            shape = RoundedCornerShape(8.dp),
+                            colors = CardDefaults.cardColors(
+                                containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f)
+                            ),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 4.dp)
+                        ) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(12.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Image,
+                                    contentDescription = block.alt,
+                                    tint = themeColor,
+                                    modifier = Modifier.size(36.dp)
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = block.alt.ifBlank { "Image" },
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                                if (block.url.isNotBlank()) {
+                                    Text(
+                                        text = block.url,
+                                        fontSize = 11.sp,
+                                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
+                                    )
+                                }
                             }
                         }
                     }
@@ -950,4 +1049,82 @@ fun EmojiPickerSheet(
             }
         }
     }
+}
+
+/**
+ * Rich text with tappable inline links: annotations are attached by
+ * [RichTextParser.parseInline] under [RichTextParser.LINK_TAG].
+ */
+@Composable
+private fun RichTextBlock(
+    text: AnnotatedString,
+    style: TextStyle,
+    onLinkClick: (String) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    ClickableText(
+        text = text,
+        style = style,
+        modifier = modifier,
+        onClick = { offset ->
+            text.getStringAnnotations(RichTextParser.LINK_TAG, offset, offset)
+                .firstOrNull()
+                ?.let { annotation -> onLinkClick(annotation.item) }
+        }
+    )
+}
+
+/** Minimal link dialog: label + URL, validates before closing. */
+@Composable
+private fun LinkDialog(
+    initialLabel: String,
+    onConfirm: (String, String) -> Boolean,
+    onDismiss: () -> Unit
+) {
+    var label by remember(initialLabel) { mutableStateOf(initialLabel) }
+    var url by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Insert link") },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = label,
+                    onValueChange = { label = it },
+                    label = { Text("Text") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = url,
+                    onValueChange = { url = it; error = null },
+                    label = { Text("URL") },
+                    placeholder = { Text("https://example.com") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                error?.let { message ->
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(message, fontSize = 12.sp, color = Color(0xFFD32F2F))
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                if (!onConfirm(label, url)) {
+                    error = "Enter a valid http(s):// or mailto: link"
+                }
+            }) {
+                Text("Insert")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        }
+    )
 }

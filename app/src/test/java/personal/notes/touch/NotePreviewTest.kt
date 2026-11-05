@@ -59,4 +59,11 @@ class NotePreviewTest {
         val whitespaceLines = extractPreviewLines("   \n\n  ", maxLines = 5)
         assertTrue(whitespaceLines.isEmpty())
     }
+
+    @Test
+    fun testExtractPreviewLinesFlattensLinksAndImages() {
+        val content = "See [the docs](https://example.com/docs) and ![cat](img_1.jpg)"
+        val lines = extractPreviewLines(content, maxLines = 3)
+        assertEquals(listOf("See the docs and [Image]"), lines)
+    }
 }

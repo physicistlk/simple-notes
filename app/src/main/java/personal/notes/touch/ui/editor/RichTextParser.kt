@@ -37,6 +37,12 @@ object RichTextParser {
     /** Highlight (==mark==) background — SiYuan default yellow-ish. */
     private val MARK_BG = Color(0xFFFFF176)
 
+    /** String annotation tag carrying a link target inside an AnnotatedString. */
+    const val LINK_TAG = "touchnotes.link"
+
+    /** Link colour (Material blue 700), underlined like a browser link. */
+    private val LINK_COLOR = Color(0xFF1565C0)
+
     fun parseMarkdown(content: String): List<RichBlock> {
         val lines = content.lines()
         val blocks = mutableListOf<RichBlock>()
@@ -330,6 +336,33 @@ object RichTextParser {
                         }
                         cursor = next + 1
                         continue
+                    }
+                }
+
+                // [label](url) — inline link (v2): styled + tagged so the
+                // preview can hand the target to ACTION_VIEW on tap.
+                if (text[cursor] == '[' && (cursor == 0 || text[cursor - 1] != '!')) {
+                    val labelEnd = text.indexOf("](", cursor + 1)
+                    if (labelEnd != -1) {
+                        val urlEnd = text.indexOf(')', labelEnd + 2)
+                        if (urlEnd != -1) {
+                            val label = text.substring(cursor + 1, labelEnd)
+                            val url = text.substring(labelEnd + 2, urlEnd).trim()
+                            if (label.isNotEmpty() && url.isNotEmpty()) {
+                                val start = length
+                                withStyle(
+                                    SpanStyle(
+                                        color = LINK_COLOR,
+                                        textDecoration = TextDecoration.Underline
+                                    )
+                                ) {
+                                    append(label)
+                                }
+                                addStringAnnotation(LINK_TAG, url, start, length)
+                                cursor = urlEnd + 1
+                                continue
+                            }
+                        }
                     }
                 }
 

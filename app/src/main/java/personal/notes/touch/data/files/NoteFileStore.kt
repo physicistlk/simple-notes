@@ -1,6 +1,7 @@
 package personal.notes.touch.data.files
 
 import android.content.Context
+import android.net.Uri
 import java.io.File
 
 class NoteFileStore(private val context: Context) {
@@ -13,6 +14,53 @@ class NoteFileStore(private val context: Context) {
 
     fun getPageFile(noteId: String, pageIndex: Int): File {
         return File(getNoteDir(noteId), "page_${pageIndex}.png")
+    }
+
+    /**
+     * Copies a picked image into the note's own directory and returns its
+     * file name (what the IMAGE block stores as `![alt](name)`). Returns null
+     * for unreadable/empty sources. No permission is needed: the picker hands
+     * over a read-grant URI.
+     */
+    fun saveNoteImage(noteId: String, source: Uri): String? {
+        return try {
+            val resolver = context.contentResolver
+            val extension = when (resolver.getType(source)?.lowercase()) {
+                "image/png" -> "png"
+                "image/webp" -> "webp"
+                "image/gif" -> "gif"
+                "image/heic", "image/heif" -> "heic"
+                else -> "jpg"
+            }
+            val fileName = "img_${System.currentTimeMillis()}.$extension"
+            val target = File(getNoteDir(noteId), fileName)
+            val copied = resolver.openInputStream(source)?.use { input ->
+                target.outputStream().use { output -> input.copyTo(output) }
+                true
+            } ?: false
+            if (!copied || target.length() <= 0L) {
+                target.delete()
+                null
+            } else {
+                fileName
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            null
+        }
+    }
+
+    /**
+     * Resolves a note-local asset referenced by markdown (`![alt](name)`).
+     * Only a plain file name inside this note's directory is accepted —
+     * separators and `..` are rejected so content can never escape the dir.
+     */
+    fun getNoteAsset(noteId: String, relativeName: String): File? {
+        val name = relativeName.trim()
+        if (name.isEmpty()) return null
+        if (name.contains('/') || name.contains('\\') || name.contains("..")) return null
+        val file = File(getNoteDir(noteId), name)
+        return file.takeIf { it.isFile }
     }
 
     /**
