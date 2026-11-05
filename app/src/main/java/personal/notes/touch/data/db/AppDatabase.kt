@@ -20,7 +20,7 @@ import personal.notes.touch.data.db.entity.PageEntity
 import personal.notes.touch.data.db.entity.SettingsEntity
 
 /**
- * TouchNotes Room database (current schema version: 4).
+ * TouchNotes Room database (current schema version: 5).
  *
  * ## Migration & data-loss policy (audit C1 / CH4, 2026-11-04)
  *
@@ -61,7 +61,7 @@ import personal.notes.touch.data.db.entity.SettingsEntity
         NoteLabelUsageEntity::class,
         SettingsEntity::class
     ],
-    version = 4,
+    version = 5,
     exportSchema = true
 )
 abstract class AppDatabase : RoomDatabase() {

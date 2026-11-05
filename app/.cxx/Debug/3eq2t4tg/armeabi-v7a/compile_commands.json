@@ -1,0 +1,7 @@
+[
+{
+  "directory": "/home/lk1/craft_apps/simple_notes/touchnotes-clone/app/.cxx/Debug/3eq2t4tg/armeabi-v7a",
+  "command": "/home/lk1/craft_apps/tools/sdk/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/clang --target=armv7-none-linux-androideabi21 --sysroot=/home/lk1/craft_apps/tools/sdk/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/sysroot -Dtouchnotes_pdfium_EXPORTS -I/home/lk1/craft_apps/simple_notes/touchnotes-clone/app/src/main/cpp/pdfium/include -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -march=armv7-a -mthumb -Wformat -Werror=format-security  -fno-limit-debug-info  -fPIC -o CMakeFiles/touchnotes_pdfium.dir/touchnotes_pdfium.c.o -c /home/lk1/craft_apps/simple_notes/touchnotes-clone/app/src/main/cpp/touchnotes_pdfium.c",
+  "file": "/home/lk1/craft_apps/simple_notes/touchnotes-clone/app/src/main/cpp/touchnotes_pdfium.c"
+}
+]

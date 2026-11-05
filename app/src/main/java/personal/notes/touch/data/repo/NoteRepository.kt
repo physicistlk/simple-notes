@@ -224,6 +224,25 @@ class NoteRepository(
         }
     }
 
+    /**
+     * F-10 vector PDF import: records where a page came from so the canvas
+     * can re-render it from the source PDF at any zoom level.
+     */
+    suspend fun setPagePdfSource(
+        noteId: String,
+        pageIndex: Int,
+        pdfSourcePath: String,
+        pdfPageIndex: Int
+    ) = withContext(Dispatchers.IO) {
+        pageDao.setPdfSource(
+            noteId = noteId,
+            index = pageIndex,
+            pdfSourcePath = pdfSourcePath,
+            pdfPageIndex = pdfPageIndex,
+            updatedAt = System.currentTimeMillis()
+        )
+    }
+
     suspend fun savePageBitmap(noteId: String, pageIndex: Int, bitmap: android.graphics.Bitmap): Boolean = withContext(Dispatchers.IO) {
         val file = fileStore.getPageFile(noteId, pageIndex)
         val ok = personal.notes.touch.util.BitmapUtils.saveBitmapToPng(bitmap, file)

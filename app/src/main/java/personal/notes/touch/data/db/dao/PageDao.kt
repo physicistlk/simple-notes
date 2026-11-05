@@ -33,4 +33,20 @@ interface PageDao {
 
     @Query("DELETE FROM pages WHERE noteId = :noteId")
     suspend fun deleteForNote(noteId: String)
+
+    /**
+     * F-10 vector PDF import: records the source document + page index for
+     * one page row (see [PageEntity.pdfSourcePath]).
+     */
+    @Query(
+        "UPDATE pages SET pdfSourcePath = :pdfSourcePath, pdfPageIndex = :pdfPageIndex, " +
+            "updatedAt = :updatedAt WHERE noteId = :noteId AND `index` = :index"
+    )
+    suspend fun setPdfSource(
+        noteId: String,
+        index: Int,
+        pdfSourcePath: String,
+        pdfPageIndex: Int,
+        updatedAt: Long
+    )
 }

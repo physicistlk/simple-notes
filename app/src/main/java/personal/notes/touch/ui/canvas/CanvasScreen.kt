@@ -133,7 +133,7 @@ import personal.notes.touch.R
 import personal.notes.touch.data.db.entity.PageEntity
 import personal.notes.touch.ui.theme.OrangePrimary
 import personal.notes.touch.util.ClipboardHelper
-import personal.notes.touch.util.PdfImportManager
+import personal.notes.touch.util.PdfVectorImporter
 
 val TouchNotesColors = listOf(
     Color(0xFF000000), // Black
@@ -281,22 +281,26 @@ fun CanvasScreen(
         }
     }
 
-    // PDF Picker Launcher — non-destructive: sets backgroundBitmap only,
-    // never touches the backingBitmap stroke layer (see DrawingCanvasView).
+    // PDF Picker Launcher — vector import (defect F-10): the source PDF is
+    // kept with the note and pages are re-rendered from pdfium at any zoom
+    // level (sharp text, no raster upscaling). The stroke layer is never
+    // touched: the rendered page is a background/preview artifact only.
     val pdfPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
         uri?.let {
             scope.launch {
+                val imported = try {
+                    withContext(Dispatchers.IO) { PdfVectorImporter.readDocument(context, it) }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    null
+                }
+                if (imported == null) {
+                    android.widget.Toast.makeText(context, "Could not open PDF", android.widget.Toast.LENGTH_SHORT).show()
+                    return@launch
+                }
                 try {
-                    // PdfRenderer / ContentResolver work belongs on IO.
-                    val count = withContext(Dispatchers.IO) {
-                        PdfImportManager.getPageCount(context, it)
-                    }
-                    if (count <= 0) {
-                        android.widget.Toast.makeText(context, "Could not open PDF", android.widget.Toast.LENGTH_SHORT).show()
-                        return@launch
-                    }
                     val noteId = viewModel.noteId
                     // Per-page render error toast: Toast.show() must run on a
                     // thread with a Looper, so bounce back to Main.
@@ -305,50 +309,38 @@ fun CanvasScreen(
                             android.widget.Toast.makeText(context, msg, android.widget.Toast.LENGTH_LONG).show()
                         }
                     }
-                    var firstPageBitmap: Bitmap? = null
-                    // Add a new page for each PDF page. Rendering, PNG
-                    // compression and the atomic file write all run on
-                    // Dispatchers.IO; the loop no longer blocks the main
-                    // thread (no progress UI exists, so nothing is posted
-                    // per page except the error toast above).
-                    withContext(Dispatchers.IO) {
-                        for (i in 0 until count) {
-                            val bmp = try {
-                                PdfImportManager.renderPage(
-                                    context = context,
-                                    uri = it,
-                                    pageIndex = i,
-                                    targetWidth = 1080,
-                                    targetHeight = if ((note?.pageType ?: "infinite") == "a4") 1528 else 1920
-                                )
-                            } catch (e: Exception) {
-                                e.printStackTrace()
-                                showPageError("PDF import error: ${e.message}")
-                                null
-                            } ?: continue
-                            val newPage = viewModel.repository.addPage(noteId)
-                            val pageIdx = newPage.index
-                            // Atomic save: write temp file in files/note/<id>/tmp then rename
-                            viewModel.fileStore.writePageFileAtomically(noteId, pageIdx) { tmp ->
-                                java.io.FileOutputStream(tmp).use { out ->
-                                    bmp.compress(Bitmap.CompressFormat.PNG, 100, out)
-                                }
-                            }
-                            // Non-destructive: background layer only, strokes untouched.
-                            // View assignment is deferred to Main below to keep
-                            // this loop purely off-main.
-                            if (i == 0) {
-                                firstPageBitmap = bmp
-                            }
-                        }
+                    // Append one page per PDF page. Rendering, PNG compression
+                    // and the atomic file write all run on Dispatchers.IO; the
+                    // loop no longer blocks the main thread (no progress UI
+                    // exists, so nothing is posted per page except the error
+                    // toast above).
+                    val firstPageBitmap = withContext(Dispatchers.IO) {
+                        PdfVectorImporter.importIntoNote(
+                            context = context,
+                            imported = imported,
+                            noteId = noteId,
+                            repository = viewModel.repository,
+                            fileStore = viewModel.fileStore,
+                            targetWidth = 1080,
+                            targetHeight = if ((note?.pageType ?: "infinite") == "a4") 1528 else 1920,
+                            reuseFirstPage = false,
+                            onPageError = { msg -> showPageError(msg) }
+                        )
                     }
+                    // Non-destructive: background layer only, strokes untouched.
                     firstPageBitmap?.let { bmp ->
                         canvasViewRef?.backgroundBitmap = bmp
                     }
-                    android.widget.Toast.makeText(context, "Imported $count PDF page(s)", android.widget.Toast.LENGTH_SHORT).show()
+                    android.widget.Toast.makeText(
+                        context,
+                        "Imported ${imported.pageCount} PDF page(s)",
+                        android.widget.Toast.LENGTH_SHORT
+                    ).show()
                 } catch (e: Exception) {
                     e.printStackTrace()
                     android.widget.Toast.makeText(context, "PDF import error: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
+                } finally {
+                    imported.document.close()
                 }
             }
         }
@@ -563,13 +555,20 @@ fun CanvasScreen(
                             // early.
                             val bmp = try {
                                 withContext(Dispatchers.IO) {
-                                    PdfImportManager.renderPage(
-                                        context = context,
-                                        uri = uri,
-                                        pageIndex = idx,
-                                        targetWidth = if (w > 0) w else 1080,
-                                        targetHeight = if (h > 0) h else if ((note?.pageType ?: "infinite") == "a4") 1528 else 1920
-                                    )
+                                    // F-10: render the chosen page from the
+                                    // vector source (pdfium) at the view's
+                                    // pixel size instead of a one-time raster.
+                                    val imported = PdfVectorImporter.readDocument(context, uri)
+                                        ?: return@withContext null
+                                    try {
+                                        imported.document.renderPage(
+                                            pageIndex = idx,
+                                            targetWidth = if (w > 0) w else 1080,
+                                            targetHeight = if (h > 0) h else if ((note?.pageType ?: "infinite") == "a4") 1528 else 1920
+                                        )
+                                    } finally {
+                                        imported.document.close()
+                                    }
                                 }
                             } catch (e: Exception) {
                                 e.printStackTrace()

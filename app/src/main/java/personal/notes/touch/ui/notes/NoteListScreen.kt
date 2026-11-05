@@ -149,7 +149,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import personal.notes.touch.util.BitmapUtils
-import personal.notes.touch.util.PdfImportManager
+import personal.notes.touch.util.PdfVectorImporter
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -233,15 +233,17 @@ fun NoteListScreen(
     ) { uri: Uri? ->
         uri?.let {
             scope.launch {
+                val imported = try {
+                    withContext(Dispatchers.IO) { PdfVectorImporter.readDocument(context, it) }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    null
+                }
+                if (imported == null) {
+                    android.widget.Toast.makeText(context, "Could not open PDF", android.widget.Toast.LENGTH_SHORT).show()
+                    return@launch
+                }
                 try {
-                    // PdfRenderer / ContentResolver work belongs on IO.
-                    val count = withContext(Dispatchers.IO) {
-                        PdfImportManager.getPageCount(context, it)
-                    }
-                    if (count <= 0) {
-                        android.widget.Toast.makeText(context, "Could not open PDF", android.widget.Toast.LENGTH_SHORT).show()
-                        return@launch
-                    }
                     val note = viewModel.repository.createNote(
                         title = "Imported PDF",
                         folderId = uiState.selectedFolderId,
@@ -256,40 +258,31 @@ fun NoteListScreen(
                             android.widget.Toast.makeText(context, msg, android.widget.Toast.LENGTH_LONG).show()
                         }
                     }
-                    // Render and save each PDF page atomically (temp file +
-                    // rename). The whole loop (render, PNG compression, file
-                    // writes) runs on Dispatchers.IO and no longer blocks
-                    // the main thread.
+                    // F-10 vector import: renders each page from pdfium and
+                    // records the source PDF so pages re-render sharply at any
+                    // zoom. The whole loop (render, PNG compression, file
+                    // writes) runs on Dispatchers.IO.
                     withContext(Dispatchers.IO) {
-                        for (i in 0 until count) {
-                            val bmp = try {
-                                PdfImportManager.renderPage(
-                                    context = context,
-                                    uri = it,
-                                    pageIndex = i,
-                                    targetWidth = 1080,
-                                    targetHeight = 1528
-                                )
-                            } catch (e: Exception) {
-                                e.printStackTrace()
-                                showPageError("PDF import error: ${e.message}")
-                                null
-                            } ?: continue
-                            val pageIdx = if (i == 0) 0 else viewModel.repository.addPage(noteId).index
-                            fileStore.writePageFileAtomically(noteId, pageIdx) { tmp ->
-                                java.io.FileOutputStream(tmp).use { out ->
-                                    bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out)
-                                }
-                            }
-                        }
+                        PdfVectorImporter.importIntoNote(
+                            context = context,
+                            imported = imported,
+                            noteId = noteId,
+                            repository = viewModel.repository,
+                            fileStore = fileStore,
+                            targetWidth = 1080,
+                            targetHeight = 1528,
+                            reuseFirstPage = true,
+                            onPageError = { msg -> showPageError(msg) }
+                        )
                     }
                     // Update note page count
-                    val updatedNote = note.copy(pageCount = count)
-                    viewModel.repository.updateNote(updatedNote)
+                    viewModel.repository.updateNote(note.copy(pageCount = imported.pageCount))
                     onNoteClick(noteId)
                 } catch (e: Exception) {
                     e.printStackTrace()
                     android.widget.Toast.makeText(context, "PDF import error: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
+                } finally {
+                    imported.document.close()
                 }
             }
         }

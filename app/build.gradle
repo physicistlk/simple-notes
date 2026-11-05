@@ -7,6 +7,7 @@ plugins {
 android {
     namespace 'personal.notes.touch'
     compileSdk 35
+    ndkVersion '27.2.12479018'
 
     defaultConfig {
         applicationId "personal.notes.touch"
@@ -14,6 +15,22 @@ android {
         targetSdk 35
         versionCode 1
         versionName "0.1.0"
+
+        // F-10 vector PDF import: our thin JNI bridge compiles per ABI;
+        // the prebuilt pdfium engine ships as jniLibs/<abi>/libpdfium.so.
+        // Only the two shipped ARM ABIs are built (no emulator/x86 bloat).
+        externalNativeBuild {
+            cmake {
+                abiFilters 'arm64-v8a', 'armeabi-v7a'
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path 'src/main/cpp/CMakeLists.txt'
+            version '3.22.1'
+        }
     }
 
     buildTypes {

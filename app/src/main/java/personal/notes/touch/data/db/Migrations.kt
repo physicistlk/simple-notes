@@ -55,4 +55,17 @@ internal val MIGRATION_3_4: Migration = object : Migration(3, 4) {
     }
 }
 
-internal val APP_MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_3_4)
+/**
+ * F-10 vector PDF import: every page remembers the source document it came
+ * from so the canvas can re-render it from vectors at any zoom level.
+ * Additive columns only — existing pages keep `pdfSourcePath = ''` /
+ * `pdfPageIndex = -1` and behave exactly as before (raster page PNG).
+ */
+internal val MIGRATION_4_5: Migration = object : Migration(4, 5) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE pages ADD COLUMN pdfSourcePath TEXT NOT NULL DEFAULT ''")
+        db.execSQL("ALTER TABLE pages ADD COLUMN pdfPageIndex INTEGER NOT NULL DEFAULT -1")
+    }
+}
+
+internal val APP_MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_3_4, MIGRATION_4_5)

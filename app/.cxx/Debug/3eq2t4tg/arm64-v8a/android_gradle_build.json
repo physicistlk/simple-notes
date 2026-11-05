@@ -1,0 +1,40 @@
+{
+  "buildFiles": [
+    "/home/lk1/craft_apps/simple_notes/touchnotes-clone/app/src/main/cpp/CMakeLists.txt"
+  ],
+  "cleanCommandsComponents": [
+    [
+      "/home/lk1/craft_apps/tools/sdk/cmake/3.22.1/bin/ninja",
+      "-C",
+      "/home/lk1/craft_apps/simple_notes/touchnotes-clone/app/.cxx/Debug/3eq2t4tg/arm64-v8a",
+      "clean"
+    ]
+  ],
+  "buildTargetsCommandComponents": [
+    "/home/lk1/craft_apps/tools/sdk/cmake/3.22.1/bin/ninja",
+    "-C",
+    "/home/lk1/craft_apps/simple_notes/touchnotes-clone/app/.cxx/Debug/3eq2t4tg/arm64-v8a",
+    "{LIST_OF_TARGETS_TO_BUILD}"
+  ],
+  "libraries": {
+    "touchnotes_pdfium::@6890427a1f51a3e7e1df": {
+      "toolchain": "toolchain",
+      "abi": "arm64-v8a",
+      "artifactName": "touchnotes_pdfium",
+      "output": "/home/lk1/craft_apps/simple_notes/touchnotes-clone/app/build/intermediates/cxx/Debug/3eq2t4tg/obj/arm64-v8a/libtouchnotes_pdfium.so",
+      "runtimeFiles": [
+        "/home/lk1/craft_apps/simple_notes/touchnotes-clone/app/src/main/jniLibs/arm64-v8a/libpdfium.so"
+      ]
+    }
+  },
+  "toolchains": {
+    "toolchain": {
+      "cCompilerExecutable": "/home/lk1/craft_apps/tools/sdk/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/clang.lld",
+      "cppCompilerExecutable": "/home/lk1/craft_apps/tools/sdk/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++.lld"
+    }
+  },
+  "cFileExtensions": [
+    "c"
+  ],
+  "cppFileExtensions": []
+}

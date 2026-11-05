@@ -1,0 +1,1 @@
+/home/lk1/craft_apps/simple_notes/touchnotes-clone/app/src/main/cpp/CMakeLists.txt
