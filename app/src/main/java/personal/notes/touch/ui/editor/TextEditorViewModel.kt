@@ -735,15 +735,13 @@ class TextEditorViewModel(
                         field = TextFieldValue(""),
                         closed = true
                     )
-                    BlockCommand.TABLE -> EditableBlock(
+                    // Only DIVIDER/CODE/TABLE reach this branch: IMAGE and LINK
+                    // are handled above (they need the picker/dialog, not a row),
+                    // so the fallback is the table.
+                    else -> EditableBlock(
                         id = insertedId,
                         type = BlockType.TABLE,
                         field = TextFieldValue(BlockModel.DEFAULT_TABLE_ROWS.joinToString("\n"))
-                    )
-                    else -> EditableBlock(
-                        id = insertedId,
-                        type = BlockType.IMAGE,
-                        field = TextFieldValue("![image](https://)", TextRange(9, 17))
                     )
                 }
                 if (freshEmpty) {
