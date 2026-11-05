@@ -104,6 +104,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -129,10 +130,13 @@ import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.math.roundToInt
 import personal.notes.touch.R
 import personal.notes.touch.data.db.entity.PageEntity
 import personal.notes.touch.ui.theme.OrangePrimary
 import personal.notes.touch.util.ClipboardHelper
+import personal.notes.touch.util.PdfDocumentCache
+import personal.notes.touch.util.PdfImportManager
 import personal.notes.touch.util.PdfVectorImporter
 
 val TouchNotesColors = listOf(
@@ -199,6 +203,67 @@ fun CanvasScreen(
 
     val totalPages = note?.pageCount ?: pages.size.coerceAtLeast(1)
 
+    // ---- F-10: vector PDF page plumbing -----------------------------------
+    // One pdfium source document per note, opened lazily and closed when the
+    // screen leaves composition.
+    val pdfDocCache = remember(viewModel.noteId) { PdfDocumentCache(context) }
+    DisposableEffect(pdfDocCache) {
+        onDispose { pdfDocCache.close() }
+    }
+
+    // The page row when [index] renders from a vector PDF source.
+    fun vectorPdfPage(index: Int): PageEntity? {
+        val page = pages.getOrNull(index) ?: return null
+        return if (page.pdfSourcePath.isNotEmpty() && page.pdfPageIndex >= 0) page else null
+    }
+
+    // Installs the live pdfium background of a vector PDF page. The renderer
+    // runs on the canvas render thread and re-renders at higher resolution as
+    // the user zooms in; the page rect stays fixed at the import geometry so
+    // stroke coordinates never shift.
+    fun applyPdfBackground(canvas: DrawingCanvasView, page: PageEntity) {
+        val relPath = page.pdfSourcePath
+        val pdfPageIndex = page.pdfPageIndex
+        val document = pdfDocCache.document(relPath)
+        if (document == null) {
+            canvas.setPdfBackground(0f, 0f, 0f, null)
+            return
+        }
+        val size = document.pageSize(pdfPageIndex)
+        if (size[0] <= 0f || size[1] <= 0f) {
+            canvas.setPdfBackground(0f, 0f, 0f, null)
+            return
+        }
+        // Same base geometry the import used, so pages keep their size/aspect.
+        val pageTypeName = note?.pageType ?: "infinite"
+        val targetHeight = if (pageTypeName == "a4" || pageTypeName == "pdf") 1528 else 1920
+        val (baseOutWidth, _) = PdfImportManager.calculateOutputSize(
+            size[0].roundToInt().coerceAtLeast(1),
+            size[1].roundToInt().coerceAtLeast(1),
+            1080,
+            targetHeight
+        )
+        val basePxPerPt = baseOutWidth / size[0]
+        canvas.setPdfBackground(size[0], size[1], basePxPerPt) { pxPerPt, outW, outH ->
+            pdfDocCache.document(relPath)?.renderPageAt(pdfPageIndex, pxPerPt, outW, outH)
+        }
+    }
+
+    // Shared page apply for every navigation callback: stroke layer of the
+    // loaded page + (for vector PDF pages) the live vector background.
+    fun applyLoadedPage(pageIndex: Int, bitmap: Bitmap?) {
+        val canvas = canvasViewRef ?: return
+        val page = vectorPdfPage(pageIndex)
+        if (page != null) {
+            canvas.setPageContent(bitmap)
+            applyPdfBackground(canvas, page)
+        } else {
+            canvas.setPdfBackground(0f, 0f, 0f, null)
+            canvas.setPageContent(bitmap)
+        }
+    }
+
+
     // Load/save layers on page change. The INITIAL page/layer load lives in
     // the AndroidView factory below, bound to the view instance it creates:
     // a LaunchedEffect-only loader can silently no-op on an reopen composition
@@ -213,18 +278,29 @@ fun CanvasScreen(
             pageEffectFirstRun = false
             return@LaunchedEffect
         }
-        val savedBitmap = viewModel.loadCurrentPageBitmap()
-        canvasViewRef?.setPageContent(savedBitmap)
-        // The saved page PNG is the raster ground truth of the stroke layer
-        // (applied by setPageContent above). Assigning it also to
-        // backgroundBitmap painted every baked stroke a second time on
-        // reopen — the stroke layer copy is scaled to the view while the
-        // background copy renders at native size, so the strokes showed as
-        // offset double lines whether the two loads' scales lined up or not.
-        // Keep a single layer: clear the background, which is the same
-        // result the old code produced whenever savedBitmap was null.
-        canvasViewRef?.backgroundBitmap = null
-        viewModel.setPageLoadedFromDisk(savedBitmap != null)
+        // F-10: vector PDF pages load their stroke-only layer and get the live
+        // pdfium background; every other page keeps the raster path.
+        val vectorPage = vectorPdfPage(currentPageIndex)
+        if (vectorPage != null) {
+            val strokes = withContext(Dispatchers.IO) { viewModel.loadPageStrokes(currentPageIndex) }
+            val canvas = canvasViewRef
+            if (canvas != null) {
+                canvas.setPageContent(strokes)
+                // The saved page PNG is the raster ground truth of the stroke
+                // layer (applied by setPageContent above). Assigning it also to
+                // backgroundBitmap painted every baked stroke a second time on
+                // reopen — keep a single layer: vector pages re-render their
+                // background from the PDF source instead.
+                canvas.backgroundBitmap = null
+                viewModel.setPageLoadedFromDisk(true)
+                applyPdfBackground(canvas, vectorPage)
+            }
+        } else {
+            val savedBitmap = viewModel.loadCurrentPageBitmap()
+            canvasViewRef?.setPageContent(savedBitmap)
+            canvasViewRef?.backgroundBitmap = null
+            viewModel.setPageLoadedFromDisk(savedBitmap != null)
+        }
         try {
             // Layer PNG decode is file I/O: read on Dispatchers.IO, apply
             // on main via applyLoadedLayers (invalidate() included).
@@ -954,7 +1030,7 @@ fun CanvasScreen(
                                         }
                                     } catch (e: Exception) { e.printStackTrace() }
                                     viewModel.previousPage(canvasViewRef?.getBackingBitmap()) { newBmp ->
-                                        newBmp?.let { canvasViewRef?.setPageContent(it) }
+                                        applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
                                     }
                                 }
                                 true
@@ -970,7 +1046,7 @@ fun CanvasScreen(
                                         }
                                     } catch (e: Exception) { e.printStackTrace() }
                                     viewModel.nextPage(canvasViewRef?.getBackingBitmap()) { newBmp ->
-                                        newBmp?.let { canvasViewRef?.setPageContent(it) }
+                                        applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
                                     }
                                 }
                                 true
@@ -1011,13 +1087,27 @@ fun CanvasScreen(
                             // setPageContent, never also as backgroundBitmap —
                             // keeping retained strokes from rendering twice,
                             // and the LaunchedEffect above skips its first run
-                            // so page 0 is not loaded a second time.
+                            // so page 0 is not loaded a second time. F-10:
+                            // vector PDF pages load their stroke-only layer
+                            // and get the live pdfium background instead.
                             scope.launch {
                                 try {
-                                    val savedBitmap = viewModel.loadCurrentPageBitmap()
-                                    setPageContent(savedBitmap)
-                                    backgroundBitmap = null
-                                    viewModel.setPageLoadedFromDisk(savedBitmap != null)
+                                    val pageIdx = viewModel.currentPageIndex.value
+                                    val vectorPage = vectorPdfPage(pageIdx)
+                                    if (vectorPage != null) {
+                                        val strokes = withContext(Dispatchers.IO) {
+                                            viewModel.loadPageStrokes(pageIdx)
+                                        }
+                                        setPageContent(strokes)
+                                        backgroundBitmap = null
+                                        viewModel.setPageLoadedFromDisk(true)
+                                        applyPdfBackground(this@apply, vectorPage)
+                                    } else {
+                                        val savedBitmap = viewModel.loadCurrentPageBitmap()
+                                        setPageContent(savedBitmap)
+                                        backgroundBitmap = null
+                                        viewModel.setPageLoadedFromDisk(savedBitmap != null)
+                                    }
                                     val layers = withContext(Dispatchers.IO) {
                                         readLayersFromDisk(viewModel.fileStore, viewModel.noteId)
                                     }
@@ -1579,7 +1669,7 @@ fun CanvasScreen(
                                     } catch (e: Exception) { e.printStackTrace() }
                                     val currentBmp = canvasViewRef?.getBackingBitmap()
                                     viewModel.previousPage(currentBmp) { newBmp ->
-                                        canvasViewRef?.setPageContent(newBmp)
+                                        applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
                                     }
                                 }
                             },
@@ -1633,7 +1723,7 @@ fun CanvasScreen(
                                     } catch (e: Exception) { e.printStackTrace() }
                                     val currentBmp = canvasViewRef?.getBackingBitmap()
                                     viewModel.nextPage(currentBmp) { newBmp ->
-                                        canvasViewRef?.setPageContent(newBmp)
+                                        applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
                                     }
                                 }
                             },
@@ -1792,7 +1882,7 @@ fun CanvasScreen(
                                                 onClick = {
                                                     val currentBmp = canvasViewRef?.getBackingBitmap()
                                                     viewModel.addNewPage(currentBmp) { newBmp ->
-                                                        canvasViewRef?.setPageContent(newBmp)
+                                                        applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
                                                     }
                                                 },
                                                 modifier = Modifier.size(32.dp)
@@ -1821,7 +1911,7 @@ fun CanvasScreen(
                                                             if (pageItem.index != currentPageIndex) {
                                                                 val currentBmp = canvasViewRef?.getBackingBitmap()
                                                                 viewModel.goToPage(pageItem.index, currentBmp) { newBmp ->
-                                                                    canvasViewRef?.setPageContent(newBmp)
+                                                                    applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
                                                                 }
                                                             }
                                                             viewModel.toggleThumbnailDrawer(false)
@@ -1948,7 +2038,7 @@ fun CanvasScreen(
                                                                 if (pageItem.index != currentPageIndex) {
                                                                     val currentBmp = canvasViewRef?.getBackingBitmap()
                                                                     viewModel.goToPage(pageItem.index, currentBmp) { newBmp ->
-                                                                        canvasViewRef?.setPageContent(newBmp)
+                                                                        applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
                                                                     }
                                                                 }
                                                                 viewModel.toggleThumbnailDrawer(false)
@@ -2088,7 +2178,7 @@ fun CanvasScreen(
                                                                 if (tocEntry.pageIndex != currentPageIndex) {
                                                                     val currentBmp = canvasViewRef?.getBackingBitmap()
                                                                     viewModel.goToPage(tocEntry.pageIndex, currentBmp) { newBmp ->
-                                                                        canvasViewRef?.setPageContent(newBmp)
+                                                                        applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
                                                                     }
                                                                 }
                                                                 viewModel.toggleThumbnailDrawer(false)
@@ -2313,7 +2403,7 @@ fun CanvasScreen(
                                             ToolsPanelItem(Icons.Default.Add, "Add Page") {
                                                 val currentBmp = canvasViewRef?.getBackingBitmap()
                                                 viewModel.addNewPage(currentBmp) { newBmp ->
-                                                    canvasViewRef?.setPageContent(newBmp)
+                                                    applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
                                                 }
                                                 viewModel.toggleToolsPanel(false)
                                             }

@@ -343,16 +343,44 @@ class CanvasViewModel(
         pageLoadedFromDisk = loaded
     }
 
+    /** F-10: true when [index] is a page rendered from a vector PDF source. */
+    private fun pageIsVectorPdf(index: Int): Boolean {
+        val page = pages.value.getOrNull(index) ?: return false
+        return page.pdfSourcePath.isNotEmpty() && page.pdfPageIndex >= 0
+    }
+
+    /** F-10: stroke-layer bitmap of [index] (vector pages keep it in a separate file). */
+    suspend fun loadPageStrokes(index: Int): Bitmap? = repository.loadPageStrokes(noteId, index)
+
+    /** F-10: persists the stroke layer the way the page's type dictates. */
+    private suspend fun saveContentLayer(index: Int, bitmap: Bitmap) {
+        if (pageIsVectorPdf(index)) {
+            repository.savePageStrokes(noteId, index, bitmap)
+        } else {
+            repository.savePageBitmap(noteId, index, bitmap)
+        }
+    }
+
+    private suspend fun loadContentLayer(index: Int): Bitmap? =
+        if (pageIsVectorPdf(index)) repository.loadPageStrokes(noteId, index)
+        else repository.loadPageBitmap(noteId, index)
+
     fun saveCurrentPageBitmap(bitmap: Bitmap) {
         val pageIdx = _currentPageIndex.value
         // Blank-save guard: when this session never loaded an existing page
-        // file into the view (pageLoadedFromDisk == false) while such a file
+        // layer into the view (pageLoadedFromDisk == false) while such a file
         // is on disk, persisting the blank backing bitmap would overwrite
         // good user content with empty pixels. Drop those writes; fresh notes
-        // (no page file yet) still save freely.
-        if (!pageLoadedFromDisk && fileStore.getPageFile(noteId, pageIdx).exists()) return
+        // (no page file yet) still save freely. Vector-PDF pages guard against
+        // their separate stroke file only.
+        val guardFile = if (pageIsVectorPdf(pageIdx)) {
+            fileStore.getStrokesFile(noteId, pageIdx)
+        } else {
+            fileStore.getPageFile(noteId, pageIdx)
+        }
+        if (!pageLoadedFromDisk && guardFile.exists()) return
         viewModelScope.launch {
-            repository.savePageBitmap(noteId, pageIdx, bitmap)
+            saveContentLayer(pageIdx, bitmap)
         }
     }
 
@@ -363,10 +391,10 @@ class CanvasViewModel(
         viewModelScope.launch {
             // Save current page
             if (currentBitmap != null) {
-                repository.savePageBitmap(noteId, _currentPageIndex.value, currentBitmap)
+                saveContentLayer(_currentPageIndex.value, currentBitmap)
             }
             _currentPageIndex.value = index
-            val newBitmap = repository.loadPageBitmap(noteId, index)
+            val newBitmap = loadContentLayer(index)
             // The save above guarded the OLD page with the OLD flag state;
             // from here on the flag describes the NEW page's load result.
             pageLoadedFromDisk = newBitmap != null
@@ -391,7 +419,7 @@ class CanvasViewModel(
         viewModelScope.launch {
             // Save current page first
             if (currentBitmap != null) {
-                repository.savePageBitmap(noteId, _currentPageIndex.value, currentBitmap)
+                saveContentLayer(_currentPageIndex.value, currentBitmap)
             }
             val newPage = repository.addPage(noteId)
             _currentPageIndex.value = newPage.index
@@ -414,7 +442,7 @@ class CanvasViewModel(
                 }.coerceAtLeast(0)
 
                 _currentPageIndex.value = newIndex
-                val newBitmap = repository.loadPageBitmap(noteId, newIndex)
+                val newBitmap = loadContentLayer(newIndex)
                 pageLoadedFromDisk = newBitmap != null
                 onBitmapLoaded(newBitmap)
             }

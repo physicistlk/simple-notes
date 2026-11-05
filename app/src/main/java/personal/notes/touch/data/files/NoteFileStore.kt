@@ -16,6 +16,16 @@ class NoteFileStore(private val context: Context) {
     }
 
     /**
+     * F-10: stroke layer of a vector-PDF page. The `page_<index>.png` file of
+     * such a page stays the pdfium-rendered preview (library thumbnails); live
+     * annotations are persisted separately here so the vector background can
+     * be re-rendered from the source at any zoom without baking a raster.
+     */
+    fun getStrokesFile(noteId: String, pageIndex: Int): File {
+        return File(getNoteDir(noteId), "strokes_${pageIndex}.png")
+    }
+
+    /**
      * Atomic per-page write: the bitmap is written to a temp file inside the
      * note's temp dir (created on demand), then atomically renamed to
      * page_<index>.png. A crash mid-write never leaves a truncated
@@ -52,10 +62,18 @@ class NoteFileStore(private val context: Context) {
 
     fun deletePageFile(noteId: String, pageIndex: Int): Boolean {
         val file = getPageFile(noteId, pageIndex)
+        val strokes = getStrokesFile(noteId, pageIndex)
+        if (strokes.exists()) strokes.delete()
         return if (file.exists()) file.delete() else true
     }
 
     fun renamePageFile(noteId: String, oldIndex: Int, newIndex: Int): Boolean {
+        val oldStrokes = getStrokesFile(noteId, oldIndex)
+        val newStrokes = getStrokesFile(noteId, newIndex)
+        if (oldStrokes.exists()) {
+            if (newStrokes.exists()) newStrokes.delete()
+            oldStrokes.renameTo(newStrokes)
+        }
         val oldFile = getPageFile(noteId, oldIndex)
         val newFile = getPageFile(noteId, newIndex)
         if (oldFile.exists()) {

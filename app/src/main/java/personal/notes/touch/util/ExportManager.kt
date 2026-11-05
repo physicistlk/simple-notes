@@ -289,7 +289,11 @@ object ExportManager {
             val bgPaint = Paint(Paint.FILTER_BITMAP_FLAG)
             canvas.drawBitmap(backgroundBitmap, null, android.graphics.Rect(0, 0, w, h), bgPaint)
         }
-        canvas.drawBitmap(bitmap, 0f, 0f, null)
+        // The page raster and the stroke layer can differ in size (vector PDF
+        // pages: pdfium render at zoom resolution vs. view-sized stroke layer).
+        // Both describe the same page rect, so stretch the stroke layer to the
+        // output size instead of pinning it to the top-left corner.
+        canvas.drawBitmap(bitmap, null, android.graphics.Rect(0, 0, w, h), Paint(Paint.FILTER_BITMAP_FLAG))
         for (layer in imageLayers) {
             if (layer.bitmap.isRecycled) continue
             val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG).apply {

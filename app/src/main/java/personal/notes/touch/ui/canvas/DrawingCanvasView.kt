@@ -11,12 +11,17 @@ import android.graphics.PorterDuff
 import android.graphics.PorterDuffXfermode
 import android.graphics.Rect
 import android.graphics.RectF
+import android.os.Handler
+import android.os.Looper
 import android.util.AttributeSet
 import android.view.MotionEvent
 import android.view.View
 import personal.notes.touch.util.BitmapUtils
 import personal.notes.touch.util.DebugGestureInjector
+import personal.notes.touch.util.PdfRenderPolicy
 import java.util.ArrayDeque
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 
 enum class CanvasTool {
     FOUNTAIN_PEN,
@@ -71,7 +76,11 @@ class DrawingCanvasView @JvmOverloads constructor(
     var panY: Float = 0f
         set(value) { field = value; updateViewMatrix() }
     var scale: Float = 1f
-        set(value) { field = value.coerceIn(0.25f, 4f); updateViewMatrix() }
+        set(value) {
+            field = value.coerceIn(0.25f, 4f)
+            updateViewMatrix()
+            schedulePdfBackgroundRefresh()
+        }
     var autoCenter: Boolean = true
     val viewMatrix: Matrix = Matrix()
     val pageInverseMatrix: Matrix = Matrix()
@@ -89,8 +98,141 @@ class DrawingCanvasView @JvmOverloads constructor(
     var backgroundBitmap: Bitmap? = null
         set(value) {
             field = value
+            // A caller-provided (non-pdfium) background is never recycled by
+            // the vector renderer; remember it so a render swap can tell.
+            if (pdfRenderScale == 0f) pdfSessionBackground = value
             invalidate()
         }
+
+    // ---- F-10: live vector PDF background --------------------------------
+    // The page is rendered from its source document at the current zoom level
+    // instead of upscaling the import-time raster. The stroke layer
+    // (backingBitmap) stays separate: annotations never bake PDF pixels.
+    private var pdfPageWidthPts = 0f
+    private var pdfPageHeightPts = 0f
+
+    /** "Fit" canvas px per PDF point — the fixed page rect the background maps into. */
+    private var pdfBasePxPerPt = 0f
+
+    /** px-per-pt of the bitmap currently in [backgroundBitmap] (0 = not pdfium-rendered). */
+    private var pdfRenderScale = 0f
+    private var pdfRenderer: ((pxPerPt: Float, outW: Int, outH: Int) -> Bitmap?)? = null
+    private var pdfRenderInFlight = false
+    private var pdfSessionBackground: Bitmap? = null
+    private val pdfRenderHandler = Handler(Looper.getMainLooper())
+    private val pdfRenderTask = Runnable { renderPdfBackgroundNow() }
+
+    /** True when a vector source is installed for the current page. */
+    val hasPdfBackground: Boolean
+        get() = pdfRenderer != null
+
+    /**
+     * Installs a live vector PDF background for the current page, or clears it
+     * when [renderer] is null. [basePxPerPt] is the import-time px-per-point
+     * mapping, used only as a fallback page rect before the view has a backing
+     * bitmap. The renderer runs on the shared background-render thread and
+     * must return a bitmap [outW]×[outH] px.
+     *
+     * The rendered bitmap is stretched into the rect the page raster used to
+     * occupy (the backing bitmap's box), so annotations drawn in view space
+     * stay aligned with the page at every zoom level.
+     */
+    fun setPdfBackground(
+        pageWidthPts: Float,
+        pageHeightPts: Float,
+        basePxPerPt: Float,
+        renderer: ((pxPerPt: Float, outW: Int, outH: Int) -> Bitmap?)?
+    ) {
+        pdfRenderHandler.removeCallbacks(pdfRenderTask)
+        // Drop any background belonging to another page/document so a page
+        // flip never shows the previous PDF while the new render is pending.
+        val previous = backgroundBitmap
+        if (pdfRenderScale > 0f && previous != null && previous !== pdfSessionBackground && !previous.isRecycled) {
+            previous.recycle()
+        }
+        pdfRenderScale = 0f
+        pdfSessionBackground = null
+        backgroundBitmap = null
+        if (renderer == null || pageWidthPts <= 0f || pageHeightPts <= 0f || basePxPerPt <= 0f) {
+            pdfRenderer = null
+            pdfPageWidthPts = 0f
+            pdfPageHeightPts = 0f
+            pdfBasePxPerPt = 0f
+            return
+        }
+        pdfPageWidthPts = pageWidthPts
+        pdfPageHeightPts = pageHeightPts
+        pdfBasePxPerPt = basePxPerPt
+        pdfRenderer = renderer
+        pdfRenderHandler.postDelayed(pdfRenderTask, PDF_RENDER_DEBOUNCE_MS)
+    }
+
+    /** Width of the rect the page (and thus its annotations) occupies, canvas units. */
+    private fun pdfPageRectWidth(): Float {
+        val bmp = backingBitmap
+        if (bmp != null && bmp.width > 0) return bmp.width.toFloat()
+        return pdfPageWidthPts * pdfBasePxPerPt
+    }
+
+    /** Height of the rect the page (and thus its annotations) occupies, canvas units. */
+    private fun pdfPageRectHeight(): Float {
+        val bmp = backingBitmap
+        if (bmp != null && bmp.height > 0) return bmp.height.toFloat()
+        return pdfPageHeightPts * pdfBasePxPerPt
+    }
+
+    /** Debounced upgrade of the vector background after a zoom change. */
+    fun schedulePdfBackgroundRefresh() {
+        if (pdfRenderer == null) return
+        pdfRenderHandler.removeCallbacks(pdfRenderTask)
+        pdfRenderHandler.postDelayed(pdfRenderTask, PDF_RENDER_DEBOUNCE_MS)
+    }
+
+    private fun renderPdfBackgroundNow() {
+        val renderer = pdfRenderer ?: return
+        if (pdfRenderInFlight) return
+        // Screen pixels per PDF point at the current zoom: the on-screen width
+        // of the page rect times the view scale, over the page's point width.
+        if (pdfPageWidthPts <= 0f) return
+        val needed = pdfPageRectWidth() * scale / pdfPageWidthPts
+        if (!PdfRenderPolicy.shouldRender(needed, pdfRenderScale)) return
+        val capped = PdfRenderPolicy.capPxPerPt(pdfPageWidthPts, pdfPageHeightPts, needed)
+        if (capped <= 0f || capped <= pdfRenderScale) return
+        val size = PdfRenderPolicy.outputSize(pdfPageWidthPts, pdfPageHeightPts, capped)
+        val outW = size[0]
+        val outH = size[1]
+        pdfRenderInFlight = true
+        pdfRenderExecutor.execute {
+            val bitmap = try {
+                renderer(capped, outW, outH)
+            } catch (e: Exception) {
+                e.printStackTrace()
+                null
+            }
+            pdfRenderHandler.post {
+                pdfRenderInFlight = false
+                if (bitmap != null && !bitmap.isRecycled && pdfRenderer == renderer) {
+                    val previous = backgroundBitmap
+                    backgroundBitmap = bitmap
+                    pdfRenderScale = capped
+                    // Recycle the bitmap we rendered previously (never a
+                    // caller-provided session background: those have scale 0).
+                    if (previous != null && previous !== bitmap && !previous.isRecycled &&
+                        previous !== pdfSessionBackground
+                    ) {
+                        previous.recycle()
+                    }
+                    pdfSessionBackground = null
+                } else if (bitmap != null && !bitmap.isRecycled) {
+                    // Render finished for a page/source that is no longer
+                    // current: drop it.
+                    bitmap.recycle()
+                }
+                // The zoom may have moved on while we rendered.
+                if (pdfRenderer != null) schedulePdfBackgroundRefresh()
+            }
+        }
+    }
 
     // Overflow layer for drawing outside the PDF page (moves with pan/zoom)
     var overflowBitmap: Bitmap? = null
@@ -874,9 +1016,24 @@ class DrawingCanvasView @JvmOverloads constructor(
         canvas.save()
         canvas.concat(viewMatrix)
 
-        // 0. Draw non-destructive background (e.g. imported PDF page) first
+        // 0. Draw non-destructive background (e.g. imported PDF page) first.
+        // A vector-rendered background is drawn into the fixed page rect so a
+        // higher render resolution never changes the page geometry.
         backgroundBitmap?.let { bmp ->
-            if (!bmp.isRecycled) canvas.drawBitmap(bmp, 0f, 0f, bitmapPaint)
+            if (!bmp.isRecycled) {
+                if (pdfRenderScale > 0f && pdfPageWidthPts > 0f) {
+                    // Stretch the vector render into the page rect (the same
+                    // rect the page raster occupies) so annotations, which
+                    // live in backing-bitmap space, stay aligned.
+                    canvas.drawBitmap(
+                        bmp, null,
+                        RectF(0f, 0f, pdfPageRectWidth(), pdfPageRectHeight()),
+                        bitmapPaint
+                    )
+                } else {
+                    canvas.drawBitmap(bmp, 0f, 0f, bitmapPaint)
+                }
+            }
         }
 
         // 0b. Draw overflow layer (drawing outside the PDF page; sticky with pan/zoom)
@@ -1863,6 +2020,7 @@ class DrawingCanvasView @JvmOverloads constructor(
 
     override fun onDetachedFromWindow() {
         super.onDetachedFromWindow()
+        pdfRenderHandler.removeCallbacks(pdfRenderTask)
         DebugGestureInjector.unregister(this)
         setOnDragListener(null)
         clearRedoStack()
@@ -1870,6 +2028,20 @@ class DrawingCanvasView @JvmOverloads constructor(
             val bmp = undoStack.removeLast()
             if (!bmp.isRecycled) bmp.recycle()
         }
+    }
+
+    companion object {
+        /** Quiet period after a zoom change before the vector re-render fires. */
+        private const val PDF_RENDER_DEBOUNCE_MS = 180L
+
+        /**
+         * One shared render thread: pdfium work for the visible page is
+         * serialized and never runs on the UI or Compose thread.
+         */
+        private val pdfRenderExecutor: ExecutorService =
+            Executors.newSingleThreadExecutor { runnable ->
+                Thread(runnable, "pdf-background-render").apply { isDaemon = true }
+            }
     }
 }
 

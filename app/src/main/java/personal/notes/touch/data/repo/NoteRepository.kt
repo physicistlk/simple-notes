@@ -201,6 +201,31 @@ class NoteRepository(
         personal.notes.touch.util.BitmapUtils.loadBitmapFromFile(file)
     }
 
+    /** F-10: loads the stroke-only layer of a vector-PDF page (null = none yet). */
+    suspend fun loadPageStrokes(noteId: String, pageIndex: Int): android.graphics.Bitmap? = withContext(Dispatchers.IO) {
+        personal.notes.touch.util.BitmapUtils.loadBitmapFromFile(fileStore.getStrokesFile(noteId, pageIndex))
+    }
+
+    /**
+     * F-10: persists the stroke-only layer of a vector-PDF page. The page PNG
+     * (pdfium preview used by library thumbnails) is intentionally untouched.
+     */
+    suspend fun savePageStrokes(noteId: String, pageIndex: Int, bitmap: android.graphics.Bitmap): Boolean = withContext(Dispatchers.IO) {
+        val file = fileStore.getStrokesFile(noteId, pageIndex)
+        val ok = personal.notes.touch.util.BitmapUtils.saveBitmapToPng(bitmap, file)
+        if (ok) {
+            try {
+                val note = noteDao.getById(noteId)
+                if (note != null) {
+                    noteDao.update(note.copy(updatedAt = System.currentTimeMillis()))
+                }
+            } catch (e: Exception) {
+                // Ignore if note lookup fails
+            }
+        }
+        ok
+    }
+
     /** Persist the per-page paper pattern (PaperPattern.code) to the page row. */
     suspend fun savePagePattern(noteId: String, pageIndex: Int, patternCode: Int): Boolean = withContext(Dispatchers.IO) {
         try {
