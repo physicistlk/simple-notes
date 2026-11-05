@@ -1,6 +1,7 @@
 package personal.notes.touch.data.db
 
 import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 
 /**
  * Central registry of Room schema [Migration]s for [AppDatabase].
@@ -11,9 +12,11 @@ import androidx.room.migration.Migration
  *   (legacy dev installs). They are covered by
  *   `fallbackToDestructiveMigrationFrom(1, 2, 3)` in TouchNotesApp:
  *   migrating FROM one of those versions with no matching [Migration] clears
- *   and recreates the database rather than crashing.
- * - Schema version 3 is the current schema and the baseline; its schema JSON
- *   is exported to `app/schemas/personal.notes.touch.data.db.AppDatabase/3.json`.
+ *   and recreates the database rather than crashing. (From 3, the
+ *   registered [MIGRATION_3_4] provides the data-preserving path.)
+ * - Schema version 3 was the baseline before this registry existed; its
+ *   schema JSON stays at `app/schemas/personal.notes.touch.data.db.AppDatabase/3.json`
+ *   and [MIGRATION_3_4] upgrades legacy 3 installs to 4 without data loss.
  * - Every future schema change MUST:
  *   1. bump `version` in [AppDatabase],
  *   2. add a real, correct [Migration] step here and append it to
@@ -45,4 +48,11 @@ import androidx.room.migration.Migration
  * }
  * ```
  */
-internal val APP_MIGRATIONS: Array<Migration> = emptyArray()
+internal val MIGRATION_3_4: Migration = object : Migration(3, 4) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        // Per-page paper pattern (0 = BLANK/unset → falls back to the app default).
+        db.execSQL("ALTER TABLE pages ADD COLUMN paperPattern INTEGER NOT NULL DEFAULT 0")
+    }
+}
+
+internal val APP_MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_3_4)

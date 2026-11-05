@@ -75,6 +75,11 @@ class CanvasViewModel(
                     3 -> PaperPattern.DOTTED
                     else -> PaperPattern.BLANK
                 }
+                // Only seed from global settings until a page-owned pattern is
+                // applied (syncPagePattern); the page row wins once it's known.
+                if (!pagePatternHydrated) {
+                    _uiState.value = _uiState.value.copy(paperPattern = pattern)
+                }
                 val pen = parsePenDefaults(settings.penDefaultsJson)
                 _uiState.value = _uiState.value.copy(
                     paperPattern = pattern,
@@ -116,6 +121,7 @@ class CanvasViewModel(
     private val _currentPageIndex = MutableStateFlow(0)
     val currentPageIndex: StateFlow<Int> = _currentPageIndex.asStateFlow()
 
+    private var pagePatternHydrated = false
     private val _uiState = MutableStateFlow(CanvasUiState())
     val uiState: StateFlow<CanvasUiState> = _uiState.asStateFlow()
 
@@ -133,6 +139,24 @@ class CanvasViewModel(
 
     fun setPaperPattern(pattern: PaperPattern) {
         _uiState.value = _uiState.value.copy(paperPattern = pattern)
+        // Persist per page so the pattern survives reopen (defect F9).
+        pagePatternHydrated = true
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.savePagePattern(noteId, _currentPageIndex.value, pattern.code)
+        }
+    }
+
+    /**
+     * Apply a page-row pattern on page load/switch. `code != 0` means the page
+     * owns its pattern (defect F9 persistence); 0 = unset → app default stays.
+     */
+    fun syncPagePattern(code: Int) {
+        if (code == 0) return
+        pagePatternHydrated = true
+        val pattern = PaperPattern.fromCode(code)
+        if (_uiState.value.paperPattern != pattern) {
+            _uiState.value = _uiState.value.copy(paperPattern = pattern)
+        }
     }
 
     fun updateUndoRedo(canUndo: Boolean, canRedo: Boolean) {

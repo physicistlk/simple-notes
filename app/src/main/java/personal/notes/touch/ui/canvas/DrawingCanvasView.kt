@@ -33,7 +33,15 @@ enum class PaperPattern {
     BLANK,
     GRID,
     LINES,
-    DOTTED
+    DOTTED;
+
+    /** Stable code persisted in the DB (`pages.paperPattern`); BLANK = 0 means "unset". */
+    val code: Int
+        get() = ordinal
+
+    companion object {
+        fun fromCode(code: Int): PaperPattern = entries.firstOrNull { it.ordinal == code } ?: BLANK
+    }
 }
 
 data class ImageLayer(

@@ -172,6 +172,12 @@ fun CanvasScreen(
     val pages by viewModel.pages.collectAsState()
     val currentPageIndex by viewModel.currentPageIndex.collectAsState()
     val uiState by viewModel.uiState.collectAsState()
+
+    // Defect F9: hydrate the per-page paper pattern from the page row on
+    // page load / switch so the Template (Paper Pattern) choice survives reopen.
+    LaunchedEffect(pages, currentPageIndex) {
+        viewModel.syncPagePattern(pages.getOrNull(currentPageIndex)?.paperPattern ?: 0)
+    }
     val scope = rememberCoroutineScope()
 
     var canvasViewRef by remember { mutableStateOf<DrawingCanvasView?>(null) }

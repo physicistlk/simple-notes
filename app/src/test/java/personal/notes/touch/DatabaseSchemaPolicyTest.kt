@@ -17,10 +17,12 @@ import java.io.File
  * AppDatabase:
  *
  * - every schema version must be exported and kept in the repo,
- * - the current schema stays at version 3 with an EMPTY migration registry
- *   (no fabrications against the unverified pre-4 schemas),
- * - if a future change bumps the version, consecutive Migration steps from
- *   version 3 up to it must exist in APP_MIGRATIONS at the same time.
+ * - the baseline schema (version 3) stays pinned at `3.json` with its shipped
+ *   table list, and legacy dev schemas (1-2) were wiped-by-policy,
+ * - the latest exported schema defines the current version: while it is the
+ *   baseline the registry must stay empty, and as soon as it is bumped,
+ *   consecutive Migration steps from version 3 up to it must exist in
+ *   APP_MIGRATIONS at the same time.
  *
  * A Room DAO smoke test (open AppDatabase via Room.inMemoryDatabaseBuilder
  * under an Android context and verify the main DAOs return empty flows) needs
@@ -34,6 +36,13 @@ class DatabaseSchemaPolicyTest {
 
     private val schemaDirRelative = "schemas/personal.notes.touch.data.db.AppDatabase"
     private val currentSchemaVersion = 3
+
+    /**
+     * Highest schema version exported so far. Bump this together with
+     * `version` in AppDatabase and the matching Migration step(s); the
+     * baseline pin above keeps `3.json` immutable for legacy reasoning.
+     */
+    private val latestSchemaVersion = 4
 
     /** Entity tables that shipped in schema version 3. */
     private val version3Tables = listOf(
@@ -102,8 +111,8 @@ class DatabaseSchemaPolicyTest {
 
     @Test
     fun migrationRegistryMatchesSchemaVersion() {
-        val file = schemaFile(currentSchemaVersion)
-        val version = databaseVersion(file.readText())
+        val latestFile = schemaFile(latestSchemaVersion)
+        val version = databaseVersion(latestFile.readText())
         if (version == currentSchemaVersion) {
             // Baseline policy: as long as the shipped schema is version 3,
             // the registry holds no migrations and none may be fabricated.
@@ -115,9 +124,10 @@ class DatabaseSchemaPolicyTest {
         } else {
             // Version was bumped: every consecutive step from the baseline
             // schema version upward must be registered in the same change.
-            assertTrue(
-                "schema version $version is below the $currentSchemaVersion baseline; the registry policy assumes versions only grow",
-                version > currentSchemaVersion
+            assertEquals(
+                "$latestSchemaVersion.json must itself carry database version $latestSchemaVersion",
+                latestSchemaVersion,
+                version
             )
             val covered = APP_MIGRATIONS.map { it.startVersion to it.endVersion }.toSet()
             for (v in currentSchemaVersion until version) {

@@ -13,5 +13,7 @@ data class PageEntity(
     val noteId: String,
     val index: Int,
     val bitmapPath: String,
+    /** Per-page paper pattern (DrawingCanvasView.PaperPattern.code); 0 = unset → fall back to app default. */
+    val paperPattern: Int = 0,
     val updatedAt: Long = System.currentTimeMillis()
 )

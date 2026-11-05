@@ -201,6 +201,29 @@ class NoteRepository(
         personal.notes.touch.util.BitmapUtils.loadBitmapFromFile(file)
     }
 
+    /** Persist the per-page paper pattern (PaperPattern.code) to the page row. */
+    suspend fun savePagePattern(noteId: String, pageIndex: Int, patternCode: Int): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val pages = pageDao.getPagesForNoteSync(noteId)
+            val page = pages.getOrNull(pageIndex) ?: return@withContext false
+            pageDao.update(page.copy(paperPattern = patternCode, updatedAt = System.currentTimeMillis()))
+            true
+        } catch (e: Exception) {
+            e.printStackTrace()
+            false
+        }
+    }
+
+    /** Read the persisted per-page paper pattern (0 = unset → app default applies). */
+    suspend fun loadPagePattern(noteId: String, pageIndex: Int): Int = withContext(Dispatchers.IO) {
+        try {
+            pageDao.getPagesForNoteSync(noteId).getOrNull(pageIndex)?.paperPattern ?: 0
+        } catch (e: Exception) {
+            e.printStackTrace()
+            0
+        }
+    }
+
     suspend fun savePageBitmap(noteId: String, pageIndex: Int, bitmap: android.graphics.Bitmap): Boolean = withContext(Dispatchers.IO) {
         val file = fileStore.getPageFile(noteId, pageIndex)
         val ok = personal.notes.touch.util.BitmapUtils.saveBitmapToPng(bitmap, file)
