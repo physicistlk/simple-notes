@@ -1,1 +1,0 @@
-/home/lk1/craft_apps/simple_notes/touchnotes-clone/app/build/intermediates/cxx/Debug/3eq2t4tg/obj/armeabi-v7a
