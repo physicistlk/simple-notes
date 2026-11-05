@@ -42,7 +42,7 @@ class DatabaseSchemaPolicyTest {
      * `version` in AppDatabase and the matching Migration step(s); the
      * baseline pin above keeps `3.json` immutable for legacy reasoning.
      */
-    private val latestSchemaVersion = 5
+    private val latestSchemaVersion = 6
 
     /** Entity tables that shipped in schema version 3. */
     private val version3Tables = listOf(

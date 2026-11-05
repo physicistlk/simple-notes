@@ -160,18 +160,34 @@ class TextEditorViewModel(
 
     private var isInitialized = false
 
-    private var spareCounter = 0
-
     init {
-        // Initialize from note entity once loaded
+        // Initialize from note entity once loaded. Block ids live in
+        // `note_blocks` (schema 6), so load them BEFORE deriving blocks from the
+        // markdown: the editor must never surface position-derived ids.
         viewModelScope.launch {
+            val storedBlocks = BlockPersistence.fromEntities(repository.loadNoteBlocks(noteId))
             repository.getNoteById(noteId).collect { loadedNote ->
                 if (loadedNote != null && !isInitialized) {
                     _title.value = loadedNote.title
                     val md = loadedNote.content ?: ""
+                    val parsed = BlockModel.parseBlocks(md)
+                    val normalized = BlockModel.serializeBlocks(parsed)
+
+                    _blocks.value = when {
+                        storedBlocks.isEmpty() -> {
+                            // Lazy migration for notes written before v6: mint
+                            // stable ids once and persist immediately, so a kill
+                            // before the first autosave cannot lose them.
+                            val minted = parsed.map { it.copy(id = BlockPersistence.newBlockId()) }
+                            repository.saveNoteBlocks(noteId, BlockPersistence.toEntities(noteId, minted))
+                            minted
+                        }
+                        BlockModel.serializeBlocks(storedBlocks) == normalized -> storedBlocks
+                        // Markdown is authoritative (two writes, one crash):
+                        // keep every id whose block survived the edit.
+                        else -> BlockPersistence.reconcileIds(parsed, storedBlocks)
+                    }
                     _contentValue.value = TextFieldValue(md)
-                    // Empty note => exactly one empty paragraph block.
-                    _blocks.value = BlockModel.parseBlocks(md)
                     isInitialized = true
                 }
             }
@@ -222,9 +238,24 @@ class TextEditorViewModel(
                 title = titleText.ifBlank { "Untitled Note" },
                 content = contentText
             )
+            persistBlocks(contentText)
         } finally {
             _isSaving.value = false
         }
+    }
+
+    /**
+     * Writes the note's block rows for the content being saved. Skipped when
+     * the block list does not describe [contentText] (e.g. a save fired before
+     * the first derivation) or is empty — the next open then falls back to the
+     * markdown and reconciles ids instead of persisting a wrong shape.
+     */
+    private suspend fun persistBlocks(contentText: String) {
+        val blocks = _blocks.value
+        if (blocks.isEmpty()) return
+        val expected = BlockModel.serializeBlocks(BlockModel.parseBlocks(contentText))
+        if (BlockModel.serializeBlocks(blocks) != expected) return
+        repository.saveNoteBlocks(noteId, BlockPersistence.toEntities(noteId, blocks))
     }
 
     // ---------------------------------------------------------------------
@@ -239,12 +270,23 @@ class TextEditorViewModel(
         _pendingFocus.value = null
     }
 
-    /** Re-derive blocks from markdown; drop the active id if its block vanished. */
+    /**
+     * Re-derive blocks from markdown (Split pane, legacy toolbar helpers).
+     * Ids are reconciled against the current list instead of re-derived from
+     * line numbers, so an in-place raw edit keeps its block identity; drop the
+     * active id only if its block really vanished.
+     */
     private fun rederiveFromContent(text: String) {
         val parsed = BlockModel.parseBlocks(text)
-        _blocks.value = parsed
+        val previous = _blocks.value
+        val reconciled = if (previous.isEmpty()) {
+            parsed.map { it.copy(id = BlockPersistence.newBlockId()) }
+        } else {
+            BlockPersistence.reconcileIds(parsed, previous)
+        }
+        _blocks.value = reconciled
         val active = _activeBlockId.value
-        if (active != null && parsed.none { it.id == active }) _activeBlockId.value = null
+        if (active != null && reconciled.none { it.id == active }) _activeBlockId.value = null
     }
 
     /** Update blocks + serialized markdown (persistence lane). */
@@ -390,14 +432,9 @@ class TextEditorViewModel(
         publishBlocks(mutable)
     }
 
-    private fun spareId(seed: Int): String {
-        spareCounter++
-        return "$seed-x-$spareCounter"
-    }
-
     private fun freshParagraph(): EditableBlock =
         EditableBlock(
-            id = "p-${spareCounter}-${System.nanoTime()}",
+            id = BlockPersistence.newBlockId(),
             type = BlockType.PARAGRAPH
         )
 
@@ -481,7 +518,7 @@ class TextEditorViewModel(
                 finish(mutable, FocusTarget(clean.id))
             }
             BlockCommand.DIVIDER, BlockCommand.CODE, BlockCommand.TABLE, BlockCommand.IMAGE -> {
-                val insertedId = spareId(idx)
+                val insertedId = BlockPersistence.newBlockId()
                 val inserted = when (command) {
                     BlockCommand.DIVIDER -> EditableBlock(id = insertedId, type = BlockType.DIVIDER)
                     BlockCommand.CODE -> EditableBlock(

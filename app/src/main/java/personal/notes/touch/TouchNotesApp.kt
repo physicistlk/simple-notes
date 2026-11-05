@@ -69,6 +69,7 @@ class TouchNotesApp : Application() {
     private fun buildNoteRepository(): NoteRepository {
         return NoteRepository(
             noteDao = database.noteDao(),
+            noteBlockDao = database.noteBlockDao(),
             folderDao = database.folderDao(),
             pageDao = database.pageDao(),
             fileStore = fileStore

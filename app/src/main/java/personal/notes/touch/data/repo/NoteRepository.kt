@@ -4,8 +4,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
 import personal.notes.touch.data.db.dao.FolderDao
+import personal.notes.touch.data.db.dao.NoteBlockDao
 import personal.notes.touch.data.db.dao.NoteDao
 import personal.notes.touch.data.db.dao.PageDao
+import personal.notes.touch.data.db.entity.NoteBlockEntity
 import personal.notes.touch.data.db.entity.NoteEntity
 import personal.notes.touch.data.db.entity.PageEntity
 import personal.notes.touch.data.files.NoteFileStore
@@ -13,6 +15,7 @@ import java.util.UUID
 
 class NoteRepository(
     private val noteDao: NoteDao,
+    private val noteBlockDao: NoteBlockDao,
     private val folderDao: FolderDao,
     private val pageDao: PageDao,
     val fileStore: NoteFileStore
@@ -69,6 +72,7 @@ class NoteRepository(
     }
 
     suspend fun emptyRecycleBin() = withContext(Dispatchers.IO) {
+        noteBlockDao.deleteForRecycledNotes()
         noteDao.clearRecycled()
     }
 
@@ -124,6 +128,19 @@ class NoteRepository(
         }
     }
 
+    // note_blocks (schema 6): stable per-block ids persisted alongside content.
+    // The markdown in `notes.content` stays the text source of truth; these
+    // rows carry identity and are rewritten from the same block list.
+
+    suspend fun loadNoteBlocks(noteId: String): List<NoteBlockEntity> = withContext(Dispatchers.IO) {
+        noteBlockDao.getBlocksForNote(noteId)
+    }
+
+    /** Replaces the note's whole block row set atomically. */
+    suspend fun saveNoteBlocks(noteId: String, blocks: List<NoteBlockEntity>) = withContext(Dispatchers.IO) {
+        noteBlockDao.replaceBlocks(noteId, blocks)
+    }
+
     suspend fun updateTitle(id: String, title: String) = withContext(Dispatchers.IO) {
         val existing = noteDao.getById(id)
         if (existing != null) {
@@ -140,6 +157,7 @@ class NoteRepository(
     }
 
     suspend fun permanentlyDeleteNote(id: String) = withContext(Dispatchers.IO) {
+        noteBlockDao.deleteForNote(id)
         pageDao.deleteForNote(id)
         noteDao.delete(id)
         fileStore.deleteNoteFiles(id)

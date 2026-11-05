@@ -68,4 +68,34 @@ internal val MIGRATION_4_5: Migration = object : Migration(4, 5) {
     }
 }
 
-internal val APP_MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_3_4, MIGRATION_4_5)
+/**
+ * note_blocks stable block ids (schema 6): the text editor stops deriving ids
+ * from the block's line number and persists one row per block with a UUID.
+ * Purely additive — `notes.content` remains the text source of truth, and
+ * existing notes are migrated lazily (ids minted on first open).
+ */
+internal val MIGRATION_5_6: Migration = object : Migration(5, 6) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS `note_blocks` (" +
+                "`id` TEXT NOT NULL, " +
+                "`noteId` TEXT NOT NULL, " +
+                "`blockIndex` INTEGER NOT NULL, " +
+                "`blockType` TEXT NOT NULL, " +
+                "`text` TEXT NOT NULL, " +
+                "`headingLevel` INTEGER NOT NULL, " +
+                "`indent` INTEGER NOT NULL, " +
+                "`orderNo` INTEGER NOT NULL, " +
+                "`checked` INTEGER NOT NULL, " +
+                "`closed` INTEGER NOT NULL, " +
+                "`updatedAt` INTEGER NOT NULL, " +
+                "PRIMARY KEY(`id`))"
+        )
+        db.execSQL(
+            "CREATE INDEX IF NOT EXISTS `index_note_blocks_noteId_blockIndex` " +
+                "ON `note_blocks` (`noteId`, `blockIndex`)"
+        )
+    }
+}
+
+internal val APP_MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6)

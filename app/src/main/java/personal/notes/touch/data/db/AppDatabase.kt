@@ -5,6 +5,7 @@ import androidx.room.RoomDatabase
 import personal.notes.touch.data.db.dao.FlashCardDao
 import personal.notes.touch.data.db.dao.FolderDao
 import personal.notes.touch.data.db.dao.LabelDao
+import personal.notes.touch.data.db.dao.NoteBlockDao
 import personal.notes.touch.data.db.dao.NoteDao
 import personal.notes.touch.data.db.dao.PageDao
 import personal.notes.touch.data.db.dao.SettingsDao
@@ -13,6 +14,7 @@ import personal.notes.touch.data.db.entity.FlashCardTagEntity
 import personal.notes.touch.data.db.entity.FlashCardTypeEntity
 import personal.notes.touch.data.db.entity.FolderEntity
 import personal.notes.touch.data.db.entity.LabelEntity
+import personal.notes.touch.data.db.entity.NoteBlockEntity
 import personal.notes.touch.data.db.entity.NoteEntity
 import personal.notes.touch.data.db.entity.NoteLabelCrossRef
 import personal.notes.touch.data.db.entity.NoteLabelUsageEntity
@@ -20,7 +22,7 @@ import personal.notes.touch.data.db.entity.PageEntity
 import personal.notes.touch.data.db.entity.SettingsEntity
 
 /**
- * TouchNotes Room database (current schema version: 5).
+ * TouchNotes Room database (current schema version: 6).
  *
  * ## Migration & data-loss policy (audit C1 / CH4, 2026-11-04)
  *
@@ -59,13 +61,15 @@ import personal.notes.touch.data.db.entity.SettingsEntity
         FlashCardTypeEntity::class,
         FlashCardTagEntity::class,
         NoteLabelUsageEntity::class,
-        SettingsEntity::class
+        SettingsEntity::class,
+        NoteBlockEntity::class
     ],
-    version = 5,
+    version = 6,
     exportSchema = true
 )
 abstract class AppDatabase : RoomDatabase() {
     abstract fun noteDao(): NoteDao
+    abstract fun noteBlockDao(): NoteBlockDao
     abstract fun folderDao(): FolderDao
     abstract fun pageDao(): PageDao
     abstract fun labelDao(): LabelDao
