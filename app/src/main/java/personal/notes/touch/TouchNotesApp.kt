@@ -56,12 +56,14 @@ class TouchNotesApp : Application() {
     private fun buildDatabase(): AppDatabase {
         return Room.databaseBuilder(this, AppDatabase::class.java, "touchnotes.db")
             .setJournalMode(RoomDatabase.JournalMode.WRITE_AHEAD_LOGGING)
-            // Destructive fallback is allowed only when migrating FROM the legacy
-            // dev schemas (versions 1-3). From schema version 4 upward a real
-            // Migration registered in data/db/Migrations.kt is mandatory:
-            // an upgrade without one will crash at open time instead of wiping
-            // user data. See the migration policy KDoc in AppDatabase.
-            .fallbackToDestructiveMigrationFrom(1, 2, 3)
+            // Destructive fallback is allowed only from the pre-release dev
+            // schemas 1-2, which never shipped user data. Version 3 onward has
+            // a registered Migration chain (3→4→5→6→7) and MUST NOT wipe:
+            // Room also rejects a Builder where a migration starts at a version
+            // listed here ("Inconsistency detected… Start version: 3"), which is
+            // exactly what guards this. An upgrade without a migration crashes
+            // at open time instead of silently destroying notes.
+            .fallbackToDestructiveMigrationFrom(1, 2)
             .addMigrations(*APP_MIGRATIONS)
             .build()
     }
@@ -70,6 +72,8 @@ class TouchNotesApp : Application() {
         return NoteRepository(
             noteDao = database.noteDao(),
             noteBlockDao = database.noteBlockDao(),
+            noteTagDao = database.noteTagDao(),
+            noteRefDao = database.noteRefDao(),
             folderDao = database.folderDao(),
             pageDao = database.pageDao(),
             fileStore = fileStore

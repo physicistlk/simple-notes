@@ -2,20 +2,31 @@ package personal.notes.touch.data.repo
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import personal.notes.touch.data.db.dao.FolderDao
 import personal.notes.touch.data.db.dao.NoteBlockDao
 import personal.notes.touch.data.db.dao.NoteDao
+import personal.notes.touch.data.db.dao.NoteRefDao
+import personal.notes.touch.data.db.dao.NoteTagDao
 import personal.notes.touch.data.db.dao.PageDao
+import personal.notes.touch.data.db.dao.RefTarget
+import personal.notes.touch.data.db.dao.TagCount
 import personal.notes.touch.data.db.entity.NoteBlockEntity
 import personal.notes.touch.data.db.entity.NoteEntity
+import personal.notes.touch.data.db.entity.NoteRefEntity
+import personal.notes.touch.data.db.entity.NoteTagEntity
 import personal.notes.touch.data.db.entity.PageEntity
 import personal.notes.touch.data.files.NoteFileStore
+import personal.notes.touch.text.NoteTags
+import personal.notes.touch.text.WikiLinks
 import java.util.UUID
 
 class NoteRepository(
     private val noteDao: NoteDao,
     private val noteBlockDao: NoteBlockDao,
+    private val noteTagDao: NoteTagDao,
+    private val noteRefDao: NoteRefDao,
     private val folderDao: FolderDao,
     private val pageDao: PageDao,
     val fileStore: NoteFileStore
@@ -27,8 +38,6 @@ class NoteRepository(
     suspend fun getNoteDirect(id: String): NoteEntity? = withContext(Dispatchers.IO) {
         noteDao.getById(id)
     }
-
-    fun searchNotes(query: String): Flow<List<NoteEntity>> = noteDao.searchNotes(query)
 
     fun getFavorites(): Flow<List<NoteEntity>> = noteDao.getFavorites()
 
@@ -73,6 +82,8 @@ class NoteRepository(
 
     suspend fun emptyRecycleBin() = withContext(Dispatchers.IO) {
         noteBlockDao.deleteForRecycledNotes()
+        noteTagDao.deleteForRecycledNotes()
+        noteRefDao.deleteForRecycledNotes()
         noteDao.clearRecycled()
     }
 
@@ -125,6 +136,7 @@ class NoteRepository(
                     updatedAt = System.currentTimeMillis()
                 )
             )
+            syncIndex(id, content)
         }
     }
 
@@ -158,9 +170,89 @@ class NoteRepository(
 
     suspend fun permanentlyDeleteNote(id: String) = withContext(Dispatchers.IO) {
         noteBlockDao.deleteForNote(id)
+        noteTagDao.deleteForNote(id)
+        noteRefDao.deleteForNote(id)
         pageDao.deleteForNote(id)
         noteDao.delete(id)
         fileStore.deleteNoteFiles(id)
+    }
+
+    // ---------------------------------------------------------------------
+    // Knowledge index (schema 7): tags + wiki-link references
+    //
+    // Both are projections of `notes.content` and are rewritten here, never by
+    // the UI. Compare-before-write keeps the 1 s autosave from touching the
+    // index when the user only edited prose.
+    // ---------------------------------------------------------------------
+
+    /** Tag bar data: tags of live notes with their note counts. */
+    fun observeTagCounts(): Flow<List<TagCount>> = noteTagDao.observeTagCounts()
+
+    /** Display tags per note id, used to filter the library and label cards. */
+    fun observeTagsByNote(): Flow<Map<String, List<String>>> =
+        noteTagDao.observeAll().map { rows ->
+            rows.groupBy({ it.noteId }, { it.displayName })
+                .mapValues { (_, names) -> names.distinct().sorted() }
+        }
+
+    /** Notes whose content links to [title] (backlinks), newest first. */
+    fun observeBacklinks(noteId: String, title: String): Flow<List<NoteEntity>> =
+        noteRefDao.observeBacklinks(WikiLinks.key(title), noteId)
+
+    /** `[[…]]` written inside [noteId], resolved against live note titles. */
+    fun observeOutgoingRefs(noteId: String): Flow<List<RefTarget>> =
+        noteRefDao.observeOutgoing(noteId)
+
+    /**
+     * Re-derives the index for [noteId] from its content. Called on every save;
+     * a write only happens when the derived rows actually changed.
+     */
+    suspend fun syncIndex(noteId: String, content: String) = withContext(Dispatchers.IO) {
+        val tags = NoteTags.parse(content).map {
+            NoteTagEntity(noteId = noteId, tag = it.key, displayName = it.display)
+        }
+        if (!sameTags(noteTagDao.getForNote(noteId), tags)) {
+            noteTagDao.replaceTags(noteId, tags)
+        }
+
+        val refs = WikiLinks.parse(content).map {
+            NoteRefEntity(noteId = noteId, targetKey = it.key, targetTitle = it.target)
+        }
+        if (!sameRefs(noteRefDao.getForNote(noteId), refs)) {
+            noteRefDao.replaceRefs(noteId, refs)
+        }
+    }
+
+    /**
+     * One-time catch-up for notes written before the index existed, and a
+     * self-healing pass in general: every note with content is re-derived,
+     * orphan rows are dropped. Idempotent — returns how many notes were
+     * (re)written, so the caller can log it.
+     */
+    suspend fun reindexAll(): Int = withContext(Dispatchers.IO) {
+        noteTagDao.deleteOrphans()
+        noteRefDao.deleteOrphans()
+        var changed = 0
+        for (note in noteDao.getNotesWithContent()) {
+            val content = note.content ?: continue
+            if (content.isBlank()) continue
+            val before = noteTagDao.getForNote(note.id) to noteRefDao.getForNote(note.id)
+            syncIndex(note.id, content)
+            val after = noteTagDao.getForNote(note.id) to noteRefDao.getForNote(note.id)
+            if (before != after) changed++
+        }
+        changed
+    }
+
+    private fun sameTags(current: List<NoteTagEntity>, next: List<NoteTagEntity>): Boolean {
+        if (current.size != next.size) return false
+        val a = current.associate { it.tag to it.displayName }
+        return next.all { a[it.tag] == it.displayName }
+    }
+
+    private fun sameRefs(current: List<NoteRefEntity>, next: List<NoteRefEntity>): Boolean {
+        if (current.size != next.size) return false
+        return current.map { it.targetKey }.toSet() == next.map { it.targetKey }.toSet()
     }
 
     // Pages (M4)

@@ -118,7 +118,14 @@ fun TouchNotesNavHost(
             )
             TextEditorScreen(
                 viewModel = viewModel,
-                onBackClick = { navController.popBackStack() }
+                onBackClick = { navController.popBackStack() },
+                // Wiki link / backlink tap: open that note in place. Single-top
+                // keeps a repeated tap from stacking the same editor twice.
+                onOpenNote = { id ->
+                    navController.navigate(Screen.Editor.createRoute(id)) {
+                        launchSingleTop = true
+                    }
+                }
             )
         }
 

@@ -126,12 +126,18 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import personal.notes.touch.data.db.dao.TagCount
 import personal.notes.touch.data.db.entity.FolderEntity
 import personal.notes.touch.data.db.entity.NoteEntity
+import personal.notes.touch.text.SearchSnippet
 import personal.notes.touch.ui.theme.OrangePrimary
 import personal.notes.touch.ui.theme.TouchNotesSwatches
 import android.net.Uri
@@ -166,6 +172,7 @@ fun NoteListScreen(
     onFlashcardsClick: (() -> Unit)? = null
 ) {
     val notes by viewModel.notes.collectAsState()
+    val tagCounts by viewModel.tagCounts.collectAsState()
     val folders by viewModel.folders.collectAsState()
     val uiState by viewModel.uiState.collectAsState()
 
@@ -838,22 +845,61 @@ fun NoteListScreen(
 
                 // Search input when opened
                 if (uiState.isSearchOpen) {
-                    OutlinedTextField(
-                        value = uiState.searchQuery,
-                        onValueChange = viewModel::onSearchQueryChanged,
-                        placeholder = { Text("Search notes by title...") },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 8.dp),
-                        singleLine = true,
-                        trailingIcon = {
-                            if (uiState.searchQuery.isNotEmpty()) {
-                                IconButton(onClick = { viewModel.onSearchQueryChanged("") }) {
-                                    Icon(Icons.Default.Close, contentDescription = "Clear")
+                    Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
+                        OutlinedTextField(
+                            value = uiState.searchQuery,
+                            onValueChange = viewModel::onSearchQueryChanged,
+                            placeholder = { Text("Search titles and content...") },
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true,
+                            trailingIcon = {
+                                if (uiState.searchQuery.isNotEmpty()) {
+                                    IconButton(onClick = { viewModel.onSearchQueryChanged("") }) {
+                                        Icon(Icons.Default.Close, contentDescription = "Clear")
+                                    }
                                 }
                             }
+                        )
+                        if (uiState.searchQuery.isNotBlank()) {
+                            Text(
+                                text = if (notes.isEmpty()) {
+                                    "No matches for \"${uiState.searchQuery.trim()}\""
+                                } else {
+                                    "${notes.size} ${if (notes.size == 1) "note" else "notes"} match"
+                                },
+                                fontSize = 12.sp,
+                                color = Color.Gray,
+                                modifier = Modifier.padding(top = 6.dp, start = 4.dp)
+                            )
                         }
-                    )
+                    }
+                }
+
+                // Tag bar (schema 7 index): one chip per tag, with note counts.
+                if (tagCounts.isNotEmpty()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState())
+                            .padding(horizontal = 16.dp, vertical = 6.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        if (uiState.selectedTag != null) {
+                            FilterChip(
+                                selected = false,
+                                onClick = { viewModel.toggleTag(null) },
+                                label = { Text("All tags") }
+                            )
+                        }
+                        tagCounts.forEach { tag ->
+                            TagChip(
+                                tag = tag,
+                                selected = uiState.selectedTag == tag.tag,
+                                onClick = { viewModel.toggleTag(tag.tag) }
+                            )
+                        }
+                    }
                 }
 
                 // Folder Filter Chips
@@ -920,10 +966,13 @@ fun NoteListScreen(
                         verticalArrangement = Arrangement.spacedBy(16.dp),
                         modifier = Modifier.fillMaxSize().weight(1f)
                     ) {
-                        items(notes, key = { it.id }) { note ->
+                        items(notes, key = { it.note.id }) { row ->
+                            val note = row.note
                             val isSelected = selectedNoteId == note.id
                             TouchNotesCard(
                                 note = note,
+                                tags = row.tags,
+                                snippet = row.snippet,
                                 isSelected = isSelected,
                                 dateFormatter = dateFormatter,
                                 onCardClick = {
@@ -959,10 +1008,13 @@ fun NoteListScreen(
                         verticalArrangement = Arrangement.spacedBy(10.dp),
                         modifier = Modifier.fillMaxSize().weight(1f)
                     ) {
-                        items(notes, key = { it.id }) { note ->
+                        items(notes, key = { it.note.id }) { row ->
+                            val note = row.note
                             val isSelected = selectedNoteId == note.id
                             TouchNotesCard(
                                 note = note,
+                                tags = row.tags,
+                                snippet = row.snippet,
                                 isSelected = isSelected,
                                 dateFormatter = dateFormatter,
                                 onCardClick = {
@@ -1288,6 +1340,8 @@ fun NavRailItem(
 @Composable
 fun TouchNotesCard(
     note: NoteEntity,
+    tags: List<String> = emptyList(),
+    snippet: SearchSnippet? = null,
     isSelected: Boolean,
     dateFormatter: SimpleDateFormat,
     onCardClick: () -> Unit,
@@ -1445,6 +1499,75 @@ fun TouchNotesCard(
             fontSize = 12.sp,
             color = Color.Gray
         )
+
+        // Search hit: the matched excerpt, tokens emphasised.
+        if (snippet != null) {
+            Spacer(modifier = Modifier.height(3.dp))
+            Text(
+                text = highlightSnippet(snippet),
+                fontSize = 11.sp,
+                lineHeight = 15.sp,
+                color = Color(0xFF495057),
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+
+        // Tags derived from the note body (#tag#), at most three on a card.
+        if (tags.isNotEmpty()) {
+            Spacer(modifier = Modifier.height(3.dp))
+            Text(
+                text = tags.take(3).joinToString("  ") { "#$it" } +
+                    if (tags.size > 3) "  +${tags.size - 3}" else "",
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Medium,
+                color = OrangePrimary.copy(alpha = 0.85f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
+/** Tag bar chip: `#name` plus its live-note count. */
+@Composable
+private fun TagChip(tag: TagCount, selected: Boolean, onClick: () -> Unit) {
+    FilterChip(
+        selected = selected,
+        onClick = onClick,
+        label = {
+            Text(
+                text = "#${tag.displayName}",
+                fontSize = 12.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        },
+        trailingIcon = {
+            Text(text = "${tag.count}", fontSize = 11.sp, color = Color.Gray)
+        },
+        colors = FilterChipDefaults.filterChipColors(
+            selectedContainerColor = OrangePrimary.copy(alpha = 0.12f),
+            selectedLabelColor = OrangePrimary
+        )
+    )
+}
+
+/** Search snippet with the query tokens in bold orange (no ellipsis loss). */
+private fun highlightSnippet(snippet: SearchSnippet): AnnotatedString = buildAnnotatedString {
+    append(snippet.text)
+    snippet.ranges.forEach { range ->
+        val end = (range.last + 1).coerceAtMost(snippet.text.length)
+        if (range.first < end) {
+            addStyle(
+                SpanStyle(
+                    fontWeight = FontWeight.Bold,
+                    color = OrangePrimary
+                ),
+                range.first,
+                end
+            )
+        }
     }
 }
 
@@ -1679,6 +1802,10 @@ fun extractPreviewLines(rawContent: String, maxLines: Int = 8): List<String> {
             .replace(Regex("\\*\\*(.*?)\\*\\*"), "$1")
             .replace(Regex("\\*(.*?)\\*"), "$1")
             .replace(Regex("`{1,3}(.*?)`{1,3}"), "$1")
+            // [[Target|alias]] -> alias, [[Target]] -> Target
+            .replace(Regex("\\[\\[([^\\[\\]|]+)(?:\\|([^\\[\\]\\n]+))?]]")) { m ->
+                m.groupValues[2].ifBlank { m.groupValues[1] }.trim()
+            }
             .replace(Regex("!\\[.*?\\]\\(.*?\\)"), "[Image]")
             .replace(Regex("\\[([^\\]]+)]\\(([^)]*)\\)"), "$1")
             .trim()

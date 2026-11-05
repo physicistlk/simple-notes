@@ -16,7 +16,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.map
@@ -24,9 +26,11 @@ import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import personal.notes.touch.data.db.dao.RefTarget
 import personal.notes.touch.data.db.entity.NoteEntity
 import personal.notes.touch.data.files.NoteFileStore
 import personal.notes.touch.data.repo.NoteRepository
+import personal.notes.touch.text.WikiLinks
 import personal.notes.touch.data.repo.SettingsRepository
 
 enum class EditorMode {
@@ -127,6 +131,82 @@ class TextEditorViewModel(
 
     fun setShowEmojiSheet(show: Boolean) {
         _showEmojiSheet.value = show
+    }
+
+    // ---------------------------------------------------------------------
+    // Wiki links + backlinks (knowledge index, schema 7)
+    // ---------------------------------------------------------------------
+
+    /** Note id + title pairs for `[[` completion and preview taps. */
+    data class NoteIndexEntry(val id: String, val title: String)
+
+    val noteIndex: StateFlow<List<NoteIndexEntry>> = repository.getAllNotes()
+        .map { notes ->
+            notes.map { NoteIndexEntry(id = it.id, title = it.title.ifBlank { "Untitled Note" }) }
+                .distinctBy { it.title.lowercase() }
+                .sortedBy { it.title.lowercase() }
+        }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
+
+    /** Notes whose content links to this note (`[[this title]]`). */
+    val backlinks: StateFlow<List<NoteEntity>> = _title
+        .map { it.ifBlank { "Untitled Note" } }
+        .distinctUntilChanged()
+        .flatMapLatest { current -> repository.observeBacklinks(noteId, current) }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
+
+    /** `[[…]]` written in this note, resolved or not. */
+    val outgoingRefs: StateFlow<List<RefTarget>> = repository.observeOutgoingRefs(noteId)
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
+
+    /**
+     * Replaces the open `[[query` of [blockId] with `[[title]]`. Returns false
+     * when the caret is no longer inside a pending link (e.g. the popup was
+     * tapped after the field moved on), so the popup can close itself.
+     */
+    fun completeWikiLink(blockId: String, title: String): Boolean {
+        val list = _blocks.value
+        val index = list.indexOfFirst { it.id == blockId }
+        if (index < 0) return false
+        val block = list[index]
+        val pending = WikiLinks.pendingAt(block.field.text, block.field.selection.end) ?: return false
+        val (text, caret) = WikiLinks.complete(block.field.text, pending, title)
+        val mutable = list.toMutableList()
+        mutable[index] = block.copy(field = TextFieldValue(text, TextRange(caret)))
+        publishBlocks(mutable, FocusTarget(blockId))
+        return true
+    }
+
+    /** Toolbar entry point: opens `[[` at the caret so the popup can suggest. */
+    fun insertWikiBracket() {
+        val id = _activeBlockId.value ?: return
+        val list = _blocks.value
+        val index = list.indexOfFirst { it.id == id }
+        if (index < 0) return
+        val block = list[index]
+        val sel = block.field.selection
+        val text = block.field.text.substring(0, sel.min) + "[[" + block.field.text.substring(sel.max)
+        val mutable = list.toMutableList()
+        mutable[index] = block.copy(field = TextFieldValue(text, TextRange(sel.min + 2)))
+        publishBlocks(mutable, FocusTarget(id))
+    }
+
+    /** Resolves a `[[Title]]` tap in preview to a note id, if the note exists. */
+    fun noteIdForTitle(title: String): String? {
+        val key = WikiLinks.key(title)
+        return noteIndex.value.firstOrNull { WikiLinks.key(it.title) == key }?.id
     }
 
     // ---------------------------------------------------------------------

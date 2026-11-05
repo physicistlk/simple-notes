@@ -66,4 +66,11 @@ class NotePreviewTest {
         val lines = extractPreviewLines(content, maxLines = 3)
         assertEquals(listOf("See the docs and [Image]"), lines)
     }
+
+    @Test
+    fun testExtractPreviewLinesFlattensWikiLinks() {
+        val content = "Link to [[Roadmap]] and [[Budget|the budget]] here"
+        val lines = extractPreviewLines(content, maxLines = 3)
+        assertEquals(listOf("Link to Roadmap and the budget here"), lines)
+    }
 }

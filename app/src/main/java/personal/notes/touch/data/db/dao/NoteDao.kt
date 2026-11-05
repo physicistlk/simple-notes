@@ -28,9 +28,6 @@ interface NoteDao {
     @Query("SELECT * FROM notes WHERE deleted = 1 ORDER BY updatedAt DESC")
     fun getRecycled(): Flow<List<NoteEntity>>
 
-    @Query("SELECT * FROM notes WHERE deleted = 0 AND title LIKE '%' || :query || '%' ORDER BY updatedAt DESC")
-    fun searchNotes(query: String): Flow<List<NoteEntity>>
-
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(note: NoteEntity)
 
@@ -51,6 +48,10 @@ interface NoteDao {
 
     @Query("DELETE FROM notes WHERE deleted = 1")
     suspend fun clearRecycled()
+
+    /** Notes the knowledge index derives from (tags, wiki links). */
+    @Query("SELECT * FROM notes WHERE deleted = 0 AND content IS NOT NULL")
+    suspend fun getNotesWithContent(): List<NoteEntity>
 
     @Query("SELECT COUNT(*) FROM notes WHERE deleted = 0")
     suspend fun count(): Int

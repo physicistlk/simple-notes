@@ -33,6 +33,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.Share
@@ -92,7 +93,9 @@ import personal.notes.touch.ui.theme.LocalThemeColor
 @Composable
 fun TextEditorScreen(
     viewModel: TextEditorViewModel,
-    onBackClick: () -> Unit
+    onBackClick: () -> Unit,
+    /** Opens another note (wiki link / backlink tap); defaults to a no-op. */
+    onOpenNote: (String) -> Unit = {}
 ) {
     val themeColor = LocalThemeColor.current
     val note by viewModel.note.collectAsState()
@@ -105,9 +108,12 @@ fun TextEditorScreen(
     val isReadOnly by viewModel.isReadOnly.collectAsState()
     val wordStats by viewModel.wordStats.collectAsState()
     val showEmojiSheet by viewModel.showEmojiSheet.collectAsState()
+    val backlinks by viewModel.backlinks.collectAsState()
+    val outgoingRefs by viewModel.outgoingRefs.collectAsState()
     val listState = rememberLazyListState()
     var showExportDialog by remember { mutableStateOf(false) }
     var showOutlineSheet by remember { mutableStateOf(false) }
+    var showReferences by remember { mutableStateOf(false) }
     val coroutineScope = rememberCoroutineScope()
     val context = LocalContext.current
     val linkDraft by viewModel.linkDraft.collectAsState()
@@ -239,6 +245,18 @@ fun TextEditorScreen(
                         )
                     }
 
+                    // References: backlinks + outgoing wiki links (schema 7 index).
+                    IconButton(onClick = {
+                        viewModel.saveNow()
+                        showReferences = true
+                    }) {
+                        Icon(
+                            imageVector = Icons.Default.Link,
+                            contentDescription = "References",
+                            tint = Color.White
+                        )
+                    }
+
                     IconButton(onClick = {
                         viewModel.saveNow()
                         showExportDialog = true
@@ -342,6 +360,9 @@ fun TextEditorScreen(
                             onToggleChecklist = { lineIdx, checked ->
                                 viewModel.toggleChecklist(lineIdx, checked)
                             },
+                            onWikiClick = { wikiTitle ->
+                                viewModel.noteIdForTitle(wikiTitle)?.let(onOpenNote)
+                            },
                             modifier = Modifier
                                 .fillMaxSize()
                                 .padding(16.dp)
@@ -386,6 +407,9 @@ fun TextEditorScreen(
                                     onToggleChecklist = { lineIdx, checked ->
                                         viewModel.toggleChecklist(lineIdx, checked)
                                     },
+                                    onWikiClick = { wikiTitle ->
+                                        viewModel.noteIdForTitle(wikiTitle)?.let(onOpenNote)
+                                    },
                                     modifier = Modifier.fillMaxSize()
                                 )
                             }
@@ -416,6 +440,19 @@ fun TextEditorScreen(
                 viewModel.setShowEmojiSheet(false)
             },
             onDismiss = { viewModel.setShowEmojiSheet(false) }
+        )
+    }
+
+    if (showReferences) {
+        ReferencesSheet(
+            noteTitle = title.ifBlank { "Untitled Note" },
+            backlinks = backlinks,
+            outgoing = outgoingRefs,
+            onOpenNote = { id ->
+                showReferences = false
+                onOpenNote(id)
+            },
+            onDismiss = { showReferences = false }
         )
     }
 
@@ -497,6 +534,10 @@ private fun FormattingToolbar(
         ToolbarButton(
             text = "🔗 Link",
             onClick = { viewModel.openLinkDialog() }
+        )
+        ToolbarButton(
+            text = "[[ Note]]",
+            onClick = { viewModel.insertWikiBracket() }
         )
 
         ToolbarDivider()
@@ -667,6 +708,7 @@ private fun PreviewPane(
     noteId: String,
     fileStore: NoteFileStore,
     onToggleChecklist: (lineIndex: Int, isChecked: Boolean) -> Unit,
+    onWikiClick: (String) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val blocks = remember(content) { RichTextParser.parseMarkdown(content) }
@@ -722,7 +764,8 @@ private fun PreviewPane(
                             color = MaterialTheme.colorScheme.onSurface
                         ),
                         modifier = Modifier.padding(top = 6.dp, bottom = 2.dp),
-                        onLinkClick = onLinkClick
+                        onLinkClick = onLinkClick,
+                        onWikiClick = onWikiClick
                     )
                 }
                 is RichBlock.Paragraph -> {
@@ -733,7 +776,8 @@ private fun PreviewPane(
                             lineHeight = 22.sp,
                             color = MaterialTheme.colorScheme.onSurface
                         ),
-                        onLinkClick = onLinkClick
+                        onLinkClick = onLinkClick,
+                        onWikiClick = onWikiClick
                     )
                 }
                 is RichBlock.Quote -> {
@@ -758,7 +802,8 @@ private fun PreviewPane(
                                 color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.85f)
                             ),
                             modifier = Modifier.padding(vertical = 4.dp, horizontal = 4.dp),
-                            onLinkClick = onLinkClick
+                            onLinkClick = onLinkClick,
+                            onWikiClick = onWikiClick
                         )
                     }
                 }
@@ -781,7 +826,8 @@ private fun PreviewPane(
                                 lineHeight = 22.sp,
                                 color = MaterialTheme.colorScheme.onSurface
                             ),
-                            onLinkClick = onLinkClick
+                            onLinkClick = onLinkClick,
+                            onWikiClick = onWikiClick
                         )
                     }
                 }
@@ -804,7 +850,8 @@ private fun PreviewPane(
                                 lineHeight = 22.sp,
                                 color = MaterialTheme.colorScheme.onSurface
                             ),
-                            onLinkClick = onLinkClick
+                            onLinkClick = onLinkClick,
+                            onWikiClick = onWikiClick
                         )
                     }
                 }
@@ -837,7 +884,8 @@ private fun PreviewPane(
                                 textDecoration = if (block.isChecked) TextDecoration.LineThrough else TextDecoration.None,
                                 color = if (block.isChecked) MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f) else MaterialTheme.colorScheme.onSurface
                             ),
-                            onLinkClick = onLinkClick
+                            onLinkClick = onLinkClick,
+                            onWikiClick = onWikiClick
                         )
                     }
                 }
@@ -1060,6 +1108,7 @@ private fun RichTextBlock(
     text: AnnotatedString,
     style: TextStyle,
     onLinkClick: (String) -> Unit,
+    onWikiClick: (String) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     ClickableText(
@@ -1067,9 +1116,15 @@ private fun RichTextBlock(
         style = style,
         modifier = modifier,
         onClick = { offset ->
-            text.getStringAnnotations(RichTextParser.LINK_TAG, offset, offset)
+            val wiki = text.getStringAnnotations(RichTextParser.WIKI_TAG, offset, offset)
                 .firstOrNull()
-                ?.let { annotation -> onLinkClick(annotation.item) }
+            if (wiki != null) {
+                onWikiClick(wiki.item)
+            } else {
+                text.getStringAnnotations(RichTextParser.LINK_TAG, offset, offset)
+                    .firstOrNull()
+                    ?.let { annotation -> onLinkClick(annotation.item) }
+            }
         }
     )
 }

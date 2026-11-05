@@ -40,6 +40,13 @@ object RichTextParser {
     /** String annotation tag carrying a link target inside an AnnotatedString. */
     const val LINK_TAG = "touchnotes.link"
 
+    /** Annotation tag carrying a wiki-link target (note title) in preview text. */
+    const val WIKI_TAG = "touchnotes.wiki"
+
+    /** Wiki-link tint: violet, to read differently from an external link. */
+    private val WIKI_COLOR = Color(0xFF6A1B9A)
+    private val WIKI_BG = Color(0xFFF3E5F5)
+
     /** Link colour (Material blue 700), underlined like a browser link. */
     private val LINK_COLOR = Color(0xFF1565C0)
 
@@ -336,6 +343,39 @@ object RichTextParser {
                         }
                         cursor = next + 1
                         continue
+                    }
+                }
+
+                // [[Note title]] / [[Note title|alias]] — wiki link (v2).
+                // Styled as a chip and tagged with the TARGET title so the
+                // preview can open the note; the alias is what gets drawn.
+                if (text.startsWith("[[", cursor)) {
+                    val close = text.indexOf("]]", cursor + 2)
+                    if (close != -1) {
+                        val inner = text.substring(cursor + 2, close)
+                        if (inner.isNotBlank() &&
+                            inner.length <= 160 &&
+                            !inner.contains('\n') &&
+                            !inner.contains("[[")
+                        ) {
+                            val target = inner.substringBefore('|').trim()
+                            val alias = inner.substringAfter('|', "").trim()
+                            if (target.isNotEmpty()) {
+                                val start = length
+                                withStyle(
+                                    SpanStyle(
+                                        color = WIKI_COLOR,
+                                        background = WIKI_BG,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                ) {
+                                    append(alias.ifEmpty { target })
+                                }
+                                addStringAnnotation(WIKI_TAG, target, start, length)
+                                cursor = close + 2
+                                continue
+                            }
+                        }
                     }
                 }
 

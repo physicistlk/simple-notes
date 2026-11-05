@@ -69,6 +69,7 @@ import androidx.compose.ui.window.PopupProperties
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import personal.notes.touch.text.WikiLinks
 import personal.notes.touch.ui.theme.LocalThemeColor
 import personal.notes.touch.util.ClipboardHelper
 
@@ -101,6 +102,11 @@ fun BlockEditPane(
 
     val activeBlock = blocks.firstOrNull { it.id == activeId }
     val hasSelection = activeBlock != null && !activeBlock.field.selection.collapsed
+
+    val noteIndex by viewModel.noteIndex.collectAsState()
+    val wikiTitles = remember(noteIndex) { noteIndex.map { it.title } }
+    // A note linking to itself is never useful; the popup hides the open note.
+    val selfTitle by viewModel.title.collectAsState()
 
     var menuBlockId by remember { mutableStateOf<String?>(null) }
     val menuBlock = blocks.firstOrNull { it.id == menuBlockId }
@@ -148,6 +154,8 @@ fun BlockEditPane(
                     viewModel = viewModel,
                     themeColor = themeColor,
                     focusRequesters = focusRequesters,
+                    wikiTitles = wikiTitles,
+                    selfTitle = selfTitle,
                     onOpenMenu = { menuBlockId = it }
                 )
             }
@@ -199,6 +207,8 @@ private fun BlockRow(
     viewModel: TextEditorViewModel,
     themeColor: Color,
     focusRequesters: MutableMap<String, FocusRequester>,
+    wikiTitles: List<String>,
+    selfTitle: String,
     onOpenMenu: (String) -> Unit
 ) {
     val focus = remember(block.id) { FocusRequester() }
@@ -211,6 +221,20 @@ private fun BlockRow(
     // character (fresh block, or caret-at-start insert); disarmed once the text
     // no longer begins with "/" — cancelling keeps the literal "/".
     var slashArmed by remember { mutableStateOf(false) }
+
+    // `[[` completion: an opened, unterminated wiki link at the caret.
+    val wikiPending = if (!isReadOnly && isActive) {
+        WikiLinks.pendingAt(block.field.text, block.field.selection.end)
+    } else {
+        null
+    }
+    val wikiMatches = remember(wikiPending?.query, wikiTitles, selfTitle) {
+        if (wikiPending == null) {
+            emptyList()
+        } else {
+            WikiLinks.suggestions(wikiPending.query, wikiTitles, exclude = selfTitle)
+        }
+    }
     val slashOpen = !isReadOnly &&
         isActive &&
         slashArmed &&
@@ -499,6 +523,14 @@ private fun BlockRow(
                 viewModel.applyBlockCommand(it)
             }
         }
+
+        if (wikiPending != null && wikiMatches.isNotEmpty()) {
+            WikiLinkPopup(
+                query = wikiPending.query,
+                titles = wikiMatches,
+                onPick = { title -> viewModel.completeWikiLink(block.id, title) }
+            )
+        }
     }
 }
 
@@ -580,6 +612,78 @@ private fun BlockTextField(
             }
         }
     )
+}
+
+// ---------------------------------------------------------------------------
+// Wiki-link completion
+// ---------------------------------------------------------------------------
+
+/**
+ * Suggestions for an open `[[` in the active block. Picking one closes the
+ * link (`[[Title]]`); the list also says what happens with no match, because
+ * v1 deliberately does not create notes from a reference.
+ */
+@Composable
+private fun WikiLinkPopup(
+    query: String,
+    titles: List<String>,
+    onPick: (String) -> Unit
+) {
+    Popup(
+        alignment = Alignment.BottomStart,
+        offset = IntOffset(0, 8),
+        properties = PopupProperties(focusable = false)
+    ) {
+        Surface(
+            shape = RoundedCornerShape(12.dp),
+            color = MaterialTheme.colorScheme.surface,
+            shadowElevation = 8.dp,
+            border = androidx.compose.foundation.BorderStroke(
+                1.dp,
+                MaterialTheme.colorScheme.onSurface.copy(alpha = 0.10f)
+            )
+        ) {
+            Column(
+                modifier = Modifier
+                    .width(260.dp)
+                    .heightIn(max = 260.dp)
+                    .verticalScroll(rememberScrollState())
+                    .padding(vertical = 6.dp)
+            ) {
+                Text(
+                    text = if (query.isBlank()) "LINK TO NOTE" else "LINK TO \"$query\"",
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f),
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp)
+                )
+                titles.forEach { title ->
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onPick(title) }
+                            .padding(horizontal = 14.dp, vertical = 8.dp)
+                    ) {
+                        Text(
+                            text = "[[" + "]]",
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.width(26.dp)
+                        )
+                        Text(
+                            text = title,
+                            fontSize = 13.sp,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 1,
+                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

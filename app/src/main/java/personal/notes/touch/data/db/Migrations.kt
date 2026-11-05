@@ -10,7 +10,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
  *
  * - Schema versions 1, 2 and 3 were shipped before this registry existed
  *   (legacy dev installs). They are covered by
- *   `fallbackToDestructiveMigrationFrom(1, 2, 3)` in TouchNotesApp:
+ *   `fallbackToDestructiveMigrationFrom(1, 2)` in TouchNotesApp (3 is migrated, never wiped):
  *   migrating FROM one of those versions with no matching [Migration] clears
  *   and recreates the database rather than crashing. (From 3, the
  *   registered [MIGRATION_3_4] provides the data-preserving path.)
@@ -98,4 +98,37 @@ internal val MIGRATION_5_6: Migration = object : Migration(5, 6) {
     }
 }
 
-internal val APP_MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6)
+
+/**
+ * Knowledge index (schema 7): `note_tags` and `note_refs` are derived from
+ * `notes.content` — tags from `#tag#`, references from `[[Title]]`. Both are
+ * additive tables; nothing existing is touched, and the first library start
+ * after the upgrade re-indexes whatever notes already carry content
+ * (`NoteRepository.reindexAll`), so the migration itself only creates schema.
+ */
+internal val MIGRATION_6_7: Migration = object : Migration(6, 7) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS `note_tags` (" +
+                "`noteId` TEXT NOT NULL, " +
+                "`tag` TEXT NOT NULL, " +
+                "`displayName` TEXT NOT NULL, " +
+                "PRIMARY KEY(`noteId`, `tag`))"
+        )
+        db.execSQL(
+            "CREATE INDEX IF NOT EXISTS `index_note_tags_tag` ON `note_tags` (`tag`)"
+        )
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS `note_refs` (" +
+                "`noteId` TEXT NOT NULL, " +
+                "`targetKey` TEXT NOT NULL, " +
+                "`targetTitle` TEXT NOT NULL, " +
+                "PRIMARY KEY(`noteId`, `targetKey`))"
+        )
+        db.execSQL(
+            "CREATE INDEX IF NOT EXISTS `index_note_refs_targetKey` ON `note_refs` (`targetKey`)"
+        )
+    }
+}
+
+internal val APP_MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7)
