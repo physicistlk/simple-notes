@@ -13,6 +13,19 @@ import kotlinx.coroutines.withContext
 
 object ClipboardHelper {
 
+    /** Puts plain [text] on the clipboard (F-10 copy of selected PDF text). */
+    fun copyText(context: Context, text: String, label: String = "Simple Notes"): Boolean {
+        if (text.isEmpty()) return false
+        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE)
+            as? android.content.ClipboardManager ?: return false
+        return try {
+            clipboard.setPrimaryClip(ClipData.newPlainText(label, text))
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
     /** Primary-clip item, used by paste-from-clipboard. */
     fun pasteFromClipboard(context: Context): ClipData.Item? {
         // ClipboardManager.getPrimaryClip().getItemAt(0)

@@ -19,6 +19,8 @@ import android.view.View
 import personal.notes.touch.util.BitmapUtils
 import personal.notes.touch.util.DebugGestureInjector
 import personal.notes.touch.util.PdfRenderPolicy
+import personal.notes.touch.util.PdfTextSelectionInfo
+import personal.notes.touch.util.PdfTextSelectionMath
 import java.util.ArrayDeque
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -125,6 +127,161 @@ class DrawingCanvasView @JvmOverloads constructor(
     /** True when a vector source is installed for the current page. */
     val hasPdfBackground: Boolean
         get() = pdfRenderer != null
+
+    // ---- F-10: PDF text selection ----------------------------------------
+    /**
+     * Canvas-space (page-space) access to a vector page's text, implemented in
+     * the Compose layer on top of [personal.notes.touch.util.PdfiumDocument].
+     * All coordinates and rects are in the same space as [backingBitmap], so
+     * selection highlights and baked marks line up with annotations at any
+     * render resolution.
+     */
+    interface PdfTextSource {
+        fun charCount(): Int
+        fun charIndexAt(x: Float, y: Float, tolerance: Float): Int
+        fun charBox(index: Int): FloatArray?
+        fun selectionRects(start: Int, count: Int): List<FloatArray>
+        fun text(start: Int, count: Int): String
+    }
+
+    private var pdfTextSource: PdfTextSource? = null
+    private var pdfTextSelectionMode = false
+    private var selAnchor = -1
+    private var selFocus = -1
+    private var selRects: List<FloatArray> = emptyList()
+    private val pdfSelectionPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0x5533B5E5
+        style = Paint.Style.FILL
+    }
+
+    /** Notified whenever the PDF text selection changes (null = nothing selected). */
+    var onPdfSelectionChanged: ((PdfTextSelectionInfo?) -> Unit)? = null
+
+    val isPdfTextSelectionMode: Boolean
+        get() = pdfTextSelectionMode
+
+    val hasPdfTextSource: Boolean
+        get() = pdfTextSource != null
+
+    /** Width of the page/annotation space in canvas units. */
+    fun pageCanvasWidth(): Float = pdfPageRectWidth()
+
+    /** Height of the page/annotation space in canvas units. */
+    fun pageCanvasHeight(): Float = pdfPageRectHeight()
+
+    /**
+     * Installs the text provider of the current vector page (or clears it).
+     * Any previous selection is dropped: it belongs to another page.
+     */
+    fun setPdfTextSource(source: PdfTextSource?) {
+        pdfTextSource = source
+        if (source == null) pdfTextSelectionMode = false
+        clearPdfSelection()
+        invalidate()
+    }
+
+    /** True when a selection gesture (tap/drag) should select page text. */
+    fun setPdfTextSelectionMode(enabled: Boolean) {
+        val next = enabled && pdfTextSource != null
+        if (pdfTextSelectionMode == next) return
+        pdfTextSelectionMode = next
+        if (!next) clearPdfSelection()
+        invalidate()
+    }
+
+    fun clearPdfSelection() {
+        selAnchor = -1
+        selFocus = -1
+        selRects = emptyList()
+        onPdfSelectionChanged?.invoke(null)
+        invalidate()
+    }
+
+    /** Inclusive selected char range, or null when nothing is selected. */
+    private fun pdfSelectionRange(): IntRange? =
+        PdfTextSelectionMath.range(selAnchor, selFocus)
+
+    /** Plain text of the current selection ("" when nothing usable is selected). */
+    fun selectedPdfText(): String {
+        val source = pdfTextSource ?: return ""
+        val range = pdfSelectionRange() ?: return ""
+        val count = PdfTextSelectionMath.count(range)
+        if (count <= 0) return ""
+        return source.text(range.first, count).trim()
+    }
+
+    fun hasPdfSelection(): Boolean =
+        pdfSelectionRange() != null && selectedPdfText().isNotEmpty()
+
+    /**
+     * Bakes the current PDF text selection into the stroke layer as a
+     * translucent marker ([mark] = true) or a solid underline band, so the
+     * annotation survives independent of the PDF background. Returns true when
+     * something was drawn.
+     */
+    fun commitPdfSelection(mark: Boolean): Boolean {
+        val source = pdfTextSource ?: return false
+        val range = pdfSelectionRange() ?: return false
+        val count = PdfTextSelectionMath.count(range)
+        if (count <= 0) return false
+        val rects = try {
+            source.selectionRects(range.first, count)
+        } catch (e: Exception) {
+            e.printStackTrace()
+            emptyList()
+        }
+        if (rects.isEmpty()) return false
+        val canvas = bitmapCanvas ?: return false
+        saveUndoState()
+        if (mark) {
+            val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                // Highlighter yellow at ~40% alpha, like the highlighter tool.
+                color = 0x66FFD600
+                style = Paint.Style.FILL
+            }
+            for (r in rects) canvas.drawRect(r[0], r[1], r[2], r[3], paint)
+        } else {
+            val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = 0xFF1A73E8.toInt()
+                style = Paint.Style.FILL
+            }
+            for (r in rects) {
+                val thickness = maxOf(2f, (r[3] - r[1]) * 0.08f)
+                val band = PdfTextSelectionMath.underlineRect(r, thickness)
+                canvas.drawRect(band[0], band[1], band[2], band[3], paint)
+            }
+        }
+        clearPdfSelection()
+        onStrokeFinishedListener?.invoke()
+        return true
+    }
+
+    /** Recomputes cached selection rects and reports the selection upward. */
+    private fun notifyPdfSelection() {
+        val source = pdfTextSource
+        val range = pdfSelectionRange()
+        if (source == null || range == null) {
+            selRects = emptyList()
+            onPdfSelectionChanged?.invoke(null)
+            return
+        }
+        val count = PdfTextSelectionMath.count(range)
+        val text = if (count > 0) {
+            try {
+                source.text(range.first, count).trim()
+            } catch (e: Exception) {
+                ""
+            }
+        } else ""
+        selRects = try {
+            source.selectionRects(range.first, count)
+        } catch (e: Exception) {
+            emptyList()
+        }
+        onPdfSelectionChanged?.invoke(
+            if (text.isEmpty()) null else PdfTextSelectionInfo(range.first, range.last, text)
+        )
+    }
 
     /**
      * Installs a live vector PDF background for the current page, or clears it
@@ -1052,6 +1209,14 @@ class DrawingCanvasView @JvmOverloads constructor(
             canvas.drawBitmap(bmp, 0f, 0f, bitmapPaint)
         }
 
+        // 3a. F-10: PDF text selection highlight (cached rects, no native call
+        // per frame; recomputed only when the selection changes).
+        if (pdfTextSelectionMode && selRects.isNotEmpty()) {
+            for (r in selRects) {
+                canvas.drawRect(r[0], r[1], r[2], r[3], pdfSelectionPaint)
+            }
+        }
+
         // 3b. Draw transformable image layers
         for (i in imageLayers.indices) {
             val layer = imageLayers[i]
@@ -1347,6 +1512,52 @@ class DrawingCanvasView @JvmOverloads constructor(
         pageInverseMatrix.mapPoints(pts)
         val x = pts[0]
         val y = pts[1]
+
+        // F-10: PDF text selection intercepts single-pointer gestures while
+        // the Text tool is active on a vector page (two-finger zoom/pan above
+        // still works). Tap = caret hit, drag = extend from the anchor.
+        if (pdfTextSelectionMode) {
+            val source = pdfTextSource
+            if (source != null) {
+                val tolerance = PdfTextSelectionMath.tolerancePageUnits(
+                    PDF_TEXT_HIT_TOLERANCE_PX, scale
+                )
+                when (event.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        val index = try {
+                            source.charIndexAt(x, y, tolerance)
+                        } catch (e: Exception) {
+                            -1
+                        }
+                        selAnchor = index
+                        selFocus = index
+                        notifyPdfSelection()
+                        invalidate()
+                        return true
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        if (selAnchor >= 0) {
+                            val index = try {
+                                source.charIndexAt(x, y, tolerance)
+                            } catch (e: Exception) {
+                                -1
+                            }
+                            if (index >= 0 && index != selFocus) {
+                                selFocus = index
+                                notifyPdfSelection()
+                                invalidate()
+                            }
+                        }
+                        return true
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        notifyPdfSelection()
+                        invalidate()
+                        return true
+                    }
+                }
+            }
+        }
 
         // Image layer interaction (tap/drag/pinch)
         if (handleImageLayerTouchEvent(event, x, y)) return true
@@ -2033,6 +2244,9 @@ class DrawingCanvasView @JvmOverloads constructor(
     companion object {
         /** Quiet period after a zoom change before the vector re-render fires. */
         private const val PDF_RENDER_DEBOUNCE_MS = 180L
+
+        /** Screen-pixel tolerance for hitting a glyph with the Text tool. */
+        private const val PDF_TEXT_HIT_TOLERANCE_PX = 28f
 
         /**
          * One shared render thread: pdfium work for the visible page is

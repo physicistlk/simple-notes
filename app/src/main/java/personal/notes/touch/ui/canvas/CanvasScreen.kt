@@ -137,6 +137,8 @@ import personal.notes.touch.ui.theme.OrangePrimary
 import personal.notes.touch.util.ClipboardHelper
 import personal.notes.touch.util.PdfDocumentCache
 import personal.notes.touch.util.PdfImportManager
+import personal.notes.touch.util.PdfPageGeometry
+import personal.notes.touch.util.PdfTextSelectionInfo
 import personal.notes.touch.util.PdfVectorImporter
 
 val TouchNotesColors = listOf(
@@ -201,6 +203,12 @@ fun CanvasScreen(
     var newChapterTitle by remember { mutableStateOf("") }
     var newTitleText by remember { mutableStateOf("") }
 
+    // F-10 PDF text selection: whether the current vector page has extractable
+    // text, whether the Text tool is in selection mode, and the live selection.
+    var pdfTextAvailable by remember { mutableStateOf(false) }
+    var pdfTextMode by remember { mutableStateOf(false) }
+    var pdfSelection by remember { mutableStateOf<PdfTextSelectionInfo?>(null) }
+
     val totalPages = note?.pageCount ?: pages.size.coerceAtLeast(1)
 
     // ---- F-10: vector PDF page plumbing -----------------------------------
@@ -220,18 +228,22 @@ fun CanvasScreen(
     // Installs the live pdfium background of a vector PDF page. The renderer
     // runs on the canvas render thread and re-renders at higher resolution as
     // the user zooms in; the page rect stays fixed at the import geometry so
-    // stroke coordinates never shift.
+    // stroke coordinates never shift. Also installs the text layer used by the
+    // Text tool (selection, copy, mark, underline).
     fun applyPdfBackground(canvas: DrawingCanvasView, page: PageEntity) {
         val relPath = page.pdfSourcePath
         val pdfPageIndex = page.pdfPageIndex
+        pdfTextAvailable = false
         val document = pdfDocCache.document(relPath)
         if (document == null) {
             canvas.setPdfBackground(0f, 0f, 0f, null)
+            canvas.setPdfTextSource(null)
             return
         }
         val size = document.pageSize(pdfPageIndex)
         if (size[0] <= 0f || size[1] <= 0f) {
             canvas.setPdfBackground(0f, 0f, 0f, null)
+            canvas.setPdfTextSource(null)
             return
         }
         // Same base geometry the import used, so pages keep their size/aspect.
@@ -247,6 +259,49 @@ fun CanvasScreen(
         canvas.setPdfBackground(size[0], size[1], basePxPerPt) { pxPerPt, outW, outH ->
             pdfDocCache.document(relPath)?.renderPageAt(pdfPageIndex, pxPerPt, outW, outH)
         }
+        // Text layer: pdfium user space (bottom-left origin) → page rect space
+        // (top-left origin), the same space the background and annotations use.
+        val pageW = size[0]
+        val pageH = size[1]
+        val rectWidth = canvas.pageCanvasWidth().takeIf { it > 0f } ?: baseOutWidth.toFloat()
+        val pxPerPt = rectWidth / pageW
+        canvas.setPdfTextSource(object : DrawingCanvasView.PdfTextSource {
+            override fun charCount(): Int = document.textCharCount(pdfPageIndex)
+
+            override fun charIndexAt(x: Float, y: Float, tolerance: Float): Int {
+                val user = PdfPageGeometry.canvasToUserPoint(x, y, pageH, pxPerPt)
+                return document.charIndexAt(
+                    pdfPageIndex, user[0], user[1], tolerance / pxPerPt
+                )
+            }
+
+            override fun charBox(index: Int): FloatArray =
+                PdfPageGeometry.userRectToCanvas(
+                    document.charBox(pdfPageIndex, index), pageH, pxPerPt
+                )
+
+            override fun selectionRects(start: Int, count: Int): List<FloatArray> =
+                document.selectionRects(pdfPageIndex, start, count)
+                    .map { PdfPageGeometry.userRectToCanvas(it, pageH, pxPerPt) }
+
+            override fun text(start: Int, count: Int): String =
+                document.text(pdfPageIndex, start, count)
+        })
+        // Text-page extraction can take a moment on complex PDFs: probe off the
+        // main thread, and leave Text mode when the page has no text layer.
+        scope.launch {
+            val available = try {
+                withContext(Dispatchers.IO) { document.textCharCount(pdfPageIndex) > 0 }
+            } catch (e: Exception) {
+                false
+            }
+            pdfTextAvailable = available
+            if (!available && pdfTextMode) {
+                pdfTextMode = false
+                pdfSelection = null
+                canvas.setPdfTextSelectionMode(false)
+            }
+        }
     }
 
     // Shared page apply for every navigation callback: stroke layer of the
@@ -259,6 +314,10 @@ fun CanvasScreen(
             applyPdfBackground(canvas, page)
         } else {
             canvas.setPdfBackground(0f, 0f, 0f, null)
+            canvas.setPdfTextSource(null)
+            pdfTextAvailable = false
+            pdfTextMode = false
+            pdfSelection = null
             canvas.setPageContent(bitmap)
         }
     }
@@ -398,7 +457,7 @@ fun CanvasScreen(
                             repository = viewModel.repository,
                             fileStore = viewModel.fileStore,
                             targetWidth = 1080,
-                            targetHeight = if ((note?.pageType ?: "infinite") == "a4") 1528 else 1920,
+                            targetHeight = if ((note?.pageType ?: "infinite").let { it == "a4" || it == "pdf" }) 1528 else 1920,
                             reuseFirstPage = false,
                             onPageError = { msg -> showPageError(msg) }
                         )
@@ -640,7 +699,7 @@ fun CanvasScreen(
                                         imported.document.renderPage(
                                             pageIndex = idx,
                                             targetWidth = if (w > 0) w else 1080,
-                                            targetHeight = if (h > 0) h else if ((note?.pageType ?: "infinite") == "a4") 1528 else 1920
+                                            targetHeight = if (h > 0) h else if ((note?.pageType ?: "infinite").let { it == "a4" || it == "pdf" }) 1528 else 1920
                                         )
                                     } finally {
                                         imported.document.close()
@@ -1070,6 +1129,7 @@ fun CanvasScreen(
                             // Wire the previously-dead 3-finger-tap paste hook.
                             onThreeFingerTap = { handleClipboardPaste() }
                             onImageSelectionChanged = { selectedImageIndex = it }
+                            onPdfSelectionChanged = { selection -> pdfSelection = selection }
                             onUndoRedoListener = { canUndo, canRedo ->
                                 viewModel.updateUndoRedo(canUndo, canRedo)
                             }
@@ -1230,6 +1290,64 @@ fun CanvasScreen(
                 // ==========================================
                 // 3. FLOATING PENCASE (TOOL DOCK)
                 // ==========================================
+                // F-10: PDF text selection actions. Shown while the Text tool
+                // is in selection mode on a vector page; the selection itself
+                // is painted by DrawingCanvasView.
+                if (pdfTextMode) {
+                    Surface(
+                        shape = RoundedCornerShape(20.dp),
+                        color = Color.White.copy(alpha = 0.97f),
+                        shadowElevation = 8.dp,
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .padding(bottom = 96.dp)
+                            .border(1.dp, Color(0xFFEEEEEE), RoundedCornerShape(20.dp))
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            val hasSelection = pdfSelection?.isEmpty == false
+                            TextButton(
+                                enabled = hasSelection,
+                                onClick = {
+                                    val text = canvasViewRef?.selectedPdfText().orEmpty()
+                                    if (text.isNotEmpty()) {
+                                        ClipboardHelper.copyText(context, text)
+                                        android.widget.Toast.makeText(
+                                            context,
+                                            "Copied ${text.length} character(s)",
+                                            android.widget.Toast.LENGTH_SHORT
+                                        ).show()
+                                    }
+                                }
+                            ) { Text("Copy", fontSize = 12.sp) }
+                            TextButton(
+                                enabled = hasSelection,
+                                onClick = {
+                                    if (canvasViewRef?.commitPdfSelection(mark = true) == true) {
+                                        pdfSelection = null
+                                    }
+                                }
+                            ) { Text("Mark", fontSize = 12.sp) }
+                            TextButton(
+                                enabled = hasSelection,
+                                onClick = {
+                                    if (canvasViewRef?.commitPdfSelection(mark = false) == true) {
+                                        pdfSelection = null
+                                    }
+                                }
+                            ) { Text("Underline", fontSize = 12.sp) }
+                            TextButton(onClick = {
+                                pdfTextMode = false
+                                pdfSelection = null
+                                canvasViewRef?.setPdfTextSelectionMode(false)
+                            }) { Text("Done", fontSize = 12.sp) }
+                        }
+                    }
+                }
+
                 if (uiState.showPencase) {
                     if (uiState.dockHorizontal) {
                         // Horizontal Dock (Top under bar)
@@ -1281,16 +1399,26 @@ fun CanvasScreen(
                                     onClick = { viewModel.selectTool(CanvasTool.ERASER) }
                                 )
 
-                                // Text Tool [T]
+                                // Text Tool [T] — on a vector PDF page with a
+                                // text layer this toggles PDF text selection
+                                // (copy / mark / underline); everywhere else it
+                                // opens the text note editor as before.
                                 PencaseToolIcon(
                                     icon = Icons.Default.TextFields,
                                     label = "Text",
-                                    isSelected = false,
+                                    isSelected = pdfTextMode,
                                     onClick = {
-                                        canvasViewRef?.getBackingBitmap()?.let { bmp ->
-                                            viewModel.saveCurrentPageBitmap(bmp)
+                                        if (pdfTextAvailable && vectorPdfPage(viewModel.currentPageIndex.value) != null) {
+                                            val next = !pdfTextMode
+                                            pdfTextMode = next
+                                            if (!next) pdfSelection = null
+                                            canvasViewRef?.setPdfTextSelectionMode(next)
+                                        } else {
+                                            canvasViewRef?.getBackingBitmap()?.let { bmp ->
+                                                viewModel.saveCurrentPageBitmap(bmp)
+                                            }
+                                            onOpenEditorClick(viewModel.noteId)
                                         }
-                                        onOpenEditorClick(viewModel.noteId)
                                     }
                                 )
 
@@ -1486,16 +1614,26 @@ fun CanvasScreen(
                                     onClick = { viewModel.selectTool(CanvasTool.ERASER) }
                                 )
 
-                                // Text Tool [T]
+                                // Text Tool [T] — on a vector PDF page with a
+                                // text layer this toggles PDF text selection
+                                // (copy / mark / underline); everywhere else it
+                                // opens the text note editor as before.
                                 PencaseToolIcon(
                                     icon = Icons.Default.TextFields,
                                     label = "Text",
-                                    isSelected = false,
+                                    isSelected = pdfTextMode,
                                     onClick = {
-                                        canvasViewRef?.getBackingBitmap()?.let { bmp ->
-                                            viewModel.saveCurrentPageBitmap(bmp)
+                                        if (pdfTextAvailable && vectorPdfPage(viewModel.currentPageIndex.value) != null) {
+                                            val next = !pdfTextMode
+                                            pdfTextMode = next
+                                            if (!next) pdfSelection = null
+                                            canvasViewRef?.setPdfTextSelectionMode(next)
+                                        } else {
+                                            canvasViewRef?.getBackingBitmap()?.let { bmp ->
+                                                viewModel.saveCurrentPageBitmap(bmp)
+                                            }
+                                            onOpenEditorClick(viewModel.noteId)
                                         }
-                                        onOpenEditorClick(viewModel.noteId)
                                     }
                                 )
 
