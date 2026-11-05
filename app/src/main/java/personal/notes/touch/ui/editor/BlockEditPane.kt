@@ -54,6 +54,8 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.isCtrlPressed
+import androidx.compose.ui.input.key.isMetaPressed
 import androidx.compose.ui.input.key.isShiftPressed
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
@@ -594,6 +596,13 @@ private fun BlockTextField(
                     event.type == KeyEventType.KeyDown && event.key == Key.Backspace &&
                         block.field.selection.collapsed && block.field.selection.start == 0 -> {
                         viewModel.onBackspaceAtBlockStart(block.id)
+                    }
+                    // Ctrl/Cmd+K opens the inline-link dialog (parser + toolbar already
+                    // cover insert; this is the keyboard entry point that was missing).
+                    event.type == KeyEventType.KeyDown && event.key == Key.K &&
+                        (event.isCtrlPressed || event.isMetaPressed) -> {
+                        viewModel.openLinkDialog()
+                        true
                     }
                     else -> false
                 }
