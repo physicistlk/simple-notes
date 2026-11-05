@@ -139,11 +139,18 @@ import android.os.Build
 import android.provider.MediaStore
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import personal.notes.touch.util.BitmapUtils
 import personal.notes.touch.util.PdfImportManager
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -928,7 +935,14 @@ fun NoteListScreen(
                                 dateFormatter = dateFormatter,
                                 onCardClick = {
                                     selectedNoteId = note.id
-                                    onNoteClick(note.id)
+                                    // Route dispatch: "text" notes open in the
+                                    // text (block) editor; canvas page types
+                                    // stay on the canvas route.
+                                    if (note.pageType == "text") {
+                                        onOpenEditorClick?.invoke(note.id) ?: onNoteClick(note.id)
+                                    } else {
+                                        onNoteClick(note.id)
+                                    }
                                 },
                                 onFavoriteClick = { viewModel.toggleFavorite(note) },
                                 onRenameClick = {
@@ -960,7 +974,14 @@ fun NoteListScreen(
                                 dateFormatter = dateFormatter,
                                 onCardClick = {
                                     selectedNoteId = note.id
-                                    onNoteClick(note.id)
+                                    // Route dispatch: "text" notes open in the
+                                    // text (block) editor; canvas page types
+                                    // stay on the canvas route.
+                                    if (note.pageType == "text") {
+                                        onOpenEditorClick?.invoke(note.id) ?: onNoteClick(note.id)
+                                    } else {
+                                        onNoteClick(note.id)
+                                    }
                                 },
                                 onFavoriteClick = { viewModel.toggleFavorite(note) },
                                 onRenameClick = {
@@ -1010,7 +1031,10 @@ fun NoteListScreen(
                         }
                         FabMenuItem(Icons.Default.TextFields, "Text Note") {
                             isFabMenuExpanded = false
-                            viewModel.createNote { id ->
+                            // pageType "text" marks this note for the text
+                            // (block) editor at dispatch time — no Room change
+                            // needed, the column already exists.
+                            viewModel.createNote(pageType = "text") { id ->
                                 onOpenEditorClick?.invoke(id) ?: onNoteClick(id)
                             }
                         }
@@ -1308,33 +1332,11 @@ fun TouchNotesCard(
             }
         ) {
             Box(modifier = Modifier.fillMaxSize()) {
-                // Paper Preview Placeholder
-                Column(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(14.dp)
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth(0.6f)
-                            .height(8.dp)
-                            .background(Color(0xFFEEEEEE), RoundedCornerShape(4.dp))
-                    )
-                    Spacer(modifier = Modifier.height(10.dp))
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(4.dp)
-                            .background(Color(0xFFF5F5F5), RoundedCornerShape(2.dp))
-                    )
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth(0.85f)
-                            .height(4.dp)
-                            .background(Color(0xFFF5F5F5), RoundedCornerShape(2.dp))
-                    )
-                }
+                // Inside Note Preview (Drawing canvas thumbnail or formatted text preview)
+                NoteInsidePreview(
+                    note = note,
+                    modifier = Modifier.fillMaxSize()
+                )
 
                 // Favorite Star in Top Right Corner (matching TouchNotes)
                 IconButton(
@@ -1522,4 +1524,180 @@ fun DrawerMenuItem(
             }
         }
     }
+}
+
+@Composable
+fun NoteInsidePreview(
+    note: NoteEntity,
+    modifier: Modifier = Modifier
+) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val targetFile = remember(note.id, note.coverPath) {
+        val cover = note.coverPath?.let { File(it) }
+        if (cover != null && cover.exists()) {
+            cover
+        } else {
+            File(File(context.filesDir, "note"), "${note.id}/page_0.png")
+        }
+    }
+
+    var thumbnailBitmap by remember(note.id, note.updatedAt) {
+        val cached = if (targetFile.exists()) {
+            BitmapUtils.getCachedThumbnail("${targetFile.absolutePath}:${targetFile.lastModified()}")
+        } else null
+        mutableStateOf(cached)
+    }
+
+    LaunchedEffect(note.id, note.updatedAt) {
+        if (thumbnailBitmap == null && targetFile.exists()) {
+            val bmp = BitmapUtils.loadThumbnail(targetFile, targetWidth = 360, targetHeight = 500)
+            if (bmp != null) {
+                thumbnailBitmap = bmp
+            }
+        }
+    }
+
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .clipToBounds()
+    ) {
+        if (thumbnailBitmap != null) {
+            Image(
+                bitmap = thumbnailBitmap!!.asImageBitmap(),
+                contentDescription = "Note preview",
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop
+            )
+        } else if (note.pageType == "text" || !note.content.isNullOrBlank()) {
+            // Text Note Inside Preview
+            val previewLines = remember(note.content) {
+                extractPreviewLines(note.content.orEmpty(), 8)
+            }
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color(0xFFFCFCFD))
+                    .padding(horizontal = 14.dp, vertical = 12.dp)
+            ) {
+                // Notebook paper header rule
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(2.dp)
+                        .background(Color(0xFFE5E7EB), RoundedCornerShape(1.dp))
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+
+                if (previewLines.isNotEmpty()) {
+                    previewLines.forEachIndexed { idx, line ->
+                        Text(
+                            text = line,
+                            fontSize = if (idx == 0) 11.sp else 10.sp,
+                            fontWeight = if (idx == 0) FontWeight.SemiBold else FontWeight.Normal,
+                            lineHeight = 14.sp,
+                            color = if (idx == 0) Color(0xFF1F2937) else Color(0xFF4B5563),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(vertical = 1.dp)
+                        )
+                    }
+                } else {
+                    Text(
+                        text = "Empty text note",
+                        fontSize = 11.sp,
+                        color = Color(0xFF9CA3AF),
+                        fontStyle = androidx.compose.ui.text.font.FontStyle.Italic
+                    )
+                }
+            }
+        } else {
+            // Blank canvas paper preview with subtle ruled lines
+            Canvas(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.White)
+            ) {
+                val step = 24.dp.toPx()
+                var y = step
+                val linePaintColor = Color(0xFFF0F0F2)
+                while (y < size.height) {
+                    drawLine(
+                        color = linePaintColor,
+                        start = androidx.compose.ui.geometry.Offset(0f, y),
+                        end = androidx.compose.ui.geometry.Offset(size.width, y),
+                        strokeWidth = 1f
+                    )
+                    y += step
+                }
+            }
+        }
+
+        // Subdued Page Count or Type badge in bottom-right corner
+        if (note.pageType == "text") {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(6.dp)
+                    .background(Color(0xCCF3F4F6), RoundedCornerShape(4.dp))
+                    .padding(horizontal = 5.dp, vertical = 2.dp)
+            ) {
+                Text(
+                    text = "TEXT",
+                    fontSize = 9.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color(0xFF6B7280)
+                )
+            }
+        } else if (note.pageCount > 1) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(6.dp)
+                    .background(Color(0xCCF3F4F6), RoundedCornerShape(4.dp))
+                    .padding(horizontal = 5.dp, vertical = 2.dp)
+            ) {
+                Text(
+                    text = "${note.pageCount}p",
+                    fontSize = 9.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color(0xFF6B7280)
+                )
+            }
+        }
+    }
+}
+
+fun extractPreviewLines(rawContent: String, maxLines: Int = 8): List<String> {
+    if (rawContent.isBlank()) return emptyList()
+    val lines = rawContent.lines()
+    val cleaned = mutableListOf<String>()
+    for (line in lines) {
+        val trimmed = line.trim()
+        if (trimmed.isEmpty()) continue
+        var cleanedLine = trimmed
+            .replace(Regex("^#{1,6}\\s*"), "")
+            .replace(Regex("^[-*+]\\s+\\[([ xX])\\]\\s*"), "☐ ")
+            .replace(Regex("^- \\[([ xX])\\]\\s*"), "☐ ")
+            .replace(Regex("^[-*+]\\s+"), "• ")
+            .replace(Regex("^\\d+\\.\\s+"), "")
+            .replace(Regex("^>\\s*"), "")
+            .replace(Regex("==(.*?)==.*"), "$1")
+            .replace(Regex("\\*\\*(.*?)\\*\\*"), "$1")
+            .replace(Regex("\\*(.*?)\\*"), "$1")
+            .replace(Regex("`{1,3}(.*?)`{1,3}"), "$1")
+            .replace(Regex("!\\[.*?\\]\\(.*?\\)"), "[Image]")
+            .trim()
+        if (cleanedLine.startsWith("|") && cleanedLine.endsWith("|")) {
+            cleanedLine = cleanedLine.split("|")
+                .map { it.trim() }
+                .filter { it.isNotEmpty() && !it.startsWith("---") }
+                .joinToString("   ")
+        }
+        if (cleanedLine.isNotBlank()) {
+            cleaned.add(cleanedLine)
+            if (cleaned.size >= maxLines) break
+        }
+    }
+    return cleaned
 }

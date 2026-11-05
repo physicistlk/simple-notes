@@ -127,6 +127,16 @@ class DrawingCanvasView @JvmOverloads constructor(
 
     private val sampledPoints = mutableListOf<Pair<Float, Float>>()
 
+    data class StrokePoint(val x: Float, val y: Float, val width: Float)
+    private val currentStrokePoints = mutableListOf<StrokePoint>()
+    private var lastSmoothedWidth: Float = -1f
+
+    private val fountainPenPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+    }
+
     enum class LassoState {
         IDLE,
         SELECTING,
@@ -198,6 +208,23 @@ class DrawingCanvasView @JvmOverloads constructor(
     private fun getCalibratedPressure(rawPressure: Float): Float {
         val clamped = rawPressure.coerceIn(0.01f, 1.0f)
         return Math.pow(clamped.toDouble(), (1.0 / pressureSensitivity.coerceIn(0.2f, 3.0f))).toFloat()
+    }
+
+    private fun calculateFountainPenWidth(rawPressure: Float): Float {
+        if (!pressureSizeEnabled) return strokeWidthPx
+        val targetWidth = if (rawPressure > 0.01f) {
+            val calibrated = getCalibratedPressure(rawPressure)
+            strokeWidthPx * (0.35f + calibrated * 1.35f)
+        } else {
+            if (lastSmoothedWidth > 0f) lastSmoothedWidth else strokeWidthPx
+        }
+        val smoothed = if (lastSmoothedWidth > 0f) {
+            lastSmoothedWidth * 0.65f + targetWidth * 0.35f
+        } else {
+            targetWidth
+        }
+        lastSmoothedWidth = smoothed
+        return smoothed
     }
 
     // Tool settings
@@ -296,7 +323,7 @@ class DrawingCanvasView @JvmOverloads constructor(
             CanvasTool.FOUNTAIN_PEN -> {
                 strokePaint.xfermode = null
                 strokePaint.color = strokeColor
-                strokePaint.strokeWidth = strokeWidthPx * 1.1f
+                strokePaint.strokeWidth = strokeWidthPx
                 strokePaint.strokeCap = Paint.Cap.ROUND
                 strokePaint.strokeJoin = Paint.Join.ROUND
                 strokePaint.alpha = 255
@@ -906,6 +933,8 @@ class DrawingCanvasView @JvmOverloads constructor(
                 }
                 else -> {}
             }
+        } else if (currentTool == CanvasTool.FOUNTAIN_PEN && currentStrokePoints.isNotEmpty()) {
+            drawFountainPenStroke(canvas, currentStrokePoints, strokePaint)
         } else if (!currentPath.isEmpty) {
             canvas.drawPath(currentPath, strokePaint)
         }
@@ -1154,19 +1183,6 @@ class DrawingCanvasView @JvmOverloads constructor(
         val x = pts[0]
         val y = pts[1]
 
-        // Pressure sensitivity modulation for all drawing tools when enabled
-        if (pressureSizeEnabled && event.pressure > 0.05f) {
-            val calibrated = getCalibratedPressure(event.pressure)
-            val dynamicWidth = if (currentTool == CanvasTool.FOUNTAIN_PEN) {
-                strokeWidthPx * (0.35f + calibrated * 1.3f)
-            } else {
-                strokeWidthPx * (0.4f + calibrated * 0.8f)
-            }
-            strokePaint.strokeWidth = dynamicWidth
-        } else {
-            strokePaint.strokeWidth = strokeWidthPx
-        }
-
         // Image layer interaction (tap/drag/pinch)
         if (handleImageLayerTouchEvent(event, x, y)) return true
 
@@ -1382,6 +1398,12 @@ class DrawingCanvasView @JvmOverloads constructor(
                 lastTouchY = y
                 sampledPoints.clear()
                 sampledPoints.add(x to y)
+                currentStrokePoints.clear()
+                lastSmoothedWidth = -1f
+                if (currentTool == CanvasTool.FOUNTAIN_PEN) {
+                    val initialWidth = calculateFountainPenWidth(event.pressure)
+                    currentStrokePoints.add(StrokePoint(x, y, initialWidth))
+                }
                 invalidate()
                 return true
             }
@@ -1389,6 +1411,34 @@ class DrawingCanvasView @JvmOverloads constructor(
                 if (multiTouchCancelsStroke) {
                     // Stroke was cancelled by a second pointer: keep the
                     // in-progress path empty until the finger is lifted.
+                    invalidate()
+                    return true
+                }
+                if (currentTool == CanvasTool.FOUNTAIN_PEN) {
+                    for (h in 0 until event.historySize) {
+                        val hPts = floatArrayOf(event.getHistoricalX(h), event.getHistoricalY(h))
+                        pageInverseMatrix.mapPoints(hPts)
+                        val hx = hPts[0]
+                        val hy = hPts[1]
+                        val last = currentStrokePoints.lastOrNull()
+                        val distSq = if (last != null) {
+                            (hx - last.x) * (hx - last.x) + (hy - last.y) * (hy - last.y)
+                        } else 999f
+                        if (distSq >= 4f) {
+                            val hw = calculateFountainPenWidth(event.getHistoricalPressure(h))
+                            currentStrokePoints.add(StrokePoint(hx, hy, hw))
+                            sampledPoints.add(hx to hy)
+                        }
+                    }
+                    val last = currentStrokePoints.lastOrNull()
+                    val distSq = if (last != null) {
+                        (x - last.x) * (x - last.x) + (y - last.y) * (y - last.y)
+                    } else 999f
+                    if (distSq >= 4f) {
+                        val w = calculateFountainPenWidth(event.pressure)
+                        currentStrokePoints.add(StrokePoint(x, y, w))
+                        sampledPoints.add(x to y)
+                    }
                     invalidate()
                     return true
                 }
@@ -1410,7 +1460,39 @@ class DrawingCanvasView @JvmOverloads constructor(
                     multiTouchCancelsStroke = false
                     currentPath.reset()
                     sampledPoints.clear()
+                    currentStrokePoints.clear()
+                    lastSmoothedWidth = -1f
                     invalidate()
+                    return true
+                }
+                if (currentTool == CanvasTool.FOUNTAIN_PEN && currentStrokePoints.isNotEmpty()) {
+                    val last = currentStrokePoints.last()
+                    val distSq = (x - last.x) * (x - last.x) + (y - last.y) * (y - last.y)
+                    if (distSq > 1f) {
+                        val finalWidth = if (lastSmoothedWidth > 0f) lastSmoothedWidth * 0.85f else strokeWidthPx
+                        currentStrokePoints.add(StrokePoint(x, y, finalWidth))
+                        sampledPoints.add(x to y)
+                    }
+                    val c = bitmapCanvas
+                    if (c != null) {
+                        if (autoShapeEnabled) {
+                            val shape = autoShape(sampledPoints)
+                            if (shape != null) {
+                                strokePaint.strokeWidth = strokeWidthPx
+                                c.drawPath(shape, strokePaint)
+                            } else {
+                                drawFountainPenStroke(c, currentStrokePoints, strokePaint)
+                            }
+                        } else {
+                            drawFountainPenStroke(c, currentStrokePoints, strokePaint)
+                        }
+                    }
+                    currentStrokePoints.clear()
+                    currentPath.reset()
+                    sampledPoints.clear()
+                    lastSmoothedWidth = -1f
+                    invalidate()
+                    onStrokeFinishedListener?.invoke()
                     return true
                 }
                 currentPath.lineTo(x, y)
@@ -1563,6 +1645,7 @@ class DrawingCanvasView @JvmOverloads constructor(
     private fun isDrawingInteractionInProgress(): Boolean {
         return !currentPath.isEmpty ||
             sampledPoints.isNotEmpty() ||
+            currentStrokePoints.isNotEmpty() ||
             isDrawingShape ||
             lassoState == LassoState.SELECTING
     }
@@ -1572,6 +1655,8 @@ class DrawingCanvasView @JvmOverloads constructor(
         multiTouchCancelsStroke = true
         currentPath.reset()
         sampledPoints.clear()
+        currentStrokePoints.clear()
+        lastSmoothedWidth = -1f
         isDrawingShape = false
         if (lassoState == LassoState.SELECTING) {
             lassoPath.reset()
@@ -1586,6 +1671,127 @@ class DrawingCanvasView @JvmOverloads constructor(
         }
         notifyUndoRedo()
         invalidate()
+    }
+
+    private fun drawFountainPenStroke(canvas: Canvas, points: List<StrokePoint>, basePaint: Paint) {
+        if (points.isEmpty()) return
+        fountainPenPaint.color = basePaint.color
+        fountainPenPaint.alpha = basePaint.alpha
+        fountainPenPaint.xfermode = basePaint.xfermode
+
+        if (points.size == 1) {
+            val p0 = points[0]
+            fountainPenPaint.strokeWidth = p0.width
+            canvas.drawPoint(p0.x, p0.y, fountainPenPaint)
+            return
+        }
+
+        if (points.size == 2) {
+            val p0 = points[0]
+            val p1 = points[1]
+            drawTaperedLine(canvas, p0.x, p0.y, p0.width, p1.x, p1.y, p1.width, fountainPenPaint)
+            return
+        }
+
+        // Draw from first point to first midpoint
+        val p0 = points[0]
+        val p1 = points[1]
+        val m0X = (p0.x + p1.x) / 2f
+        val m0Y = (p0.y + p1.y) / 2f
+        val m0W = (p0.width + p1.width) / 2f
+        drawTaperedLine(canvas, p0.x, p0.y, p0.width, m0X, m0Y, m0W, fountainPenPaint)
+
+        // Draw intermediate quadratic beziers between midpoints
+        var prevMX = m0X
+        var prevMY = m0Y
+        var prevMW = m0W
+
+        for (i in 1 until points.size - 1) {
+            val curr = points[i]
+            val next = points[i + 1]
+            val nextMX = (curr.x + next.x) / 2f
+            val nextMY = (curr.y + next.y) / 2f
+            val nextMW = (curr.width + next.width) / 2f
+            drawTaperedQuad(
+                canvas,
+                prevMX, prevMY, prevMW,
+                curr.x, curr.y,
+                nextMX, nextMY, nextMW,
+                fountainPenPaint
+            )
+            prevMX = nextMX
+            prevMY = nextMY
+            prevMW = nextMW
+        }
+
+        // Draw from last midpoint to last point
+        val pLast = points.last()
+        drawTaperedLine(canvas, prevMX, prevMY, prevMW, pLast.x, pLast.y, pLast.width, fountainPenPaint)
+    }
+
+    private fun drawTaperedLine(
+        canvas: Canvas,
+        x0: Float, y0: Float, w0: Float,
+        x1: Float, y1: Float, w1: Float,
+        paint: Paint
+    ) {
+        val dx = x1 - x0
+        val dy = y1 - y0
+        val dist = Math.hypot(dx.toDouble(), dy.toDouble()).toFloat()
+        if (dist < 0.5f) {
+            paint.strokeWidth = (w0 + w1) / 2f
+            canvas.drawPoint(x0, y0, paint)
+            return
+        }
+        val steps = maxOf(1, (dist / 3f).toInt())
+        var prevX = x0
+        var prevY = y0
+        var prevW = w0
+        for (i in 1..steps) {
+            val t = i.toFloat() / steps
+            val curX = x0 + dx * t
+            val curY = y0 + dy * t
+            val curW = w0 + (w1 - w0) * t
+            paint.strokeWidth = (prevW + curW) / 2f
+            canvas.drawLine(prevX, prevY, curX, curY, paint)
+            prevX = curX
+            prevY = curY
+            prevW = curW
+        }
+    }
+
+    private fun drawTaperedQuad(
+        canvas: Canvas,
+        x0: Float, y0: Float, w0: Float,
+        cx: Float, cy: Float,
+        x1: Float, y1: Float, w1: Float,
+        paint: Paint
+    ) {
+        val chordDist = Math.hypot((x1 - x0).toDouble(), (y1 - y0).toDouble()).toFloat()
+        val controlDist = Math.hypot((cx - x0).toDouble(), (cy - y0).toDouble()).toFloat() +
+                          Math.hypot((x1 - cx).toDouble(), (y1 - cy).toDouble()).toFloat()
+        val approxLen = (chordDist + controlDist) / 2f
+        if (approxLen < 0.5f) {
+            paint.strokeWidth = (w0 + w1) / 2f
+            canvas.drawPoint(x0, y0, paint)
+            return
+        }
+        val steps = maxOf(2, (approxLen / 3f).toInt().coerceAtMost(32))
+        var prevX = x0
+        var prevY = y0
+        var prevW = w0
+        for (i in 1..steps) {
+            val t = i.toFloat() / steps
+            val invT = 1f - t
+            val curX = invT * invT * x0 + 2f * invT * t * cx + t * t * x1
+            val curY = invT * invT * y0 + 2f * invT * t * cy + t * t * y1
+            val curW = invT * w0 + t * w1
+            paint.strokeWidth = (prevW + curW) / 2f
+            canvas.drawLine(prevX, prevY, curX, curY, paint)
+            prevX = curX
+            prevY = curY
+            prevW = curW
+        }
     }
 
     /**

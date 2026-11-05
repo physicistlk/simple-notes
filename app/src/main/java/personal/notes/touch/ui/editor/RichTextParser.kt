@@ -7,6 +7,7 @@ import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.BaselineShift
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.withStyle
 
@@ -14,14 +15,27 @@ sealed class RichBlock {
     data class Header(val level: Int, val text: AnnotatedString) : RichBlock()
     data class Paragraph(val text: AnnotatedString) : RichBlock()
     data class Quote(val text: AnnotatedString) : RichBlock()
-    data class BulletItem(val text: AnnotatedString) : RichBlock()
-    data class NumberedItem(val number: String, val text: AnnotatedString) : RichBlock()
+    /** [indent] = nesting level, parsed from leading spaces (parser v2). */
+    data class BulletItem(val text: AnnotatedString, val indent: Int = 0) : RichBlock()
+    data class NumberedItem(val number: String, val text: AnnotatedString, val indent: Int = 0) : RichBlock()
     data class ChecklistItem(val isChecked: Boolean, val text: AnnotatedString, val lineIndex: Int) : RichBlock()
+    /** GFM-style table, kept verbatim per row (parser v2, P1.4). */
+    data class Table(val rows: List<String>) : RichBlock()
+    /** Image block (v2, P1.5): ![alt](url). */
+    data class Image(val alt: String, val url: String) : RichBlock()
     object Divider : RichBlock()
     data class CodeBlock(val code: String) : RichBlock()
 }
 
+/**
+ * Parser v2 (Phase-1 P1.2): headings 1-6, nested lists by indent, GFM tables,
+ * ==highlight==, <sup>/<sub>; tolerant to legacy content — old notes keep
+ * rendering through the same constructs the original parser accepted.
+ */
 object RichTextParser {
+
+    /** Highlight (==mark==) background — SiYuan default yellow-ish. */
+    private val MARK_BG = Color(0xFFFFF176)
 
     fun parseMarkdown(content: String): List<RichBlock> {
         val lines = content.lines()
@@ -29,7 +43,9 @@ object RichTextParser {
         var inCodeBlock = false
         val codeBuffer = StringBuilder()
 
-        for ((lineIdx, line) in lines.withIndex()) {
+        var i = 0
+        while (i < lines.size) {
+            val line = lines[i]
             val trimmed = line.trim()
 
             // Code block toggle
@@ -41,69 +57,98 @@ object RichTextParser {
                 } else {
                     inCodeBlock = true
                 }
+                i++
                 continue
             }
 
             if (inCodeBlock) {
                 codeBuffer.append(line).append("\n")
+                i++
                 continue
             }
 
             // Horizontal Divider
             if (trimmed == "---" || trimmed == "***" || trimmed == "___") {
                 blocks.add(RichBlock.Divider)
+                i++
                 continue
             }
 
-            // Headers
-            if (trimmed.startsWith("# ")) {
-                blocks.add(RichBlock.Header(1, parseInline(trimmed.removePrefix("# "))))
+            // Image (v2): ![alt](url)
+            val imageMatch = Regex("""^!\[([^\]]*)\]\(([^)]*)\)$""").find(trimmed)
+            if (imageMatch != null) {
+                blocks.add(RichBlock.Image(imageMatch.groupValues[1], imageMatch.groupValues[2]))
+                i++
                 continue
             }
-            if (trimmed.startsWith("## ")) {
-                blocks.add(RichBlock.Header(2, parseInline(trimmed.removePrefix("## "))))
+
+            // Table (v2): group consecutive "|" rows into one bordered block
+            if (trimmed.startsWith("|")) {
+                val rows = mutableListOf<String>()
+                var j = i
+                while (j < lines.size && lines[j].trim().startsWith("|")) {
+                    rows.add(lines[j].trim())
+                    j++
+                }
+                blocks.add(RichBlock.Table(rows))
+                i = j
                 continue
             }
-            if (trimmed.startsWith("### ")) {
-                blocks.add(RichBlock.Header(3, parseInline(trimmed.removePrefix("### "))))
+
+            // Headers (v2: levels 1-6)
+            val headingMatch = Regex("""^(#{1,6}) (.*)$""").find(trimmed)
+            if (headingMatch != null) {
+                val level = headingMatch.groupValues[1].length
+                blocks.add(RichBlock.Header(level, parseInline(headingMatch.groupValues[2])))
+                i++
                 continue
             }
 
             // Quotes
             if (trimmed.startsWith("> ")) {
                 blocks.add(RichBlock.Quote(parseInline(trimmed.removePrefix("> "))))
+                i++
                 continue
             }
 
+            // Nested list indent (v2): two spaces or one tab per level
+            val indent = indentOf(line)
+            val body = line.trimStart()
+
             // Checklist
-            if (trimmed.startsWith("- [ ] ") || trimmed.startsWith("* [ ] ")) {
-                blocks.add(RichBlock.ChecklistItem(false, parseInline(trimmed.substring(6)), lineIdx))
+            if (body.startsWith("- [ ] ") || body.startsWith("* [ ] ")) {
+                blocks.add(RichBlock.ChecklistItem(false, parseInline(body.substring(6)), i))
+                i++
                 continue
             }
-            if (trimmed.startsWith("- [x] ") || trimmed.startsWith("- [X] ") ||
-                trimmed.startsWith("* [x] ") || trimmed.startsWith("* [X] ")
+            if (body.startsWith("- [x] ") || body.startsWith("- [X] ") ||
+                body.startsWith("* [x] ") || body.startsWith("* [X] ")
             ) {
-                blocks.add(RichBlock.ChecklistItem(true, parseInline(trimmed.substring(6)), lineIdx))
+                blocks.add(RichBlock.ChecklistItem(true, parseInline(body.substring(6)), i))
+                i++
                 continue
             }
 
             // Bullet list
-            if (trimmed.startsWith("- ") || trimmed.startsWith("* ") || trimmed.startsWith("• ")) {
-                blocks.add(RichBlock.BulletItem(parseInline(trimmed.substring(2))))
+            if (body.startsWith("- ") || body.startsWith("* ") || body.startsWith("• ")) {
+                blocks.add(RichBlock.BulletItem(parseInline(body.substring(2)), indent))
+                i++
                 continue
             }
 
             // Numbered list: e.g. "1. " or "12. "
-            val numberedMatch = Regex("""^(\d+)\.\s+(.*)""").find(trimmed)
+            val numberedMatch = Regex("""^(\d+)\.\s+(.*)""").find(body)
             if (numberedMatch != null) {
                 val num = numberedMatch.groupValues[1]
                 val rest = numberedMatch.groupValues[2]
-                blocks.add(RichBlock.NumberedItem(num, parseInline(rest)))
+                blocks.add(RichBlock.NumberedItem(num, parseInline(rest), indent))
+                i++
                 continue
             }
 
             // Regular paragraph or empty line
             blocks.add(RichBlock.Paragraph(parseInline(line)))
+            i++
         }
 
         if (inCodeBlock && codeBuffer.isNotEmpty()) {
@@ -113,12 +158,26 @@ object RichTextParser {
         return blocks
     }
 
+    private fun indentOf(raw: String): Int {
+        var spaces = 0
+        for (ch in raw) {
+            when (ch) {
+                ' ' -> spaces++
+                '\t' -> spaces += 2
+                else -> break
+            }
+        }
+        return spaces / 2
+    }
+
     /**
      * Parses inline styles:
      * - **bold**
      * - *italic*
      * - <u>underline</u>
      * - ~~strikethrough~~
+     * - ==highlight== (v2, ==mark==)
+     * - <sup>/<sub> (v2)
      * - `code`
      * - <font color="#hex">colored text</font>
      */
@@ -169,6 +228,64 @@ object RichTextParser {
                         }
                         cursor = closeTag + 4
                         continue
+                    }
+                }
+
+                // v2: <sup> / <sub>
+                if (text.startsWith("<sup>", cursor, ignoreCase = true)) {
+                    val closeTag = text.indexOf("</sup>", cursor, ignoreCase = true)
+                    if (closeTag != -1) {
+                        val inner = text.substring(cursor + 5, closeTag)
+                        withStyle(SpanStyle(baselineShift = BaselineShift.Superscript)) {
+                            append(parseInline(inner))
+                        }
+                        cursor = closeTag + 6
+                        continue
+                    }
+                }
+                if (text.startsWith("<sub>", cursor, ignoreCase = true)) {
+                    val closeTag = text.indexOf("</sub>", cursor, ignoreCase = true)
+                    if (closeTag != -1) {
+                        val inner = text.substring(cursor + 5, closeTag)
+                        withStyle(SpanStyle(baselineShift = BaselineShift.Subscript)) {
+                            append(parseInline(inner))
+                        }
+                        cursor = closeTag + 6
+                        continue
+                    }
+                }
+
+                // v2: ==highlight==
+                if (text.startsWith("==", cursor)) {
+                    val next = text.indexOf("==", cursor + 2)
+                    if (next != -1) {
+                        val inner = text.substring(cursor + 2, next)
+                        withStyle(SpanStyle(background = MARK_BG)) {
+                            append(parseInline(inner))
+                        }
+                        cursor = next + 2
+                        continue
+                    }
+                }
+
+                // v2: #tag# or #category/tag#
+                if (text[cursor] == '#' && cursor + 1 < len) {
+                    val nextHash = text.indexOf('#', cursor + 1)
+                    if (nextHash != -1) {
+                        val candidate = text.substring(cursor + 1, nextHash)
+                        if (candidate.isNotEmpty() && !candidate.contains(' ') && !candidate.contains('\n')) {
+                            withStyle(
+                                SpanStyle(
+                                    color = Color(0xFF1565C0),
+                                    background = Color(0xFFE3F2FD),
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            ) {
+                                append("#$candidate#")
+                            }
+                            cursor = nextHash + 1
+                            continue
+                        }
                     }
                 }
 

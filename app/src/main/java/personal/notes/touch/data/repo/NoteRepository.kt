@@ -203,6 +203,17 @@ class NoteRepository(
 
     suspend fun savePageBitmap(noteId: String, pageIndex: Int, bitmap: android.graphics.Bitmap): Boolean = withContext(Dispatchers.IO) {
         val file = fileStore.getPageFile(noteId, pageIndex)
-        personal.notes.touch.util.BitmapUtils.saveBitmapToPng(bitmap, file)
+        val ok = personal.notes.touch.util.BitmapUtils.saveBitmapToPng(bitmap, file)
+        if (ok) {
+            try {
+                val note = noteDao.getById(noteId)
+                if (note != null) {
+                    noteDao.update(note.copy(updatedAt = System.currentTimeMillis()))
+                }
+            } catch (e: Exception) {
+                // Ignore if note lookup fails
+            }
+        }
+        ok
     }
 }

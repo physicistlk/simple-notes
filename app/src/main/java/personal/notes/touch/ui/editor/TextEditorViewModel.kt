@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -30,6 +31,17 @@ enum class EditorMode {
     PREVIEW,
     SPLIT
 }
+
+/**
+ * Focus hand-off after structural block edits (Enter split/continue, Backspace
+ * merge/demote, slash picks). The op already sets the block field's selection;
+ * the row only has to place real IME focus on it.
+ */
+data class FocusTarget(val blockId: String)
+
+data class OutlineEntry(val blockIndex: Int, val level: Int, val text: String)
+
+data class WordStats(val wordCount: Int, val charCount: Int)
 
 @OptIn(FlowPreview::class)
 class TextEditorViewModel(
@@ -49,8 +61,93 @@ class TextEditorViewModel(
     private val _title = MutableStateFlow("")
     val title: StateFlow<String> = _title.asStateFlow()
 
+    /**
+     * Serialized markdown of the whole note — the single source of truth.
+     * Block edits re-write it here; raw edits (SPLIT pane, legacy toolbar
+     * fallbacks, preview checkbox toggle) re-derive [blocks] from it.
+     */
     private val _contentValue = MutableStateFlow(TextFieldValue(""))
     val contentValue: StateFlow<TextFieldValue> = _contentValue.asStateFlow()
+
+    /** Derived block list for the block editor (kept in sync both ways). */
+    private val _blocks = MutableStateFlow<List<EditableBlock>>(emptyList())
+    val blocks: StateFlow<List<EditableBlock>> = _blocks.asStateFlow()
+
+    private val _activeBlockId = MutableStateFlow<String?>(null)
+    val activeBlockId: StateFlow<String?> = _activeBlockId.asStateFlow()
+
+    private val _pendingFocus = MutableStateFlow<FocusTarget?>(null)
+    val pendingFocus: StateFlow<FocusTarget?> = _pendingFocus.asStateFlow()
+
+    /** Outline of headings 1–6 in current blocks (SiYuan document outline). */
+    val outline: StateFlow<List<OutlineEntry>> = _blocks
+        .map { list ->
+            list.mapIndexedNotNull { i, b ->
+                if (b.type == BlockType.HEADING && b.headingLevel in 1..6 && b.field.text.isNotBlank()) {
+                    OutlineEntry(blockIndex = i, level = b.headingLevel, text = b.field.text)
+                } else {
+                    null
+                }
+            }
+        }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
+
+    /** Real-time document statistics: words and characters count. */
+    val wordStats: StateFlow<WordStats> = _contentValue
+        .map { tfv ->
+            val text = tfv.text
+            val charCount = text.length
+            val wordCount = if (text.isBlank()) 0 else text.trim().split(Regex("""\s+""")).size
+            WordStats(wordCount = wordCount, charCount = charCount)
+        }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = WordStats(0, 0)
+        )
+
+    /** SiYuan read-only view mode toggle. */
+    private val _isReadOnly = MutableStateFlow(false)
+    val isReadOnly: StateFlow<Boolean> = _isReadOnly.asStateFlow()
+
+    fun toggleReadOnly() {
+        _isReadOnly.value = !_isReadOnly.value
+    }
+
+    /** Emoji sheet visibility. */
+    private val _showEmojiSheet = MutableStateFlow(false)
+    val showEmojiSheet: StateFlow<Boolean> = _showEmojiSheet.asStateFlow()
+
+    fun setShowEmojiSheet(show: Boolean) {
+        _showEmojiSheet.value = show
+    }
+
+    fun insertEmoji(emoji: String) {
+        val activeId = _activeBlockId.value
+        val list = _blocks.value
+        val idx = if (activeId != null) list.indexOfFirst { it.id == activeId } else -1
+
+        if (idx >= 0) {
+            val cur = list[idx]
+            val f = cur.field
+            val at = f.selection.start.coerceIn(0, f.text.length)
+            val newText = f.text.substring(0, at) + emoji + f.text.substring(at)
+            val newSel = TextRange(at + emoji.length)
+            val mutable = list.toMutableList()
+            mutable[idx] = cur.copy(field = TextFieldValue(newText, newSel))
+            publishBlocks(mutable, FocusTarget(cur.id))
+        } else {
+            val cur = _contentValue.value
+            val at = cur.selection.start.coerceIn(0, cur.text.length)
+            val newText = cur.text.substring(0, at) + emoji + cur.text.substring(at)
+            val newSel = TextRange(at + emoji.length)
+            onContentChange(TextFieldValue(newText, newSel))
+        }
+    }
 
     private val _isSaving = MutableStateFlow(false)
     val isSaving: StateFlow<Boolean> = _isSaving.asStateFlow()
@@ -63,19 +160,27 @@ class TextEditorViewModel(
 
     private var isInitialized = false
 
+    private var spareCounter = 0
+
     init {
         // Initialize from note entity once loaded
         viewModelScope.launch {
             repository.getNoteById(noteId).collect { loadedNote ->
                 if (loadedNote != null && !isInitialized) {
                     _title.value = loadedNote.title
-                    _contentValue.value = TextFieldValue(loadedNote.content ?: "")
+                    val md = loadedNote.content ?: ""
+                    _contentValue.value = TextFieldValue(md)
+                    // Empty note => exactly one empty paragraph block.
+                    _blocks.value = BlockModel.parseBlocks(md)
                     isInitialized = true
                 }
             }
         }
 
-        // Setup debounced autosave (M2 spec: debounce 1s)
+        // Setup debounced autosave (M2 spec: debounce 1s) — unchanged persistence
+        // path. Block edits funnel into _contentValue, so this still covers them;
+        // TextEditorScreen additionally calls saveNow() on ON_PAUSE / back /
+        // check so notes survive an app kill.
         combine(_title, _contentValue) { t, c -> t to c.text }
             .drop(1)
             .filter { isInitialized }
@@ -86,12 +191,12 @@ class TextEditorViewModel(
             .launchIn(viewModelScope)
     }
 
+    // ---------------------------------------------------------------------
+    // Title / mode / persistence
+    // ---------------------------------------------------------------------
+
     fun onTitleChange(newTitle: String) {
         _title.value = newTitle
-    }
-
-    fun onContentChange(newVal: TextFieldValue) {
-        _contentValue.value = newVal
     }
 
     fun setEditorMode(mode: EditorMode) {
@@ -122,7 +227,328 @@ class TextEditorViewModel(
         }
     }
 
-    // --- Rich Text Insertion & Formatting Helpers ---
+    // ---------------------------------------------------------------------
+    // Block editor surface
+    // ---------------------------------------------------------------------
+
+    fun setActiveBlock(id: String?) {
+        _activeBlockId.value = id
+    }
+
+    fun consumePendingFocus() {
+        _pendingFocus.value = null
+    }
+
+    /** Re-derive blocks from markdown; drop the active id if its block vanished. */
+    private fun rederiveFromContent(text: String) {
+        val parsed = BlockModel.parseBlocks(text)
+        _blocks.value = parsed
+        val active = _activeBlockId.value
+        if (active != null && parsed.none { it.id == active }) _activeBlockId.value = null
+    }
+
+    /** Update blocks + serialized markdown (persistence lane). */
+    private fun publishBlocks(newList: List<EditableBlock>, focus: FocusTarget? = null) {
+        _blocks.value = newList
+        if (focus != null) {
+            _activeBlockId.value = focus.blockId
+            _pendingFocus.value = focus
+        }
+        val md = BlockModel.serializeBlocks(newList)
+        val cur = _contentValue.value
+        if (cur.text != md) {
+            _contentValue.value = cur.copy(
+                text = md,
+                selection = TextRange(
+                    cur.selection.start.coerceIn(0, md.length),
+                    cur.selection.end.coerceIn(0, md.length)
+                )
+            )
+        }
+    }
+
+    /** Plain per-keystroke change of one block's text field; also detects Enter. */
+    fun onBlockValueChange(id: String, newValue: TextFieldValue) {
+        val list = _blocks.value
+        val idx = list.indexOfFirst { it.id == id }
+        if (idx < 0) return
+        val cur = list[idx]
+
+        val sel = newValue.selection
+        val grew = newValue.text.length > cur.field.text.length
+        val enteredNewline = cur.type != BlockType.CODE &&
+            grew &&
+            sel.collapsed &&
+            sel.start in 1..newValue.text.length &&
+            newValue.text[sel.start - 1] == '\n'
+
+        if (enteredNewline) {
+            val caret = sel.start
+            val pre = newValue.text.substring(0, caret - 1)
+            val post = newValue.text.substring(caret)
+            val atEnd = caret - 1 >= cur.field.text.length
+            val newList = BlockOps.enterSplit(list, id, pre, post, atEnd)
+            val nextId = newList.getOrNull(idx + 1)?.id
+            publishBlocks(newList, nextId?.let { FocusTarget(it) })
+            return
+        }
+
+        val updated = cur.copy(field = newValue)
+        val mutable = list.toMutableList()
+        mutable[idx] = updated
+        publishBlocks(mutable)
+    }
+
+    /** Enter key handled through the key-event path (hardware / some IMEs). */
+    fun onEnterPressed(id: String) {
+        val list = _blocks.value
+        val idx = list.indexOfFirst { it.id == id }
+        if (idx < 0) return
+        val cur = list[idx]
+        if (cur.type == BlockType.CODE) return // code blocks stay multi-line
+        val f = cur.field
+        if (f.selection.collapsed) {
+            val caret = f.selection.start
+            splitAt(list, idx, pre = f.text.substring(0, caret), post = f.text.substring(caret))
+        } else {
+            val s = f.selection.start
+            val e = f.selection.end
+            splitAt(list, idx, pre = f.text.substring(0, s), post = f.text.substring(e))
+        }
+    }
+
+    private fun splitAt(list: List<EditableBlock>, idx: Int, pre: String, post: String) {
+        val blockId = list[idx].id
+        val atEnd = list[idx].field.selection.end >= list[idx].field.text.length
+        val newList = BlockOps.enterSplit(list, blockId, pre, post, atEnd)
+        val nextId = newList.getOrNull(idx + 1)?.id
+        publishBlocks(newList, nextId?.let { FocusTarget(it) })
+    }
+
+    /**
+     * Backspace at column 0 of a block. Returns true when the editor consumed
+     * the event (via Modifier.onPreviewKeyEvent — soft IMEs vary in whether
+     * they emit it, see known edge cases in the handover).
+     */
+    fun onBackspaceAtBlockStart(id: String): Boolean {
+        val list = _blocks.value
+        val idx = list.indexOfFirst { it.id == id }
+        if (idx < 0) return false
+        val cur = list[idx]
+        if (!cur.field.selection.collapsed || cur.field.selection.start != 0) return false
+        // Atomic fenced/static blocks keep native behaviour only.
+        if (cur.type == BlockType.CODE || cur.type == BlockType.TABLE || cur.type == BlockType.IMAGE) {
+            return false
+        }
+
+        val result = BlockOps.backspaceAtStart(list, id)
+        if (result.blocks === list && result.focusId == null) {
+            // Sensible stay per spec: divider or empty heading before, or an
+            // unchanged first block. Consume so nothing destructive happens.
+            return true
+        }
+        if (result.focusId != null) {
+            publishBlocks(result.blocks, FocusTarget(result.focusId))
+        } else {
+            publishBlocks(result.blocks)
+        }
+        return true
+    }
+
+    /** Checkbox tap inside a TASK block row. */
+    fun onToggleTaskChecked(id: String, checked: Boolean? = null) {
+        val list = _blocks.value
+        val idx = list.indexOfFirst { it.id == id }
+        if (idx < 0) return
+        val cur = list[idx]
+        if (cur.type != BlockType.TASK) return
+        val updated = cur.copy(checked = checked ?: !cur.checked)
+        val mutable = list.toMutableList()
+        mutable[idx] = updated
+        publishBlocks(mutable)
+    }
+
+    /** Inline markdown wrapper on the ACTIVE block's selection (formatting bar). */
+    fun applyInlineToActiveBlock(
+        prefix: String,
+        suffix: String = prefix,
+        placeholder: String = "text"
+    ) {
+        val list = _blocks.value
+        val id = _activeBlockId.value ?: run {
+            applyWrapFormatting(prefix, suffix, placeholder)
+            return
+        }
+        val idx = list.indexOfFirst { b -> b.id == id }
+        if (idx < 0) {
+            applyWrapFormatting(prefix, suffix, placeholder)
+            return
+        }
+        val updated = BlockOps.wrapInline(list[idx], prefix, suffix, placeholder)
+        val mutable = list.toMutableList()
+        mutable[idx] = updated
+        publishBlocks(mutable)
+    }
+
+    private fun spareId(seed: Int): String {
+        spareCounter++
+        return "$seed-x-$spareCounter"
+    }
+
+    private fun freshParagraph(): EditableBlock =
+        EditableBlock(
+            id = "p-${spareCounter}-${System.nanoTime()}",
+            type = BlockType.PARAGRAPH
+        )
+
+    /**
+     * One command path for the slash menu AND the formatting toolbar:
+     * H1-H3 / lists / quote transform the active block, Divider/Code/Table/
+     * Image insert blocks, Tag/Highlight write inline markdown. The "Rich"
+     * inserts are simple markdown placeholders — the follow-up worker swaps in
+     * real pickers (image assets, tag chips) at this same seam.
+     */
+    fun applyBlockCommand(command: BlockCommand) {
+        val list = _blocks.value
+        val id = _activeBlockId.value ?: return
+        val idx = list.indexOfFirst { it.id == id }
+        if (idx < 0) return
+        val cur = list[idx]
+        val (clean, body) = BlockOps.stripSlashQuery(cur)
+        val bodyField = TextFieldValue(body, TextRange(body.length))
+        val mutable = list.toMutableList()
+        mutable[idx] = clean
+        val freshEmpty = body.isEmpty() && cur.type == BlockType.PARAGRAPH
+
+        val finish: (List<EditableBlock>, FocusTarget?) -> Unit = { l, focus ->
+            publishBlocks(l, focus)
+        }
+
+        fun insertAfter(index: Int, block: EditableBlock) {
+            mutable.add(index + 1, block)
+        }
+
+        when (command) {
+            BlockCommand.H1, BlockCommand.H2, BlockCommand.H3,
+            BlockCommand.H4, BlockCommand.H5, BlockCommand.H6 -> {
+                mutable[idx] = clean.copy(
+                    type = BlockType.HEADING,
+                    headingLevel = when (command) {
+                        BlockCommand.H1 -> 1
+                        BlockCommand.H2 -> 2
+                        BlockCommand.H3 -> 3
+                        BlockCommand.H4 -> 4
+                        BlockCommand.H5 -> 5
+                        else -> 6
+                    },
+                    indent = 0,
+                    field = bodyField
+                )
+                finish(mutable, FocusTarget(clean.id))
+            }
+            BlockCommand.BULLET -> {
+                mutable[idx] = clean.copy(
+                    type = BlockType.BULLET,
+                    indent = cur.indent,
+                    field = bodyField
+                )
+                finish(mutable, FocusTarget(clean.id))
+            }
+            BlockCommand.NUMBERED -> {
+                mutable[idx] = clean.copy(
+                    type = BlockType.NUMBERED,
+                    order = 1,
+                    indent = cur.indent,
+                    field = bodyField
+                )
+                finish(mutable, FocusTarget(clean.id))
+            }
+            BlockCommand.TASK -> {
+                mutable[idx] = clean.copy(
+                    type = BlockType.TASK,
+                    checked = false,
+                    indent = cur.indent,
+                    field = bodyField
+                )
+                finish(mutable, FocusTarget(clean.id))
+            }
+            BlockCommand.QUOTE -> {
+                mutable[idx] = clean.copy(
+                    type = BlockType.QUOTE,
+                    indent = cur.indent,
+                    field = bodyField
+                )
+                finish(mutable, FocusTarget(clean.id))
+            }
+            BlockCommand.DIVIDER, BlockCommand.CODE, BlockCommand.TABLE, BlockCommand.IMAGE -> {
+                val insertedId = spareId(idx)
+                val inserted = when (command) {
+                    BlockCommand.DIVIDER -> EditableBlock(id = insertedId, type = BlockType.DIVIDER)
+                    BlockCommand.CODE -> EditableBlock(
+                        id = insertedId,
+                        type = BlockType.CODE,
+                        field = TextFieldValue(""),
+                        closed = true
+                    )
+                    BlockCommand.TABLE -> EditableBlock(
+                        id = insertedId,
+                        type = BlockType.TABLE,
+                        field = TextFieldValue(BlockModel.DEFAULT_TABLE_ROWS.joinToString("\n"))
+                    )
+                    else -> EditableBlock(
+                        id = insertedId,
+                        type = BlockType.IMAGE,
+                        field = TextFieldValue("![image](https://)", TextRange(9, 17))
+                    )
+                }
+                if (freshEmpty) {
+                    // "/"-only brand-new block → becomes the inserted block itself.
+                    mutable[idx] = inserted.copy(id = clean.id)
+                } else {
+                    mutable[idx] = clean.copy(field = bodyField)
+                    insertAfter(idx, inserted)
+                }
+                // Prose row right after the static block so Enter/caret have a home.
+                val afterIdx = if (freshEmpty) idx else idx + 1
+                insertAfter(afterIdx, freshParagraph())
+                // Focus HOME: Divider → the prose row; Code/Table/Image → the
+                // content block itself (its field carries the caret/selection).
+                val focusId = when (command) {
+                    BlockCommand.CODE, BlockCommand.TABLE, BlockCommand.IMAGE ->
+                        if (freshEmpty) clean.id else insertedId
+                    else -> mutable.getOrNull(afterIdx + 1)?.id
+                }
+                finish(mutable, focusId?.let { FocusTarget(it) })
+            }
+            BlockCommand.TAG -> {
+                val text = "#tag#" + body
+                mutable[idx] = clean.copy(field = TextFieldValue(text, TextRange(1, 4)))
+                finish(mutable, FocusTarget(clean.id))
+            }
+            BlockCommand.HIGHLIGHT -> {
+                val text = if (body.isEmpty()) "====" else "==" + body + "=="
+                val sel = if (body.isEmpty()) TextRange(2, 2) else TextRange(2, 2 + body.length)
+                mutable[idx] = clean.copy(field = TextFieldValue(text, sel))
+                finish(mutable, FocusTarget(clean.id))
+            }
+            BlockCommand.EMOJI -> {
+                _showEmojiSheet.value = true
+                mutable[idx] = clean.copy(field = bodyField)
+                finish(mutable, FocusTarget(clean.id))
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Legacy raw-surface helpers (SPLIT source editing / no active block).
+    // They all funnel into onContentChange so blocks re-derive from the same
+    // markdown source.
+    // ---------------------------------------------------------------------
+
+    fun onContentChange(value: TextFieldValue) {
+        _contentValue.value = value
+        rederiveFromContent(value.text)
+    }
 
     fun applyWrapFormatting(prefix: String, suffix: String = prefix, placeholder: String = "text") {
         val current = _contentValue.value
@@ -148,7 +574,7 @@ class TextEditorViewModel(
             )
         }
 
-        _contentValue.value = TextFieldValue(newText, newSelection)
+        onContentChange(TextFieldValue(newText, newSelection))
     }
 
     fun applyBold() = applyWrapFormatting("**")
@@ -176,7 +602,7 @@ class TextEditorViewModel(
         val newText = before + prefix + after
         val newCursor = selectionStart + prefix.length
 
-        _contentValue.value = TextFieldValue(newText, TextRange(newCursor))
+        onContentChange(TextFieldValue(newText, TextRange(newCursor)))
     }
 
     fun applyH1() = applyLinePrefix("# ")
@@ -194,7 +620,7 @@ class TextEditorViewModel(
         val insert = "\n---\n"
         val newText = text.substring(0, cursor) + insert + text.substring(cursor)
         val newCursor = cursor + insert.length
-        _contentValue.value = TextFieldValue(newText, TextRange(newCursor))
+        onContentChange(TextFieldValue(newText, TextRange(newCursor)))
     }
 
     fun insertCodeBlock() {
@@ -204,7 +630,7 @@ class TextEditorViewModel(
         val insert = "\n```\ncode\n```\n"
         val newText = text.substring(0, cursor) + insert + text.substring(cursor)
         val newCursor = cursor + 5
-        _contentValue.value = TextFieldValue(newText, TextRange(newCursor, newCursor + 4))
+        onContentChange(TextFieldValue(newText, TextRange(newCursor, newCursor + 4)))
     }
 
     fun toggleChecklist(lineIndex: Int, isChecked: Boolean) {
@@ -219,7 +645,7 @@ class TextEditorViewModel(
             }
             lines[lineIndex] = updatedLine
             val newText = lines.joinToString("\n")
-            _contentValue.value = current.copy(text = newText)
+            onContentChange(current.copy(text = newText))
             viewModelScope.launch {
                 performSave(_title.value, newText)
             }
