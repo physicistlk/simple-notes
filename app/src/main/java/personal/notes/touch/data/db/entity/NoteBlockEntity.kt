@@ -47,5 +47,6 @@ data class NoteBlockEntity(
     val checked: Boolean = false,
     /** CODE only: closing fence present. */
     val closed: Boolean = true,
+    val collapsed: Boolean = false,
     val updatedAt: Long = System.currentTimeMillis()
 )

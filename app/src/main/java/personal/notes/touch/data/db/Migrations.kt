@@ -131,4 +131,10 @@ internal val MIGRATION_6_7: Migration = object : Migration(6, 7) {
     }
 }
 
-internal val APP_MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7)
+internal val MIGRATION_7_8: Migration = object : Migration(7, 8) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE note_blocks ADD COLUMN collapsed INTEGER NOT NULL DEFAULT 0")
+    }
+}
+
+internal val APP_MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8)

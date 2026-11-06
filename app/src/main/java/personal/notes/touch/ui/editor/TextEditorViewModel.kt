@@ -30,6 +30,7 @@ import personal.notes.touch.data.db.dao.RefTarget
 import personal.notes.touch.data.db.entity.NoteEntity
 import personal.notes.touch.data.files.NoteFileStore
 import personal.notes.touch.data.repo.NoteRepository
+import personal.notes.touch.text.TableModel
 import personal.notes.touch.text.WikiLinks
 import personal.notes.touch.data.repo.SettingsRepository
 
@@ -674,6 +675,28 @@ class TextEditorViewModel(
     fun outdentBlock(id: String) {
         val updated = BlockStructureOps.shiftIndent(_blocks.value, id, -1)
         if (updated !== _blocks.value) publishBlocks(updated)
+    }
+
+    /** Toggles the fold state of a heading block. */
+    fun toggleFold(id: String) {
+        val list = _blocks.value
+        val index = list.indexOfFirst { it.id == id }
+        if (index < 0 || list[index].type != BlockType.HEADING) return
+        val updated = list.toMutableList()
+        updated[index] = list[index].copy(collapsed = !list[index].collapsed)
+        publishBlocks(updated)
+    }
+
+    /** Replaces a TABLE block's markdown (cells, add/remove row or column). */
+    fun updateTableBlock(id: String, rows: List<List<String>>) {
+        val list = _blocks.value
+        val index = list.indexOfFirst { it.id == id }
+        if (index < 0 || list[index].type != BlockType.TABLE) return
+        val markdown = TableModel.serialize(rows)
+        if (markdown == list[index].field.text) return
+        val updated = list.toMutableList()
+        updated[index] = list[index].copy(field = TextFieldValue(markdown))
+        publishBlocks(updated)
     }
 
     fun duplicateBlock(id: String) {

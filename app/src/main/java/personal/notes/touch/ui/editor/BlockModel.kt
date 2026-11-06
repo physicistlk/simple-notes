@@ -43,6 +43,8 @@ data class EditableBlock(
     val checked: Boolean = false,
     /** CODE only: is the closing fence present? */
     val closed: Boolean = true,
+    /** HEADING only: whether the section below is folded away. */
+    val collapsed: Boolean = false,
 ) {
     val isEmptyText: Boolean get() = this.field.text.isEmpty()
 }

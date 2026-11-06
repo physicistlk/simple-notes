@@ -38,6 +38,7 @@ object BlockPersistence {
         orderNo = block.order,
         checked = block.checked,
         closed = block.closed,
+        collapsed = block.collapsed,
         updatedAt = now
     )
 
@@ -68,7 +69,8 @@ object BlockPersistence {
             indent = row.indent.coerceAtLeast(0),
             order = row.orderNo.coerceAtLeast(1),
             checked = row.checked,
-            closed = row.closed
+            closed = row.closed,
+            collapsed = row.collapsed
         )
     }
 

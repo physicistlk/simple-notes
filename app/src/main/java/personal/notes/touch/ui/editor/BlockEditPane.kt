@@ -4,6 +4,10 @@ import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import kotlinx.coroutines.withTimeoutOrNull
+import androidx.compose.ui.input.pointer.positionChange
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -24,12 +28,17 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ChevronRight
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CheckboxDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Surface
@@ -51,7 +60,9 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.isCtrlPressed
@@ -140,6 +151,10 @@ fun BlockEditPane(
             HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f))
         }
 
+        // Heading folding: a collapsed heading hides every block below it until
+        // the next heading of equal or higher level (pure logic in BlockStructureOps).
+        val visibleBlocks = remember(blocks) { BlockStructureOps.visibleBlocks(blocks) }
+
         LazyColumn(
             state = listState,
             modifier = Modifier
@@ -147,11 +162,11 @@ fun BlockEditPane(
                 .padding(horizontal = 16.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp)
         ) {
-            itemsIndexed(blocks, key = { _, b -> b.id }) { _, block ->
+            itemsIndexed(visibleBlocks, key = { _, b -> b.id }) { _, block ->
                 BlockRow(
                     block = block,
                     isActive = block.id == activeId,
-                    isOnlyBlock = blocks.size == 1,
+                    isOnlyBlock = visibleBlocks.size == 1,
                     isReadOnly = isReadOnly,
                     viewModel = viewModel,
                     themeColor = themeColor,
@@ -199,6 +214,9 @@ fun BlockEditPane(
 /** Slash menu is not offered inside atomic fenced/table blocks. */
 private val slashForbiddenTypes: Set<BlockType> =
     setOf(BlockType.CODE, BlockType.TABLE)
+
+/** Vertical travel (in dp) that moves a dragged block by one position. */
+private val REORDER_STEP = 44.dp
 
 @Composable
 private fun BlockRow(
@@ -250,6 +268,16 @@ private fun BlockRow(
             modifier = Modifier.fillMaxWidth()
         ) {
             if (!isReadOnly) {
+                // Gutter handle, one gesture owner for both actions so neither
+                // steals the pointer from the other:
+                //  * tap (down + up before the long-press timeout) opens the
+                //    block menu;
+                //  * hold still, then drag up/down reorders, one block per
+                //    `ReorderDrag` bucket (routes vary in height, so there is
+                //    no row measurement);
+                //  * moving before the timeout is left alone so the LazyColumn
+                //    still scrolls normally from the gutter.
+                val dragStepPx = with(LocalDensity.current) { REORDER_STEP.toPx() }
                 Text(
                     text = "⋮",
                     fontSize = 16.sp,
@@ -259,7 +287,51 @@ private fun BlockRow(
                         .copy(alpha = if (isActive) 0.55f else 0.22f),
                     modifier = Modifier
                         .width(22.dp)
-                        .clickable { onOpenMenu(block.id) }
+                        .pointerInput(block.id, dragStepPx) {
+                            val longPressTimeout = viewConfiguration.longPressTimeoutMillis
+                            val slop = viewConfiguration.touchSlop
+                            awaitEachGesture {
+                                val down = awaitFirstDown(requireUnconsumed = false)
+                                var released = false
+                                var movedAway = false
+                                val heldStill = withTimeoutOrNull(longPressTimeout) {
+                                    var travel = 0f
+                                    while (true) {
+                                        val event = awaitPointerEvent()
+                                        val change = event.changes
+                                            .firstOrNull { it.id == down.id }
+                                            ?: return@withTimeoutOrNull false
+                                        if (!change.pressed) {
+                                            released = true
+                                            return@withTimeoutOrNull false
+                                        }
+                                        travel += change.positionChange().getDistance()
+                                        if (travel > slop) {
+                                            movedAway = true
+                                            return@withTimeoutOrNull false
+                                        }
+                                    }
+                                    @Suppress("UNREACHABLE_CODE") false
+                                }
+                                when {
+                                    heldStill == null -> {
+                                        // Long press reached: reorder while held.
+                                        val reorder = ReorderDrag(dragStepPx)
+                                        while (true) {
+                                            val event = awaitPointerEvent()
+                                            val change = event.changes
+                                                .firstOrNull { it.id == down.id } ?: break
+                                            if (!change.pressed) break
+                                            change.consume()
+                                            val step = reorder.add(change.positionChange().y)
+                                            if (step != 0) viewModel.moveBlock(block.id, step)
+                                        }
+                                    }
+                                    released -> onOpenMenu(block.id)
+                                    movedAway -> Unit
+                                }
+                            }
+                        }
                         .padding(top = 1.dp)
                 )
             }
@@ -298,51 +370,12 @@ private fun BlockRow(
                 }
             }
             BlockType.TABLE -> {
-                Card(
-                    shape = RoundedCornerShape(8.dp),
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)
-                    ),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .border(
-                            1.dp,
-                            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f),
-                            RoundedCornerShape(8.dp)
-                        )
-                ) {
-                    Column {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .background(themeColor.copy(alpha = 0.10f))
-                                .padding(horizontal = 10.dp, vertical = 4.dp)
-                        ) {
-                            Text(
-                                text = "Markdown table",
-                                fontSize = 11.sp,
-                                color = themeColor,
-                                fontWeight = FontWeight.Medium
-                            )
-                        }
-                        BlockTextField(
-                            block = block,
-                            viewModel = viewModel,
-                            focusRequester = focus,
-                            onSlashArmed = { slashArmed = it },
-                            readOnly = isReadOnly,
-                            textStyle = TextStyle(
-                                fontFamily = FontFamily.Monospace,
-                                fontSize = 12.sp,
-                                lineHeight = 17.sp,
-                                color = MaterialTheme.colorScheme.onSurface
-                            ),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(10.dp)
-                        )
-                    }
-                }
+                TableBlockEditor(
+                    block = block,
+                    viewModel = viewModel,
+                    themeColor = themeColor,
+                    readOnly = isReadOnly
+                )
             }
             BlockType.IMAGE -> {
                 Column(modifier = Modifier.fillMaxWidth()) {
@@ -384,20 +417,37 @@ private fun BlockRow(
             }
             BlockType.HEADING -> {
                 val (size, weight) = headingStyle(block.headingLevel)
-                BlockTextField(
-                    block = block,
-                    viewModel = viewModel,
-                    focusRequester = focus,
-                    onSlashArmed = { slashArmed = it },
-                    readOnly = isReadOnly,
-                    textStyle = TextStyle(
-                        fontSize = size.sp,
-                        fontWeight = weight,
-                        lineHeight = (size + 6).sp,
-                        color = MaterialTheme.colorScheme.onSurface
-                    ),
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier.fillMaxWidth()
-                )
+                ) {
+                    // Fold toggle: collapse/expand the section below this heading.
+                    IconButton(
+                        onClick = { if (!isReadOnly) viewModel.toggleFold(block.id) },
+                        modifier = Modifier.size(24.dp)
+                    ) {
+                        Icon(
+                            imageVector = if (block.collapsed) Icons.Default.ChevronRight else Icons.Default.ExpandMore,
+                            contentDescription = if (block.collapsed) "Expand" else "Collapse",
+                            tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f),
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                    BlockTextField(
+                        block = block,
+                        viewModel = viewModel,
+                        focusRequester = focus,
+                        onSlashArmed = { slashArmed = it },
+                        readOnly = isReadOnly,
+                        textStyle = TextStyle(
+                            fontSize = size.sp,
+                            fontWeight = weight,
+                            lineHeight = (size + 6).sp,
+                            color = MaterialTheme.colorScheme.onSurface
+                        ),
+                        modifier = Modifier.weight(1f)
+                    )
+                }
             }
             BlockType.BULLET, BlockType.NUMBERED -> {
                 Row(

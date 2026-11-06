@@ -61,6 +61,31 @@ object BlockStructureOps {
         return mutable
     }
 
+    /**
+     * Blocks visible in the editor when heading folding is applied: after a
+     * collapsed heading, everything is hidden until the next heading whose
+     * level is equal or higher (1 = H1). Headings themselves always stay
+     * visible so they can be unfolded.
+     */
+    fun visibleBlocks(blocks: List<EditableBlock>): List<EditableBlock> {
+        val result = ArrayList<EditableBlock>(blocks.size)
+        var collapseLevel: Int? = null
+        for (block in blocks) {
+            if (collapseLevel != null) {
+                if (block.type == BlockType.HEADING && block.headingLevel <= collapseLevel) {
+                    collapseLevel = null
+                } else {
+                    continue
+                }
+            }
+            result.add(block)
+            if (block.type == BlockType.HEADING && block.collapsed) {
+                collapseLevel = block.headingLevel
+            }
+        }
+        return result
+    }
+
     /** Moves [id] by [delta] positions (clamped); returns the same list when out of range. */
     fun move(blocks: List<EditableBlock>, id: String, delta: Int): List<EditableBlock> {
         val index = blocks.indexOfFirst { it.id == id }
