@@ -8,6 +8,7 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -1931,8 +1932,15 @@ private fun TemplatesDialog(
                         Text("Add starter templates", color = OrangePrimary)
                     }
                 } else {
-                    LazyColumn(modifier = Modifier.heightIn(max = 340.dp)) {
-                        items(templates, key = { it.id }) { template ->
+                    // A plain scrolling Column, not LazyColumn: an AlertDialog's
+                    // text slot can measure children with an unbounded height and
+                    // a lazy list would throw on that constraint.
+                    Column(
+                        modifier = Modifier
+                            .heightIn(max = 340.dp)
+                            .verticalScroll(rememberScrollState())
+                    ) {
+                        templates.forEach { template ->
                             TemplateRow(
                                 template = template,
                                 onUse = { onUse(template) },
