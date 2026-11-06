@@ -42,7 +42,8 @@ object BlockCards {
     }
 
     /** Marker-free display text of one side of the card. */
-    fun plain(text: String): String = InlineMarkdown.plain(text).trim()
+    fun plain(text: String): String =
+        InlineMarkdown.plain(BlockRefs.strip(text)).trim()
 
     /** Deck name for a note; an untitled note still gets a usable deck. */
     fun deckName(noteTitle: String?): String =

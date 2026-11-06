@@ -1,5 +1,7 @@
 package personal.notes.touch.ui.editor
 
+import personal.notes.touch.text.BlockRefs
+
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
@@ -43,14 +45,24 @@ object RichTextParser {
     /** Annotation tag carrying a wiki-link target (note title) in preview text. */
     const val WIKI_TAG = "touchnotes.wiki"
 
+    /** Annotation tag carrying a block target (short block key) in preview text. */
+    const val BLOCK_REF_TAG = "touchnotes.blockref"
+
     /** Wiki-link tint: violet, to read differently from an external link. */
     private val WIKI_COLOR = Color(0xFF6A1B9A)
     private val WIKI_BG = Color(0xFFF3E5F5)
 
+    /** Block-reference tint: teal, distinct from a note link. */
+    private val BLOCK_REF_COLOR = Color(0xFF00695C)
+    private val BLOCK_REF_BG = Color(0xFFE0F2F1)
+
     /** Link colour (Material blue 700), underlined like a browser link. */
     private val LINK_COLOR = Color(0xFF1565C0)
 
-    fun parseMarkdown(content: String): List<RichBlock> {
+    fun parseMarkdown(
+        content: String,
+        blockRefLabel: (String) -> String? = { null }
+    ): List<RichBlock> {
         val lines = content.lines()
         val blocks = mutableListOf<RichBlock>()
         var inCodeBlock = false
@@ -112,14 +124,14 @@ object RichTextParser {
             val headingMatch = Regex("""^(#{1,6}) (.*)$""").find(trimmed)
             if (headingMatch != null) {
                 val level = headingMatch.groupValues[1].length
-                blocks.add(RichBlock.Header(level, parseInline(headingMatch.groupValues[2])))
+                blocks.add(RichBlock.Header(level, parseInline(headingMatch.groupValues[2], blockRefLabel)))
                 i++
                 continue
             }
 
             // Quotes
             if (trimmed.startsWith("> ")) {
-                blocks.add(RichBlock.Quote(parseInline(trimmed.removePrefix("> "))))
+                blocks.add(RichBlock.Quote(parseInline(trimmed.removePrefix("> "), blockRefLabel)))
                 i++
                 continue
             }
@@ -130,21 +142,21 @@ object RichTextParser {
 
             // Checklist
             if (body.startsWith("- [ ] ") || body.startsWith("* [ ] ")) {
-                blocks.add(RichBlock.ChecklistItem(false, parseInline(body.substring(6)), i))
+                blocks.add(RichBlock.ChecklistItem(false, parseInline(body.substring(6), blockRefLabel), i))
                 i++
                 continue
             }
             if (body.startsWith("- [x] ") || body.startsWith("- [X] ") ||
                 body.startsWith("* [x] ") || body.startsWith("* [X] ")
             ) {
-                blocks.add(RichBlock.ChecklistItem(true, parseInline(body.substring(6)), i))
+                blocks.add(RichBlock.ChecklistItem(true, parseInline(body.substring(6), blockRefLabel), i))
                 i++
                 continue
             }
 
             // Bullet list
             if (body.startsWith("- ") || body.startsWith("* ") || body.startsWith("• ")) {
-                blocks.add(RichBlock.BulletItem(parseInline(body.substring(2)), indent))
+                blocks.add(RichBlock.BulletItem(parseInline(body.substring(2), blockRefLabel), indent))
                 i++
                 continue
             }
@@ -154,13 +166,13 @@ object RichTextParser {
             if (numberedMatch != null) {
                 val num = numberedMatch.groupValues[1]
                 val rest = numberedMatch.groupValues[2]
-                blocks.add(RichBlock.NumberedItem(num, parseInline(rest), indent))
+                blocks.add(RichBlock.NumberedItem(num, parseInline(rest, blockRefLabel), indent))
                 i++
                 continue
             }
 
             // Regular paragraph or empty line
-            blocks.add(RichBlock.Paragraph(parseInline(line)))
+            blocks.add(RichBlock.Paragraph(parseInline(line, blockRefLabel)))
             i++
         }
 
@@ -194,7 +206,10 @@ object RichTextParser {
      * - `code`
      * - <font color="#hex">colored text</font>
      */
-    fun parseInline(text: String): AnnotatedString {
+    fun parseInline(
+        text: String,
+        blockRefLabel: (String) -> String? = { null }
+    ): AnnotatedString {
         if (text.isEmpty()) return AnnotatedString("")
 
         return buildAnnotatedString {
@@ -202,6 +217,31 @@ object RichTextParser {
             val len = text.length
 
             while (cursor < len) {
+                // ((blockId)) / ((blockId|alias)) — a block reference. The
+                // grammar lives in BlockRefs so the editor, the index and the
+                // tests cannot drift apart.
+                if (text[cursor] == '(') {
+                    val token = BlockRefs.matchAt(text, cursor)
+                    if (token != null) {
+                        val label = blockRefLabel(token.ref.target)
+                            ?: token.ref.alias
+                            ?: "Block ${token.ref.target}"
+                        val start = length
+                        withStyle(
+                            SpanStyle(
+                                color = BLOCK_REF_COLOR,
+                                background = BLOCK_REF_BG,
+                                fontWeight = FontWeight.Medium
+                            )
+                        ) {
+                            append(label)
+                        }
+                        addStringAnnotation(BLOCK_REF_TAG, token.ref.target, start, length)
+                        cursor = token.end
+                        continue
+                    }
+                }
+
                 // Check for <font color="#hex">text</font>
                 if (text.startsWith("<font color=\"", cursor, ignoreCase = true)) {
                     val colorEnd = text.indexOf("\">", cursor)
@@ -211,7 +251,7 @@ object RichTextParser {
                         val inner = text.substring(colorEnd + 2, fontClose)
                         val parsedColor = parseColor(hex)
                         withStyle(SpanStyle(color = parsedColor)) {
-                            append(parseInline(inner))
+                            append(parseInline(inner, blockRefLabel))
                         }
                         cursor = fontClose + 7
                         continue
@@ -224,7 +264,7 @@ object RichTextParser {
                     if (closeTag != -1) {
                         val inner = text.substring(cursor + 3, closeTag)
                         withStyle(SpanStyle(textDecoration = TextDecoration.Underline)) {
-                            append(parseInline(inner))
+                            append(parseInline(inner, blockRefLabel))
                         }
                         cursor = closeTag + 4
                         continue
@@ -237,7 +277,7 @@ object RichTextParser {
                     if (closeTag != -1) {
                         val inner = text.substring(cursor + 3, closeTag)
                         withStyle(SpanStyle(textDecoration = TextDecoration.LineThrough)) {
-                            append(parseInline(inner))
+                            append(parseInline(inner, blockRefLabel))
                         }
                         cursor = closeTag + 4
                         continue
@@ -250,7 +290,7 @@ object RichTextParser {
                     if (closeTag != -1) {
                         val inner = text.substring(cursor + 5, closeTag)
                         withStyle(SpanStyle(baselineShift = BaselineShift.Superscript)) {
-                            append(parseInline(inner))
+                            append(parseInline(inner, blockRefLabel))
                         }
                         cursor = closeTag + 6
                         continue
@@ -261,7 +301,7 @@ object RichTextParser {
                     if (closeTag != -1) {
                         val inner = text.substring(cursor + 5, closeTag)
                         withStyle(SpanStyle(baselineShift = BaselineShift.Subscript)) {
-                            append(parseInline(inner))
+                            append(parseInline(inner, blockRefLabel))
                         }
                         cursor = closeTag + 6
                         continue
@@ -274,7 +314,7 @@ object RichTextParser {
                     if (next != -1) {
                         val inner = text.substring(cursor + 2, next)
                         withStyle(SpanStyle(background = MARK_BG)) {
-                            append(parseInline(inner))
+                            append(parseInline(inner, blockRefLabel))
                         }
                         cursor = next + 2
                         continue
@@ -308,7 +348,7 @@ object RichTextParser {
                     if (next != -1) {
                         val inner = text.substring(cursor + 2, next)
                         withStyle(SpanStyle(fontWeight = FontWeight.Bold)) {
-                            append(parseInline(inner))
+                            append(parseInline(inner, blockRefLabel))
                         }
                         cursor = next + 2
                         continue
@@ -321,7 +361,7 @@ object RichTextParser {
                     if (next != -1) {
                         val inner = text.substring(cursor + 2, next)
                         withStyle(SpanStyle(textDecoration = TextDecoration.LineThrough)) {
-                            append(parseInline(inner))
+                            append(parseInline(inner, blockRefLabel))
                         }
                         cursor = next + 2
                         continue
@@ -412,7 +452,7 @@ object RichTextParser {
                     if (next != -1) {
                         val inner = text.substring(cursor + 1, next)
                         withStyle(SpanStyle(fontStyle = FontStyle.Italic)) {
-                            append(parseInline(inner))
+                            append(parseInline(inner, blockRefLabel))
                         }
                         cursor = next + 1
                         continue

@@ -166,5 +166,6 @@ Status legend: Planned (not implemented), Implemented. Source cites analysis fil
 - **Volume-key** — Settings `volumeForPage` → CanvasScreen `KEYCODE_VOLUME_UP/DOWN` handler (saves + page turn).
 - **Background density** — Settings `backgroundDensity` (default 40) → grid/dotted step `coerceIn(20f,80f)`.
 - **SM-2 flashcards** — see S1 above.
+- **Block references + backlinks (schema 11)** — `((blockId))` / `((blockId|alias))` links to one block (the first 8 chars of its stable UUID). Typing `((` opens an autocomplete over every persisted block (block text + note title); preview renders a teal chip showing the alias or the target's live text, and taps open the target note. `block_refs` indexes one row per (source note, source block, target key); the References sheet gains **Block backlinks** and **Blocks linked from here**, with missing targets shown, not hidden. Fenced code and CODE blocks are not indexed.
 - **TOC sidebar** — Drawer OUTLINE tab (hierarchical `TocItem` chapters/sections, `P.N` badges, jump-to-page, add-chapter dialog) persisted to `catalog.json` + `bookmarks.json` via `CanvasViewModel.addTocEntry/deleteTocEntry`.
 - **Image layers hide/show/reorder** — see S5 above (`setLayerVisible`, `moveImageLayer`, `setLayerOpacity`, layers panel).

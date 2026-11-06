@@ -35,8 +35,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import personal.notes.touch.data.db.dao.BlockBacklink
+import personal.notes.touch.data.db.dao.BlockRefTarget
 import personal.notes.touch.data.db.dao.RefTarget
 import personal.notes.touch.data.db.entity.NoteEntity
+import personal.notes.touch.text.BlockRefs
 import personal.notes.touch.ui.theme.LocalThemeColor
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -57,6 +60,8 @@ fun ReferencesSheet(
     noteTitle: String,
     backlinks: List<NoteEntity>,
     outgoing: List<RefTarget>,
+    blockOutgoing: List<BlockRefTarget> = emptyList(),
+    blockBacklinks: List<BlockBacklink> = emptyList(),
     onOpenNote: (String) -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -125,6 +130,48 @@ fun ReferencesSheet(
                             ref = ref,
                             themeColor = themeColor,
                             onClick = { ref.noteId?.let(onOpenNote) }
+                        )
+                    }
+                }
+
+                item {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    SectionHeader("BLOCK BACKLINKS", blockBacklinks.size)
+                }
+                if (blockBacklinks.isEmpty()) {
+                    item {
+                        Hint(
+                            "No note points at a block here yet. Type (( in a block " +
+                                "to pick one from any note."
+                        )
+                    }
+                } else {
+                    items(
+                        blockBacklinks,
+                        key = { it.sourceNoteId + "|" + it.targetKey }
+                    ) { ref ->
+                        BlockBacklinkRow(
+                            ref = ref,
+                            themeColor = themeColor,
+                            onClick = { onOpenNote(ref.sourceNoteId) }
+                        )
+                    }
+                }
+
+                item {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    SectionHeader("BLOCKS LINKED FROM HERE", blockOutgoing.size)
+                }
+                if (blockOutgoing.isEmpty()) {
+                    item {
+                        Hint("This note has no ((block references)) yet.")
+                    }
+                } else {
+                    items(blockOutgoing, key = { it.targetKey }) { ref ->
+                        BlockRefRow(
+                            ref = ref,
+                            themeColor = themeColor,
+                            onClick = { ref.targetNoteId?.let(onOpenNote) }
                         )
                     }
                 }
@@ -262,6 +309,102 @@ private fun OutgoingRow(
                     color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f)
                 )
             }
+        }
+    }
+}
+
+@Composable
+private fun BlockBacklinkRow(
+    ref: BlockBacklink,
+    themeColor: Color,
+    onClick: () -> Unit
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = 20.dp, vertical = 10.dp)
+    ) {
+        Icon(
+            imageVector = Icons.Default.Link,
+            contentDescription = null,
+            tint = themeColor,
+            modifier = Modifier.size(16.dp)
+        )
+        Spacer(modifier = Modifier.size(10.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = ref.sourceTitle.ifBlank { "Untitled Note" },
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Medium,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = "→ " + BlockRefs.labelFromText(ref.targetText)
+                    .ifEmpty { "Missing block" },
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+        Icon(
+            imageVector = Icons.AutoMirrored.Filled.ArrowForward,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.35f),
+            modifier = Modifier.size(16.dp)
+        )
+    }
+}
+
+@Composable
+private fun BlockRefRow(
+    ref: BlockRefTarget,
+    themeColor: Color,
+    onClick: () -> Unit
+) {
+    val resolved = ref.targetBlockId != null && ref.targetTitle != null
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(enabled = resolved, onClick = onClick)
+            .padding(horizontal = 20.dp, vertical = 9.dp)
+    ) {
+        Icon(
+            imageVector = if (resolved) Icons.Default.CheckCircleOutline else Icons.Default.WarningAmber,
+            contentDescription = null,
+            tint = if (resolved) themeColor else Color(0xFFE0A800),
+            modifier = Modifier.size(16.dp)
+        )
+        Spacer(modifier = Modifier.size(10.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = BlockRefs.displayLabel(ref.targetAlias, ref.targetText, ref.targetKey),
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Medium,
+                color = if (resolved) {
+                    MaterialTheme.colorScheme.onSurface
+                } else {
+                    MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f)
+                },
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = if (resolved) {
+                    ref.targetTitle ?: "Untitled Note"
+                } else {
+                    "No block with this id"
+                },
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
         }
     }
 }

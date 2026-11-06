@@ -52,6 +52,10 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
+import kotlinx.coroutines.flow.first
+import personal.notes.touch.data.db.dao.BlockCandidate
+import personal.notes.touch.text.BlockRefs
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
@@ -366,6 +370,21 @@ private fun BlockRow(
             WikiLinks.suggestions(wikiPending.query, wikiTitles, exclude = selfTitle)
         }
     }
+    // `((` completion: an opened, unterminated block reference at the caret.
+    val blockRefPending = if (!isReadOnly && isActive) {
+        BlockRefs.pendingAt(block.field.text, block.field.selection.end)
+    } else {
+        null
+    }
+    val refQuery = blockRefPending?.query
+    val refMatches by produceState(emptyList<BlockCandidate>(), refQuery, block.id) {
+        value = if (refQuery == null) {
+            emptyList()
+        } else {
+            viewModel.searchBlocks(refQuery, block.id).first()
+        }
+    }
+
     val slashOpen = !isReadOnly &&
         isActive &&
         slashArmed &&
@@ -692,6 +711,14 @@ private fun BlockRow(
                 query = wikiPending.query,
                 titles = wikiMatches,
                 onPick = { title -> viewModel.completeWikiLink(block.id, title) }
+            )
+        }
+
+        if (blockRefPending != null && refMatches.isNotEmpty()) {
+            BlockRefPopup(
+                query = blockRefPending.query,
+                candidates = refMatches,
+                onPick = { candidate -> viewModel.completeBlockRef(block.id, candidate) }
             )
         }
     }
@@ -1103,6 +1130,83 @@ fun OutlineSheet(
                             HorizontalDivider(
                                 modifier = Modifier.padding(horizontal = 20.dp),
                                 color = themeColor.copy(alpha = 0.15f)
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * `((` autocomplete: every persisted block, with the note it lives in and its
+ * first line, so two similar paragraphs are still tellable apart. Picking one
+ * writes `((shortKey|label))`; the label keeps the raw markdown readable.
+ */
+@Composable
+private fun BlockRefPopup(
+    query: String,
+    candidates: List<BlockCandidate>,
+    onPick: (BlockCandidate) -> Unit
+) {
+    Popup(
+        alignment = Alignment.BottomStart,
+        offset = IntOffset(0, 8),
+        properties = PopupProperties(focusable = false)
+    ) {
+        Surface(
+            shape = RoundedCornerShape(12.dp),
+            color = MaterialTheme.colorScheme.surface,
+            shadowElevation = 8.dp,
+            border = androidx.compose.foundation.BorderStroke(
+                1.dp,
+                MaterialTheme.colorScheme.onSurface.copy(alpha = 0.10f)
+            )
+        ) {
+            Column(
+                modifier = Modifier
+                    .width(300.dp)
+                    .heightIn(max = 280.dp)
+                    .verticalScroll(rememberScrollState())
+                    .padding(vertical = 6.dp)
+            ) {
+                Text(
+                    text = if (query.isBlank()) "LINK TO BLOCK" else "BLOCK \"$query\"",
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f),
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp)
+                )
+                candidates.forEach { candidate ->
+                    Row(
+                        verticalAlignment = Alignment.Top,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onPick(candidate) }
+                            .padding(horizontal = 14.dp, vertical = 7.dp)
+                    ) {
+                        Text(
+                            text = "(( ))",
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.width(34.dp)
+                        )
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = BlockRefs.labelFromText(candidate.text),
+                                fontSize = 13.sp,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                maxLines = 2,
+                                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = candidate.noteTitle.ifBlank { "Untitled Note" },
+                                fontSize = 10.sp,
+                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f),
+                                maxLines = 1,
+                                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
                             )
                         }
                     }

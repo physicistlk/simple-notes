@@ -110,6 +110,28 @@ fun TextEditorScreen(
     val showEmojiSheet by viewModel.showEmojiSheet.collectAsState()
     val backlinks by viewModel.backlinks.collectAsState()
     val outgoingRefs by viewModel.outgoingRefs.collectAsState()
+    val outgoingBlockRefs by viewModel.outgoingBlockRefs.collectAsState()
+    val blockBacklinks by viewModel.blockBacklinks.collectAsState()
+    // key -> what the chip shows, and key -> note to open on tap. Both derive
+    // from the saved index; a token typed a second ago renders its alias until
+    // the debounced save catches up.
+    val blockRefLabels = remember(outgoingBlockRefs) {
+        outgoingBlockRefs.associate {
+            it.targetKey to personal.notes.touch.text.BlockRefs.displayLabel(
+                it.targetAlias,
+                it.targetText,
+                it.targetKey
+            )
+        }
+    }
+    val blockRefNotes = remember(outgoingBlockRefs) {
+        // Only a live note is tappable: a block whose note sits in the recycle
+        // bin still renders its text, but there is nothing to open.
+        outgoingBlockRefs.mapNotNull { ref ->
+            if (ref.targetTitle == null) return@mapNotNull null
+            ref.targetNoteId?.let { ref.targetKey to it }
+        }.toMap()
+    }
     val listState = rememberLazyListState()
     var showExportDialog by remember { mutableStateOf(false) }
     var showOutlineSheet by remember { mutableStateOf(false) }
@@ -363,6 +385,8 @@ fun TextEditorScreen(
                             onWikiClick = { wikiTitle ->
                                 viewModel.noteIdForTitle(wikiTitle)?.let(onOpenNote)
                             },
+                            blockRefLabels = blockRefLabels,
+                            onBlockRefClick = { key -> blockRefNotes[key]?.let(onOpenNote) },
                             modifier = Modifier
                                 .fillMaxSize()
                                 .padding(16.dp)
@@ -410,6 +434,8 @@ fun TextEditorScreen(
                                     onWikiClick = { wikiTitle ->
                                         viewModel.noteIdForTitle(wikiTitle)?.let(onOpenNote)
                                     },
+                                    blockRefLabels = blockRefLabels,
+                                    onBlockRefClick = { key -> blockRefNotes[key]?.let(onOpenNote) },
                                     modifier = Modifier.fillMaxSize()
                                 )
                             }
@@ -448,6 +474,8 @@ fun TextEditorScreen(
             noteTitle = title.ifBlank { "Untitled Note" },
             backlinks = backlinks,
             outgoing = outgoingRefs,
+            blockOutgoing = outgoingBlockRefs,
+            blockBacklinks = blockBacklinks,
             onOpenNote = { id ->
                 showReferences = false
                 onOpenNote(id)
@@ -709,9 +737,13 @@ private fun PreviewPane(
     fileStore: NoteFileStore,
     onToggleChecklist: (lineIndex: Int, isChecked: Boolean) -> Unit,
     onWikiClick: (String) -> Unit = {},
+    blockRefLabels: Map<String, String> = emptyMap(),
+    onBlockRefClick: (String) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
-    val blocks = remember(content) { RichTextParser.parseMarkdown(content) }
+    val blocks = remember(content, blockRefLabels) {
+        RichTextParser.parseMarkdown(content) { key -> blockRefLabels[key] }
+    }
     val themeColor = LocalThemeColor.current
     val context = LocalContext.current
     val onLinkClick: (String) -> Unit = { url -> LinkTarget.open(context, url) }
@@ -765,7 +797,7 @@ private fun PreviewPane(
                         ),
                         modifier = Modifier.padding(top = 6.dp, bottom = 2.dp),
                         onLinkClick = onLinkClick,
-                        onWikiClick = onWikiClick
+                        onWikiClick = onWikiClick, onBlockRefClick = onBlockRefClick
                     )
                 }
                 is RichBlock.Paragraph -> {
@@ -777,7 +809,7 @@ private fun PreviewPane(
                             color = MaterialTheme.colorScheme.onSurface
                         ),
                         onLinkClick = onLinkClick,
-                        onWikiClick = onWikiClick
+                        onWikiClick = onWikiClick, onBlockRefClick = onBlockRefClick
                     )
                 }
                 is RichBlock.Quote -> {
@@ -803,7 +835,7 @@ private fun PreviewPane(
                             ),
                             modifier = Modifier.padding(vertical = 4.dp, horizontal = 4.dp),
                             onLinkClick = onLinkClick,
-                            onWikiClick = onWikiClick
+                            onWikiClick = onWikiClick, onBlockRefClick = onBlockRefClick
                         )
                     }
                 }
@@ -827,7 +859,7 @@ private fun PreviewPane(
                                 color = MaterialTheme.colorScheme.onSurface
                             ),
                             onLinkClick = onLinkClick,
-                            onWikiClick = onWikiClick
+                            onWikiClick = onWikiClick, onBlockRefClick = onBlockRefClick
                         )
                     }
                 }
@@ -851,7 +883,7 @@ private fun PreviewPane(
                                 color = MaterialTheme.colorScheme.onSurface
                             ),
                             onLinkClick = onLinkClick,
-                            onWikiClick = onWikiClick
+                            onWikiClick = onWikiClick, onBlockRefClick = onBlockRefClick
                         )
                     }
                 }
@@ -885,7 +917,7 @@ private fun PreviewPane(
                                 color = if (block.isChecked) MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f) else MaterialTheme.colorScheme.onSurface
                             ),
                             onLinkClick = onLinkClick,
-                            onWikiClick = onWikiClick
+                            onWikiClick = onWikiClick, onBlockRefClick = onBlockRefClick
                         )
                     }
                 }
@@ -1109,6 +1141,7 @@ private fun RichTextBlock(
     style: TextStyle,
     onLinkClick: (String) -> Unit,
     onWikiClick: (String) -> Unit = {},
+    onBlockRefClick: (String) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     ClickableText(
@@ -1116,12 +1149,15 @@ private fun RichTextBlock(
         style = style,
         modifier = modifier,
         onClick = { offset ->
+            val blockRef = text.getStringAnnotations(
+                RichTextParser.BLOCK_REF_TAG, offset, offset
+            ).firstOrNull()
             val wiki = text.getStringAnnotations(RichTextParser.WIKI_TAG, offset, offset)
                 .firstOrNull()
-            if (wiki != null) {
-                onWikiClick(wiki.item)
-            } else {
-                text.getStringAnnotations(RichTextParser.LINK_TAG, offset, offset)
+            when {
+                blockRef != null -> onBlockRefClick(blockRef.item)
+                wiki != null -> onWikiClick(wiki.item)
+                else -> text.getStringAnnotations(RichTextParser.LINK_TAG, offset, offset)
                     .firstOrNull()
                     ?.let { annotation -> onLinkClick(annotation.item) }
             }

@@ -10,6 +10,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -18,6 +19,7 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.launchIn
@@ -26,12 +28,16 @@ import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import personal.notes.touch.data.db.dao.BlockBacklink
+import personal.notes.touch.data.db.dao.BlockCandidate
+import personal.notes.touch.data.db.dao.BlockRefTarget
 import personal.notes.touch.data.db.dao.RefTarget
 import personal.notes.touch.data.db.entity.NoteEntity
 import personal.notes.touch.data.files.NoteFileStore
 import personal.notes.touch.data.repo.FlashCardRepository
 import personal.notes.touch.data.repo.NoteRepository
 import personal.notes.touch.text.BlockCards
+import personal.notes.touch.text.BlockRefs
 import personal.notes.touch.text.TableModel
 import personal.notes.touch.text.WikiLinks
 import personal.notes.touch.data.repo.SettingsRepository
@@ -175,6 +181,51 @@ class TextEditorViewModel(
             started = SharingStarted.WhileSubscribed(5000),
             initialValue = emptyList()
         )
+
+    /** `((…))` written in this note, each resolved to its live target block. */
+    val outgoingBlockRefs: StateFlow<List<BlockRefTarget>> =
+        repository.observeOutgoingBlockRefs(noteId)
+            .stateIn(
+                scope = viewModelScope,
+                started = SharingStarted.WhileSubscribed(5000),
+                initialValue = emptyList()
+            )
+
+    /** `((…))` in other notes that point at a block of this note. */
+    val blockBacklinks: StateFlow<List<BlockBacklink>> =
+        repository.observeBlockBacklinks(noteId)
+            .stateIn(
+                scope = viewModelScope,
+                started = SharingStarted.WhileSubscribed(5000),
+                initialValue = emptyList()
+            )
+
+    /** Blocks for the `((` autocomplete; the target note is excluded? No — cross-note is the point. */
+    fun searchBlocks(query: String, excludeBlockId: String): Flow<List<BlockCandidate>> =
+        flow { emit(repository.searchBlocks(query, excludeBlockId)) }
+
+    /**
+     * Replaces the open `((query` of [blockId] with `((shortKey|label))`.
+     * Returns false when the caret has left the pending token.
+     */
+    fun completeBlockRef(blockId: String, candidate: BlockCandidate): Boolean {
+        val list = _blocks.value
+        val index = list.indexOfFirst { it.id == blockId }
+        if (index < 0) return false
+        val block = list[index]
+        val pending = BlockRefs.pendingAt(block.field.text, block.field.selection.end)
+            ?: return false
+        val (text, caret) = BlockRefs.complete(
+            text = block.field.text,
+            pending = pending,
+            blockId = candidate.blockId,
+            label = candidate.text
+        )
+        val mutable = list.toMutableList()
+        mutable[index] = block.copy(field = TextFieldValue(text, TextRange(caret)))
+        publishBlocks(mutable, FocusTarget(blockId))
+        return true
+    }
 
     /**
      * Replaces the open `[[query` of [blockId] with `[[title]]`. Returns false

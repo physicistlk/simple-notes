@@ -4,6 +4,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
+import personal.notes.touch.data.db.dao.BlockBacklink
+import personal.notes.touch.data.db.dao.BlockCandidate
+import personal.notes.touch.data.db.dao.BlockRefDao
+import personal.notes.touch.data.db.dao.BlockRefTarget
 import personal.notes.touch.data.db.dao.FolderDao
 import personal.notes.touch.data.db.dao.NoteBlockDao
 import personal.notes.touch.data.db.dao.NoteDao
@@ -13,6 +17,7 @@ import personal.notes.touch.data.db.dao.PageDao
 import personal.notes.touch.data.db.dao.TemplateDao
 import personal.notes.touch.data.db.dao.RefTarget
 import personal.notes.touch.data.db.dao.TagCount
+import personal.notes.touch.data.db.entity.BlockRefEntity
 import personal.notes.touch.data.db.entity.NoteBlockEntity
 import personal.notes.touch.data.db.entity.NoteEntity
 import personal.notes.touch.data.db.entity.TemplateEntity
@@ -20,6 +25,7 @@ import personal.notes.touch.data.db.entity.NoteRefEntity
 import personal.notes.touch.data.db.entity.NoteTagEntity
 import personal.notes.touch.data.db.entity.PageEntity
 import personal.notes.touch.data.files.NoteFileStore
+import personal.notes.touch.text.BlockRefs
 import personal.notes.touch.text.NoteTemplates
 import personal.notes.touch.text.NoteTags
 import personal.notes.touch.text.WikiLinks
@@ -33,6 +39,7 @@ class NoteRepository(
     private val folderDao: FolderDao,
     private val pageDao: PageDao,
     private val templateDao: TemplateDao,
+    private val blockRefDao: BlockRefDao,
     val fileStore: NoteFileStore
 ) {
     fun getAllNotes(): Flow<List<NoteEntity>> = noteDao.getAll()
@@ -88,6 +95,7 @@ class NoteRepository(
         noteBlockDao.deleteForRecycledNotes()
         noteTagDao.deleteForRecycledNotes()
         noteRefDao.deleteForRecycledNotes()
+        blockRefDao.deleteForRecycledNotes()
         noteDao.clearRecycled()
     }
 
@@ -245,7 +253,67 @@ class NoteRepository(
     /** Replaces the note's whole block row set atomically. */
     suspend fun saveNoteBlocks(noteId: String, blocks: List<NoteBlockEntity>) = withContext(Dispatchers.IO) {
         noteBlockDao.replaceBlocks(noteId, blocks)
+        syncBlockRefs(noteId, blocks)
     }
+
+    // ---- block references (schema 11) --------------------------------------
+
+    fun observeOutgoingBlockRefs(noteId: String): Flow<List<BlockRefTarget>> =
+        blockRefDao.observeOutgoing(noteId)
+
+    /** `((…))` in other notes that point at a block of [noteId]. */
+    fun observeBlockBacklinks(noteId: String): Flow<List<BlockBacklink>> =
+        blockRefDao.observeBacklinks(noteId)
+
+    /** `((` autocomplete over every persisted block, newest notes first. */
+    suspend fun searchBlocks(
+        query: String,
+        excludeBlockId: String,
+        limit: Int = 20
+    ): List<BlockCandidate> = withContext(Dispatchers.IO) {
+        noteBlockDao.searchBlocks(likeEscape(query.trim()), excludeBlockId, limit)
+    }
+
+    /**
+     * Derives the block-reference rows for one note from its persisted blocks.
+     * CODE blocks are skipped: their body is quoted markup, so a documented
+     * `((syntax))` sample must not create a live reference.
+     */
+    private suspend fun syncBlockRefs(noteId: String, blocks: List<NoteBlockEntity>) {
+        val refs = blockRefsOf(noteId, blocks)
+        if (!sameBlockRefs(blockRefDao.getForNote(noteId), refs)) {
+            blockRefDao.replaceForNote(noteId, refs)
+        }
+    }
+
+    private fun blockRefsOf(
+        noteId: String,
+        blocks: List<NoteBlockEntity>
+    ): List<BlockRefEntity> = blocks
+        .asSequence()
+        .filter { it.blockType != "CODE" }
+        .flatMap { block ->
+            BlockRefs.parseLine(block.text).map { ref ->
+                BlockRefEntity(
+                    sourceNoteId = noteId,
+                    sourceBlockId = block.id,
+                    targetKey = ref.target,
+                    targetAlias = ref.alias
+                )
+            }
+        }
+        .distinctBy { Triple(it.sourceNoteId, it.sourceBlockId, it.targetKey) }
+        .toList()
+
+    private fun sameBlockRefs(current: List<BlockRefEntity>, next: List<BlockRefEntity>): Boolean {
+        if (current.size != next.size) return false
+        val a = current.map { Triple(it.sourceBlockId, it.targetKey, it.targetAlias) }.toSet()
+        return next.all { Triple(it.sourceBlockId, it.targetKey, it.targetAlias) in a }
+    }
+
+    /** `%`, `_` and `\` are literal in a search box, not LIKE wildcards. */
+    private fun likeEscape(text: String): String =
+        text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
     suspend fun updateTitle(id: String, title: String) = withContext(Dispatchers.IO) {
         val existing = noteDao.getById(id)
@@ -326,6 +394,7 @@ class NoteRepository(
     suspend fun reindexAll(): Int = withContext(Dispatchers.IO) {
         noteTagDao.deleteOrphans()
         noteRefDao.deleteOrphans()
+        blockRefDao.deleteForRecycledNotes()
         var changed = 0
         for (note in noteDao.getNotesWithContent()) {
             val content = note.content ?: continue
@@ -334,6 +403,17 @@ class NoteRepository(
             syncIndex(note.id, content)
             val after = noteTagDao.getForNote(note.id) to noteRefDao.getForNote(note.id)
             if (before != after) changed++
+        }
+        // Block refs are derived from note_blocks rather than from content:
+        // ids live only in the table, so this pass is what backfills notes
+        // whose blocks predate the index.
+        for ((noteId, blocks) in noteBlockDao.getAllForLiveNotes().groupBy { it.noteId }) {
+            val before = blockRefDao.getForNote(noteId)
+            val next = blockRefsOf(noteId, blocks)
+            if (!sameBlockRefs(before, next)) {
+                blockRefDao.replaceForNote(noteId, next)
+                changed++
+            }
         }
         changed
     }

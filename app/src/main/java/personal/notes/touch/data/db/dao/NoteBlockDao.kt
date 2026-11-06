@@ -33,6 +33,43 @@ abstract class NoteBlockDao {
     @Query("DELETE FROM note_blocks WHERE noteId IN (SELECT id FROM notes WHERE deleted = 1)")
     abstract suspend fun deleteForRecycledNotes(): Int
 
+    /**
+     * `((` autocomplete: blocks whose text matches [query], newest notes first.
+     * The query is escaped by the repository; ESCAPE keeps `%`/`_` literal.
+     */
+    @Query(
+        """
+        SELECT b.id AS blockId,
+               b.noteId AS noteId,
+               b.text AS text,
+               n.title AS noteTitle,
+               b.blockIndex AS blockIndex
+        FROM note_blocks b
+        INNER JOIN notes n ON n.id = b.noteId
+        WHERE n.deleted = 0
+          AND b.text != ''
+          AND b.id != :excludeBlockId
+          AND b.text LIKE '%' || :query || '%' ESCAPE '\'
+        ORDER BY n.updatedAt DESC, b.blockIndex ASC
+        LIMIT :limit
+        """
+    )
+    abstract suspend fun searchBlocks(
+        query: String,
+        excludeBlockId: String,
+        limit: Int
+    ): List<BlockCandidate>
+
+    /** Every block of a live note, for the one-time reference reindex. */
+    @Query(
+        """
+        SELECT b.* FROM note_blocks b
+        INNER JOIN notes n ON n.id = b.noteId AND n.deleted = 0
+        ORDER BY b.noteId, b.blockIndex
+        """
+    )
+    abstract suspend fun getAllForLiveNotes(): List<NoteBlockEntity>
+
     /** Atomic rewrite: an empty [blocks] list just clears the note's rows. */
     @Transaction
     open suspend fun replaceBlocks(noteId: String, blocks: List<NoteBlockEntity>) {
