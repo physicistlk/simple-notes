@@ -22,7 +22,9 @@ class FlashCardRepository(private val flashCardDao: FlashCardDao) {
         answer: String,
         tips: String? = null,
         noteId: String = "general",
-        cardName: String = "Card"
+        cardName: String = "Card",
+        sourceNoteId: String? = null,
+        sourceBlockId: String? = null
     ): FlashCardEntity = withContext(Dispatchers.IO) {
         val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
         val nowStr = dateFormat.format(Date())
@@ -36,10 +38,58 @@ class FlashCardRepository(private val flashCardDao: FlashCardDao) {
             cNum = 0,
             cRDate = nowStr,
             nid = noteId,
-            reviewStatus = 0
+            reviewStatus = 0,
+            sourceNoteId = sourceNoteId,
+            sourceBlockId = sourceBlockId
         )
         flashCardDao.insertCard(card)
         card
+    }
+
+    /** Outcome of adding a block to a deck; [created] is false when refreshed. */
+    data class BlockCardResult(val card: FlashCardEntity, val created: Boolean)
+
+    /**
+     * Adds [blockId] to a deck, or refreshes the card already linked to it.
+     *
+     * The block stays the source of truth: re-adding an edited block updates
+     * the existing card instead of creating a duplicate, and the card keeps
+     * its review history (cNum/easeFactor/dates) because only the text and the
+     * deck name are replaced. Cards outlive their block — deleting the block in
+     * the note does not delete study material.
+     */
+    suspend fun addCardFromBlock(
+        noteId: String,
+        blockId: String,
+        question: String,
+        answer: String,
+        deck: String,
+        tips: String? = null
+    ): BlockCardResult = withContext(Dispatchers.IO) {
+        val existing = flashCardDao.getForBlock(blockId)
+        if (existing != null) {
+            val updated = existing.copy(
+                cName = deck.trim().ifBlank { existing.cName },
+                cQuestion = question,
+                cAns = answer,
+                cTips = tips
+            )
+            flashCardDao.insertCard(updated)
+            BlockCardResult(updated, created = false)
+        } else {
+            BlockCardResult(
+                card = createCard(
+                    question = question,
+                    answer = answer,
+                    tips = tips,
+                    noteId = noteId,
+                    cardName = deck.trim().ifBlank { "Card" },
+                    sourceNoteId = noteId,
+                    sourceBlockId = blockId
+                ),
+                created = true
+            )
+        }
     }
 
     suspend fun recordReview(card: FlashCardEntity, rating: Int) = withContext(Dispatchers.IO) {

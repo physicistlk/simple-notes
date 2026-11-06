@@ -155,4 +155,19 @@ internal val MIGRATION_8_9: Migration = object : Migration(8, 9) {
     }
 }
 
-internal val APP_MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9)
+internal val MIGRATION_9_10: Migration = object : Migration(9, 10) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        // Nullable provenance for cards minted from an editor block. ALTER TABLE
+        // ADD COLUMN with no default keeps every existing card valid; Room reads
+        // the missing value back as null (same shape as the entity).
+        db.execSQL("ALTER TABLE `flash_cards` ADD COLUMN `sourceNoteId` TEXT")
+        db.execSQL("ALTER TABLE `flash_cards` ADD COLUMN `sourceBlockId` TEXT")
+        // Block cards are looked up by block id; the note id is used by the
+        // editor to list a note's cards. Both stay non-unique: a future import
+        // may legitimately attach several cards to one block.
+        db.execSQL("CREATE INDEX IF NOT EXISTS `index_flash_cards_sourceBlockId` ON `flash_cards` (`sourceBlockId`)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS `index_flash_cards_sourceNoteId` ON `flash_cards` (`sourceNoteId`)")
+    }
+}
+
+internal val APP_MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10)

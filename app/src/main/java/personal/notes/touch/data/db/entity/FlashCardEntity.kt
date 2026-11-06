@@ -6,7 +6,11 @@ import androidx.room.PrimaryKey
 
 @Entity(
     tableName = "flash_cards",
-    indices = [Index(value = ["id"], unique = true)]
+    indices = [
+        Index(value = ["id"], unique = true),
+        Index(value = ["sourceBlockId"]),
+        Index(value = ["sourceNoteId"])
+    ]
 )
 data class FlashCardEntity(
     @PrimaryKey(autoGenerate = true) val cAutoID: Long = 0,
@@ -27,5 +31,14 @@ data class FlashCardEntity(
     val easeFactor: Double = 2.5,
     val card_last_usn: Int = 0,
     val note_usn: Int = 0,
-    val note_last_usn: Int = 0
+    val note_last_usn: Int = 0,
+    /**
+     * Provenance for cards minted from an editor block (schema 10). Null for
+     * cards created by hand in the Flashcards screen. The block id is the
+     * note_blocks UUID, so the link survives edits and reordering; the note id
+     * is kept alongside it because looking up the note from a deleted block is
+     * otherwise impossible.
+     */
+    val sourceNoteId: String? = null,
+    val sourceBlockId: String? = null
 )

@@ -79,6 +79,7 @@ Status legend: Planned (not implemented), Implemented. Source cites analysis fil
 - Source: state/SCOPE.md (S1 deferred); state/AUDIT-2026-11-04.md §4.2; STATE decision 17 (G7)
 - Description: Deck browser (3-column tablet grid) + tap-to-reveal study carousel with Again/Hard/Good/Easy grading; offline SM-2.
 - Implementation: Room entities `FlashCardEntity`, `FlashCardTypeEntity`, `FlashCardTagEntity` + `FlashCardDao` + `FlashCardRepository.recordReview` (SM-2) + `FlashcardScreen` (545 LOC) + `FlashcardViewModel`.
+- Block bridge (schema 10): the block menu's **Add to deck** turns a block into a card. `text/BlockCards` splits `question :: answer` (first unescaped, unquoted separator; inline markdown stripped), the dialog can edit both sides and the deck (defaults to the note title), and every card records `sourceNoteId`/`sourceBlockId`. Re-adding an edited block refreshes the same card instead of duplicating it, keeping its SM-2 history.
 - Performance Notes: All local (Room Flow); no network.
 - Status: Implemented
 

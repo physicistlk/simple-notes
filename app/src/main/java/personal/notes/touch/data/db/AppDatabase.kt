@@ -28,7 +28,7 @@ import personal.notes.touch.data.db.entity.SettingsEntity
 import personal.notes.touch.data.db.entity.TemplateEntity
 
 /**
- * TouchNotes Room database (current schema version: 9).
+ * TouchNotes Room database (current schema version: 10).
  *
  * ## Migration & data-loss policy (audit C1 / CH4, 2026-11-04)
  *
@@ -74,7 +74,7 @@ import personal.notes.touch.data.db.entity.TemplateEntity
         NoteRefEntity::class,
         TemplateEntity::class
     ],
-    version = 9,
+    version = 10,
     exportSchema = true
 )
 abstract class AppDatabase : RoomDatabase() {

@@ -112,7 +112,8 @@ fun TouchNotesNavHost(
                     noteId = noteId,
                     repository = app.noteRepository,
                     fileStore = app.fileStore,
-                    settingsRepository = app.settingsRepository
+                    settingsRepository = app.settingsRepository,
+                    flashCardRepository = app.flashCardRepository
                 ),
                 key = "editor_$noteId"
             )

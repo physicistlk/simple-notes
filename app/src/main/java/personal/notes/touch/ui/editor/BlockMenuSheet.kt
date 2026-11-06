@@ -46,6 +46,7 @@ fun BlockMenuSheet(
     onMoveDown: () -> Unit,
     onDuplicate: () -> Unit,
     onCopy: () -> Unit,
+    onAddToDeck: () -> Unit,
     onDelete: () -> Unit
 ) {
     val themeColor = LocalThemeColor.current
@@ -116,6 +117,11 @@ fun BlockMenuSheet(
             MenuRow(label = "Move down", hint = "↓", onClick = onMoveDown)
             MenuRow(label = "Duplicate", hint = "⧉", onClick = onDuplicate)
             MenuRow(label = "Copy block", hint = "📋", onClick = onCopy)
+            // Divider/image blocks carry no text to study; everything else
+            // (paragraph, heading, list, task, quote, code, table) can.
+            if (block.type != BlockType.DIVIDER && block.type != BlockType.IMAGE) {
+                MenuRow(label = "Add to deck", hint = "🃏", onClick = onAddToDeck)
+            }
             MenuRow(label = "Delete block", hint = "🗑", danger = true, onClick = onDelete)
         }
     }

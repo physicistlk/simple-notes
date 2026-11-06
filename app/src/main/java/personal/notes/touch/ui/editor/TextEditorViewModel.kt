@@ -29,7 +29,9 @@ import kotlinx.coroutines.withContext
 import personal.notes.touch.data.db.dao.RefTarget
 import personal.notes.touch.data.db.entity.NoteEntity
 import personal.notes.touch.data.files.NoteFileStore
+import personal.notes.touch.data.repo.FlashCardRepository
 import personal.notes.touch.data.repo.NoteRepository
+import personal.notes.touch.text.BlockCards
 import personal.notes.touch.text.TableModel
 import personal.notes.touch.text.WikiLinks
 import personal.notes.touch.data.repo.SettingsRepository
@@ -56,7 +58,9 @@ class TextEditorViewModel(
     val noteId: String,
     val repository: NoteRepository,
     val fileStore: NoteFileStore,
-    val settingsRepository: SettingsRepository? = null
+    val settingsRepository: SettingsRepository? = null,
+    /** Bridge to the deck engine; null in contexts that only read the note. */
+    val flashCardRepository: FlashCardRepository? = null
 ) : ViewModel() {
 
     val note: StateFlow<NoteEntity?> = repository.getNoteById(noteId)
@@ -738,6 +742,35 @@ class TextEditorViewModel(
     }
 
     /**
+     * Flashcard bridge: adds one block to a deck, or refreshes the card already
+     * linked to it. Saving first guarantees the block row exists in
+     * `note_blocks` before a card stores its id, so provenance never points at
+     * a block that was only in memory.
+     */
+    fun addBlockCard(
+        blockId: String,
+        front: String,
+        back: String,
+        deck: String,
+        onResult: (FlashCardRepository.BlockCardResult) -> Unit
+    ) {
+        val cards = flashCardRepository ?: return
+        val question = front.trim()
+        if (question.isEmpty()) return
+        viewModelScope.launch {
+            performSave(_title.value, _contentValue.value.text)
+            val result = cards.addCardFromBlock(
+                noteId = noteId,
+                blockId = blockId,
+                question = question,
+                answer = back.trim(),
+                deck = BlockCards.deckName(deck)
+            )
+            onResult(result)
+        }
+    }
+
+    /**
      * One command path for the slash menu AND the formatting toolbar:
      * H1-H3 / lists / quote transform the active block, Divider/Code/Table/
      * Image insert blocks, Tag/Highlight write inline markdown. The "Rich"
@@ -1002,11 +1035,18 @@ class TextEditorViewModel(
         private val noteId: String,
         private val repository: NoteRepository,
         private val fileStore: NoteFileStore,
-        private val settingsRepository: SettingsRepository? = null
+        private val settingsRepository: SettingsRepository? = null,
+        private val flashCardRepository: FlashCardRepository? = null
     ) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : ViewModel> create(modelClass: Class<T>): T {
-            return TextEditorViewModel(noteId, repository, fileStore, settingsRepository) as T
+            return TextEditorViewModel(
+                noteId,
+                repository,
+                fileStore,
+                settingsRepository,
+                flashCardRepository
+            ) as T
         }
     }
 }

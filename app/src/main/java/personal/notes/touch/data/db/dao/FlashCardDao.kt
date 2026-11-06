@@ -17,6 +17,17 @@ interface FlashCardDao {
     @Query("SELECT * FROM flash_cards WHERE nid = :noteId")
     fun getCardsByNote(noteId: String): Flow<List<FlashCardEntity>>
 
+    /**
+     * Block provenance lookups (schema 10). A card minted from a block keeps
+     * the note_blocks UUID, which survives edits and reordering, so this is the
+     * identity used to avoid duplicating a card for the same block.
+     */
+    @Query("SELECT COUNT(*) FROM flash_cards WHERE sourceBlockId = :blockId")
+    suspend fun countForBlock(blockId: String): Int
+
+    @Query("SELECT * FROM flash_cards WHERE sourceBlockId = :blockId ORDER BY cAutoID ASC LIMIT 1")
+    suspend fun getForBlock(blockId: String): FlashCardEntity?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertCard(card: FlashCardEntity)
 

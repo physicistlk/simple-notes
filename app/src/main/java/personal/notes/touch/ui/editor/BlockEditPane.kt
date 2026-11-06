@@ -41,6 +41,9 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -82,6 +85,7 @@ import androidx.compose.ui.window.PopupProperties
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import personal.notes.touch.text.BlockCards
 import personal.notes.touch.text.WikiLinks
 import personal.notes.touch.ui.theme.LocalThemeColor
 import personal.notes.touch.util.ClipboardHelper
@@ -123,6 +127,8 @@ fun BlockEditPane(
 
     var menuBlockId by remember { mutableStateOf<String?>(null) }
     val menuBlock = blocks.firstOrNull { it.id == menuBlockId }
+    var cardBlockId by remember { mutableStateOf<String?>(null) }
+    val cardBlock = blocks.firstOrNull { it.id == cardBlockId }
     LaunchedEffect(menuBlockId, blocks) {
         if (menuBlockId != null && blocks.none { it.id == menuBlockId }) menuBlockId = null
     }
@@ -202,9 +208,114 @@ fun BlockEditPane(
                 ).show()
                 menuBlockId = null
             },
+            onAddToDeck = {
+                cardBlockId = menuBlock.id
+                menuBlockId = null
+            },
             onDelete = { viewModel.deleteBlock(menuBlock.id); menuBlockId = null }
         )
     }
+
+    if (cardBlock != null) {
+        AddBlockCardDialog(
+            block = cardBlock,
+            noteTitle = selfTitle,
+            onDismiss = { cardBlockId = null },
+            onConfirm = { front, back, deck ->
+                val id = cardBlock.id
+                cardBlockId = null
+                viewModel.addBlockCard(id, front, back, deck) { result ->
+                    Toast.makeText(
+                        context,
+                        if (result.created) {
+                            "Card added to ${result.card.cName}"
+                        } else {
+                            "Card updated in ${result.card.cName}"
+                        },
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+        )
+    }
+}
+
+/**
+ * Flashcard prefill for one block. `front :: back` in the note is suggested
+ * automatically; a block without the separator still yields a card whose
+ * answer the user fills in here. Editing the fields does not rewrite the note —
+ * the block keeps its markdown, the card keeps its own text.
+ */
+@Composable
+private fun AddBlockCardDialog(
+    block: EditableBlock,
+    noteTitle: String,
+    onDismiss: () -> Unit,
+    onConfirm: (front: String, back: String, deck: String) -> Unit
+) {
+    val initial = remember(block.id) { BlockCards.split(block.field.text) }
+    var front by remember(block.id) { mutableStateOf(initial.front) }
+    var back by remember(block.id) { mutableStateOf(initial.back) }
+    var deck by remember(block.id) { mutableStateOf(BlockCards.deckName(noteTitle)) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text("Add to deck", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+        },
+        text = {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    if (initial.hasSeparator) {
+                        "Split from the block at `::`. Edit either side if needed."
+                    } else {
+                        "Tip: write `question :: answer` in the block to split it automatically."
+                    },
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = front,
+                    onValueChange = { front = it },
+                    label = { Text("Question") },
+                    minLines = 2,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = back,
+                    onValueChange = { back = it },
+                    label = { Text("Answer") },
+                    minLines = 2,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = deck,
+                    onValueChange = { deck = it },
+                    label = { Text("Deck") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = front.isNotBlank(),
+                onClick = { onConfirm(front, back, deck) }
+            ) {
+                Text(
+                    "Save card",
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
 }
 
 // ---------------------------------------------------------------------------
