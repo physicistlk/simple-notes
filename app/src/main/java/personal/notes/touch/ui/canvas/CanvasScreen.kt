@@ -211,6 +211,16 @@ fun CanvasScreen(
 
     val totalPages = note?.pageCount ?: pages.size.coerceAtLeast(1)
 
+    // Touching the page means "I am writing again": the slide-over menus
+    // (page drawer, tools panel, layers, shapes menu) close themselves so the
+    // user never has to tap a close button after changing a setting. The
+    // pen-case dock is left alone — it is the tool palette, not a menu.
+    val dismissCanvasOverlays: () -> Unit = {
+        viewModel.dismissCanvasMenus()
+        showLayersPanel = false
+        showShapesMenu = false
+    }
+
     // ---- F-10: vector PDF page plumbing -----------------------------------
     // One pdfium source document per note, opened lazily and closed when the
     // screen leaves composition.
@@ -1128,6 +1138,8 @@ fun CanvasScreen(
                             )
                             // Wire the previously-dead 3-finger-tap paste hook.
                             onThreeFingerTap = { handleClipboardPaste() }
+                            // Any touch on the page closes the open menus.
+                            onCanvasTouchStart = { dismissCanvasOverlays() }
                             onImageSelectionChanged = { selectedImageIndex = it }
                             onPdfSelectionChanged = { selection -> pdfSelection = selection }
                             onUndoRedoListener = { canUndo, canRedo ->

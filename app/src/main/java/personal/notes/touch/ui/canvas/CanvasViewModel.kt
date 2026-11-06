@@ -183,6 +183,14 @@ class CanvasViewModel(
         )
     }
 
+    /**
+     * Closes the page drawer / tools panel / page manager because the user
+     * touched the page again. No-op (and no state emission) when none is open.
+     */
+    fun dismissCanvasMenus() {
+        CanvasMenus.dismiss(_uiState.value)?.let { _uiState.value = it }
+    }
+
     fun setActiveToolsTab(tab: Int) {
         _uiState.value = _uiState.value.copy(activeToolsTab = tab)
     }

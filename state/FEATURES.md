@@ -19,6 +19,7 @@ Status legend: Planned (not implemented), Implemented. Source cites analysis fil
 ## M3 — Drawing canvas
 - Source: analysis/02-ui-components.md (PadWhiteBoard full-screen transparent, PanelGlView, PageBackgroundView, ColorPanelView, PenWidth, MeetPenWidth); analysis/02-classes.md (PadWhiteBoard, PanelGlView); analysis/02-data-model.md (native draw libs — not replicated)
 - Description: Freehand drawing with pen/eraser, color picker, width presets, pressure (optional), undo/redo, clear page, background (blank/grid/dotted), zoom/pan.
+- Touch-to-dismiss: the page drawer (left), tools panel (right), layers panel and shapes menu close themselves on the next touch of the page (`CanvasMenus.dismiss` + `DrawingCanvasView.onCanvasTouchStart`), so changing a setting does not cost an extra close tap before writing again; the pen-case dock and active selections are left alone.
 - Implementation: Custom `View` `DrawingCanvasView` using Android Canvas + `Bitmap` backing store (ARGB_8888, max 2048×2048). Touch events draw `Path` with `Paint`; commit stroke to bitmap. Undo stack of `Bitmap` snapshots (cap 20) or stroke list. Eraser uses `PorterDuff.Mode.CLEAR`.
 - Performance Notes: Allocate bitmap once per page; downscale on low-memory; cap undo to 20; run heavy bitmap ops off main thread via coroutine; `setLayerType(LAYER_TYPE_HARDWARE)` only if beneficial (test).
 - Status: Implemented

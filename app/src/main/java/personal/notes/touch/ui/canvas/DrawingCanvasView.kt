@@ -415,6 +415,14 @@ class DrawingCanvasView @JvmOverloads constructor(
             onImageSelectionChanged?.invoke(value)
         }
     var onImageSelectionChanged: ((Int) -> Unit)? = null
+
+    /**
+     * Fired on the first pointer-down of a gesture on the page (stylus or
+     * finger, before any stroke is committed). Used to auto-close the slide-
+     * over menus: touching the page means the user is done configuring and is
+     * writing again.
+     */
+    var onCanvasTouchStart: (() -> Unit)? = null
     // Touch Path & Shapes
     private val currentPath = Path()
     private var lastTouchX = 0f
@@ -1490,6 +1498,12 @@ class DrawingCanvasView @JvmOverloads constructor(
         // Check stylus-only filter
         if (stylusOnly && event.getToolType(0) != MotionEvent.TOOL_TYPE_STYLUS) {
             return false
+        }
+
+        // First touch of a gesture: let the screen close its slide-over menus
+        // so the user does not need a separate "close" tap after configuring.
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+            onCanvasTouchStart?.invoke()
         }
 
         // A fresh gesture drops any stale multi-touch cancellation state.
