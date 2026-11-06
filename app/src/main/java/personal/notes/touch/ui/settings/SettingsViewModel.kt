@@ -127,6 +127,14 @@ class SettingsViewModel(private val repository: SettingsRepository) : ViewModel(
         }
     }
 
+    fun setPageTurningDirection(direction: Int) {
+        viewModelScope.launch { repository.updatePageTurningDirection(direction) }
+    }
+
+    fun setPageTurningMode(mode: Int) {
+        viewModelScope.launch { repository.updatePageTurningMode(mode) }
+    }
+
     fun setPenSlot(slot: Int, color: Int, width: Float) {
         viewModelScope.launch {
             repository.updatePenSlot(slot, color, width)

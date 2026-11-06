@@ -24,5 +24,9 @@ data class SettingsEntity(
     val penSlot1Color: Int = 0xFF000000.toInt(),
     val penSlot1Width: Float = 6f,
     val penSlot2Color: Int = 0xFFFB6443.toInt(),
-    val penSlot2Width: Float = 3f
+    val penSlot2Width: Float = 3f,
+    /** Page turning direction: 0=vertical (scroll), 1=horizontal (swipe). */
+    val pageTurningDirection: Int = 0,
+    /** Page turning mode: 0=continuous (scroll all), 1=single (one at a time). */
+    val pageTurningMode: Int = 0
 )

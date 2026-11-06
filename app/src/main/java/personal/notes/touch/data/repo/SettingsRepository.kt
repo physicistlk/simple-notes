@@ -89,6 +89,16 @@ class SettingsRepository(private val settingsDao: SettingsDao) {
         settingsDao.insertOrUpdate(current.copy(autoCenter = enabled))
     }
 
+    suspend fun updatePageTurningDirection(direction: Int) = withContext(Dispatchers.IO) {
+        val current = getSettingsDirect()
+        settingsDao.insertOrUpdate(current.copy(pageTurningDirection = direction))
+    }
+
+    suspend fun updatePageTurningMode(mode: Int) = withContext(Dispatchers.IO) {
+        val current = getSettingsDirect()
+        settingsDao.insertOrUpdate(current.copy(pageTurningMode = mode))
+    }
+
     suspend fun updatePenSlot(slot: Int, color: Int, width: Float) = withContext(Dispatchers.IO) {
         val current = getSettingsDirect()
         val updated = if (slot == 1) current.copy(penSlot1Color = color, penSlot1Width = width)

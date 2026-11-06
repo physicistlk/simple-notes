@@ -77,7 +77,7 @@ import personal.notes.touch.data.db.entity.TemplateEntity
         TemplateEntity::class,
         BlockRefEntity::class
     ],
-    version = 11,
+    version = 12,
     exportSchema = true
 )
 abstract class AppDatabase : RoomDatabase() {

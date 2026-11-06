@@ -710,6 +710,66 @@ fun SettingsScreen(
                             )
                         }
 
+                        HorizontalDivider(
+                            modifier = Modifier.padding(vertical = 16.dp),
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f)
+                        )
+
+                        Text(
+                            text = "Page Turning Direction",
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 15.sp
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            val directions = listOf(0 to "Vertical", 1 to "Horizontal")
+                            directions.forEach { (dirVal, label) ->
+                                val isSelected = settings.pageTurningDirection == dirVal
+                                FilterChip(
+                                    selected = isSelected,
+                                    onClick = { viewModel.setPageTurningDirection(dirVal) },
+                                    label = { Text(label, fontSize = 12.sp) },
+                                    colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = themeColor,
+                                        selectedLabelColor = Color.White
+                                    )
+                                )
+                            }
+                        }
+
+                        HorizontalDivider(
+                            modifier = Modifier.padding(vertical = 16.dp),
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f)
+                        )
+
+                        Text(
+                            text = "Page Turning Mode",
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 15.sp
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            val modes = listOf(0 to "Continuous", 1 to "Single")
+                            modes.forEach { (modeVal, label) ->
+                                val isSelected = settings.pageTurningMode == modeVal
+                                FilterChip(
+                                    selected = isSelected,
+                                    onClick = { viewModel.setPageTurningMode(modeVal) },
+                                    label = { Text(label, fontSize = 12.sp) },
+                                    colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = themeColor,
+                                        selectedLabelColor = Color.White
+                                    )
+                                )
+                            }
+                        }
+
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
