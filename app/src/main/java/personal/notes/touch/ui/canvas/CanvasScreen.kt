@@ -36,6 +36,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.automirrored.filled.MenuBook
 import androidx.compose.material.icons.automirrored.filled.Redo
 import androidx.compose.material.icons.automirrored.filled.Undo
@@ -1966,7 +1967,7 @@ fun CanvasScreen(
                             modifier = Modifier.size(32.dp)
                         ) {
                             Icon(
-                                imageVector = Icons.Default.ArrowUpward,
+                                imageVector = if (uiState.pageTurningDirection == 1) Icons.AutoMirrored.Filled.ArrowBack else Icons.Default.ArrowUpward,
                                 contentDescription = "Prev Page",
                                 tint = if (currentPageIndex > 0) Color.DarkGray else Color.LightGray,
                                 modifier = Modifier.size(16.dp)
@@ -2020,7 +2021,7 @@ fun CanvasScreen(
                             modifier = Modifier.size(32.dp)
                         ) {
                             Icon(
-                                imageVector = Icons.Default.ArrowDownward,
+                                imageVector = if (uiState.pageTurningDirection == 1) Icons.AutoMirrored.Filled.ArrowForward else Icons.Default.ArrowDownward,
                                 contentDescription = "Next Page",
                                 tint = if (currentPageIndex < totalPages - 1) Color.DarkGray else Color.LightGray,
                                 modifier = Modifier.size(16.dp)
@@ -2956,28 +2957,85 @@ fun CanvasScreen(
 
                                             Divider(color = Color(0xFFEEEEEE))
 
+                                            val isInfiniteNote = (note?.pageType ?: "infinite") == "infinite"
+
+                                            // PAGE TURNING DIRECTION
                                             Text("Page Turning Direction", fontWeight = FontWeight.Medium, fontSize = 13.sp, color = Color.DarkGray)
                                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                                val isVert = uiState.pageTurningDirection == 0
                                                 Surface(
                                                     shape = RoundedCornerShape(12.dp),
-                                                    color = OrangePrimary,
-                                                    modifier = Modifier.padding(vertical = 4.dp)
+                                                    color = if (isVert) OrangePrimary else Color(0xFFF0F0F0),
+                                                    modifier = Modifier
+                                                        .padding(vertical = 4.dp)
+                                                        .clickable { viewModel.setPageTurningDirection(0) }
                                                 ) {
                                                     Text(
                                                         "Vertical",
-                                                        color = Color.White,
+                                                        color = if (isVert) Color.White else Color.DarkGray,
                                                         fontSize = 12.sp,
                                                         modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp)
                                                     )
                                                 }
                                                 Surface(
                                                     shape = RoundedCornerShape(12.dp),
-                                                    color = Color(0xFFF0F0F0),
-                                                    modifier = Modifier.padding(vertical = 4.dp)
+                                                    color = if (!isVert) OrangePrimary else Color(0xFFF0F0F0),
+                                                    modifier = Modifier
+                                                        .padding(vertical = 4.dp)
+                                                        .clickable { viewModel.setPageTurningDirection(1) }
                                                 ) {
                                                     Text(
                                                         "Horizontal",
-                                                        color = Color.DarkGray,
+                                                        color = if (!isVert) Color.White else Color.DarkGray,
+                                                        fontSize = 12.sp,
+                                                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp)
+                                                    )
+                                                }
+                                            }
+
+                                            Spacer(modifier = Modifier.height(6.dp))
+
+                                            // PAGE TURNING MODE
+                                            Text("Page Turning Mode", fontWeight = FontWeight.Medium, fontSize = 13.sp, color = Color.DarkGray)
+                                            if (isInfiniteNote) {
+                                                Text(
+                                                    "Continuous not required for infinite",
+                                                    fontSize = 11.sp,
+                                                    color = Color.Gray,
+                                                    modifier = Modifier.padding(bottom = 2.dp)
+                                                )
+                                            }
+                                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                                val isContinuousMode = !isInfiniteNote && uiState.pageTurningMode == 0
+                                                Surface(
+                                                    shape = RoundedCornerShape(12.dp),
+                                                    color = if (isContinuousMode) OrangePrimary else Color(0xFFF0F0F0),
+                                                    modifier = Modifier
+                                                        .padding(vertical = 4.dp)
+                                                        .clickable(enabled = !isInfiniteNote) {
+                                                            viewModel.setPageTurningMode(0)
+                                                        }
+                                                ) {
+                                                    Text(
+                                                        "Continuous",
+                                                        color = if (isInfiniteNote) Color.LightGray else if (isContinuousMode) Color.White else Color.DarkGray,
+                                                        fontSize = 12.sp,
+                                                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp)
+                                                    )
+                                                }
+                                                val isSingle = isInfiniteNote || uiState.pageTurningMode == 1
+                                                Surface(
+                                                    shape = RoundedCornerShape(12.dp),
+                                                    color = if (isSingle) OrangePrimary else Color(0xFFF0F0F0),
+                                                    modifier = Modifier
+                                                        .padding(vertical = 4.dp)
+                                                        .clickable {
+                                                            viewModel.setPageTurningMode(1)
+                                                        }
+                                                ) {
+                                                    Text(
+                                                        "Single",
+                                                        color = if (isSingle) Color.White else Color.DarkGray,
                                                         fontSize = 12.sp,
                                                         modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp)
                                                     )
