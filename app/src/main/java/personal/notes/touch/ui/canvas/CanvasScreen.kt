@@ -202,6 +202,8 @@ fun CanvasScreen(
     var showAddChapterDialog by remember { mutableStateOf(false) }
     var newChapterTitle by remember { mutableStateOf("") }
     var newTitleText by remember { mutableStateOf("") }
+    var showTextInputDialog by remember { mutableStateOf(false) }
+    var textInputText by remember { mutableStateOf("") }
 
     // F-10 PDF text selection: whether the current vector page has extractable
     // text, whether the Text tool is in selection mode, and the live selection.
@@ -751,6 +753,59 @@ fun CanvasScreen(
             imageLayers = canvasViewRef?.imageLayers ?: emptyList(),
             currentPageIndex = currentPageIndex,
             onDismiss = { showExportDialog = false }
+        )
+    }
+
+    // Text Input Dialog (insert text as a layer)
+    if (showTextInputDialog) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { showTextInputDialog = false },
+            title = { androidx.compose.material3.Text("Insert text") },
+            text = {
+                androidx.compose.material3.OutlinedTextField(
+                    value = textInputText,
+                    onValueChange = { textInputText = it },
+                    label = { androidx.compose.material3.Text("Text") },
+                    minLines = 3,
+                    modifier = androidx.compose.ui.Modifier.fillMaxWidth()
+                )
+            },
+            confirmButton = {
+                androidx.compose.material3.TextButton(
+                    onClick = {
+                        val text = textInputText.trim()
+                        if (text.isNotEmpty()) {
+                            canvasViewRef?.getBackingBitmap()?.let { bmp ->
+                                viewModel.saveCurrentPageBitmap(bmp)
+                            }
+                            val inserted = canvasViewRef?.addTextBlock(text) == true
+                            if (inserted) {
+                                scope.launch {
+                                    try {
+                                        withContext(Dispatchers.IO) {
+                                            canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                                        }
+                                    } catch (e: Exception) {
+                                        e.printStackTrace()
+                                    }
+                                }
+                            } else {
+                                android.widget.Toast.makeText(
+                                    context, "Could not insert text", android.widget.Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                        }
+                        showTextInputDialog = false
+                    }
+                ) {
+                    androidx.compose.material3.Text("Insert")
+                }
+            },
+            dismissButton = {
+                androidx.compose.material3.TextButton(onClick = { showTextInputDialog = false }) {
+                    androidx.compose.material3.Text("Cancel")
+                }
+            }
         )
     }
 
@@ -1426,10 +1481,8 @@ fun CanvasScreen(
                                             if (!next) pdfSelection = null
                                             canvasViewRef?.setPdfTextSelectionMode(next)
                                         } else {
-                                            canvasViewRef?.getBackingBitmap()?.let { bmp ->
-                                                viewModel.saveCurrentPageBitmap(bmp)
-                                            }
-                                            onOpenEditorClick(viewModel.noteId)
+                                            textInputText = ""
+                                            showTextInputDialog = true
                                         }
                                     }
                                 )
@@ -1641,10 +1694,8 @@ fun CanvasScreen(
                                             if (!next) pdfSelection = null
                                             canvasViewRef?.setPdfTextSelectionMode(next)
                                         } else {
-                                            canvasViewRef?.getBackingBitmap()?.let { bmp ->
-                                                viewModel.saveCurrentPageBitmap(bmp)
-                                            }
-                                            onOpenEditorClick(viewModel.noteId)
+                                            textInputText = ""
+                                            showTextInputDialog = true
                                         }
                                     }
                                 )
