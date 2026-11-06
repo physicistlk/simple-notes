@@ -182,6 +182,20 @@ class TextEditorViewModel(
             initialValue = emptyList()
         )
 
+    /**
+     * Notes the "Open beside" picker may offer: live text notes only (a
+     * drawing note has its own full-screen canvas) and not this note itself.
+     */
+    val noteChoices: StateFlow<List<NoteEntity>> = repository.getAllNotes()
+        .map { notes ->
+            notes.filter { it.pageType == "text" && it.id != noteId }
+        }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
+
     /** `((…))` written in this note, each resolved to its live target block. */
     val outgoingBlockRefs: StateFlow<List<BlockRefTarget>> =
         repository.observeOutgoingBlockRefs(noteId)

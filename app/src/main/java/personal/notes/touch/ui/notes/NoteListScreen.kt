@@ -181,6 +181,7 @@ fun NoteListScreen(
     val notes by viewModel.notes.collectAsState()
     val tagCounts by viewModel.tagCounts.collectAsState()
     val folders by viewModel.folders.collectAsState()
+    val folderCounts by viewModel.folderCounts.collectAsState()
     val uiState by viewModel.uiState.collectAsState()
 
     var isLeftRailCollapsed by remember { mutableStateOf(false) }
@@ -193,6 +194,21 @@ fun NoteListScreen(
     // Dialog States
     var showCreateFolderDialog by remember { mutableStateOf(false) }
     var folderNameToCreate by remember { mutableStateOf("") }
+    // null = a new root notebook; otherwise the parent chosen in the tree.
+    var newFolderParentId by remember { mutableStateOf<String?>(null) }
+    var deleteFolderTarget by remember { mutableStateOf<FolderEntity?>(null) }
+
+    // Notebook tree: which folders are open. Everything starts expanded so the
+    // hierarchy that existed in the database but was never drawn is visible on
+    // first open; the chevrons collapse from there.
+    var expandedFolders by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var treeInitialised by remember { mutableStateOf(false) }
+    LaunchedEffect(folders) {
+        if (!treeInitialised && folders.isNotEmpty()) {
+            expandedFolders = folders.map { it.id }.toSet()
+            treeInitialised = true
+        }
+    }
 
     var renameFolderTarget by remember { mutableStateOf<FolderEntity?>(null) }
     var newFolderNameText by remember { mutableStateOf("") }
@@ -313,29 +329,76 @@ fun NoteListScreen(
 
     // Dialog: Create Folder
     if (showCreateFolderDialog) {
+        val parentName = newFolderParentId?.let { id -> folders.firstOrNull { it.id == id }?.name }
         AlertDialog(
             onDismissRequest = { showCreateFolderDialog = false },
-            title = { Text("New Folder", fontWeight = FontWeight.Bold) },
-            text = {
-                OutlinedTextField(
-                    value = folderNameToCreate,
-                    onValueChange = { folderNameToCreate = it },
-                    singleLine = true,
-                    label = { Text("Folder Name") },
-                    modifier = Modifier.fillMaxWidth()
+            title = {
+                Text(
+                    if (parentName != null) "New subfolder" else "New Folder",
+                    fontWeight = FontWeight.Bold
                 )
+            },
+            text = {
+                Column {
+                    if (parentName != null) {
+                        Text(
+                            "Inside \"$parentName\"",
+                            fontSize = 11.sp,
+                            color = Color.Gray,
+                            modifier = Modifier.padding(bottom = 6.dp)
+                        )
+                    }
+                    OutlinedTextField(
+                        value = folderNameToCreate,
+                        onValueChange = { folderNameToCreate = it },
+                        singleLine = true,
+                        label = { Text("Folder Name") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
             },
             confirmButton = {
                 TextButton(onClick = {
+                    val parentId = newFolderParentId
                     if (folderNameToCreate.isNotBlank()) {
-                        viewModel.createFolder(folderNameToCreate)
+                        viewModel.createFolder(folderNameToCreate, parentId)
+                        // A fresh subfolder is invisible while its parent is
+                        // collapsed, so open the parent right away.
+                        if (parentId != null) expandedFolders = expandedFolders + parentId
                         folderNameToCreate = ""
+                        newFolderParentId = null
                         showCreateFolderDialog = false
                     }
                 }) { Text("Create", color = OrangePrimary, fontWeight = FontWeight.Bold) }
             },
             dismissButton = {
-                TextButton(onClick = { showCreateFolderDialog = false }) { Text("Cancel") }
+                TextButton(onClick = {
+                    showCreateFolderDialog = false
+                    newFolderParentId = null
+                }) { Text("Cancel") }
+            }
+        )
+    }
+
+    // Dialog: Delete Folder (children and notes move up one level)
+    deleteFolderTarget?.let { folder ->
+        AlertDialog(
+            onDismissRequest = { deleteFolderTarget = null },
+            title = { Text("Delete notebook", fontWeight = FontWeight.Bold) },
+            text = {
+                Text(
+                    "Delete \"${folder.name}\"? Its notes and subfolders move up one " +
+                        "level; nothing is deleted from the notes themselves."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    viewModel.deleteFolder(folder.id)
+                    deleteFolderTarget = null
+                }) { Text("Delete", color = Color.Red, fontWeight = FontWeight.Bold) }
+            },
+            dismissButton = {
+                TextButton(onClick = { deleteFolderTarget = null }) { Text("Cancel") }
             }
         )
     }
@@ -739,7 +802,37 @@ fun NoteListScreen(
                         onClick = { showThemeColorDialog = true }
                     )
 
-                    Spacer(modifier = Modifier.weight(1f))
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    // Notebook hierarchy (folders.parentId has existed since
+                    // v3; this is the view that finally exposes it).
+                    NotebookTreePanel(
+                        folders = folders,
+                        counts = folderCounts,
+                        selectedFolderId = uiState.selectedFolderId,
+                        expanded = expandedFolders,
+                        onToggleExpand = { id ->
+                            expandedFolders = if (id in expandedFolders) {
+                                expandedFolders - id
+                            } else {
+                                expandedFolders + id
+                            }
+                        },
+                        onSelectFolder = { viewModel.selectFolder(it) },
+                        onNewFolder = { parentId ->
+                            newFolderParentId = parentId
+                            folderNameToCreate = ""
+                            showCreateFolderDialog = true
+                        },
+                        onRenameFolder = { folder ->
+                            renameFolderTarget = folder
+                            newFolderNameText = folder.name
+                        },
+                        onDeleteFolder = { deleteFolderTarget = it },
+                        modifier = Modifier.weight(1f)
+                    )
+
+                    Spacer(modifier = Modifier.height(6.dp))
 
                     // Collapse button (<)
                     Row(
@@ -883,7 +976,10 @@ fun NoteListScreen(
                             }
 
                             // New Folder icon
-                            IconButton(onClick = { showCreateFolderDialog = true }) {
+                            IconButton(onClick = {
+                                newFolderParentId = null
+                                showCreateFolderDialog = true
+                            }) {
                                 Icon(
                                     imageVector = Icons.Default.CreateNewFolder,
                                     contentDescription = "New Folder",
@@ -995,7 +1091,13 @@ fun NoteListScreen(
                             FilterChip(
                                 selected = uiState.selectedFolderId == folder.id,
                                 onClick = { viewModel.selectFolder(folder.id) },
-                                label = { Text(folder.name) },
+                                // The flat row stays for fast filtering; the
+                                // marker keeps nested folders distinguishable.
+                                label = {
+                                    Text(
+                                        if (folder.parentId != null) "\u21B3 ${folder.name}" else folder.name
+                                    )
+                                },
                                 colors = FilterChipDefaults.filterChipColors(
                                     selectedContainerColor = OrangePrimary.copy(alpha = 0.12f),
                                     selectedLabelColor = OrangePrimary
@@ -1143,6 +1245,7 @@ fun NoteListScreen(
                         }
                         FabMenuItem(Icons.Default.Folder, "Folder") {
                             isFabMenuExpanded = false
+                            newFolderParentId = uiState.selectedFolderId
                             showCreateFolderDialog = true
                         }
                         FabMenuItem(Icons.Default.TextFields, "Text Note") {
@@ -1330,7 +1433,37 @@ fun NoteListScreen(
                     }
                 )
 
-                Spacer(modifier = Modifier.weight(1f))
+                Divider(color = Color(0xFFEEEEEE), thickness = 1.dp)
+                Spacer(modifier = Modifier.height(8.dp))
+                NotebookTreePanel(
+                    folders = folders,
+                    counts = folderCounts,
+                    selectedFolderId = uiState.selectedFolderId,
+                    expanded = expandedFolders,
+                    onToggleExpand = { id ->
+                        expandedFolders = if (id in expandedFolders) {
+                            expandedFolders - id
+                        } else {
+                            expandedFolders + id
+                        }
+                    },
+                    onSelectFolder = { folderId ->
+                        viewModel.selectFolder(folderId)
+                        isModalDrawerOpen = false
+                    },
+                    onNewFolder = { parentId ->
+                        newFolderParentId = parentId
+                        folderNameToCreate = ""
+                        showCreateFolderDialog = true
+                    },
+                    onRenameFolder = { folder ->
+                        renameFolderTarget = folder
+                        newFolderNameText = folder.name
+                    },
+                    onDeleteFolder = { deleteFolderTarget = it },
+                    modifier = Modifier.weight(1f)
+                )
+                Spacer(modifier = Modifier.height(8.dp))
                 Divider(color = Color(0xFFEEEEEE), thickness = 1.dp)
                 Spacer(modifier = Modifier.height(14.dp))
 

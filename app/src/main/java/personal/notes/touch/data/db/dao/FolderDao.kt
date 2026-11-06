@@ -25,6 +25,10 @@ interface FolderDao {
     @Update
     suspend fun update(folder: FolderEntity)
 
+    /** Children of a deleted notebook move up to its own parent. */
+    @Query("UPDATE folders SET parentId = :to WHERE parentId = :from")
+    suspend fun reparentChildren(from: String, to: String?)
+
     @Query("DELETE FROM folders WHERE id = :id")
     suspend fun delete(id: String)
 }

@@ -8,6 +8,9 @@ import androidx.room.Update
 import kotlinx.coroutines.flow.Flow
 import personal.notes.touch.data.db.entity.NoteEntity
 
+/** Live notes filed directly in one folder (null = unfiled), for the tree. */
+data class FolderCount(val folderId: String?, val count: Int)
+
 @Dao
 interface NoteDao {
     @Query("SELECT * FROM notes WHERE deleted = 0 ORDER BY updatedAt DESC")
@@ -21,6 +24,13 @@ interface NoteDao {
 
     @Query("SELECT * FROM notes WHERE deleted = 0 AND folderId = :folderId ORDER BY updatedAt DESC")
     fun getByFolder(folderId: String?): Flow<List<NoteEntity>>
+
+    /** Notes in any of [folderIds] — one notebook subtree in a single query. */
+    @Query(
+        "SELECT * FROM notes WHERE deleted = 0 AND folderId IN (:folderIds) " +
+            "ORDER BY updatedAt DESC"
+    )
+    fun getByFolders(folderIds: List<String>): Flow<List<NoteEntity>>
 
     @Query("SELECT * FROM notes WHERE deleted = 0 AND favorite = 1 ORDER BY updatedAt DESC")
     fun getFavorites(): Flow<List<NoteEntity>>
@@ -46,6 +56,10 @@ interface NoteDao {
     @Query("UPDATE notes SET folderId = :folderId, updatedAt = :updatedAt WHERE id = :id")
     suspend fun setFolder(id: String, folderId: String?, updatedAt: Long = System.currentTimeMillis())
 
+    /** Bulk move when a notebook is deleted; notes are never deleted with it. */
+    @Query("UPDATE notes SET folderId = :to, updatedAt = :updatedAt WHERE folderId = :from")
+    suspend fun reassignFolder(from: String, to: String?, updatedAt: Long = System.currentTimeMillis())
+
     @Query("DELETE FROM notes WHERE deleted = 1")
     suspend fun clearRecycled()
 
@@ -56,6 +70,17 @@ interface NoteDao {
     /** Newest live note with this exact title (daily notes are titled by date). */
     @Query("SELECT * FROM notes WHERE deleted = 0 AND title = :title ORDER BY updatedAt DESC LIMIT 1")
     suspend fun getByTitle(title: String): NoteEntity?
+
+    /**
+     * One row per folder that holds notes, plus a null-folder row. The
+     * notebook tree aggregates descendants itself, so this stays a cheap
+     * GROUP BY rather than a recursive query.
+     */
+    @Query(
+        "SELECT folderId AS folderId, COUNT(*) AS count FROM notes " +
+            "WHERE deleted = 0 GROUP BY folderId"
+    )
+    fun observeFolderCounts(): Flow<List<FolderCount>>
 
     @Query("SELECT COUNT(*) FROM notes WHERE deleted = 0")
     suspend fun count(): Int

@@ -51,6 +51,18 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.VerticalSplit
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.ui.text.style.TextOverflow
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import personal.notes.touch.data.db.entity.NoteEntity
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -95,7 +107,15 @@ fun TextEditorScreen(
     viewModel: TextEditorViewModel,
     onBackClick: () -> Unit,
     /** Opens another note (wiki link / backlink tap); defaults to a no-op. */
-    onOpenNote: (String) -> Unit = {}
+    onOpenNote: (String) -> Unit = {},
+    /** Starts a two-pane workspace with the picked note in the other pane. */
+    onOpenBeside: (String) -> Unit = {},
+    /** Split-pane presentation: a compact header instead of the full top bar. */
+    embedded: Boolean = false,
+    /** Closes this pane (embedded only); null hides the control. */
+    onClosePane: (() -> Unit)? = null,
+    /** Gives this pane the whole width by closing the other (embedded only). */
+    onMaximizePane: (() -> Unit)? = null
 ) {
     val themeColor = LocalThemeColor.current
     val note by viewModel.note.collectAsState()
@@ -138,6 +158,8 @@ fun TextEditorScreen(
     var showReferences by remember { mutableStateOf(false) }
     val coroutineScope = rememberCoroutineScope()
     val context = LocalContext.current
+    var showOpenBeside by remember { mutableStateOf(false) }
+    val noteChoices by viewModel.noteChoices.collectAsState()
     val linkDraft by viewModel.linkDraft.collectAsState()
     val imagePickRequest by viewModel.imagePickRequest.collectAsState()
 
@@ -175,6 +197,17 @@ fun TextEditorScreen(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
+    if (showOpenBeside) {
+        OpenBesideDialog(
+            notes = noteChoices,
+            onDismiss = { showOpenBeside = false },
+            onPick = { id ->
+                showOpenBeside = false
+                onOpenBeside(id)
+            }
+        )
+    }
+
     val exportTarget = note
     if (showExportDialog && exportTarget != null) {
         personal.notes.touch.ui.export.ExportDialog(
@@ -189,119 +222,169 @@ fun TextEditorScreen(
 
     Scaffold(
         topBar = {
-            TopAppBar(
-                navigationIcon = {
-                    IconButton(onClick = {
-                        viewModel.saveNow { onBackClick() }
-                    }) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = "Back",
-                            tint = Color.White
-                        )
-                    }
-                },
-                title = {
-                    Column {
-                        Text(
-                            text = if (title.isBlank()) "Untitled Note" else title,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 17.sp,
-                            maxLines = 1,
-                            color = Color.White
-                        )
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            if (!isReadOnly && isSaving) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(10.dp),
-                                    strokeWidth = 1.5.dp,
-                                    color = Color.White.copy(alpha = 0.8f)
-                                )
-                                Spacer(modifier = Modifier.width(4.dp))
+            if (embedded) {
+                // A split pane cannot afford the full top bar (title block,
+                // three mode tabs, four actions). The compact header keeps the
+                // title, a one-tap mode cycle and everything else behind “⋮”.
+                SplitPaneHeader(
+                    title = title,
+                    isSaving = isSaving,
+                    isReadOnly = isReadOnly,
+                    editorMode = editorMode,
+                    themeColor = themeColor,
+                    onClosePane = onClosePane,
+                    onCycleMode = {
+                        viewModel.setEditorMode(
+                            when (editorMode) {
+                                EditorMode.EDIT -> EditorMode.SPLIT
+                                EditorMode.SPLIT -> EditorMode.PREVIEW
+                                EditorMode.PREVIEW -> EditorMode.EDIT
                             }
-                            val statusText = if (isReadOnly) "Read-only" else if (isSaving) "Saving..." else "Auto-saved (1s)"
-                            Text(
-                                text = "${wordStats.wordCount} words · ${wordStats.charCount} chars · $statusText",
-                                fontSize = 11.sp,
-                                color = Color.White.copy(alpha = 0.75f)
-                            )
-                        }
-                    }
-                },
-                actions = {
-                    // Mode Switcher: Edit, Split, Preview
-                    Row(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(20.dp))
-                            .background(Color.White.copy(alpha = 0.15f))
-                            .padding(2.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        ModeTabButton(
-                            label = "Edit",
-                            isSelected = editorMode == EditorMode.EDIT,
-                            themeColor = themeColor,
-                            onClick = { viewModel.setEditorMode(EditorMode.EDIT) }
                         )
-                        ModeTabButton(
-                            label = "Split",
-                            isSelected = editorMode == EditorMode.SPLIT,
-                            themeColor = themeColor,
-                            onClick = { viewModel.setEditorMode(EditorMode.SPLIT) }
-                        )
-                        ModeTabButton(
-                            label = "Preview",
-                            isSelected = editorMode == EditorMode.PREVIEW,
-                            themeColor = themeColor,
-                            onClick = { viewModel.setEditorMode(EditorMode.PREVIEW) }
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.width(6.dp))
-
-                    IconButton(onClick = { viewModel.toggleReadOnly() }) {
-                        Icon(
-                            imageVector = if (isReadOnly) Icons.Default.Lock else Icons.Default.LockOpen,
-                            contentDescription = if (isReadOnly) "Read-only mode" else "Editable mode",
-                            tint = if (isReadOnly) Color(0xFFFFD54F) else Color.White
-                        )
-                    }
-
-                    // References: backlinks + outgoing wiki links (schema 7 index).
-                    IconButton(onClick = {
+                    },
+                    onOpenBeside = {
+                        viewModel.saveNow()
+                        showOpenBeside = true
+                    },
+                    onMaximizePane = onMaximizePane,
+                    onToggleReadOnly = { viewModel.toggleReadOnly() },
+                    onReferences = {
                         viewModel.saveNow()
                         showReferences = true
-                    }) {
-                        Icon(
-                            imageVector = Icons.Default.Link,
-                            contentDescription = "References",
-                            tint = Color.White
-                        )
-                    }
-
-                    IconButton(onClick = {
+                    },
+                    onExport = {
                         viewModel.saveNow()
                         showExportDialog = true
-                    }) {
-                        Icon(
-                            imageVector = Icons.Default.Share,
-                            contentDescription = "Export Note",
-                            tint = Color.White
-                        )
-                    }
-
-                    IconButton(onClick = { viewModel.saveNow() }) {
-                        Icon(
-                            imageVector = Icons.Default.Check,
-                            contentDescription = "Save Note",
-                            tint = Color.White
-                        )
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = themeColor
+                    },
+                    onSave = { viewModel.saveNow() }
                 )
+            } else {
+                TopAppBar(
+                    navigationIcon = {
+                        IconButton(onClick = {
+                            viewModel.saveNow { onBackClick() }
+                        }) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                                contentDescription = "Back",
+                                tint = Color.White
+                            )
+                        }
+                    },
+                    title = {
+                        Column {
+                            Text(
+                                text = if (title.isBlank()) "Untitled Note" else title,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 17.sp,
+                                maxLines = 1,
+                                color = Color.White
+                            )
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                if (!isReadOnly && isSaving) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(10.dp),
+                                        strokeWidth = 1.5.dp,
+                                        color = Color.White.copy(alpha = 0.8f)
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                }
+                                val statusText = if (isReadOnly) "Read-only" else if (isSaving) "Saving..." else "Auto-saved (1s)"
+                                Text(
+                                    text = "${wordStats.wordCount} words · ${wordStats.charCount} chars · $statusText",
+                                    fontSize = 11.sp,
+                                    color = Color.White.copy(alpha = 0.75f)
+                                )
+                            }
+                        }
+                    },
+                    actions = {
+                        // Mode Switcher: Edit, Split, Preview
+                        Row(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(20.dp))
+                                .background(Color.White.copy(alpha = 0.15f))
+                                .padding(2.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            ModeTabButton(
+                                label = "Edit",
+                                isSelected = editorMode == EditorMode.EDIT,
+                                themeColor = themeColor,
+                                onClick = { viewModel.setEditorMode(EditorMode.EDIT) }
+                            )
+                            ModeTabButton(
+                                label = "Split",
+                                isSelected = editorMode == EditorMode.SPLIT,
+                                themeColor = themeColor,
+                                onClick = { viewModel.setEditorMode(EditorMode.SPLIT) }
+                            )
+                            ModeTabButton(
+                                label = "Preview",
+                                isSelected = editorMode == EditorMode.PREVIEW,
+                                themeColor = themeColor,
+                                onClick = { viewModel.setEditorMode(EditorMode.PREVIEW) }
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.width(6.dp))
+
+                        IconButton(onClick = { viewModel.toggleReadOnly() }) {
+                            Icon(
+                                imageVector = if (isReadOnly) Icons.Default.Lock else Icons.Default.LockOpen,
+                                contentDescription = if (isReadOnly) "Read-only mode" else "Editable mode",
+                                tint = if (isReadOnly) Color(0xFFFFD54F) else Color.White
+                            )
+                        }
+
+                        // Two-pane workspace: this note + one picked from a searchable list.
+                        IconButton(onClick = {
+                            viewModel.saveNow()
+                            showOpenBeside = true
+                        }) {
+                            Icon(
+                                imageVector = Icons.Default.VerticalSplit,
+                                contentDescription = "Open beside",
+                                tint = Color.White
+                            )
+                        }
+
+                        // References: backlinks + outgoing wiki links (schema 7 index).
+                        IconButton(onClick = {
+                            viewModel.saveNow()
+                            showReferences = true
+                        }) {
+                            Icon(
+                                imageVector = Icons.Default.Link,
+                                contentDescription = "References",
+                                tint = Color.White
+                            )
+                        }
+
+                        IconButton(onClick = {
+                            viewModel.saveNow()
+                            showExportDialog = true
+                        }) {
+                            Icon(
+                                imageVector = Icons.Default.Share,
+                                contentDescription = "Export Note",
+                                tint = Color.White
+                            )
+                        }
+
+                        IconButton(onClick = { viewModel.saveNow() }) {
+                            Icon(
+                                imageVector = Icons.Default.Check,
+                                contentDescription = "Save Note",
+                                tint = Color.White
+                            )
+                        }
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = themeColor
+                    )
             )
+            }
         }
     ) { innerPadding ->
         Column(
@@ -1216,6 +1299,209 @@ private fun LinkDialog(
             TextButton(onClick = onDismiss) {
                 Text("Cancel")
             }
+        }
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Split-pane chrome + "open beside" picker
+// ---------------------------------------------------------------------------
+
+/**
+ * Compact header for one pane of [SplitWorkspaceScreen]. The full top bar
+ * (title block, three mode tabs, four actions) does not fit half a tablet, so
+ * this keeps the title, a one-tap mode cycle, and hides the rest behind “⋮”.
+ */
+@Composable
+private fun SplitPaneHeader(
+    title: String,
+    isSaving: Boolean,
+    isReadOnly: Boolean,
+    editorMode: EditorMode,
+    themeColor: Color,
+    onClosePane: (() -> Unit)?,
+    onCycleMode: () -> Unit,
+    onOpenBeside: () -> Unit,
+    onMaximizePane: (() -> Unit)?,
+    onToggleReadOnly: () -> Unit,
+    onReferences: () -> Unit,
+    onExport: () -> Unit,
+    onSave: () -> Unit
+) {
+    var menuOpen by remember { mutableStateOf(false) }
+
+    Surface(color = themeColor, shadowElevation = 2.dp) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(46.dp)
+                .padding(horizontal = 4.dp)
+        ) {
+            if (onClosePane != null) {
+                IconButton(onClick = onClosePane, modifier = Modifier.size(32.dp)) {
+                    Icon(
+                        imageVector = Icons.Default.Close,
+                        contentDescription = "Close pane",
+                        tint = Color.White.copy(alpha = 0.9f),
+                        modifier = Modifier.size(17.dp)
+                    )
+                }
+            }
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(horizontal = 6.dp)
+            ) {
+                Text(
+                    text = title.ifBlank { "Untitled Note" },
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = when {
+                        isReadOnly -> "Read-only"
+                        isSaving -> "Saving…"
+                        else -> "Pane · ${editorMode.name.lowercase()}"
+                    },
+                    fontSize = 9.sp,
+                    color = Color.White.copy(alpha = 0.7f),
+                    maxLines = 1
+                )
+            }
+            IconButton(onClick = onCycleMode, modifier = Modifier.size(32.dp)) {
+                Icon(
+                    imageVector = when (editorMode) {
+                        EditorMode.EDIT -> Icons.Default.Edit
+                        EditorMode.SPLIT -> Icons.Default.VerticalSplit
+                        EditorMode.PREVIEW -> Icons.Default.Visibility
+                    },
+                    contentDescription = "Switch editor mode",
+                    tint = Color.White.copy(alpha = 0.9f),
+                    modifier = Modifier.size(17.dp)
+                )
+            }
+            Box {
+                IconButton(onClick = { menuOpen = true }, modifier = Modifier.size(32.dp)) {
+                    Icon(
+                        imageVector = Icons.Default.MoreVert,
+                        contentDescription = "Pane actions",
+                        tint = Color.White.copy(alpha = 0.9f),
+                        modifier = Modifier.size(17.dp)
+                    )
+                }
+                DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                    PaneMenuItem("Open beside…") { menuOpen = false; onOpenBeside() }
+                    if (onMaximizePane != null) {
+                        PaneMenuItem("Maximize pane") { menuOpen = false; onMaximizePane() }
+                    }
+                    PaneMenuItem(if (isReadOnly) "Editable mode" else "Read-only mode") {
+                        menuOpen = false
+                        onToggleReadOnly()
+                    }
+                    PaneMenuItem("References") { menuOpen = false; onReferences() }
+                    PaneMenuItem("Export") { menuOpen = false; onExport() }
+                    PaneMenuItem("Save now") { menuOpen = false; onSave() }
+                    if (onClosePane != null) {
+                        PaneMenuItem("Close pane") { menuOpen = false; onClosePane() }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PaneMenuItem(label: String, onClick: () -> Unit) {
+    DropdownMenuItem(
+        text = { Text(label, fontSize = 13.sp) },
+        onClick = onClick
+    )
+}
+
+/**
+ * Searchable note picker for "Open beside". Only text notes are offered: a
+ * drawing note's canvas owns the full screen and cannot be embedded in a pane
+ * yet, so showing it here would promise something the split cannot deliver.
+ */
+@Composable
+private fun OpenBesideDialog(
+    notes: List<NoteEntity>,
+    onDismiss: () -> Unit,
+    onPick: (String) -> Unit
+) {
+    var query by remember { mutableStateOf("") }
+    val dateFormat = remember { SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()) }
+    val filtered = remember(notes, query) {
+        val needle = query.trim()
+        notes
+            .filter { needle.isEmpty() || it.title.contains(needle, ignoreCase = true) }
+            .sortedByDescending { it.updatedAt }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Open beside", fontWeight = FontWeight.Bold, fontSize = 18.sp) },
+        text = {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    text = "Pick a text note for the other pane. Drawing notes still open full screen.",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = query,
+                    onValueChange = { query = it },
+                    placeholder = { Text("Search notes", fontSize = 13.sp) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                if (filtered.isEmpty()) {
+                    Text(
+                        text = if (notes.isEmpty()) {
+                            "No other text notes yet. Create one first."
+                        } else {
+                            "No note matches \"${query.trim()}\"."
+                        },
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f),
+                        modifier = Modifier.padding(vertical = 12.dp)
+                    )
+                } else {
+                    LazyColumn(modifier = Modifier.heightIn(max = 380.dp)) {
+                        itemsIndexed(filtered, key = { _, n -> n.id }) { _, note ->
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { onPick(note.id) }
+                                    .padding(vertical = 9.dp)
+                            ) {
+                                Text(
+                                    text = note.title.ifBlank { "Untitled Note" },
+                                    fontSize = 14.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = dateFormat.format(Date(note.updatedAt)),
+                                    fontSize = 10.sp,
+                                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
         }
     )
 }

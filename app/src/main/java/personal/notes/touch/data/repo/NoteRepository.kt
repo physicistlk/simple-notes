@@ -8,6 +8,7 @@ import personal.notes.touch.data.db.dao.BlockBacklink
 import personal.notes.touch.data.db.dao.BlockCandidate
 import personal.notes.touch.data.db.dao.BlockRefDao
 import personal.notes.touch.data.db.dao.BlockRefTarget
+import personal.notes.touch.data.db.dao.FolderCount
 import personal.notes.touch.data.db.dao.FolderDao
 import personal.notes.touch.data.db.dao.NoteBlockDao
 import personal.notes.touch.data.db.dao.NoteDao
@@ -62,8 +63,15 @@ class NoteRepository(
         }
     }
 
+    /** Notes filed in [folderIds]; the library passes a whole subtree. */
+    fun getNotesByFolders(folderIds: List<String>): Flow<List<NoteEntity>> =
+        noteDao.getByFolders(folderIds)
+
     // Folders
     fun getAllFolders(): Flow<List<personal.notes.touch.data.db.entity.FolderEntity>> = folderDao.getAll()
+
+    /** Live-note counts per folder, for the notebook tree. */
+    fun observeFolderCounts(): Flow<List<FolderCount>> = noteDao.observeFolderCounts()
 
     suspend fun createFolder(name: String, parentId: String? = null): personal.notes.touch.data.db.entity.FolderEntity = withContext(Dispatchers.IO) {
         val folder = personal.notes.touch.data.db.entity.FolderEntity(
@@ -83,7 +91,16 @@ class NoteRepository(
         }
     }
 
+    /**
+     * Deletes a notebook without deleting anything inside it: subfolders and
+     * notes move up to the deleted folder's own parent (root when it had none).
+     * Two separate statements, so a crash between them can leave orphans — the
+     * tree already renders an orphan as a root rather than losing it.
+     */
     suspend fun deleteFolder(id: String) = withContext(Dispatchers.IO) {
+        val folder = folderDao.getById(id) ?: return@withContext
+        folderDao.reparentChildren(from = id, to = folder.parentId)
+        noteDao.reassignFolder(from = id, to = folder.parentId)
         folderDao.delete(id)
     }
 

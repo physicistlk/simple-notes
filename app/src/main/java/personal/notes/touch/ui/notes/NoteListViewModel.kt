@@ -11,13 +11,16 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import personal.notes.touch.data.db.dao.FolderCount
 import personal.notes.touch.data.db.dao.TagCount
 import personal.notes.touch.data.db.entity.FolderEntity
 import personal.notes.touch.data.db.entity.NoteEntity
 import personal.notes.touch.data.db.entity.TemplateEntity
 import personal.notes.touch.data.repo.NoteRepository
+import personal.notes.touch.text.FolderTree
 import personal.notes.touch.text.NoteSearch
 import personal.notes.touch.text.SearchSnippet
 
@@ -68,6 +71,18 @@ class NoteListViewModel(
             initialValue = emptyList()
         )
 
+    /**
+     * `folderId -> live note count` (null key = unfiled notes). The tree adds
+     * descendants on top, so a collapsed notebook still shows its real size.
+     */
+    val folderCounts: StateFlow<Map<String?, Int>> = repository.observeFolderCounts()
+        .map { rows -> rows.associate { it.folderId to it.count } }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyMap()
+        )
+
     /** Tag bar: every tag of a live note, with counts (schema 7 index). */
     val tagCounts: StateFlow<List<TagCount>> = repository.observeTagCounts()
         .stateIn(
@@ -83,21 +98,37 @@ class NoteListViewModel(
             initialValue = emptyMap()
         )
 
-    /** Notes of the selected section/folder — the pre-search list. */
-    private val baseNotes: StateFlow<List<NoteEntity>> = _uiState
-        .flatMapLatest { state ->
-            when {
-                state.currentFilter == NoteFilter.FAVORITES -> repository.getFavorites()
-                state.currentFilter == NoteFilter.RECYCLE_BIN -> repository.getRecycledNotes()
-                state.selectedFolderId != null -> repository.getNotesByFolder(state.selectedFolderId)
-                else -> repository.getAllNotes()
+    /**
+     * Notes of the selected section/notebook — the pre-search list.
+     *
+     * A notebook selection covers its whole subtree: picking "Physics" shows
+     * the notes of Physics and of every folder below it, which is exactly the
+     * population its tree count advertises. `folders` is part of the pipeline
+     * so a rename/move/re-parent re-resolves the subtree.
+     */
+    private val baseNotes: StateFlow<List<NoteEntity>> =
+        combine(_uiState, folders) { state, all -> state to all }
+            .flatMapLatest { (state, all) ->
+                when {
+                    state.currentFilter == NoteFilter.FAVORITES -> repository.getFavorites()
+                    state.currentFilter == NoteFilter.RECYCLE_BIN -> repository.getRecycledNotes()
+                    state.selectedFolderId != null -> {
+                        val ids = FolderTree.subtreeIds(
+                            input = all.map {
+                                FolderTree.Input(id = it.id, name = it.name, parentId = it.parentId)
+                            },
+                            id = state.selectedFolderId
+                        )
+                        repository.getNotesByFolders(ids)
+                    }
+                    else -> repository.getAllNotes()
+                }
             }
-        }
-        .stateIn(
-            scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(5000),
-            initialValue = emptyList()
-        )
+            .stateIn(
+                scope = viewModelScope,
+                started = SharingStarted.WhileSubscribed(5000),
+                initialValue = emptyList()
+            )
 
     /**
      * Search + tag filtering happens here, not in SQL: matching must be
@@ -190,10 +221,11 @@ class NoteListViewModel(
         _uiState.value = _uiState.value.copy(viewMode = newMode)
     }
 
-    fun createFolder(name: String) {
+    /** [parentId] non-null creates a sub-notebook under that folder. */
+    fun createFolder(name: String, parentId: String? = null) {
         viewModelScope.launch {
             if (name.isNotBlank()) {
-                repository.createFolder(name = name)
+                repository.createFolder(name = name, parentId = parentId)
             }
         }
     }
