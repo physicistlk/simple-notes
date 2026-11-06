@@ -119,9 +119,12 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
@@ -1185,6 +1188,10 @@ fun CanvasScreen(
                 val isContinuous = uiState.pageTurningMode == 1
                 val isHorizontal = uiState.pageTurningDirection == 1
 
+                var continuousScale by remember { mutableStateOf(1f) }
+                var continuousPanX by remember { mutableStateOf(0f) }
+                var continuousPanY by remember { mutableStateOf(0f) }
+
                 if (isContinuous) {
                     // Continuous scroll mode: all pages in a scrollable list
                     val pageBitmapsState = remember { mutableStateOf<List<Pair<Int, android.graphics.Bitmap?>>>(emptyList()) }
@@ -1200,7 +1207,15 @@ fun CanvasScreen(
                     val pageBitmaps = pageBitmapsState.value
                     if (isHorizontal) {
                         androidx.compose.foundation.lazy.LazyRow(
-                            modifier = Modifier.fillMaxSize(),
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .pointerInput(Unit) {
+                                    detectTransformGestures { _, pan, zoom, _ ->
+                                        continuousScale = (continuousScale * zoom).coerceIn(0.5f, 4f)
+                                        continuousPanX += pan.x
+                                        continuousPanY += pan.y
+                                    }
+                                },
                             horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(8.dp)
                         ) {
                             items(pageBitmaps.size) { idx ->
@@ -1211,6 +1226,12 @@ fun CanvasScreen(
                                     modifier = androidx.compose.ui.Modifier
                                         .fillParentMaxHeight()
                                         .aspectRatio(0.707f)
+                                        .graphicsLayer {
+                                            scaleX = continuousScale
+                                            scaleY = continuousScale
+                                            translationX = continuousPanX
+                                            translationY = continuousPanY
+                                        }
                                         .clickable {
                                             // Switch to single mode to edit this page
                                             viewModel.goToPage(idx, canvasViewRef?.getBackingBitmap()) { newBmp ->
@@ -1222,7 +1243,15 @@ fun CanvasScreen(
                         }
                     } else {
                         androidx.compose.foundation.lazy.LazyColumn(
-                            modifier = Modifier.fillMaxSize(),
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .pointerInput(Unit) {
+                                    detectTransformGestures { _, pan, zoom, _ ->
+                                        continuousScale = (continuousScale * zoom).coerceIn(0.5f, 4f)
+                                        continuousPanX += pan.x
+                                        continuousPanY += pan.y
+                                    }
+                                },
                             verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(8.dp)
                         ) {
                             items(pageBitmaps.size) { idx ->
@@ -1233,6 +1262,12 @@ fun CanvasScreen(
                                     modifier = androidx.compose.ui.Modifier
                                         .fillMaxWidth()
                                         .aspectRatio(0.707f)
+                                        .graphicsLayer {
+                                            scaleX = continuousScale
+                                            scaleY = continuousScale
+                                            translationX = continuousPanX
+                                            translationY = continuousPanY
+                                        }
                                         .clickable {
                                             viewModel.goToPage(idx, canvasViewRef?.getBackingBitmap()) { newBmp ->
                                                 applyLoadedPage(idx, newBmp)
