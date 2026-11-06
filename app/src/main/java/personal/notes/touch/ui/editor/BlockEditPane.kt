@@ -83,6 +83,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
@@ -487,6 +488,8 @@ private fun BlockRow(
                         focusRequester = focus,
                         onSlashArmed = { slashArmed = it },
                         readOnly = isReadOnly,
+                        // Code is literal; markdown markers have no meaning there.
+                        inlineStyling = false,
                         textStyle = TextStyle(
                             fontFamily = FontFamily.Monospace,
                             fontSize = 13.sp,
@@ -750,8 +753,23 @@ private fun BlockTextField(
     textStyle: TextStyle,
     modifier: Modifier = Modifier,
     readOnly: Boolean = false,
-    isOnlyBlock: Boolean = false
+    isOnlyBlock: Boolean = false,
+    inlineStyling: Boolean = true
 ) {
+    var hasFocus by remember { mutableStateOf(false) }
+    val inlineColors = InlineEditorStyle.colors()
+    // Markers stay visible (dimmed) while the block is being edited; the
+    // rendered text then matches the stored markdown exactly, so caret and IME
+    // offsets are never remapped during typing. Unfocused or read-only blocks
+    // drop the markers for the WYSIWYG look.
+    val hideInlineMarkers = readOnly || !hasFocus
+    val visualTransformation = remember(inlineStyling, hideInlineMarkers, inlineColors) {
+        if (inlineStyling) {
+            InlineEditorStyle.transformation(hideInlineMarkers, inlineColors)
+        } else {
+            VisualTransformation.None
+        }
+    }
     BasicTextField(
         value = block.field,
         onValueChange = { value ->
@@ -767,10 +785,12 @@ private fun BlockTextField(
         readOnly = readOnly,
         textStyle = textStyle,
         cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+        visualTransformation = visualTransformation,
         modifier = Modifier
             .then(modifier)
             .focusRequester(focusRequester)
             .onFocusChanged { state ->
+                hasFocus = state.isFocused
                 if (state.isFocused) viewModel.setActiveBlock(block.id)
             }
             .onPreviewKeyEvent { event ->
