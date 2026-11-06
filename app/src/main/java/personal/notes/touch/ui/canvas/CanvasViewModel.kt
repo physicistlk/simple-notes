@@ -31,6 +31,8 @@ data class CanvasUiState(
     val paperPattern: PaperPattern = PaperPattern.BLANK,
     val backgroundMode: Int = 0,
     val backgroundDensity: Int = 40,
+    val pageTurningDirection: Int = 0,
+    val pageTurningMode: Int = 0,
     val canUndo: Boolean = false,
     val canRedo: Boolean = false,
     val isColorPickerOpen: Boolean = false,
@@ -95,7 +97,9 @@ class CanvasViewModel(
                     penSlot2Color = settings.penSlot2Color,
                     penSlot2Width = settings.penSlot2Width,
                     backgroundMode = settings.backgroundMode,
-                    backgroundDensity = settings.backgroundDensity
+                    backgroundDensity = settings.backgroundDensity,
+                    pageTurningDirection = settings.pageTurningDirection,
+                    pageTurningMode = settings.pageTurningMode
                 )
             }
         }
