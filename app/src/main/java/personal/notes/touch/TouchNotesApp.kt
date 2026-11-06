@@ -76,6 +76,7 @@ class TouchNotesApp : Application() {
             noteRefDao = database.noteRefDao(),
             folderDao = database.folderDao(),
             pageDao = database.pageDao(),
+            templateDao = database.templateDao(),
             fileStore = fileStore
         )
     }

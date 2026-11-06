@@ -53,6 +53,10 @@ interface NoteDao {
     @Query("SELECT * FROM notes WHERE deleted = 0 AND content IS NOT NULL")
     suspend fun getNotesWithContent(): List<NoteEntity>
 
+    /** Newest live note with this exact title (daily notes are titled by date). */
+    @Query("SELECT * FROM notes WHERE deleted = 0 AND title = :title ORDER BY updatedAt DESC LIMIT 1")
+    suspend fun getByTitle(title: String): NoteEntity?
+
     @Query("SELECT COUNT(*) FROM notes WHERE deleted = 0")
     suspend fun count(): Int
 }

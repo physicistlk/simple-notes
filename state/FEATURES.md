@@ -14,6 +14,7 @@ Status legend: Planned (not implemented), Implemented. Source cites analysis fil
 - Description: Editable text note with formatting (bold/italic/underline, color, size, alignment), multiple paragraphs; autosave.
 - Implementation: Compose `TextEditorScreen` using `BasicTextField` with `AnnotatedString` + span styles; persist as HTML or markdown in Room `NoteEntity.content` (TEXT). Simpler: store plain text + JSON style runs.
 - Performance Notes: Debounce autosave 1s; max note text 1MB; avoid recomposition on every keystroke via derived state.
+- Templates + daily notes: the left rail offers **Today** (opens the note titled `yyyy-MM-dd`, creating it from the daily template when absent) and **Templates** (list / create / edit / delete, star = use for Today). Template bodies are markdown with variables resolved at creation (`{{date}}`, `{{time}}`, `{{datetime}}`, `{{title}}`, `{{timestamp}}`, `{{date:yyyy/MM}}`); stored in `templates` (schema 9).
 - Status: Implemented
 
 ## M3 — Drawing canvas

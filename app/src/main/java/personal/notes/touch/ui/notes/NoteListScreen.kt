@@ -104,12 +104,17 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.FloatingActionButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Surface
+import androidx.compose.material.icons.filled.Today
+import androidx.compose.material.icons.filled.Widgets
+import androidx.compose.material3.Switch
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
@@ -137,6 +142,7 @@ import androidx.compose.ui.unit.sp
 import personal.notes.touch.data.db.dao.TagCount
 import personal.notes.touch.data.db.entity.FolderEntity
 import personal.notes.touch.data.db.entity.NoteEntity
+import personal.notes.touch.data.db.entity.TemplateEntity
 import personal.notes.touch.text.SearchSnippet
 import personal.notes.touch.ui.theme.OrangePrimary
 import personal.notes.touch.ui.theme.TouchNotesSwatches
@@ -197,6 +203,12 @@ fun NoteListScreen(
     var exportTargetNote by remember { mutableStateOf<NoteEntity?>(null) }
     var showThemeColorDialog by remember { mutableStateOf(false) }
     var showEmptyRecycleDialog by remember { mutableStateOf(false) }
+
+    // Templates + daily notes (schema 9)
+    var showTemplatesDialog by remember { mutableStateOf(false) }
+    var showTemplateEditor by remember { mutableStateOf(false) }
+    var editingTemplate by remember { mutableStateOf<TemplateEntity?>(null) }
+    val templates by viewModel.templates.collectAsState()
 
     val context = androidx.compose.ui.platform.LocalContext.current
     val scope = rememberCoroutineScope()
@@ -542,6 +554,46 @@ fun NoteListScreen(
         )
     }
 
+    // Daily notes + templates
+    if (showTemplatesDialog) {
+        TemplatesDialog(
+            templates = templates,
+            onDismiss = { showTemplatesDialog = false },
+            onUse = { template ->
+                showTemplatesDialog = false
+                viewModel.createFromTemplate(template.id) { id ->
+                    onOpenEditorClick?.invoke(id) ?: onNoteClick(id)
+                }
+            },
+            onEdit = { template ->
+                editingTemplate = template
+                showTemplatesDialog = false
+                showTemplateEditor = true
+            },
+            onSetDaily = { template ->
+                viewModel.saveTemplate(template.id, template.name, template.content, true)
+            },
+            onDelete = { viewModel.deleteTemplate(it.id) },
+            onAddStarters = { viewModel.addStarterTemplates() }
+        )
+    }
+
+    if (showTemplateEditor) {
+        TemplateEditDialog(
+            template = editingTemplate,
+            onDismiss = {
+                showTemplateEditor = false
+                editingTemplate = null
+            },
+            onSave = { name, content, daily ->
+                viewModel.saveTemplate(editingTemplate?.id, name, content, daily)
+                showTemplateEditor = false
+                editingTemplate = null
+                showTemplatesDialog = true
+            }
+        )
+    }
+
     // Dialog: User Manual & Gestures (Screen 2 parity)
     if (showUserManualDialog) {
         AlertDialog(
@@ -624,6 +676,24 @@ fun NoteListScreen(
                         label = "Notes",
                         isSelected = uiState.currentFilter == NoteFilter.ALL && uiState.selectedFolderId == null,
                         onClick = { viewModel.setFilter(NoteFilter.ALL) }
+                    )
+
+                    NavRailItem(
+                        icon = Icons.Default.Today,
+                        label = "Today",
+                        isSelected = false,
+                        onClick = {
+                            viewModel.openToday { id ->
+                                onOpenEditorClick?.invoke(id) ?: onNoteClick(id)
+                            }
+                        }
+                    )
+
+                    NavRailItem(
+                        icon = Icons.Default.Widgets,
+                        label = "Templates",
+                        isSelected = false,
+                        onClick = { showTemplatesDialog = true }
                     )
 
                     NavRailItem(
@@ -1821,4 +1891,195 @@ fun extractPreviewLines(rawContent: String, maxLines: Int = 8): List<String> {
         }
     }
     return cleaned
+}
+
+// ---------------------------------------------------------------- templates --
+
+/**
+ * Template picker: tap a row to create a note from it, star to make it the
+ * "Today" template, edit to change its body, delete to remove it. Variables in
+ * the body are resolved at creation time by [personal.notes.touch.text.NoteTemplates].
+ */
+@Composable
+private fun TemplatesDialog(
+    templates: List<TemplateEntity>,
+    onDismiss: () -> Unit,
+    onUse: (TemplateEntity) -> Unit,
+    onEdit: (TemplateEntity?) -> Unit,
+    onSetDaily: (TemplateEntity) -> Unit,
+    onDelete: (TemplateEntity) -> Unit,
+    onAddStarters: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text("Templates", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+        },
+        text = {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    "Tap a template to start a new note. Body variables: " +
+                        "{{date}}, {{time}}, {{title}}, {{date:yyyy/MM}}.",
+                    fontSize = 12.sp,
+                    color = Color.Gray
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+
+                if (templates.isEmpty()) {
+                    Text("No templates yet.", fontSize = 13.sp)
+                    TextButton(onClick = onAddStarters) {
+                        Text("Add starter templates", color = OrangePrimary)
+                    }
+                } else {
+                    LazyColumn(modifier = Modifier.heightIn(max = 340.dp)) {
+                        items(templates, key = { it.id }) { template ->
+                            TemplateRow(
+                                template = template,
+                                onUse = { onUse(template) },
+                                onSetDaily = { onSetDaily(template) },
+                                onEdit = { onEdit(template) },
+                                onDelete = { onDelete(template) }
+                            )
+                            HorizontalDivider(
+                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f)
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onEdit(null) }) {
+                Text("New template", color = OrangePrimary, fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Close") }
+        }
+    )
+}
+
+@Composable
+private fun TemplateRow(
+    template: TemplateEntity,
+    onUse: () -> Unit,
+    onSetDaily: () -> Unit,
+    onEdit: () -> Unit,
+    onDelete: () -> Unit
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onUse)
+            .padding(vertical = 2.dp)
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = template.name,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Medium,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+            val preview = template.content.lineSequence()
+                .firstOrNull { it.isNotBlank() }
+                ?.take(48)
+                .orEmpty()
+            Text(
+                text = if (template.isDaily) "Daily template · $preview" else preview,
+                fontSize = 11.sp,
+                maxLines = 1,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+            )
+        }
+        IconButton(onClick = onSetDaily, modifier = Modifier.size(32.dp)) {
+            Icon(
+                imageVector = Icons.Default.Star,
+                contentDescription = if (template.isDaily) "Daily template" else "Use for Today",
+                tint = if (template.isDaily) OrangePrimary else Color(0xFFBDBDBD),
+                modifier = Modifier.size(18.dp)
+            )
+        }
+        IconButton(onClick = onEdit, modifier = Modifier.size(32.dp)) {
+            Icon(
+                imageVector = Icons.Default.Edit,
+                contentDescription = "Edit template",
+                tint = Color.Gray,
+                modifier = Modifier.size(18.dp)
+            )
+        }
+        IconButton(onClick = onDelete, modifier = Modifier.size(32.dp)) {
+            Icon(
+                imageVector = Icons.Default.Delete,
+                contentDescription = "Delete template",
+                tint = Color(0xFFE57373),
+                modifier = Modifier.size(18.dp)
+            )
+        }
+    }
+}
+
+@Composable
+private fun TemplateEditDialog(
+    template: TemplateEntity?,
+    onDismiss: () -> Unit,
+    onSave: (name: String, content: String, isDaily: Boolean) -> Unit
+) {
+    var name by remember { mutableStateOf(template?.name.orEmpty()) }
+    var content by remember { mutableStateOf(template?.content.orEmpty()) }
+    var daily by remember { mutableStateOf(template?.isDaily ?: false) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text(
+                text = if (template == null) "New template" else "Edit template",
+                fontWeight = FontWeight.Bold,
+                fontSize = 18.sp
+            )
+        },
+        text = {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text("Name") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = content,
+                    onValueChange = { content = it },
+                    label = { Text("Body (markdown)") },
+                    textStyle = androidx.compose.ui.text.TextStyle(fontSize = 13.sp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 140.dp, max = 240.dp)
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Switch(checked = daily, onCheckedChange = { daily = it })
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Use for Today", fontSize = 13.sp)
+                }
+                Text(
+                    "Variables: {{date}} {{time}} {{datetime}} {{title}} {{date:yyyy/MM}}",
+                    fontSize = 11.sp,
+                    color = Color.Gray
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = name.isNotBlank(),
+                onClick = { onSave(name, content, daily) }
+            ) {
+                Text("Save", color = OrangePrimary, fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
 }

@@ -10,14 +10,17 @@ import personal.notes.touch.data.db.dao.NoteDao
 import personal.notes.touch.data.db.dao.NoteRefDao
 import personal.notes.touch.data.db.dao.NoteTagDao
 import personal.notes.touch.data.db.dao.PageDao
+import personal.notes.touch.data.db.dao.TemplateDao
 import personal.notes.touch.data.db.dao.RefTarget
 import personal.notes.touch.data.db.dao.TagCount
 import personal.notes.touch.data.db.entity.NoteBlockEntity
 import personal.notes.touch.data.db.entity.NoteEntity
+import personal.notes.touch.data.db.entity.TemplateEntity
 import personal.notes.touch.data.db.entity.NoteRefEntity
 import personal.notes.touch.data.db.entity.NoteTagEntity
 import personal.notes.touch.data.db.entity.PageEntity
 import personal.notes.touch.data.files.NoteFileStore
+import personal.notes.touch.text.NoteTemplates
 import personal.notes.touch.text.NoteTags
 import personal.notes.touch.text.WikiLinks
 import java.util.UUID
@@ -29,6 +32,7 @@ class NoteRepository(
     private val noteRefDao: NoteRefDao,
     private val folderDao: FolderDao,
     private val pageDao: PageDao,
+    private val templateDao: TemplateDao,
     val fileStore: NoteFileStore
 ) {
     fun getAllNotes(): Flow<List<NoteEntity>> = noteDao.getAll()
@@ -138,6 +142,96 @@ class NoteRepository(
             )
             syncIndex(id, content)
         }
+    }
+
+    // ---- templates + daily notes (schema 9) --------------------------------
+
+    fun observeTemplates(): Flow<List<TemplateEntity>> = templateDao.observeAll()
+
+    /**
+     * Creates or updates a template. Marking one as the daily template clears
+     * the flag on the others, so "Today" always has one unambiguous source.
+     */
+    suspend fun saveTemplate(
+        id: String?,
+        name: String,
+        content: String,
+        isDaily: Boolean,
+        now: Long = System.currentTimeMillis()
+    ): TemplateEntity = withContext(Dispatchers.IO) {
+        val existing = if (id != null) templateDao.getById(id) else null
+        val template = TemplateEntity(
+            id = existing?.id ?: UUID.randomUUID().toString(),
+            name = name.trim().ifBlank { "Untitled template" },
+            content = content,
+            isDaily = isDaily,
+            createdAt = existing?.createdAt ?: now,
+            updatedAt = now
+        )
+        if (isDaily) templateDao.clearDailyFlags()
+        templateDao.upsert(template)
+        template
+    }
+
+    suspend fun deleteTemplate(id: String) = withContext(Dispatchers.IO) {
+        templateDao.delete(id)
+    }
+
+    /** Two starters, offered from the empty templates dialog. No-op if any exist. */
+    suspend fun addStarterTemplates(now: Long = System.currentTimeMillis()) =
+        withContext(Dispatchers.IO) {
+            if (templateDao.count() > 0) return@withContext
+            templateDao.upsert(
+                TemplateEntity(
+                    id = UUID.randomUUID().toString(),
+                    name = NoteTemplates.DEFAULT_DAILY_NAME,
+                    content = NoteTemplates.DEFAULT_DAILY_CONTENT,
+                    isDaily = true,
+                    createdAt = now,
+                    updatedAt = now
+                )
+            )
+            templateDao.upsert(
+                TemplateEntity(
+                    id = UUID.randomUUID().toString(),
+                    name = NoteTemplates.STARTER_MEETING_NAME,
+                    content = NoteTemplates.STARTER_MEETING_CONTENT,
+                    createdAt = now + 1,
+                    updatedAt = now + 1
+                )
+            )
+        }
+
+    /**
+     * Opens today's note, creating it from the daily template when absent.
+     * Title = the date (yyyy-MM-dd), so "Today" is idempotent per day and the
+     * note can be referenced from other notes with `[[2026-11-06]]`.
+     */
+    suspend fun openOrCreateDailyNote(
+        now: Long = System.currentTimeMillis()
+    ): NoteEntity = withContext(Dispatchers.IO) {
+        val title = NoteTemplates.dailyTitle(now)
+        noteDao.getByTitle(title)?.let { return@withContext it }
+
+        val content = templateDao.getDaily()
+            ?.let { NoteTemplates.expand(it.content, title, now) }
+            .orEmpty()
+        val note = createNote(title = title, pageType = "text")
+        if (content.isNotBlank()) updateNoteContent(note.id, title, content)
+        noteDao.getById(note.id) ?: note
+    }
+
+    /** New text note whose body is the template with its variables resolved. */
+    suspend fun createNoteFromTemplate(
+        templateId: String,
+        now: Long = System.currentTimeMillis()
+    ): NoteEntity? = withContext(Dispatchers.IO) {
+        val template = templateDao.getById(templateId) ?: return@withContext null
+        val title = template.name
+        val content = NoteTemplates.expand(template.content, title, now)
+        val note = createNote(title = title, pageType = "text")
+        if (content.isNotBlank()) updateNoteContent(note.id, title, content)
+        noteDao.getById(note.id) ?: note
     }
 
     // note_blocks (schema 6): stable per-block ids persisted alongside content.

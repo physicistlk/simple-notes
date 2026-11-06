@@ -16,6 +16,7 @@ import kotlinx.coroutines.launch
 import personal.notes.touch.data.db.dao.TagCount
 import personal.notes.touch.data.db.entity.FolderEntity
 import personal.notes.touch.data.db.entity.NoteEntity
+import personal.notes.touch.data.db.entity.TemplateEntity
 import personal.notes.touch.data.repo.NoteRepository
 import personal.notes.touch.text.NoteSearch
 import personal.notes.touch.text.SearchSnippet
@@ -212,6 +213,37 @@ class NoteListViewModel(
                 _uiState.value = _uiState.value.copy(selectedFolderId = null)
             }
         }
+    }
+
+    // ---- templates + daily notes ------------------------------------------
+
+    val templates: StateFlow<List<TemplateEntity>> = repository.observeTemplates()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    /** Opens today's note (created from the daily template when it does not exist). */
+    fun openToday(onOpened: (String) -> Unit) {
+        viewModelScope.launch {
+            val note = repository.openOrCreateDailyNote()
+            onOpened(note.id)
+        }
+    }
+
+    fun createFromTemplate(templateId: String, onCreated: (String) -> Unit) {
+        viewModelScope.launch {
+            repository.createNoteFromTemplate(templateId)?.let { onCreated(it.id) }
+        }
+    }
+
+    fun saveTemplate(id: String?, name: String, content: String, isDaily: Boolean) {
+        viewModelScope.launch { repository.saveTemplate(id, name, content, isDaily) }
+    }
+
+    fun deleteTemplate(id: String) {
+        viewModelScope.launch { repository.deleteTemplate(id) }
+    }
+
+    fun addStarterTemplates() {
+        viewModelScope.launch { repository.addStarterTemplates() }
     }
 
     fun createNote(title: String = "Untitled Note", pageType: String = "infinite", onCreated: (String) -> Unit) {

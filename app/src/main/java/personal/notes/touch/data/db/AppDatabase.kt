@@ -11,6 +11,7 @@ import personal.notes.touch.data.db.dao.NoteRefDao
 import personal.notes.touch.data.db.dao.NoteTagDao
 import personal.notes.touch.data.db.dao.PageDao
 import personal.notes.touch.data.db.dao.SettingsDao
+import personal.notes.touch.data.db.dao.TemplateDao
 import personal.notes.touch.data.db.entity.FlashCardEntity
 import personal.notes.touch.data.db.entity.FlashCardTagEntity
 import personal.notes.touch.data.db.entity.FlashCardTypeEntity
@@ -24,9 +25,10 @@ import personal.notes.touch.data.db.entity.NoteRefEntity
 import personal.notes.touch.data.db.entity.NoteTagEntity
 import personal.notes.touch.data.db.entity.PageEntity
 import personal.notes.touch.data.db.entity.SettingsEntity
+import personal.notes.touch.data.db.entity.TemplateEntity
 
 /**
- * TouchNotes Room database (current schema version: 8).
+ * TouchNotes Room database (current schema version: 9).
  *
  * ## Migration & data-loss policy (audit C1 / CH4, 2026-11-04)
  *
@@ -69,9 +71,10 @@ import personal.notes.touch.data.db.entity.SettingsEntity
         SettingsEntity::class,
         NoteBlockEntity::class,
         NoteTagEntity::class,
-        NoteRefEntity::class
+        NoteRefEntity::class,
+        TemplateEntity::class
     ],
-    version = 8,
+    version = 9,
     exportSchema = true
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -84,4 +87,5 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun labelDao(): LabelDao
     abstract fun flashCardDao(): FlashCardDao
     abstract fun settingsDao(): SettingsDao
+    abstract fun templateDao(): TemplateDao
 }
