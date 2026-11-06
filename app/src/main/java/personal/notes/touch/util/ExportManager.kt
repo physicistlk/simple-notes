@@ -15,6 +15,7 @@ import kotlinx.coroutines.withContext
 import personal.notes.touch.data.db.entity.NoteEntity
 import personal.notes.touch.data.files.NoteFileStore
 import personal.notes.touch.data.repo.NoteRepository
+import personal.notes.touch.text.MarkdownExport
 import personal.notes.touch.ui.canvas.ImageLayer
 import java.io.File
 import java.io.FileOutputStream
@@ -194,6 +195,42 @@ object ExportManager {
         }
         file.writeText(fullText)
         file
+    }
+
+    /**
+     * Text note → standalone HTML page (inline CSS, no external assets).
+     * Returns the written file so it can be shared straight from the dialog.
+     */
+    suspend fun exportTextNoteToHtmlFile(
+        context: Context,
+        noteTitle: String,
+        content: String
+    ): File = withContext(Dispatchers.IO) {
+        val safeTitle = sanitizeFilename(noteTitle)
+        val file = File(getExportCacheDir(context), "$safeTitle.html")
+        file.outputStream().use { out -> exportTextNoteToHtmlStream(noteTitle, content, out) }
+        file
+    }
+
+    fun exportTextNoteToHtmlStream(title: String, content: String, out: OutputStream) {
+        out.write(MarkdownExport.htmlDocument(title, content).toByteArray(Charsets.UTF_8))
+        out.flush()
+    }
+
+    /** Text note → multi-page A4 PDF rendered from the markdown itself. */
+    suspend fun exportTextNoteToPdfFile(
+        context: Context,
+        noteTitle: String,
+        content: String
+    ): File = withContext(Dispatchers.IO) {
+        val safeTitle = sanitizeFilename(noteTitle)
+        val file = File(getExportCacheDir(context), "$safeTitle.pdf")
+        file.outputStream().use { out -> exportTextNoteToPdfStream(noteTitle, content, out) }
+        file
+    }
+
+    fun exportTextNoteToPdfStream(title: String, content: String, out: OutputStream) {
+        TextNotePdfExporter.write(title, content, out)
     }
 
     /**

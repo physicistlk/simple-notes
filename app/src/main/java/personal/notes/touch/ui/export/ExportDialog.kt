@@ -24,6 +24,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.FileDownload
 import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.AlertDialog
@@ -87,6 +88,10 @@ fun ExportDialog(
 
     val safeFilename = remember(note.title) { ExportManager.sanitizeFilename(note.title) }
 
+    // Text notes get the markdown-rendering exporters (HTML / paginated PDF);
+    // drawing notes keep the rasterised page exporter.
+    val isTextNote = note.pageType == "text"
+
     // SAF Document Creator Launchers
     val createPdfLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("application/pdf")
@@ -97,16 +102,24 @@ fun ExportDialog(
                 exportStatusText = "Writing PDF to device storage..."
                 try {
                     context.contentResolver.openOutputStream(uri)?.use { out ->
-                        ExportManager.exportNoteToPdfStream(
-                            note = note,
-                            repository = repository,
-                            fileStore = fileStore,
-                            currentEditingBitmap = currentBitmap,
-                            currentPageIndex = currentPageIndex,
-                            outputStream = out,
-                            currentEditingBackground = backgroundBitmap,
-                            currentEditingImageLayers = imageLayers
-                        )
+                        if (isTextNote) {
+                            ExportManager.exportTextNoteToPdfStream(
+                                title = note.title,
+                                content = note.content.orEmpty(),
+                                out = out
+                            )
+                        } else {
+                            ExportManager.exportNoteToPdfStream(
+                                note = note,
+                                repository = repository,
+                                fileStore = fileStore,
+                                currentEditingBitmap = currentBitmap,
+                                currentPageIndex = currentPageIndex,
+                                outputStream = out,
+                                currentEditingBackground = backgroundBitmap,
+                                currentEditingImageLayers = imageLayers
+                            )
+                        }
                     }
                     Toast.makeText(context, "PDF saved successfully!", Toast.LENGTH_SHORT).show()
                     onDismiss()
@@ -158,6 +171,32 @@ fun ExportDialog(
                         }
                     }
                     Toast.makeText(context, "Text note saved!", Toast.LENGTH_SHORT).show()
+                    onDismiss()
+                } catch (e: Exception) {
+                    Toast.makeText(context, "Error saving file: ${e.message}", Toast.LENGTH_LONG).show()
+                } finally {
+                    isExporting = false
+                }
+            }
+        }
+    }
+
+    val createHtmlLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("text/html")
+    ) { uri: Uri? ->
+        if (uri != null) {
+            scope.launch {
+                isExporting = true
+                exportStatusText = "Writing HTML page..."
+                try {
+                    context.contentResolver.openOutputStream(uri)?.use { out ->
+                        ExportManager.exportTextNoteToHtmlStream(
+                            title = note.title,
+                            content = note.content.orEmpty(),
+                            out = out
+                        )
+                    }
+                    Toast.makeText(context, "HTML page saved!", Toast.LENGTH_SHORT).show()
                     onDismiss()
                 } catch (e: Exception) {
                     Toast.makeText(context, "Error saving file: ${e.message}", Toast.LENGTH_LONG).show()
@@ -228,7 +267,11 @@ fun ExportDialog(
                     // Option 1: PDF Document
                     ExportOptionCard(
                         title = "PDF Document (.pdf)",
-                        subtitle = "High-resolution multi-page PDF document",
+                        subtitle = if (isTextNote) {
+                            "Paginated A4 PDF rendered from the note text"
+                        } else {
+                            "High-resolution multi-page PDF document"
+                        },
                         icon = Icons.Default.PictureAsPdf,
                         iconTint = Color(0xFFD32F2F),
                         onShareClick = {
@@ -236,16 +279,24 @@ fun ExportDialog(
                                 isExporting = true
                                 exportStatusText = "Rendering PDF pages..."
                                 try {
-                                    val file = ExportManager.exportNoteToPdfFile(
-                                        context = context,
-                                        note = note,
-                                        repository = repository,
-                                        fileStore = fileStore,
-                                        currentEditingBitmap = currentBitmap,
-                                        currentPageIndex = currentPageIndex,
-                                        currentEditingBackground = backgroundBitmap,
-                                        currentEditingImageLayers = imageLayers
-                                    )
+                                    val file = if (isTextNote) {
+                                        ExportManager.exportTextNoteToPdfFile(
+                                            context = context,
+                                            noteTitle = note.title,
+                                            content = note.content.orEmpty()
+                                        )
+                                    } else {
+                                        ExportManager.exportNoteToPdfFile(
+                                            context = context,
+                                            note = note,
+                                            repository = repository,
+                                            fileStore = fileStore,
+                                            currentEditingBitmap = currentBitmap,
+                                            currentPageIndex = currentPageIndex,
+                                            currentEditingBackground = backgroundBitmap,
+                                            currentEditingImageLayers = imageLayers
+                                        )
+                                    }
                                     ExportManager.shareFile(context, file, "application/pdf", "Share PDF Note")
                                     onDismiss()
                                 } catch (e: Exception) {
@@ -322,6 +373,35 @@ fun ExportDialog(
                             },
                             onSaveClick = {
                                 createTextLauncher.launch("$safeFilename.md")
+                            }
+                        )
+
+                        ExportOptionCard(
+                            title = "Web Page (.html)",
+                            subtitle = "Standalone page with formatting, opens in any browser",
+                            icon = Icons.Default.Language,
+                            iconTint = Color(0xFF00796B),
+                            onShareClick = {
+                                scope.launch {
+                                    isExporting = true
+                                    exportStatusText = "Preparing HTML page..."
+                                    try {
+                                        val file = ExportManager.exportTextNoteToHtmlFile(
+                                            context = context,
+                                            noteTitle = note.title,
+                                            content = note.content.orEmpty()
+                                        )
+                                        ExportManager.shareFile(context, file, "text/html", "Share HTML Note")
+                                        onDismiss()
+                                    } catch (e: Exception) {
+                                        Toast.makeText(context, "Export error: ${e.message}", Toast.LENGTH_LONG).show()
+                                    } finally {
+                                        isExporting = false
+                                    }
+                                }
+                            },
+                            onSaveClick = {
+                                createHtmlLauncher.launch("$safeFilename.html")
                             }
                         )
                     }

@@ -49,6 +49,7 @@ Status legend: Planned (not implemented), Implemented. Source cites analysis fil
 - Source: analysis/02-ui-components.md (export image, PDF grey/image PDF, audio, stickers); analysis/03-live-capture.md (exported PDF under note/.pdf)
 - Description: Export current note/page to PNG image and to PDF (via PdfDocument) via SAF (createDocument). Share via Intent.
 - Implementation: `ExportManager` renders canvas bitmap(s) to `PdfDocument` pages; image export copies bitmap to PNG via `MediaStore`/SAF. Run on IO dispatcher with progress.
+- Text notes additionally export as a **standalone HTML page** (inline CSS, no external assets, `MarkdownExport.htmlDocument`) and as a **paginated A4 PDF rendered from the markdown** (`TextNotePdfExporter`: headings, lists, tasks, quotes, code, tables, inline bold/italic/strike/code/highlight/links, page numbers). Local image attachments are named, not embedded, because they live outside the export.
 - Performance Notes: Render off main thread; downscale images to 2048 max; stream to file (avoid full in-memory PDF for large notes).
 - Status: Implemented
 
