@@ -37,6 +37,7 @@ import personal.notes.touch.data.files.NoteFileStore
 import personal.notes.touch.data.repo.FlashCardRepository
 import personal.notes.touch.data.repo.NoteRepository
 import personal.notes.touch.text.BlockCards
+import personal.notes.touch.text.QueryBlocks
 import personal.notes.touch.text.BlockRefs
 import personal.notes.touch.text.TableModel
 import personal.notes.touch.text.WikiLinks
@@ -186,6 +187,24 @@ class TextEditorViewModel(
      * Notes the "Open beside" picker may offer: live text notes only (a
      * drawing note has its own full-screen canvas) and not this note itself.
      */
+    /** Live blocks available to embedded QUERY blocks in this note. */
+    val queryCandidates: StateFlow<List<BlockCandidate>> = repository
+        .observeQueryCandidates()
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
+
+    /** Executes a QUERY block expression against the current candidate index. */
+    fun resultsForQuery(expression: String, excludeBlockId: String): List<BlockCandidate> =
+        QueryBlocks.search(
+            candidates = queryCandidates.value,
+            expression = expression,
+            excludeBlockId = excludeBlockId
+        )
+
+    /** Type shown before a transfer; the repository is authoritative. */
     val noteChoices: StateFlow<List<NoteEntity>> = repository.getAllNotes()
         .map { notes ->
             notes.filter { it.pageType == "text" && it.id != noteId }
@@ -479,6 +498,28 @@ class TextEditorViewModel(
             }
         }
 
+        // Cross-document transfer: a repository event means either this note
+        // received blocks or one of its blocks was moved away. Reload from the
+        // database rather than saving first, so an editor cannot resurrect the
+        // rows the transfer just removed. Autosave then persists that state.
+        repository.blockTransfers
+            .filter { it.sourceNoteId == noteId || it.targetNoteId == noteId }
+            .onEach {
+                if (isInitialized) reloadFromStorage()
+            }
+            .launchIn(viewModelScope)
+
+        // Cross-document transfer: a repository event means either this note
+        // received blocks or one of its blocks was moved away. Reload from the
+        // database rather than saving first, so an editor cannot resurrect the
+        // rows the transfer just removed. Autosave then persists that state.
+        repository.blockTransfers
+            .filter { it.sourceNoteId == noteId || it.targetNoteId == noteId }
+            .onEach {
+                if (isInitialized) reloadFromStorage()
+            }
+            .launchIn(viewModelScope)
+
         // Setup debounced autosave (M2 spec: debounce 1s) — unchanged persistence
         // path. Block edits funnel into _contentValue, so this still covers them;
         // TextEditorScreen additionally calls saveNow() on ON_PAUSE / back /
@@ -528,6 +569,21 @@ class TextEditorViewModel(
         } finally {
             _isSaving.value = false
         }
+    }
+
+    private suspend fun reloadFromStorage() {
+        val latest = repository.getNoteDirect(noteId) ?: return
+        val md = latest.content ?: ""
+        val stored = BlockPersistence.fromEntities(repository.loadNoteBlocks(noteId))
+        val parsed = BlockModel.parseBlocks(md)
+        _blocks.value = when {
+            stored.isEmpty() -> parsed.map { it.copy(id = BlockPersistence.newBlockId()) }
+            BlockModel.serializeBlocks(stored) == BlockModel.serializeBlocks(parsed) -> stored
+            else -> BlockPersistence.reconcileIds(parsed, stored)
+        }
+        _title.value = latest.title
+        _contentValue.value = TextFieldValue(md)
+        _activeBlockId.value = null
     }
 
     /**
@@ -604,7 +660,7 @@ class TextEditorViewModel(
 
         val sel = newValue.selection
         val grew = newValue.text.length > cur.field.text.length
-        val enteredNewline = cur.type != BlockType.CODE &&
+        val enteredNewline = cur.type != BlockType.CODE && cur.type != BlockType.QUERY &&
             grew &&
             sel.collapsed &&
             sel.start in 1..newValue.text.length &&
@@ -633,7 +689,7 @@ class TextEditorViewModel(
         val idx = list.indexOfFirst { it.id == id }
         if (idx < 0) return
         val cur = list[idx]
-        if (cur.type == BlockType.CODE) return // code blocks stay multi-line
+        if (cur.type == BlockType.CODE || cur.type == BlockType.QUERY) return // one-line blocks
         val f = cur.field
         if (f.selection.collapsed) {
             val caret = f.selection.start
@@ -665,7 +721,9 @@ class TextEditorViewModel(
         val cur = list[idx]
         if (!cur.field.selection.collapsed || cur.field.selection.start != 0) return false
         // Atomic fenced/static blocks keep native behaviour only.
-        if (cur.type == BlockType.CODE || cur.type == BlockType.TABLE || cur.type == BlockType.IMAGE) {
+        if (cur.type == BlockType.CODE || cur.type == BlockType.TABLE || cur.type == BlockType.IMAGE ||
+            cur.type == BlockType.QUERY
+        ) {
             return false
         }
 
@@ -800,6 +858,19 @@ class TextEditorViewModel(
         if (updated !== _blocks.value) publishBlocks(updated, FocusTarget(id))
     }
 
+    /** Cross-document transfer of one block and its indented descendants. */
+    fun transferBlock(blockId: String, targetNoteId: String, move: Boolean, onResult: (Int) -> Unit) {
+        if (_isReadOnly.value || targetNoteId.isBlank() || targetNoteId == noteId) {
+            onResult(0)
+            return
+        }
+        viewModelScope.launch {
+            performSave(_title.value, _contentValue.value.text)
+            val count = repository.transferBlocks(noteId, targetNoteId, setOf(blockId), move)
+            onResult(count)
+        }
+    }
+
     /** Markdown of one block, used by the menu's "Copy block" action. */
     fun blockMarkdown(id: String): String? {
         val block = _blocks.value.firstOrNull { it.id == id } ?: return null
@@ -912,6 +983,14 @@ class TextEditorViewModel(
                     indent = cur.indent,
                     field = bodyField
                 )
+                finish(mutable, FocusTarget(clean.id))
+            }
+            BlockCommand.QUERY -> {
+                mutable[idx] = clean.copy(
+                    type = BlockType.QUERY,
+                    field = bodyField
+                )
+                if (freshEmpty) insertAfter(idx, freshParagraph())
                 finish(mutable, FocusTarget(clean.id))
             }
             BlockCommand.IMAGE -> {

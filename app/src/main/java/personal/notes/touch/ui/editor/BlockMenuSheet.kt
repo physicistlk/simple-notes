@@ -47,6 +47,8 @@ fun BlockMenuSheet(
     onDuplicate: () -> Unit,
     onCopy: () -> Unit,
     onAddToDeck: () -> Unit,
+    onMoveToNote: () -> Unit = {},
+    onCopyToNote: () -> Unit = {},
     onDelete: () -> Unit
 ) {
     val themeColor = LocalThemeColor.current
@@ -117,6 +119,10 @@ fun BlockMenuSheet(
             MenuRow(label = "Move down", hint = "↓", onClick = onMoveDown)
             MenuRow(label = "Duplicate", hint = "⧉", onClick = onDuplicate)
             MenuRow(label = "Copy block", hint = "📋", onClick = onCopy)
+            if (block.type != BlockType.IMAGE) {
+                MenuRow(label = "Move to note…", hint = "⇄", onClick = onMoveToNote)
+                MenuRow(label = "Copy to note…", hint = "⛉", onClick = onCopyToNote)
+            }
             // Divider/image blocks carry no text to study; everything else
             // (paragraph, heading, list, task, quote, code, table) can.
             if (block.type != BlockType.DIVIDER && block.type != BlockType.IMAGE) {
@@ -151,6 +157,7 @@ private fun typeLabel(block: EditableBlock): String = when (block.type) {
     BlockType.TABLE -> "Table"
     BlockType.IMAGE -> "Image"
     BlockType.DIVIDER -> "Divider"
+    BlockType.QUERY -> "Query block"
 }
 
 @Composable

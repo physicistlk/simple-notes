@@ -58,6 +58,10 @@ object BlockPersistence {
     fun fromEntities(rows: List<NoteBlockEntity>): List<EditableBlock> =
         rows.sortedBy { it.blockIndex }.map(::fromEntity)
 
+    /** Serialized markdown for persisted rows, identical to the editor output. */
+    fun serializeRows(rows: List<NoteBlockEntity>): String =
+        BlockModel.serializeBlocks(fromEntities(rows))
+
     fun fromEntity(row: NoteBlockEntity): EditableBlock {
         val type = BlockType.values().firstOrNull { it.name == row.blockType }
             ?: BlockType.PARAGRAPH

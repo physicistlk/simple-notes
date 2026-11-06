@@ -11,6 +11,12 @@ import personal.notes.touch.data.db.entity.NoteEntity
 /** Live notes filed directly in one folder (null = unfiled), for the tree. */
 data class FolderCount(val folderId: String?, val count: Int)
 
+/** One note-to-note edge derived from `[[wiki links]]`. */
+data class NoteGraphEdge(
+    val sourceNoteId: String,
+    val targetNoteId: String
+)
+
 @Dao
 interface NoteDao {
     @Query("SELECT * FROM notes WHERE deleted = 0 ORDER BY updatedAt DESC")
@@ -84,4 +90,18 @@ interface NoteDao {
 
     @Query("SELECT COUNT(*) FROM notes WHERE deleted = 0")
     suspend fun count(): Int
+
+    @Query("SELECT * FROM notes WHERE deleted = 0 ORDER BY updatedAt DESC")
+    suspend fun getAllLive(): List<NoteEntity>
+
+    /** Resolved `[[Title]]` links, for the knowledge graph. */
+    @Query(
+        """
+        SELECT r.noteId AS sourceNoteId, n.id AS targetNoteId
+        FROM note_refs r
+        INNER JOIN notes n ON lower(n.title) = r.targetKey AND n.deleted = 0
+        INNER JOIN notes s ON s.id = r.noteId AND s.deleted = 0
+        """
+    )
+    suspend fun getWikiGraphEdges(): List<NoteGraphEdge>
 }

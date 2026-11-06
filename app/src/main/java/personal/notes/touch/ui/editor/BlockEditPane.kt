@@ -90,6 +90,7 @@ import androidx.compose.ui.window.PopupProperties
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import personal.notes.touch.data.db.entity.NoteEntity
 import personal.notes.touch.text.BlockCards
 import personal.notes.touch.text.WikiLinks
 import personal.notes.touch.ui.theme.LocalThemeColor
@@ -113,7 +114,8 @@ import personal.notes.touch.util.ClipboardHelper
 fun BlockEditPane(
     viewModel: TextEditorViewModel,
     listState: LazyListState,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    onOpenNote: (String) -> Unit = {}
 ) {
     val themeColor = LocalThemeColor.current
     val blocks by viewModel.blocks.collectAsState()
@@ -130,8 +132,12 @@ fun BlockEditPane(
     // A note linking to itself is never useful; the popup hides the open note.
     val selfTitle by viewModel.title.collectAsState()
 
+    val noteChoices by viewModel.noteChoices.collectAsState()
     var menuBlockId by remember { mutableStateOf<String?>(null) }
     val menuBlock = blocks.firstOrNull { it.id == menuBlockId }
+    var transferBlockId by remember { mutableStateOf<String?>(null) }
+    var transferMove by remember { mutableStateOf(true) }
+    val transferBlock = blocks.firstOrNull { it.id == transferBlockId }
     var cardBlockId by remember { mutableStateOf<String?>(null) }
     val cardBlock = blocks.firstOrNull { it.id == cardBlockId }
     LaunchedEffect(menuBlockId, blocks) {
@@ -184,6 +190,7 @@ fun BlockEditPane(
                     focusRequesters = focusRequesters,
                     wikiTitles = wikiTitles,
                     selfTitle = selfTitle,
+                    onOpenNote = onOpenNote,
                     onOpenMenu = { menuBlockId = it }
                 )
             }
@@ -217,7 +224,41 @@ fun BlockEditPane(
                 cardBlockId = menuBlock.id
                 menuBlockId = null
             },
+            onMoveToNote = {
+                transferBlockId = menuBlock.id
+                transferMove = true
+                menuBlockId = null
+            },
+            onCopyToNote = {
+                transferBlockId = menuBlock.id
+                transferMove = false
+                menuBlockId = null
+            },
             onDelete = { viewModel.deleteBlock(menuBlock.id); menuBlockId = null }
+        )
+    }
+
+    if (transferBlock != null) {
+        TransferBlockDialog(
+            move = transferMove,
+            targets = noteChoices,
+            onDismiss = { transferBlockId = null },
+            onPick = { targetId ->
+                val id = transferBlock.id
+                val move = transferMove
+                transferBlockId = null
+                viewModel.transferBlock(id, targetId, move) { count ->
+                    Toast.makeText(
+                        context,
+                        if (count > 0) {
+                            (if (move) "Moved " else "Copied ") + "$count block(s)"
+                        } else {
+                            "Could not transfer block"
+                        },
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
         )
     }
 
@@ -323,13 +364,92 @@ private fun AddBlockCardDialog(
     )
 }
 
+@Composable
+private fun TransferBlockDialog(
+    move: Boolean,
+    targets: List<NoteEntity>,
+    onDismiss: () -> Unit,
+    onPick: (String) -> Unit
+) {
+    var query by remember { mutableStateOf("") }
+    val filtered = remember(query, targets) {
+        if (query.isBlank()) targets
+        else targets.filter { it.title.contains(query.trim(), ignoreCase = true) }
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text(if (move) "Move block to note" else "Copy block to note", fontWeight = FontWeight.Bold)
+        },
+        text = {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    text = if (move) {
+                        "The block and indented descendants keep their block ids across notes."
+                    } else {
+                        "The block and indented descendants are copied with new ids."
+                    },
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+                )
+                OutlinedTextField(
+                    value = query,
+                    onValueChange = { query = it },
+                    label = { Text("Search notes") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                if (filtered.isEmpty()) {
+                    Text(
+                        text = "No other text notes",
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f),
+                        modifier = Modifier.padding(vertical = 16.dp)
+                    )
+                } else {
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 320.dp)
+                    ) {
+                        items(filtered.size, key = { filtered[it].id }) { index ->
+                            val target = filtered[index]
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { onPick(target.id) }
+                                    .padding(vertical = 10.dp)
+                            ) {
+                                Text(
+                                    text = target.title.ifBlank { "Untitled Note" },
+                                    fontSize = 15.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                                Text(
+                                    text = if (target.pageType == "text") "Text note" else "Drawing note",
+                                    fontSize = 12.sp,
+                                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Block rows
 // ---------------------------------------------------------------------------
 
 /** Slash menu is not offered inside atomic fenced/table blocks. */
 private val slashForbiddenTypes: Set<BlockType> =
-    setOf(BlockType.CODE, BlockType.TABLE)
+    setOf(BlockType.CODE, BlockType.TABLE, BlockType.QUERY)
 
 /** Vertical travel (in dp) that moves a dragged block by one position. */
 private val REORDER_STEP = 44.dp
@@ -345,7 +465,8 @@ private fun BlockRow(
     focusRequesters: MutableMap<String, FocusRequester>,
     wikiTitles: List<String>,
     selfTitle: String,
-    onOpenMenu: (String) -> Unit
+    onOpenMenu: (String) -> Unit,
+    onOpenNote: (String) -> Unit = {}
 ) {
     val focus = remember(block.id) { FocusRequester() }
     DisposableEffect(block.id) {
@@ -392,6 +513,15 @@ private fun BlockRow(
         block.field.text.startsWith("/") &&
         block.field.selection.end >= 1 &&
         block.type !in slashForbiddenTypes
+
+    val queryCandidates by viewModel.queryCandidates.collectAsState()
+    val queryResults = remember(block.field.text, queryCandidates) {
+        if (block.type == BlockType.QUERY) {
+            viewModel.resultsForQuery(block.field.text, block.id)
+        } else {
+            emptyList()
+        }
+    }
 
     Box(modifier = Modifier.fillMaxWidth()) {
         Row(
@@ -468,6 +598,85 @@ private fun BlockRow(
             }
             Box(modifier = Modifier.weight(1f)) {
                 when (block.type) {
+            BlockType.QUERY -> {
+                Card(
+                    shape = RoundedCornerShape(8.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.45f)
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(12.dp)
+                    ) {
+                        Text(
+                            text = "QUERY",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        BlockTextField(
+                            block = block,
+                            viewModel = viewModel,
+                            focusRequester = focus,
+                            onSlashArmed = { slashArmed = it },
+                            readOnly = isReadOnly,
+                            inlineStyling = false,
+                            textStyle = TextStyle(
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 13.sp,
+                                lineHeight = 18.sp,
+                                color = MaterialTheme.colorScheme.onSurface
+                            ),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        HorizontalDivider(
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.10f),
+                            modifier = Modifier.padding(vertical = 8.dp)
+                        )
+                        if (queryResults.isEmpty()) {
+                            Text(
+                                text = "No matching blocks",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f),
+                                modifier = Modifier.padding(vertical = 4.dp)
+                            )
+                        } else {
+                            queryResults.take(10).forEach { candidate ->
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable { onOpenNote(candidate.noteId) }
+                                        .padding(vertical = 5.dp)
+                                ) {
+                                    Text(
+                                        text = candidate.noteTitle.ifBlank { "Untitled Note" },
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                    Text(
+                                        text = candidate.text,
+                                        fontSize = 13.sp,
+                                        lineHeight = 18.sp,
+                                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.82f)
+                                    )
+                                }
+                            }
+                            if (queryResults.size > 10) {
+                                Text(
+                                    text = "+${queryResults.size - 10} more",
+                                    fontSize = 11.sp,
+                                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.55f)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
             BlockType.DIVIDER -> {
                 HorizontalDivider(
                     modifier = Modifier.padding(vertical = 12.dp),
@@ -992,6 +1201,7 @@ private fun slashGlyph(command: BlockCommand): String = when (command) {
     BlockCommand.TAG -> "#"
     BlockCommand.HIGHLIGHT -> "≡"
     BlockCommand.EMOJI -> "🙂"
+    BlockCommand.QUERY -> "⌕"
 }
 
 // ---------------------------------------------------------------------------

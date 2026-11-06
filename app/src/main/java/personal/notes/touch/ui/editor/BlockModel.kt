@@ -25,7 +25,9 @@ enum class BlockType {
     CODE,
     DIVIDER,
     TABLE,
-    IMAGE
+    IMAGE,
+    /** An embedded live query over the knowledge base. */
+    QUERY
 }
 
 /**
@@ -71,6 +73,8 @@ object BlockModel {
     private val NUMBERED_LINE = Regex("""^(\d{1,9})\. (.*)""")
     private val HEADING_LINE = Regex("""^#{1,6} .*$""")
     private val IMAGE_LINE = Regex("""^!\[[^\]]*\]\([^)]*\)$""")
+    /** Embedded query: `{{query: tag:project alpha}}`, one block per line. */
+    private val QUERY_LINE = Regex("""^\{\{query:\s*(.*?)\s*\}\}$""")
 
     fun blockId(startLine: Int): String = "blk$startLine"
 
@@ -83,6 +87,7 @@ object BlockModel {
         BlockType.NUMBERED -> INDENT_UNIT.repeat(b.indent) + "${b.order}. "
         BlockType.TASK -> INDENT_UNIT.repeat(b.indent) + if (b.checked) "- [x] " else "- [ ] "
         BlockType.QUOTE -> "> "
+        BlockType.QUERY -> ""
         else -> ""
     }
 
@@ -95,6 +100,7 @@ object BlockModel {
         BlockType.TABLE -> b.field.text.split('\n').filter { it.isNotBlank() }
         BlockType.IMAGE -> listOf(b.field.text)
         BlockType.DIVIDER -> listOf("---")
+        BlockType.QUERY -> listOf("{{query:${b.field.text.trim()}}}")
         else -> listOf(markerPrefix(b) + b.field.text)
     }
 
@@ -128,6 +134,18 @@ object BlockModel {
                         closed = closed
                     )
                     i = if (closed) j + 1 else lines.size
+                }
+                QUERY_LINE.matches(trimmed) -> {
+                    val expression = QUERY_LINE.matchEntire(trimmed)
+                        ?.groupValues?.getOrNull(1)
+                        ?.trim()
+                        .orEmpty()
+                    out += EditableBlock(
+                        id = blockId(i),
+                        type = BlockType.QUERY,
+                        field = TextFieldValue(expression)
+                    )
+                    i++
                 }
                 trimmed == "---" || trimmed == "***" || trimmed == "___" -> {
                     out += EditableBlock(id = blockId(i), type = BlockType.DIVIDER)
@@ -261,6 +279,7 @@ object BlockModel {
         if (t.isEmpty()) return null
         if (t.startsWith(CODE_FENCE)) return null
         if (t == "---" || t == "***" || t == "___") return null
+        if (QUERY_LINE.matches(t)) return null
         if (t.startsWith("#")) return null
         val indented = line.trimStart()
         if (indented.startsWith("> ")) return null
@@ -312,6 +331,7 @@ enum class BlockCommand(val label: String, val groupName: String) {
     CODE("Code block", SLASH_GROUP_BASIC),
     TABLE("Table", SLASH_GROUP_RICH),
     IMAGE("Image", SLASH_GROUP_RICH),
+    QUERY("Query block", SLASH_GROUP_RICH),
     LINK("Link", SLASH_GROUP_RICH),
     TAG("Tag", SLASH_GROUP_RICH),
     HIGHLIGHT("Highlight", SLASH_GROUP_RICH),
@@ -326,7 +346,7 @@ enum class BlockCommand(val label: String, val groupName: String) {
         fun slashGroups(): List<Pair<String, List<BlockCommand>>> = listOf(
             GROUP_HEADINGS to listOf(H1, H2, H3, H4, H5, H6),
             GROUP_BASIC to listOf(BULLET, NUMBERED, TASK, QUOTE, DIVIDER, CODE),
-            GROUP_RICH to listOf(TABLE, IMAGE, LINK, TAG, HIGHLIGHT, EMOJI)
+            GROUP_RICH to listOf(TABLE, IMAGE, QUERY, LINK, TAG, HIGHLIGHT, EMOJI)
         )
     }
 }

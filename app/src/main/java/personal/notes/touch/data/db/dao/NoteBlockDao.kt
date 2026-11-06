@@ -43,7 +43,8 @@ abstract class NoteBlockDao {
                b.noteId AS noteId,
                b.text AS text,
                n.title AS noteTitle,
-               b.blockIndex AS blockIndex
+               b.blockIndex AS blockIndex,
+               b.blockType AS blockType
         FROM note_blocks b
         INNER JOIN notes n ON n.id = b.noteId
         WHERE n.deleted = 0
@@ -59,6 +60,26 @@ abstract class NoteBlockDao {
         excludeBlockId: String,
         limit: Int
     ): List<BlockCandidate>
+
+    /**
+     * Live blocks for the embedded query block. Room observes the joined
+     * tables, so typing in any note refreshes every open query.
+     */
+    @Query(
+        """
+        SELECT b.id AS blockId,
+               b.noteId AS noteId,
+               b.text AS text,
+               n.title AS noteTitle,
+               b.blockIndex AS blockIndex,
+               b.blockType AS blockType
+        FROM note_blocks b
+        INNER JOIN notes n ON n.id = b.noteId AND n.deleted = 0
+        WHERE b.text != ''
+        ORDER BY n.updatedAt DESC, b.blockIndex ASC
+        """
+    )
+    abstract fun observeQueryCandidates(): kotlinx.coroutines.flow.Flow<List<BlockCandidate>>
 
     /** Every block of a live note, for the one-time reference reindex. */
     @Query(

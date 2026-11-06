@@ -39,8 +39,11 @@ data class BlockCandidate(
     val noteId: String,
     val text: String,
     val noteTitle: String,
-    val blockIndex: Int
+    val blockIndex: Int,
+    /** [personal.notes.touch.ui.editor.BlockType] name, so a query can skip QUERY blocks. */
+    val blockType: String = "PARAGRAPH"
 )
+
 
 /**
  * Block-reference index (`block_refs`, schema 11).
@@ -64,6 +67,18 @@ abstract class BlockRefDao {
 
     @Query("DELETE FROM block_refs WHERE sourceNoteId IN (SELECT id FROM notes WHERE deleted = 1)")
     abstract suspend fun deleteForRecycledNotes(): Int
+
+    /** Source note → note that owns the referenced block, for the graph view. */
+    @Query(
+        """
+        SELECT r.sourceNoteId AS sourceNoteId, b.noteId AS targetNoteId
+        FROM block_refs r
+        INNER JOIN note_blocks b ON b.id LIKE r.targetKey || '%'
+        INNER JOIN notes s ON s.id = r.sourceNoteId AND s.deleted = 0
+        INNER JOIN notes t ON t.id = b.noteId AND t.deleted = 0
+        """
+    )
+    abstract suspend fun getGraphEdges(): List<NoteGraphEdge>
 
     @Transaction
     open suspend fun replaceForNote(noteId: String, refs: List<BlockRefEntity>) {

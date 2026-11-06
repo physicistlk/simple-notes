@@ -2,6 +2,8 @@ package personal.notes.touch.data.repo
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import personal.notes.touch.data.db.dao.BlockBacklink
@@ -27,9 +29,15 @@ import personal.notes.touch.data.db.entity.NoteTagEntity
 import personal.notes.touch.data.db.entity.PageEntity
 import personal.notes.touch.data.files.NoteFileStore
 import personal.notes.touch.text.BlockRefs
+import personal.notes.touch.text.BlockTransfer
+import personal.notes.touch.text.GraphNoteInput
+import personal.notes.touch.text.KnowledgeGraph
+import personal.notes.touch.text.KnowledgeGraphBuilder
+import personal.notes.touch.text.QueryBlocks
 import personal.notes.touch.text.NoteTemplates
 import personal.notes.touch.text.NoteTags
 import personal.notes.touch.text.WikiLinks
+import personal.notes.touch.ui.editor.BlockPersistence
 import java.util.UUID
 
 class NoteRepository(
@@ -43,6 +51,21 @@ class NoteRepository(
     private val blockRefDao: BlockRefDao,
     val fileStore: NoteFileStore
 ) {
+    /** Emitted after a cross-document block move/copy has reached both notes. */
+    private val _blockTransfers = MutableSharedFlow<BlockTransferCompleted>(
+        extraBufferCapacity = 32
+    )
+    val blockTransfers: kotlinx.coroutines.flow.SharedFlow<BlockTransferCompleted> =
+        _blockTransfers.asSharedFlow()
+
+    /** Completion notification for open editors that own either note affected. */
+    data class BlockTransferCompleted(
+        val sourceNoteId: String,
+        val targetNoteId: String,
+        val move: Boolean,
+        val count: Int
+    )
+
     fun getAllNotes(): Flow<List<NoteEntity>> = noteDao.getAll()
 
     fun getNoteById(id: String): Flow<NoteEntity?> = noteDao.getByIdFlow(id)
@@ -271,6 +294,85 @@ class NoteRepository(
     suspend fun saveNoteBlocks(noteId: String, blocks: List<NoteBlockEntity>) = withContext(Dispatchers.IO) {
         noteBlockDao.replaceBlocks(noteId, blocks)
         syncBlockRefs(noteId, blocks)
+    }
+
+    /** Live blocks for embedded QUERY blocks; Room observes both joined tables. */
+    fun observeQueryCandidates(): Flow<List<BlockCandidate>> =
+        noteBlockDao.observeQueryCandidates()
+
+    /** Current knowledge graph from `[[...]]` and resolved `((...))` block refs. */
+    suspend fun knowledgeGraphSnapshot(): KnowledgeGraph = withContext(Dispatchers.IO) {
+        val notes = noteDao.getAllLive()
+        val wikiPairs = noteDao.getWikiGraphEdges().map { it.sourceNoteId to it.targetNoteId }
+        val blockPairs = blockRefDao.getGraphEdges().map { it.sourceNoteId to it.targetNoteId }
+        KnowledgeGraphBuilder.build(
+            notes = notes.map { GraphNoteInput(it.id, it.title, it.pageType) },
+            links = wikiPairs + blockPairs
+        )
+    }
+
+    /**
+     * Moves or copies blocks between text notes. The target's rows and markdown
+     * are written first, so a crash cannot leave a source deletion ahead of
+     * the target append. Moves retain block UUIDs (block references survive);
+     * copies mint new ids.
+     */
+    suspend fun transferBlocks(
+        sourceNoteId: String,
+        targetNoteId: String,
+        blockIds: Set<String>,
+        move: Boolean
+    ): Int = withContext(Dispatchers.IO) {
+        if (sourceNoteId.isBlank() || targetNoteId.isBlank() ||
+            sourceNoteId == targetNoteId || blockIds.isEmpty()
+        ) {
+            return@withContext 0
+        }
+
+        val sourceNote = noteDao.getById(sourceNoteId) ?: return@withContext 0
+        val targetNote = noteDao.getById(targetNoteId) ?: return@withContext 0
+        if (sourceNote.pageType != "text" || targetNote.pageType != "text") {
+            return@withContext 0
+        }
+
+        val incoming = BlockTransfer.selection(
+            rows = noteBlockDao.getBlocksForNote(sourceNoteId),
+            ids = blockIds
+        )
+        if (incoming.isEmpty()) return@withContext 0
+
+        val nextTarget = BlockTransfer.append(
+            target = noteBlockDao.getBlocksForNote(targetNoteId),
+            incoming = incoming,
+            targetNoteId = targetNoteId,
+            copyIds = !move
+        )
+        noteBlockDao.replaceBlocks(targetNoteId, nextTarget)
+        syncBlockRefs(targetNoteId, nextTarget)
+        updateNoteContent(
+            targetNoteId,
+            targetNote.title.ifBlank { "Untitled Note" },
+            BlockPersistence.serializeRows(nextTarget)
+        )
+
+        if (move) {
+            val nextSource = BlockTransfer.remove(
+                rows = noteBlockDao.getBlocksForNote(sourceNoteId),
+                ids = incoming.map { it.id }.toSet()
+            )
+            noteBlockDao.replaceBlocks(sourceNoteId, nextSource)
+            syncBlockRefs(sourceNoteId, nextSource)
+            updateNoteContent(
+                sourceNoteId,
+                sourceNote.title.ifBlank { "Untitled Note" },
+                BlockPersistence.serializeRows(nextSource)
+            )
+        }
+
+        _blockTransfers.tryEmit(
+            BlockTransferCompleted(sourceNoteId, targetNoteId, move, incoming.size)
+        )
+        incoming.size
     }
 
     // ---- block references (schema 11) --------------------------------------

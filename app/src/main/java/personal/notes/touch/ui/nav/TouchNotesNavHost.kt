@@ -259,6 +259,9 @@ fun TouchNotesNavHost(
                 onBackClick = { navController.popBackStack() }
             )
         }
+
+        // TODO: Re-enable Graph screen after fixing Canvas API
+        // composable(Screen.Graph.route) { ... }
         }
     }
 }
