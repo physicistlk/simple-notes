@@ -255,6 +255,20 @@ class CanvasViewModel(
         _uiState.value = _uiState.value.copy(drawerTab = tab)
     }
 
+    fun setPageTurningDirection(direction: Int) {
+        _uiState.value = _uiState.value.copy(pageTurningDirection = direction)
+        viewModelScope.launch(Dispatchers.IO) {
+            settingsRepository?.updatePageTurningDirection(direction)
+        }
+    }
+
+    fun setPageTurningMode(mode: Int) {
+        _uiState.value = _uiState.value.copy(pageTurningMode = mode)
+        viewModelScope.launch(Dispatchers.IO) {
+            settingsRepository?.updatePageTurningMode(mode)
+        }
+    }
+
     fun toggleBookmark(pageIndex: Int) {
         val current = _uiState.value.bookmarkedPages.toMutableSet()
         if (current.contains(pageIndex)) {

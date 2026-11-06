@@ -24,6 +24,7 @@ import personal.notes.touch.util.PdfTextSelectionMath
 import java.util.ArrayDeque
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import kotlin.math.roundToInt
 
 enum class CanvasTool {
     FOUNTAIN_PEN,
@@ -618,7 +619,7 @@ class DrawingCanvasView @JvmOverloads constructor(
         strokeWidth = 1.5f
     }
 
-    private val bitmapPaint = Paint(Paint.DITHER_FLAG)
+    private val bitmapPaint = Paint(Paint.DITHER_FLAG or Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
 
     // Undo / Redo
     private val maxUndoSnapshots = 20
@@ -763,8 +764,8 @@ class DrawingCanvasView @JvmOverloads constructor(
     }
 
     private fun initBackingBitmap(width: Int, height: Int) {
-        val pageWidth = width.coerceIn(1, 2048)
-        val safeHeight = height.coerceIn(1, 2048)
+        val pageWidth = width.coerceIn(1, 4096)
+        val safeHeight = height.coerceIn(1, 4096)
         val targetWidth = if (doublePage) (pageWidth * 2 + 40).coerceIn(1, 4096) else pageWidth
         val bmp = BitmapUtils.createSafeBitmap(targetWidth, safeHeight)
         backingBitmap = bmp
@@ -802,8 +803,16 @@ class DrawingCanvasView @JvmOverloads constructor(
         if (bitmap != null) {
             loadBitmap(bitmap)
         } else {
-            val w = if (width > 0) width else 1080
-            val h = if (height > 0) height else if (pageType == "a4") 1528 else 1920
+            val w = if (pdfPageWidthPts > 0f && pdfBasePxPerPt > 0f) {
+                (pdfPageWidthPts * pdfBasePxPerPt).roundToInt()
+            } else if (pageType == "a4" || pageType == "pdf") {
+                2160
+            } else if (width > 0) width else 1080
+            val h = if (pdfPageHeightPts > 0f && pdfBasePxPerPt > 0f) {
+                (pdfPageHeightPts * pdfBasePxPerPt).roundToInt()
+            } else if (pageType == "a4" || pageType == "pdf") {
+                3056
+            } else if (height > 0) height else 1920
             initBackingBitmap(w, h)
             undoStack.clear()
             clearRedoStack()

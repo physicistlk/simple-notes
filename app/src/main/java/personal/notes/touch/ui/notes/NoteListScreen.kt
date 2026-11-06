@@ -305,8 +305,8 @@ fun NoteListScreen(
                             noteId = noteId,
                             repository = viewModel.repository,
                             fileStore = fileStore,
-                            targetWidth = 1080,
-                            targetHeight = 1528,
+                            targetWidth = 2160,
+                            targetHeight = 3056,
                             reuseFirstPage = true,
                             onPageError = { msg -> showPageError(msg) }
                         )

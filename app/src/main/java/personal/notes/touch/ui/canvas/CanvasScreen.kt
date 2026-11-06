@@ -265,14 +265,11 @@ fun CanvasScreen(
         }
         // Same base geometry the import used, so pages keep their size/aspect.
         val pageTypeName = note?.pageType ?: "infinite"
-        val targetHeight = if (pageTypeName == "a4" || pageTypeName == "pdf") 1528 else 1920
-        val (baseOutWidth, _) = PdfImportManager.calculateOutputSize(
-            size[0].roundToInt().coerceAtLeast(1),
-            size[1].roundToInt().coerceAtLeast(1),
-            1080,
-            targetHeight
-        )
-        val basePxPerPt = baseOutWidth / size[0]
+        val targetHeight = if (pageTypeName == "a4" || pageTypeName == "pdf") 3056f else 3840f
+        val targetWidth = 2160f
+        val scale = minOf(targetWidth / size[0], targetHeight / size[1])
+        val baseOutWidth = (size[0] * scale).roundToInt().coerceAtLeast(1)
+        val basePxPerPt = scale
         canvas.setPdfBackground(size[0], size[1], basePxPerPt) { pxPerPt, outW, outH ->
             pdfDocCache.document(relPath)?.renderPageAt(pdfPageIndex, pxPerPt, outW, outH)
         }
@@ -327,8 +324,8 @@ fun CanvasScreen(
         val canvas = canvasViewRef ?: return
         val page = vectorPdfPage(pageIndex)
         if (page != null) {
-            canvas.setPageContent(bitmap)
             applyPdfBackground(canvas, page)
+            canvas.setPageContent(bitmap)
         } else {
             canvas.setPdfBackground(0f, 0f, 0f, null)
             canvas.setPdfTextSource(null)
@@ -361,15 +358,10 @@ fun CanvasScreen(
             val strokes = withContext(Dispatchers.IO) { viewModel.loadPageStrokes(currentPageIndex) }
             val canvas = canvasViewRef
             if (canvas != null) {
-                canvas.setPageContent(strokes)
-                // The saved page PNG is the raster ground truth of the stroke
-                // layer (applied by setPageContent above). Assigning it also to
-                // backgroundBitmap painted every baked stroke a second time on
-                // reopen — keep a single layer: vector pages re-render their
-                // background from the PDF source instead.
                 canvas.backgroundBitmap = null
                 viewModel.setPageLoadedFromDisk(true)
                 applyPdfBackground(canvas, vectorPage)
+                canvas.setPageContent(strokes)
             }
         } else {
             val savedBitmap = viewModel.loadCurrentPageBitmap()
@@ -473,15 +465,19 @@ fun CanvasScreen(
                             noteId = noteId,
                             repository = viewModel.repository,
                             fileStore = viewModel.fileStore,
-                            targetWidth = 1080,
-                            targetHeight = if ((note?.pageType ?: "infinite").let { it == "a4" || it == "pdf" }) 1528 else 1920,
+                            targetWidth = 2160,
+                            targetHeight = if ((note?.pageType ?: "infinite").let { it == "a4" || it == "pdf" }) 3056 else 3840,
                             reuseFirstPage = false,
                             onPageError = { msg -> showPageError(msg) }
                         )
                     }
-                    // Non-destructive: background layer only, strokes untouched.
-                    firstPageBitmap?.let { bmp ->
-                        canvasViewRef?.backgroundBitmap = bmp
+                    val canvas = canvasViewRef
+                    val curIdx = viewModel.currentPageIndex.value
+                    val curPage = vectorPdfPage(curIdx)
+                    if (canvas != null && curPage != null) {
+                        applyPdfBackground(canvas, curPage)
+                    } else if (firstPageBitmap != null) {
+                        canvas?.backgroundBitmap = firstPageBitmap
                     }
                     android.widget.Toast.makeText(
                         context,
@@ -715,8 +711,8 @@ fun CanvasScreen(
                                     try {
                                         imported.document.renderPage(
                                             pageIndex = idx,
-                                            targetWidth = if (w > 0) w else 1080,
-                                            targetHeight = if (h > 0) h else if ((note?.pageType ?: "infinite").let { it == "a4" || it == "pdf" }) 1528 else 1920
+                                            targetWidth = if (w > 0) w else 2160,
+                                            targetHeight = if (h > 0) h else if ((note?.pageType ?: "infinite").let { it == "a4" || it == "pdf" }) 3056 else 3840
                                         )
                                     } finally {
                                         imported.document.close()
@@ -1185,7 +1181,8 @@ fun CanvasScreen(
                     } else false
                 }
         ) {
-                val isContinuous = uiState.pageTurningMode == 1
+                val isInfinite = (note?.pageType ?: "infinite") == "infinite"
+                val isContinuous = !isInfinite && uiState.pageTurningMode == 0
                 val isHorizontal = uiState.pageTurningDirection == 1
 
                 var continuousScale by remember { mutableStateOf(1f) }
@@ -1193,18 +1190,6 @@ fun CanvasScreen(
                 var continuousPanY by remember { mutableStateOf(0f) }
 
                 if (isContinuous) {
-                    // Continuous scroll mode: all pages in a scrollable list
-                    val pageBitmapsState = remember { mutableStateOf<List<Pair<Int, android.graphics.Bitmap?>>>(emptyList()) }
-                    LaunchedEffect(pages, viewModel.noteId) {
-                        val bitmaps = pages.mapIndexed { idx, page ->
-                            val bmp = try {
-                                viewModel.repository.loadPageBitmap(viewModel.noteId, idx)
-                            } catch (e: Exception) { null }
-                            idx to bmp
-                        }
-                        pageBitmapsState.value = bitmaps
-                    }
-                    val pageBitmaps = pageBitmapsState.value
                     if (isHorizontal) {
                         androidx.compose.foundation.lazy.LazyRow(
                             modifier = Modifier
@@ -1216,28 +1201,29 @@ fun CanvasScreen(
                                         continuousPanY += pan.y
                                     }
                                 },
-                            horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(8.dp)
+                            horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(16.dp),
+                            contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp)
                         ) {
-                            items(pageBitmaps.size) { idx ->
-                                val bmp = pageBitmaps.getOrNull(idx)?.second
-                                androidx.compose.foundation.Image(
-                                    bitmap = bmp?.asImageBitmap() ?: androidx.compose.ui.graphics.ImageBitmap(1, 1),
-                                    contentDescription = "Page ${idx + 1}",
+                            items(pages.size) { idx ->
+                                val page = pages[idx]
+                                ContinuousPageView(
+                                    pageIndex = idx,
+                                    page = page,
+                                    noteId = viewModel.noteId,
+                                    pdfDocCache = pdfDocCache,
+                                    repository = viewModel.repository,
+                                    scale = continuousScale,
+                                    panX = continuousPanX,
+                                    panY = continuousPanY,
                                     modifier = androidx.compose.ui.Modifier
                                         .fillParentMaxHeight()
-                                        .aspectRatio(0.707f)
-                                        .graphicsLayer {
-                                            scaleX = continuousScale
-                                            scaleY = continuousScale
-                                            translationX = continuousPanX
-                                            translationY = continuousPanY
+                                        .aspectRatio(0.707f),
+                                    onClick = {
+                                        viewModel.setPageTurningMode(1)
+                                        viewModel.goToPage(idx, canvasViewRef?.getBackingBitmap()) { newBmp ->
+                                            applyLoadedPage(idx, newBmp)
                                         }
-                                        .clickable {
-                                            // Switch to single mode to edit this page
-                                            viewModel.goToPage(idx, canvasViewRef?.getBackingBitmap()) { newBmp ->
-                                                applyLoadedPage(idx, newBmp)
-                                            }
-                                        }
+                                    }
                                 )
                             }
                         }
@@ -1252,27 +1238,29 @@ fun CanvasScreen(
                                         continuousPanY += pan.y
                                     }
                                 },
-                            verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(8.dp)
+                            verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(16.dp),
+                            contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 16.dp, horizontal = 32.dp)
                         ) {
-                            items(pageBitmaps.size) { idx ->
-                                val bmp = pageBitmaps.getOrNull(idx)?.second
-                                androidx.compose.foundation.Image(
-                                    bitmap = bmp?.asImageBitmap() ?: androidx.compose.ui.graphics.ImageBitmap(1, 1),
-                                    contentDescription = "Page ${idx + 1}",
+                            items(pages.size) { idx ->
+                                val page = pages[idx]
+                                ContinuousPageView(
+                                    pageIndex = idx,
+                                    page = page,
+                                    noteId = viewModel.noteId,
+                                    pdfDocCache = pdfDocCache,
+                                    repository = viewModel.repository,
+                                    scale = continuousScale,
+                                    panX = continuousPanX,
+                                    panY = continuousPanY,
                                     modifier = androidx.compose.ui.Modifier
                                         .fillMaxWidth()
-                                        .aspectRatio(0.707f)
-                                        .graphicsLayer {
-                                            scaleX = continuousScale
-                                            scaleY = continuousScale
-                                            translationX = continuousPanX
-                                            translationY = continuousPanY
+                                        .aspectRatio(0.707f),
+                                    onClick = {
+                                        viewModel.setPageTurningMode(1)
+                                        viewModel.goToPage(idx, canvasViewRef?.getBackingBitmap()) { newBmp ->
+                                            applyLoadedPage(idx, newBmp)
                                         }
-                                        .clickable {
-                                            viewModel.goToPage(idx, canvasViewRef?.getBackingBitmap()) { newBmp ->
-                                                applyLoadedPage(idx, newBmp)
-                                            }
-                                        }
+                                    }
                                 )
                             }
                         }
@@ -1321,13 +1309,13 @@ fun CanvasScreen(
                                     val pageIdx = viewModel.currentPageIndex.value
                                     val vectorPage = vectorPdfPage(pageIdx)
                                     if (vectorPage != null) {
+                                        backgroundBitmap = null
+                                        viewModel.setPageLoadedFromDisk(true)
+                                        applyPdfBackground(this@apply, vectorPage)
                                         val strokes = withContext(Dispatchers.IO) {
                                             viewModel.loadPageStrokes(pageIdx)
                                         }
                                         setPageContent(strokes)
-                                        backgroundBitmap = null
-                                        viewModel.setPageLoadedFromDisk(true)
-                                        applyPdfBackground(this@apply, vectorPage)
                                     } else {
                                         val savedBitmap = viewModel.loadCurrentPageBitmap()
                                         setPageContent(savedBitmap)
@@ -2165,6 +2153,177 @@ fun CanvasScreen(
                                     .fillMaxHeight()
                                     .padding(start = 14.dp, top = 16.dp, end = 10.dp, bottom = 16.dp)
                             ) {
+                                // Header: Back to Notes & Close
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.clickable { saveAndExit() }
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                                            contentDescription = "Back",
+                                            tint = Color(0xFF333333),
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text(
+                                            text = "Back",
+                                            fontSize = 13.sp,
+                                            color = Color(0xFF333333),
+                                            fontWeight = FontWeight.Medium
+                                        )
+                                    }
+                                    IconButton(
+                                        onClick = { viewModel.toggleThumbnailDrawer(false) },
+                                        modifier = Modifier.size(28.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Close,
+                                            contentDescription = "Close Menu",
+                                            tint = Color.Gray,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+                                }
+
+                                // Page Settings Card: Page turning direction & Page turning mode
+                                val isInfiniteNote = (note?.pageType ?: "infinite") == "infinite"
+                                Card(
+                                    modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
+                                    shape = RoundedCornerShape(8.dp),
+                                    colors = CardDefaults.cardColors(containerColor = Color(0xFFF7F7F7)),
+                                    border = androidx.compose.foundation.BorderStroke(0.5.dp, Color(0xFFE0E0E0))
+                                ) {
+                                    Column(modifier = Modifier.padding(10.dp)) {
+                                        // 1. Page turning direction
+                                        Text(
+                                            text = "Page turning direction",
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = Color(0xFF222222)
+                                        )
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .height(32.dp)
+                                                .background(Color(0xFFE8E8E8), RoundedCornerShape(6.dp))
+                                                .padding(2.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            val isVert = uiState.pageTurningDirection == 0
+                                            Surface(
+                                                modifier = Modifier
+                                                    .weight(1f)
+                                                    .fillMaxHeight()
+                                                    .clickable { viewModel.setPageTurningDirection(0) },
+                                                shape = RoundedCornerShape(5.dp),
+                                                color = if (isVert) OrangePrimary else Color.Transparent,
+                                                shadowElevation = if (isVert) 1.dp else 0.dp
+                                            ) {
+                                                Box(contentAlignment = Alignment.Center) {
+                                                    Text(
+                                                        text = "Vertical",
+                                                        fontSize = 11.sp,
+                                                        fontWeight = if (isVert) FontWeight.Bold else FontWeight.Normal,
+                                                        color = if (isVert) Color.White else Color.DarkGray
+                                                    )
+                                                }
+                                            }
+                                            Surface(
+                                                modifier = Modifier
+                                                    .weight(1f)
+                                                    .fillMaxHeight()
+                                                    .clickable { viewModel.setPageTurningDirection(1) },
+                                                shape = RoundedCornerShape(5.dp),
+                                                color = if (!isVert) OrangePrimary else Color.Transparent,
+                                                shadowElevation = if (!isVert) 1.dp else 0.dp
+                                            ) {
+                                                Box(contentAlignment = Alignment.Center) {
+                                                    Text(
+                                                        text = "Horizontal",
+                                                        fontSize = 11.sp,
+                                                        fontWeight = if (!isVert) FontWeight.Bold else FontWeight.Normal,
+                                                        color = if (!isVert) Color.White else Color.DarkGray
+                                                    )
+                                                }
+                                            }
+                                        }
+
+                                        Spacer(modifier = Modifier.height(8.dp))
+
+                                        // 2. Page turning mode
+                                        Text(
+                                            text = "Page turning mode",
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = Color(0xFF222222)
+                                        )
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .height(32.dp)
+                                                .background(Color(0xFFE8E8E8), RoundedCornerShape(6.dp))
+                                                .padding(2.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            val isContinuousMode = !isInfiniteNote && uiState.pageTurningMode == 0
+                                            Surface(
+                                                modifier = Modifier
+                                                    .weight(1f)
+                                                    .fillMaxHeight()
+                                                    .clickable(enabled = !isInfiniteNote) {
+                                                        if (!isInfiniteNote) viewModel.setPageTurningMode(0)
+                                                    },
+                                                shape = RoundedCornerShape(5.dp),
+                                                color = if (isContinuousMode) OrangePrimary else Color.Transparent,
+                                                shadowElevation = if (isContinuousMode) 1.dp else 0.dp
+                                            ) {
+                                                Box(contentAlignment = Alignment.Center) {
+                                                    Text(
+                                                        text = "Continuous",
+                                                        fontSize = 11.sp,
+                                                        fontWeight = if (isContinuousMode) FontWeight.Bold else FontWeight.Normal,
+                                                        color = if (isContinuousMode) Color.White else if (!isInfiniteNote) Color.DarkGray else Color.Gray
+                                                    )
+                                                }
+                                            }
+                                            val isSingleMode = isInfiniteNote || uiState.pageTurningMode == 1
+                                            Surface(
+                                                modifier = Modifier
+                                                    .weight(1f)
+                                                    .fillMaxHeight()
+                                                    .clickable { viewModel.setPageTurningMode(1) },
+                                                shape = RoundedCornerShape(5.dp),
+                                                color = if (isSingleMode) OrangePrimary else Color.Transparent,
+                                                shadowElevation = if (isSingleMode) 1.dp else 0.dp
+                                            ) {
+                                                Box(contentAlignment = Alignment.Center) {
+                                                    Text(
+                                                        text = "Single",
+                                                        fontSize = 11.sp,
+                                                        fontWeight = if (isSingleMode) FontWeight.Bold else FontWeight.Normal,
+                                                        color = if (isSingleMode) Color.White else Color.DarkGray
+                                                    )
+                                                }
+                                            }
+                                        }
+                                        if (isInfiniteNote) {
+                                            Spacer(modifier = Modifier.height(2.dp))
+                                            Text(
+                                                text = "Continuous not required for infinite",
+                                                fontSize = 10.sp,
+                                                color = Color.Gray
+                                            )
+                                        }
+                                    }
+                                }
+
                                 when (uiState.drawerTab) {
                                     DrawerTab.THUMBNAILS -> {
                                         // Header
@@ -2975,6 +3134,114 @@ fun SettingsCheckboxRow(
                 text = subtitle,
                 fontSize = 11.sp,
                 color = Color.Gray
+            )
+        }
+    }
+}
+
+@Composable
+fun ContinuousPageView(
+    pageIndex: Int,
+    page: personal.notes.touch.data.db.entity.PageEntity,
+    noteId: String,
+    pdfDocCache: personal.notes.touch.util.PdfDocumentCache,
+    repository: personal.notes.touch.data.repo.NoteRepository,
+    scale: Float,
+    panX: Float,
+    panY: Float,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit
+) {
+    val isVector = page.pdfSourcePath.isNotEmpty() && page.pdfPageIndex >= 0
+    val pageBitmapState = remember(page.id, page.pdfSourcePath, page.pdfPageIndex, page.updatedAt) {
+        mutableStateOf<android.graphics.Bitmap?>(null)
+    }
+
+    LaunchedEffect(page.id, page.pdfSourcePath, page.pdfPageIndex, page.updatedAt) {
+        val bmp = withContext(Dispatchers.IO) {
+            try {
+                if (isVector) {
+                    val doc = pdfDocCache.document(page.pdfSourcePath)
+                    if (doc != null) {
+                        val size = doc.pageSize(page.pdfPageIndex)
+                        val pW = size[0].coerceAtLeast(1f)
+                        val pH = size[1].coerceAtLeast(1f)
+                        val targetW = 1600
+                        val renderScale = targetW / pW
+                        val outW = targetW
+                        val outH = (pH * renderScale).roundToInt().coerceAtLeast(1)
+                        val pdfBmp = doc.renderPageAt(page.pdfPageIndex, renderScale, outW, outH)
+                        val strokes = repository.loadPageStrokes(noteId, pageIndex)
+                        if (pdfBmp != null && strokes != null) {
+                            val composite = android.graphics.Bitmap.createBitmap(outW, outH, android.graphics.Bitmap.Config.ARGB_8888)
+                            val canvas = android.graphics.Canvas(composite)
+                            val paint = android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG or android.graphics.Paint.ANTI_ALIAS_FLAG)
+                            canvas.drawBitmap(pdfBmp, 0f, 0f, paint)
+                            canvas.drawBitmap(strokes, null, android.graphics.Rect(0, 0, outW, outH), paint)
+                            pdfBmp.recycle()
+                            composite
+                        } else {
+                            pdfBmp ?: strokes ?: repository.loadPageBitmap(noteId, pageIndex)
+                        }
+                    } else {
+                        repository.loadPageBitmap(noteId, pageIndex)
+                    }
+                } else {
+                    repository.loadPageBitmap(noteId, pageIndex)
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                null
+            }
+        }
+        pageBitmapState.value = bmp
+    }
+
+    val bmp = pageBitmapState.value
+    Box(
+        modifier = modifier
+            .graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+                translationX = panX
+                translationY = panY
+            }
+            .clickable { onClick() }
+    ) {
+        if (bmp != null && !bmp.isRecycled) {
+            androidx.compose.foundation.Image(
+                bitmap = bmp.asImageBitmap(),
+                contentDescription = "Page ${pageIndex + 1}",
+                modifier = Modifier.fillMaxSize(),
+                filterQuality = androidx.compose.ui.graphics.FilterQuality.High
+            )
+        } else {
+            Surface(
+                modifier = Modifier.fillMaxSize(),
+                color = Color.White,
+                shape = RoundedCornerShape(4.dp),
+                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFE0E0E0))
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    androidx.compose.material3.CircularProgressIndicator(
+                        modifier = Modifier.size(24.dp),
+                        color = OrangePrimary,
+                        strokeWidth = 2.dp
+                    )
+                }
+            }
+        }
+        Surface(
+            color = Color.Black.copy(alpha = 0.5f),
+            shape = RoundedCornerShape(bottomEnd = 8.dp),
+            modifier = Modifier.align(Alignment.TopStart)
+        ) {
+            Text(
+                text = "${pageIndex + 1}",
+                color = Color.White,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
             )
         }
     }

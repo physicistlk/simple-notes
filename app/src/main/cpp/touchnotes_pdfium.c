@@ -235,8 +235,9 @@ Java_personal_notes_touch_util_PdfiumBridge_render(JNIEnv *env, jobject thiz,
                 int startY = (int) lroundf(-srcY * pxPerPt);
                 int sizeX = (int) lroundf(FPDF_GetPageWidthF(page) * pxPerPt);
                 int sizeY = (int) lroundf(FPDF_GetPageHeightF(page) * pxPerPt);
+                int flags = (renderAnnots ? FPDF_ANNOT : 0) | FPDF_LCD_TEXT;
                 FPDF_RenderPageBitmap(target, page, startX, startY, sizeX, sizeY, 0,
-                                      renderAnnots ? FPDF_ANNOT : 0);
+                                      flags);
                 FPDFBitmap_Destroy(target);
                 ok = JNI_TRUE;
             }

@@ -22,12 +22,12 @@ object PdfRenderPolicy {
 
     /**
      * Total pixel budget per background bitmap. ARGB_8888 = 4 bytes/px, so
-     * 8M px ≈ 32 MB — a safe single-page budget on low-end tablets.
+     * 18M px ≈ 72 MB — high quality 300+ DPI render budget for vector pages.
      */
-    const val MAX_PIXELS = 8_000_000L
+    const val MAX_PIXELS = 18_000_000L
 
-    /** Re-render only when the needed scale exceeds the current one by this factor. */
-    const val HYSTERESIS = 1.4f
+    /** Re-render when the needed scale exceeds current by 15% for smooth vector sharpness. */
+    const val HYSTERESIS = 1.15f
 
     /**
      * True when a render at [neededPxPerPt] would improve on a bitmap

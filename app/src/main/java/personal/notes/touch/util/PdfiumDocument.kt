@@ -63,22 +63,19 @@ class PdfiumDocument : AutoCloseable {
 
     /**
      * Renders [pageIndex] fitted into [targetWidth]×[targetHeight], keeping
-     * the page aspect ratio and the same [PdfImportManager.MAX_DIMENSION]
-     * cap as the historical raster importer (so page geometry does not jump
-     * between builds).
+     * the page aspect ratio up to [PdfRenderPolicy.MAX_DIMENSION] (4096 px).
      */
     fun renderPage(pageIndex: Int, targetWidth: Int, targetHeight: Int): Bitmap? {
         val size = pageSize(pageIndex)
         val ptsW = size[0]
         val ptsH = size[1]
         if (ptsW <= 0f || ptsH <= 0f) return null
-        val (outW, outH) = PdfImportManager.calculateOutputSize(
-            ptsW.roundToInt().coerceAtLeast(1),
-            ptsH.roundToInt().coerceAtLeast(1),
-            targetWidth,
-            targetHeight
-        )
-        return renderPageAt(pageIndex, outW.toFloat() / ptsW, outW, outH)
+        val tW = targetWidth.coerceIn(1, PdfRenderPolicy.MAX_DIMENSION)
+        val tH = targetHeight.coerceIn(1, PdfRenderPolicy.MAX_DIMENSION)
+        val scale = minOf(tW.toFloat() / ptsW, tH.toFloat() / ptsH)
+        val outW = (ptsW * scale).roundToInt().coerceIn(1, PdfRenderPolicy.MAX_DIMENSION)
+        val outH = (ptsH * scale).roundToInt().coerceIn(1, PdfRenderPolicy.MAX_DIMENSION)
+        return renderPageAt(pageIndex, scale, outW, outH)
     }
 
     /**
