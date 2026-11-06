@@ -118,6 +118,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.platform.LocalContext
@@ -1180,6 +1182,68 @@ fun CanvasScreen(
                     } else false
                 }
         ) {
+                val isContinuous = uiState.pageTurningMode == 1
+                val isHorizontal = uiState.pageTurningDirection == 1
+
+                if (isContinuous) {
+                    // Continuous scroll mode: all pages in a scrollable list
+                    val pageBitmapsState = remember { mutableStateOf<List<Pair<Int, android.graphics.Bitmap?>>>(emptyList()) }
+                    LaunchedEffect(pages, viewModel.noteId) {
+                        val bitmaps = pages.mapIndexed { idx, page ->
+                            val bmp = try {
+                                viewModel.repository.loadPageBitmap(viewModel.noteId, idx)
+                            } catch (e: Exception) { null }
+                            idx to bmp
+                        }
+                        pageBitmapsState.value = bitmaps
+                    }
+                    val pageBitmaps = pageBitmapsState.value
+                    if (isHorizontal) {
+                        androidx.compose.foundation.lazy.LazyRow(
+                            modifier = Modifier.fillMaxSize(),
+                            horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(8.dp)
+                        ) {
+                            items(pageBitmaps.size) { idx ->
+                                val bmp = pageBitmaps.getOrNull(idx)?.second
+                                androidx.compose.foundation.Image(
+                                    bitmap = bmp?.asImageBitmap() ?: androidx.compose.ui.graphics.ImageBitmap(1, 1),
+                                    contentDescription = "Page ${idx + 1}",
+                                    modifier = androidx.compose.ui.Modifier
+                                        .fillParentMaxHeight()
+                                        .aspectRatio(0.707f)
+                                        .clickable {
+                                            // Switch to single mode to edit this page
+                                            viewModel.goToPage(idx, canvasViewRef?.getBackingBitmap()) { newBmp ->
+                                                applyLoadedPage(idx, newBmp)
+                                            }
+                                        }
+                                )
+                            }
+                        }
+                    } else {
+                        androidx.compose.foundation.lazy.LazyColumn(
+                            modifier = Modifier.fillMaxSize(),
+                            verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(8.dp)
+                        ) {
+                            items(pageBitmaps.size) { idx ->
+                                val bmp = pageBitmaps.getOrNull(idx)?.second
+                                androidx.compose.foundation.Image(
+                                    bitmap = bmp?.asImageBitmap() ?: androidx.compose.ui.graphics.ImageBitmap(1, 1),
+                                    contentDescription = "Page ${idx + 1}",
+                                    modifier = androidx.compose.ui.Modifier
+                                        .fillMaxWidth()
+                                        .aspectRatio(0.707f)
+                                        .clickable {
+                                            viewModel.goToPage(idx, canvasViewRef?.getBackingBitmap()) { newBmp ->
+                                                applyLoadedPage(idx, newBmp)
+                                            }
+                                        }
+                                )
+                            }
+                        }
+                    }
+                } else {
+                // Single page mode (default)
                 // Drawing Canvas
                 AndroidView(
                     factory = { ctx ->
@@ -1261,6 +1325,7 @@ fun CanvasScreen(
                     },
                     modifier = Modifier.fillMaxSize()
                 )
+                } // end single page mode
 
                 // Image layer controls
                 if (selectedImageIndex >= 0) {
