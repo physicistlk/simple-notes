@@ -80,7 +80,7 @@ class DrawingCanvasView @JvmOverloads constructor(
         set(value) { field = value; updateViewMatrix() }
     var scale: Float = 1f
         set(value) {
-            field = value.coerceIn(0.25f, 4f)
+            field = value.coerceIn(0.15f, 8f)
             updateViewMatrix()
             schedulePdfBackgroundRefresh()
         }
@@ -96,6 +96,8 @@ class DrawingCanvasView @JvmOverloads constructor(
     private var gestureStartMidX = 0f
     private var gestureStartMidY = 0f
     private var gestureStartDist = 0f
+    private var gestureStartFocalCanvasX = 0f
+    private var gestureStartFocalCanvasY = 0f
 
     // Non-destructive background (e.g. imported PDF page)
     var backgroundBitmap: Bitmap? = null
@@ -714,6 +716,9 @@ class DrawingCanvasView @JvmOverloads constructor(
                     gestureStartMidX = (x0 + x1) / 2f
                     gestureStartMidY = (y0 + y1) / 2f
                     gestureStartDist = Math.hypot((x1 - x0).toDouble(), (y1 - y0).toDouble()).toFloat()
+                    val s = if (scale > 0.0001f) scale else 1f
+                    gestureStartFocalCanvasX = (gestureStartMidX - panX) / s
+                    gestureStartFocalCanvasY = (gestureStartMidY - panY) / s
                     return true
                 }
             }
@@ -724,21 +729,27 @@ class DrawingCanvasView @JvmOverloads constructor(
                     val midX = (x0 + x1) / 2f
                     val midY = (y0 + y1) / 2f
                     val dist = Math.hypot((x1 - x0).toDouble(), (y1 - y0).toDouble()).toFloat()
-                    panX = gestureStartPanX + (midX - gestureStartMidX)
-                    panY = gestureStartPanY + (midY - gestureStartMidY)
                     if (gestureStartDist > 0f) {
-                        scale = (gestureStartScale * (dist / gestureStartDist)).coerceIn(0.25f, 4f)
+                        val newScale = (gestureStartScale * (dist / gestureStartDist)).coerceIn(0.15f, 8f)
+                        scale = newScale
+                        panX = midX - gestureStartFocalCanvasX * scale
+                        panY = midY - gestureStartFocalCanvasY * scale
+                    } else {
+                        panX = gestureStartPanX + (midX - gestureStartMidX)
+                        panY = gestureStartPanY + (midY - gestureStartMidY)
                     }
-                    // Beyond-paper: allow panning freely; else clamp to keep at least part visible
+                    // Beyond-paper: allow panning freely; else clamp with margin to keep part visible
                     if (!beyondPaper) {
                         val bmpW = backingBitmap?.width?.toFloat() ?: width.toFloat()
                         val bmpH = backingBitmap?.height?.toFloat() ?: height.toFloat()
                         val scaledW = bmpW * scale
                         val scaledH = bmpH * scale
-                        val minPanX = -(scaledW - width).coerceAtLeast(0f)
-                        val maxPanX = 0f
-                        val minPanY = -(scaledH - height).coerceAtLeast(0f)
-                        val maxPanY = 0f
+                        val marginX = width * 0.4f
+                        val marginY = height * 0.4f
+                        val minPanX = if (scaledW > width) width - scaledW - marginX else (width - scaledW) / 2f - marginX
+                        val maxPanX = if (scaledW > width) marginX else (width - scaledW) / 2f + marginX
+                        val minPanY = if (scaledH > height) height - scaledH - marginY else (height - scaledH) / 2f - marginY
+                        val maxPanY = if (scaledH > height) marginY else (height - scaledH) / 2f + marginY
                         panX = panX.coerceIn(minPanX, maxPanX)
                         panY = panY.coerceIn(minPanY, maxPanY)
                     }
@@ -746,7 +757,33 @@ class DrawingCanvasView @JvmOverloads constructor(
                     return true
                 }
             }
-            MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+            MotionEvent.ACTION_POINTER_UP -> {
+                val remainingPointers = event.pointerCount - 1
+                if (remainingPointers >= 2) {
+                    val upIndex = event.actionIndex
+                    var idx0 = 0
+                    if (idx0 == upIndex) idx0++
+                    var idx1 = idx0 + 1
+                    if (idx1 == upIndex) idx1++
+                    if (idx1 < event.pointerCount) {
+                        gestureStartPanX = panX
+                        gestureStartPanY = panY
+                        gestureStartScale = scale
+                        val x0 = event.getX(idx0); val y0 = event.getY(idx0)
+                        val x1 = event.getX(idx1); val y1 = event.getY(idx1)
+                        gestureStartMidX = (x0 + x1) / 2f
+                        gestureStartMidY = (y0 + y1) / 2f
+                        gestureStartDist = Math.hypot((x1 - x0).toDouble(), (y1 - y0).toDouble()).toFloat()
+                        val s = if (scale > 0.0001f) scale else 1f
+                        gestureStartFocalCanvasX = (gestureStartMidX - panX) / s
+                        gestureStartFocalCanvasY = (gestureStartMidY - panY) / s
+                        return true
+                    }
+                }
+                gestureActive = false
+                return true
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 gestureActive = false
                 return true
             }

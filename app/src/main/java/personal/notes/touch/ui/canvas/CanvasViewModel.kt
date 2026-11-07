@@ -410,9 +410,26 @@ class CanvasViewModel(
         }
     }
 
-    fun goToPage(index: Int, currentBitmap: Bitmap?, onBitmapLoaded: (Bitmap?) -> Unit) {
+    fun setCurrentPageIndex(index: Int) {
         val totalPages = note.value?.pageCount ?: 1
-        if (index !in 0 until totalPages || index == _currentPageIndex.value) return
+        if (index in 0 until totalPages) {
+            _currentPageIndex.value = index
+        }
+    }
+
+    fun goToPage(index: Int, currentBitmap: Bitmap?, onBitmapLoaded: (Bitmap?) -> Unit) {
+        goToPage(index, currentBitmap, forceReload = false, onBitmapLoaded = onBitmapLoaded)
+    }
+
+    fun goToPage(
+        index: Int,
+        currentBitmap: Bitmap?,
+        forceReload: Boolean = false,
+        onBitmapLoaded: (Bitmap?) -> Unit
+    ) {
+        val totalPages = note.value?.pageCount ?: 1
+        if (index !in 0 until totalPages) return
+        if (index == _currentPageIndex.value && !forceReload) return
 
         viewModelScope.launch {
             // Save current page

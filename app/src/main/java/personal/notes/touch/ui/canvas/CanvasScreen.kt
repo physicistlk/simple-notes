@@ -337,6 +337,8 @@ fun CanvasScreen(
         }
     }
 
+    val continuousColState = androidx.compose.foundation.lazy.rememberLazyListState()
+    val continuousRowState = androidx.compose.foundation.lazy.rememberLazyListState()
 
     // Load/save layers on page change. The INITIAL page/layer load lives in
     // the AndroidView factory below, bound to the view instance it creates:
@@ -1186,89 +1188,39 @@ fun CanvasScreen(
                 val isContinuous = !isInfinite && uiState.pageTurningMode == 0
                 val isHorizontal = uiState.pageTurningDirection == 1
 
-                var continuousScale by remember { mutableStateOf(1f) }
-                var continuousPanX by remember { mutableStateOf(0f) }
-                var continuousPanY by remember { mutableStateOf(0f) }
+                var continuousScale by remember { mutableFloatStateOf(1f) }
+                var continuousPanX by remember { mutableFloatStateOf(0f) }
+                var continuousPanY by remember { mutableFloatStateOf(0f) }
 
-                if (isContinuous) {
-                    if (isHorizontal) {
-                        androidx.compose.foundation.lazy.LazyRow(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .pointerInput(Unit) {
-                                    detectTransformGestures { _, pan, zoom, _ ->
-                                        continuousScale = (continuousScale * zoom).coerceIn(0.5f, 4f)
-                                        continuousPanX += pan.x
-                                        continuousPanY += pan.y
-                                    }
-                                },
-                            horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(16.dp),
-                            contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp)
-                        ) {
-                            items(pages.size) { idx ->
-                                val page = pages[idx]
-                                ContinuousPageView(
-                                    pageIndex = idx,
-                                    page = page,
-                                    noteId = viewModel.noteId,
-                                    pdfDocCache = pdfDocCache,
-                                    repository = viewModel.repository,
-                                    scale = continuousScale,
-                                    panX = continuousPanX,
-                                    panY = continuousPanY,
-                                    modifier = androidx.compose.ui.Modifier
-                                        .fillParentMaxHeight()
-                                        .aspectRatio(0.707f),
-                                    onClick = {
-                                        viewModel.setPageTurningMode(1)
-                                        viewModel.goToPage(idx, canvasViewRef?.getBackingBitmap()) { newBmp ->
-                                            applyLoadedPage(idx, newBmp)
-                                        }
-                                    }
-                                )
-                            }
-                        }
-                    } else {
-                        androidx.compose.foundation.lazy.LazyColumn(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .pointerInput(Unit) {
-                                    detectTransformGestures { _, pan, zoom, _ ->
-                                        continuousScale = (continuousScale * zoom).coerceIn(0.5f, 4f)
-                                        continuousPanX += pan.x
-                                        continuousPanY += pan.y
-                                    }
-                                },
-                            verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(16.dp),
-                            contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 16.dp, horizontal = 32.dp)
-                        ) {
-                            items(pages.size) { idx ->
-                                val page = pages[idx]
-                                ContinuousPageView(
-                                    pageIndex = idx,
-                                    page = page,
-                                    noteId = viewModel.noteId,
-                                    pdfDocCache = pdfDocCache,
-                                    repository = viewModel.repository,
-                                    scale = continuousScale,
-                                    panX = continuousPanX,
-                                    panY = continuousPanY,
-                                    modifier = androidx.compose.ui.Modifier
-                                        .fillMaxWidth()
-                                        .aspectRatio(0.707f),
-                                    onClick = {
-                                        viewModel.setPageTurningMode(1)
-                                        viewModel.goToPage(idx, canvasViewRef?.getBackingBitmap()) { newBmp ->
-                                            applyLoadedPage(idx, newBmp)
-                                        }
-                                    }
-                                )
-                            }
+                // When entering continuous mode, scroll to the current page index
+                LaunchedEffect(isContinuous) {
+                    if (isContinuous) {
+                        continuousScale = 1f
+                        continuousPanX = 0f
+                        continuousPanY = 0f
+                        val target = currentPageIndex.coerceIn(0, (pages.size - 1).coerceAtLeast(0))
+                        if (isHorizontal) {
+                            continuousRowState.scrollToItem(target)
+                        } else {
+                            continuousColState.scrollToItem(target)
                         }
                     }
+                }
+
+                // Sync current visible item index in continuous mode to viewModel
+                val currentContinuousVisible = if (isHorizontal) {
+                    continuousRowState.firstVisibleItemIndex
                 } else {
-                // Single page mode (default)
-                // Drawing Canvas
+                    continuousColState.firstVisibleItemIndex
+                }
+                LaunchedEffect(isContinuous, currentContinuousVisible) {
+                    if (isContinuous && pages.isNotEmpty()) {
+                        val validIdx = currentContinuousVisible.coerceIn(0, pages.size - 1)
+                        viewModel.setCurrentPageIndex(validIdx)
+                    }
+                }
+
+                // Drawing Canvas (always mounted in composition)
                 AndroidView(
                     factory = { ctx ->
                         DrawingCanvasView(ctx).apply {
@@ -1349,7 +1301,84 @@ fun CanvasScreen(
                     },
                     modifier = Modifier.fillMaxSize()
                 )
-                } // end single page mode
+
+                // Continuous page overlay when continuous mode is active
+                if (isContinuous) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(Color(0xFFEEEEEE))
+                            .pointerInput(Unit) {
+                                detectTransformGestures { centroid, pan, zoom, _ ->
+                                    val oldScale = continuousScale
+                                    val newScale = (continuousScale * zoom).coerceIn(0.5f, 4f)
+                                    val factor = newScale / oldScale
+                                    continuousPanX = centroid.x - (centroid.x - continuousPanX) * factor + pan.x
+                                    continuousPanY = centroid.y - (centroid.y - continuousPanY) * factor + pan.y
+                                    continuousScale = newScale
+                                }
+                            }
+                            .graphicsLayer {
+                                scaleX = continuousScale
+                                scaleY = continuousScale
+                                translationX = continuousPanX
+                                translationY = continuousPanY
+                                transformOrigin = androidx.compose.ui.graphics.TransformOrigin(0f, 0f)
+                            }
+                    ) {
+                        if (isHorizontal) {
+                            androidx.compose.foundation.lazy.LazyRow(
+                                state = continuousRowState,
+                                modifier = Modifier.fillMaxSize(),
+                                horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(16.dp),
+                                contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp)
+                            ) {
+                                items(pages.size) { idx ->
+                                    val page = pages[idx]
+                                    ContinuousPageView(
+                                        pageIndex = idx,
+                                        page = page,
+                                        noteId = viewModel.noteId,
+                                        pdfDocCache = pdfDocCache,
+                                        repository = viewModel.repository,
+                                        modifier = androidx.compose.ui.Modifier.fillParentMaxHeight(),
+                                        onClick = {
+                                            viewModel.setPageTurningMode(1)
+                                            viewModel.goToPage(idx, null, forceReload = true) { newBmp ->
+                                                applyLoadedPage(idx, newBmp)
+                                            }
+                                        }
+                                    )
+                                }
+                            }
+                        } else {
+                            androidx.compose.foundation.lazy.LazyColumn(
+                                state = continuousColState,
+                                modifier = Modifier.fillMaxSize(),
+                                verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(16.dp),
+                                contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 16.dp, horizontal = 32.dp)
+                            ) {
+                                items(pages.size) { idx ->
+                                    val page = pages[idx]
+                                    ContinuousPageView(
+                                        pageIndex = idx,
+                                        page = page,
+                                        noteId = viewModel.noteId,
+                                        pdfDocCache = pdfDocCache,
+                                        repository = viewModel.repository,
+                                        modifier = androidx.compose.ui.Modifier.fillMaxWidth(),
+                                        onClick = {
+                                            viewModel.setPageTurningMode(1)
+                                            viewModel.goToPage(idx, null, forceReload = true) { newBmp ->
+                                                applyLoadedPage(idx, newBmp)
+                                            }
+                                        }
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // Image layer controls
                 if (selectedImageIndex >= 0) {
@@ -2988,7 +3017,12 @@ fun CanvasScreen(
                                                                 .fillMaxHeight()
                                                                 .background(if (isContinuousMode) OrangePrimary else Color.White)
                                                                 .clickable(enabled = !isInfiniteNote) {
-                                                                    viewModel.setPageTurningMode(0)
+                                                                    if (!isContinuousMode) {
+                                                                        canvasViewRef?.getBackingBitmap()?.let { bmp ->
+                                                                            viewModel.saveCurrentPageBitmap(bmp)
+                                                                        }
+                                                                        viewModel.setPageTurningMode(0)
+                                                                    }
                                                                 },
                                                             contentAlignment = Alignment.Center
                                                         ) {
@@ -3005,7 +3039,16 @@ fun CanvasScreen(
                                                                 .weight(1f)
                                                                 .fillMaxHeight()
                                                                 .background(if (isSingleMode) OrangePrimary else Color.White)
-                                                                .clickable { viewModel.setPageTurningMode(1) },
+                                                                .clickable {
+                                                                    if (!isSingleMode) {
+                                                                        val targetIdx = (if (uiState.pageTurningDirection == 1) continuousRowState.firstVisibleItemIndex else continuousColState.firstVisibleItemIndex)
+                                                                            .coerceIn(0, (pages.size - 1).coerceAtLeast(0))
+                                                                        viewModel.setPageTurningMode(1)
+                                                                        viewModel.goToPage(targetIdx, null, forceReload = true) { newBmp ->
+                                                                            applyLoadedPage(targetIdx, newBmp)
+                                                                        }
+                                                                    }
+                                                                },
                                                             contentAlignment = Alignment.Center
                                                         ) {
                                                             Text(
@@ -3216,15 +3259,24 @@ fun ContinuousPageView(
     noteId: String,
     pdfDocCache: personal.notes.touch.util.PdfDocumentCache,
     repository: personal.notes.touch.data.repo.NoteRepository,
-    scale: Float,
-    panX: Float,
-    panY: Float,
     modifier: Modifier = Modifier,
     onClick: () -> Unit
 ) {
     val isVector = page.pdfSourcePath.isNotEmpty() && page.pdfPageIndex >= 0
     val pageBitmapState = remember(page.id, page.pdfSourcePath, page.pdfPageIndex, page.updatedAt) {
         mutableStateOf<android.graphics.Bitmap?>(null)
+    }
+
+    val pageRatio = remember(page.id, page.pdfSourcePath, page.pdfPageIndex) {
+        if (isVector) {
+            val doc = pdfDocCache.document(page.pdfSourcePath)
+            if (doc != null) {
+                val size = doc.pageSize(page.pdfPageIndex)
+                val pW = size[0].coerceAtLeast(1f)
+                val pH = size[1].coerceAtLeast(1f)
+                pW / pH
+            } else 0.707f
+        } else 0.707f
     }
 
     LaunchedEffect(page.id, page.pdfSourcePath, page.pdfPageIndex, page.updatedAt) {
@@ -3270,12 +3322,7 @@ fun ContinuousPageView(
     val bmp = pageBitmapState.value
     Box(
         modifier = modifier
-            .graphicsLayer {
-                scaleX = scale
-                scaleY = scale
-                translationX = panX
-                translationY = panY
-            }
+            .aspectRatio(pageRatio)
             .clickable { onClick() }
     ) {
         if (bmp != null && !bmp.isRecycled) {
