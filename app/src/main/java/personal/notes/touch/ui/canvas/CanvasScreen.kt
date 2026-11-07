@@ -2654,301 +2654,442 @@ fun CanvasScreen(
                 // 7. RIGHT SLIDE-OVER MENU (TOOLS PANEL)
                 // ==========================================
                 if (uiState.isToolsPanelOpen) {
-                    Surface(
+                    Box(
                         modifier = Modifier
-                            .align(Alignment.CenterEnd)
+                            .align(Alignment.TopEnd)
+                            .padding(top = 10.dp, end = 14.dp, bottom = 16.dp)
                             .width(320.dp)
-                            .fillMaxHeight(),
-                        color = Color.White,
-                        shadowElevation = 16.dp
+                            .fillMaxHeight()
                     ) {
-                        Column(modifier = Modifier.fillMaxSize()) {
-                            // Tabs Header: Tools | Export | Settings | Manager
-                            val tabs = listOf("Tools", "Export", "Settings", "Manager")
-                            TabRow(
-                                selectedTabIndex = uiState.activeToolsTab,
-                                containerColor = Color.White,
-                                contentColor = OrangePrimary,
-                                indicator = { tabPositions ->
-                                    TabRowDefaults.SecondaryIndicator(
-                                        Modifier.tabIndicatorOffset(tabPositions[uiState.activeToolsTab]),
-                                        color = OrangePrimary
-                                    )
-                                }
+                        Column(
+                            modifier = Modifier.fillMaxSize(),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            // 1. Tabs Pill Card: Tools | Export | Settings | Manager
+                            Surface(
+                                shape = RoundedCornerShape(22.dp),
+                                color = Color.White,
+                                shadowElevation = 3.dp,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(44.dp)
                             ) {
-                                tabs.forEachIndexed { index, title ->
-                                    Tab(
-                                        selected = uiState.activeToolsTab == index,
-                                        onClick = { viewModel.setActiveToolsTab(index) },
-                                        text = {
-                                            Text(
-                                                text = title,
-                                                fontSize = 13.sp,
-                                                fontWeight = if (uiState.activeToolsTab == index) FontWeight.Bold else FontWeight.Normal,
-                                                color = if (uiState.activeToolsTab == index) OrangePrimary else Color.DarkGray
-                                            )
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .padding(horizontal = 6.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceEvenly
+                                ) {
+                                    val tabs = listOf("Tools", "Export", "Settings", "Manager")
+                                    tabs.forEachIndexed { index, title ->
+                                        val isSelected = uiState.activeToolsTab == index
+                                        Box(
+                                            modifier = Modifier
+                                                .clip(RoundedCornerShape(12.dp))
+                                                .clickable { viewModel.setActiveToolsTab(index) }
+                                                .padding(horizontal = 10.dp, vertical = 6.dp),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                                Text(
+                                                    text = title,
+                                                    fontSize = 14.sp,
+                                                    fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
+                                                    color = if (isSelected) OrangePrimary else Color(0xFF333333)
+                                                )
+                                                if (isSelected) {
+                                                    Spacer(modifier = Modifier.height(2.dp))
+                                                    Box(
+                                                        modifier = Modifier
+                                                            .width(24.dp)
+                                                            .height(2.dp)
+                                                            .background(OrangePrimary, RoundedCornerShape(1.dp))
+                                                    )
+                                                }
+                                            }
                                         }
-                                    )
+                                    }
                                 }
                             }
 
-                            Divider(color = Color(0xFFEAEAEA), thickness = 1.dp)
+                            // 2. More Settings Card (shown when on Settings tab)
+                            if (uiState.activeToolsTab == 2) {
+                                Surface(
+                                    shape = RoundedCornerShape(16.dp),
+                                    color = Color.White,
+                                    shadowElevation = 2.dp,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(42.dp)
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .padding(horizontal = 16.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Text("•••", fontSize = 16.sp, color = Color(0xFF333333), fontWeight = FontWeight.Bold)
+                                        Text("More Settings", fontSize = 14.sp, color = Color(0xFF333333), fontWeight = FontWeight.Normal)
+                                    }
+                                }
+                            }
 
-                            // Tab Content
-                            Box(
+                            // 3. Tab Content Card
+                            Surface(
+                                shape = RoundedCornerShape(20.dp),
+                                color = Color.White,
+                                shadowElevation = 4.dp,
                                 modifier = Modifier
-                                    .weight(1f)
                                     .fillMaxWidth()
-                                    .verticalScroll(rememberScrollState())
-                                    .padding(16.dp)
+                                    .weight(1f)
                             ) {
-                                when (uiState.activeToolsTab) {
-                                    0 -> {
-                                        // TOOLS TAB
-                                        Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                                            // Productivity Integration
-                                            Text("Productivity Integration", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = Color.Gray)
-                                            ToolsPanelItem(Icons.Default.Category, "Web Excerpt") { /* Web excerpt */ }
-                                            ToolsPanelItem(Icons.Default.Category, "Open in CardsMind") { /* CardsMind */ }
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .verticalScroll(rememberScrollState())
+                                        .padding(horizontal = 16.dp, vertical = 14.dp)
+                                ) {
+                                    when (uiState.activeToolsTab) {
+                                        0 -> {
+                                            // TOOLS TAB
+                                            Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                                                // Productivity Integration
+                                                Text("Productivity Integration", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = Color.Gray)
+                                                ToolsPanelItem(Icons.Default.Category, "Web Excerpt") { /* Web excerpt */ }
+                                                ToolsPanelItem(Icons.Default.Category, "Open in CardsMind") { /* CardsMind */ }
 
-                                            // Add Section
-                                            Text("Add", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = Color.Gray)
-                                            ToolsPanelItem(Icons.Default.Image, "Image") {
-                                                imagePickerLauncher.launch("image/*")
-                                                viewModel.toggleToolsPanel(false)
-                                            }
-                                            ToolsPanelItem(Icons.Default.Description, "Import PDF") {
-                                                pdfPickerLauncher.launch(arrayOf("application/pdf"))
-                                                viewModel.toggleToolsPanel(false)
-                                            }
-                                            ToolsPanelItem(Icons.Default.Category, "Sticker") { /* Sticker */ }
-                                            ToolsPanelItem(Icons.Default.Timeline, "Add Mind Map") { /* MindMap */ }
-                                            ToolsPanelItem(Icons.Default.Category, "Flashcard") { /* Flashcard */ }
-
-                                            // Page Section
-                                            Text("Page", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = Color.Gray)
-                                            ToolsPanelItem(Icons.Default.Add, "Add Page") {
-                                                val currentBmp = canvasViewRef?.getBackingBitmap()
-                                                viewModel.addNewPage(currentBmp) { newBmp ->
-                                                    applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
+                                                // Add Section
+                                                Text("Add", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = Color.Gray)
+                                                ToolsPanelItem(Icons.Default.Image, "Image") {
+                                                    imagePickerLauncher.launch("image/*")
+                                                    viewModel.toggleToolsPanel(false)
                                                 }
-                                                viewModel.toggleToolsPanel(false)
-                                            }
-                                            ToolsPanelItem(Icons.Default.GridOn, "Template (Paper Pattern)") {
-                                                // Cycle paper pattern
-                                                val nextPattern = when (uiState.paperPattern) {
-                                                    PaperPattern.BLANK -> PaperPattern.GRID
-                                                    PaperPattern.GRID -> PaperPattern.LINES
-                                                    PaperPattern.LINES -> PaperPattern.DOTTED
-                                                    PaperPattern.DOTTED -> PaperPattern.BLANK
+                                                ToolsPanelItem(Icons.Default.Description, "Import PDF") {
+                                                    pdfPickerLauncher.launch(arrayOf("application/pdf"))
+                                                    viewModel.toggleToolsPanel(false)
                                                 }
-                                                viewModel.setPaperPattern(nextPattern)
-                                            }
+                                                ToolsPanelItem(Icons.Default.Category, "Sticker") { /* Sticker */ }
+                                                ToolsPanelItem(Icons.Default.Timeline, "Add Mind Map") { /* MindMap */ }
+                                                ToolsPanelItem(Icons.Default.Category, "Flashcard") { /* Flashcard */ }
 
-                                            // Write Section
-                                            Text("Write", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = Color.Gray)
-                                            ToolsPanelItem(Icons.Default.Brush, "Zoom Write") { /* Zoom write */ }
-                                            ToolsPanelItem(Icons.Default.AutoFixHigh, "Auto Recognition") { /* OCR */ }
-                                            ToolsPanelItem(Icons.Default.Timeline, "Laser Pointer") { /* Pointer */ }
-
-                                            // Other Section
-                                            Text("Other", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = Color.Gray)
-                                            ToolsPanelItem(Icons.Default.Save, "Save Note") {
-                                                canvasViewRef?.getBackingBitmap()?.let { bmp ->
-                                                    viewModel.saveCurrentPageBitmap(bmp)
+                                                // Page Section
+                                                Text("Page", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = Color.Gray)
+                                                ToolsPanelItem(Icons.Default.Add, "Add Page") {
+                                                    val currentBmp = canvasViewRef?.getBackingBitmap()
+                                                    viewModel.addNewPage(currentBmp) { newBmp ->
+                                                        applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
+                                                    }
+                                                    viewModel.toggleToolsPanel(false)
                                                 }
-                                                viewModel.toggleToolsPanel(false)
-                                            }
-                                            ToolsPanelItem(Icons.Default.Delete, "Clear Canvas") {
-                                                showClearDialog = true
-                                                viewModel.toggleToolsPanel(false)
+                                                ToolsPanelItem(Icons.Default.GridOn, "Template (Paper Pattern)") {
+                                                    val nextPattern = when (uiState.paperPattern) {
+                                                        PaperPattern.BLANK -> PaperPattern.GRID
+                                                        PaperPattern.GRID -> PaperPattern.LINES
+                                                        PaperPattern.LINES -> PaperPattern.DOTTED
+                                                        PaperPattern.DOTTED -> PaperPattern.BLANK
+                                                    }
+                                                    viewModel.setPaperPattern(nextPattern)
+                                                }
+
+                                                // Write Section
+                                                Text("Write", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = Color.Gray)
+                                                ToolsPanelItem(Icons.Default.Brush, "Zoom Write") { /* Zoom write */ }
+                                                ToolsPanelItem(Icons.Default.AutoFixHigh, "Auto Recognition") { /* OCR */ }
+                                                ToolsPanelItem(Icons.Default.Timeline, "Laser Pointer") { /* Pointer */ }
+
+                                                // Other Section
+                                                Text("Other", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = Color.Gray)
+                                                ToolsPanelItem(Icons.Default.Save, "Save Note") {
+                                                    canvasViewRef?.getBackingBitmap()?.let { bmp ->
+                                                        viewModel.saveCurrentPageBitmap(bmp)
+                                                    }
+                                                    viewModel.toggleToolsPanel(false)
+                                                }
+                                                ToolsPanelItem(Icons.Default.Delete, "Clear Canvas") {
+                                                    showClearDialog = true
+                                                    viewModel.toggleToolsPanel(false)
+                                                }
                                             }
                                         }
-                                    }
-                                    1 -> {
-                                        // EXPORT TAB
-                                        Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                                            Text("Document Export", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color.Gray)
-                                            ToolsPanelItem(Icons.Default.Description, "Export as Multi-Page PDF") {
-                                                canvasViewRef?.getBackingBitmap()?.let { bmp ->
-                                                    viewModel.saveCurrentPageBitmap(bmp)
+                                        1 -> {
+                                            // EXPORT TAB
+                                            Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                                                Text("Document Export", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color.Gray)
+                                                ToolsPanelItem(Icons.Default.Description, "Export as Multi-Page PDF") {
+                                                    canvasViewRef?.getBackingBitmap()?.let { bmp ->
+                                                        viewModel.saveCurrentPageBitmap(bmp)
+                                                    }
+                                                    showExportDialog = true
+                                                    viewModel.toggleToolsPanel(false)
                                                 }
-                                                showExportDialog = true
-                                                viewModel.toggleToolsPanel(false)
-                                            }
-                                            ToolsPanelItem(Icons.Default.Image, "Export Current Page as PNG") {
-                                                canvasViewRef?.getBackingBitmap()?.let { bmp ->
-                                                    viewModel.saveCurrentPageBitmap(bmp)
+                                                ToolsPanelItem(Icons.Default.Image, "Export Current Page as PNG") {
+                                                    canvasViewRef?.getBackingBitmap()?.let { bmp ->
+                                                        viewModel.saveCurrentPageBitmap(bmp)
+                                                    }
+                                                    showExportDialog = true
+                                                    viewModel.toggleToolsPanel(false)
                                                 }
-                                                showExportDialog = true
-                                                viewModel.toggleToolsPanel(false)
-                                            }
-                                            ToolsPanelItem(Icons.Default.TextFields, "Export Plain Text / Markdown") {
-                                                showExportDialog = true
-                                                viewModel.toggleToolsPanel(false)
-                                            }
-                                            ToolsPanelItem(Icons.Default.Share, "Share via Android Sheet") {
-                                                showExportDialog = true
-                                                viewModel.toggleToolsPanel(false)
+                                                ToolsPanelItem(Icons.Default.TextFields, "Export Plain Text / Markdown") {
+                                                    showExportDialog = true
+                                                    viewModel.toggleToolsPanel(false)
+                                                }
+                                                ToolsPanelItem(Icons.Default.Share, "Share via Android Sheet") {
+                                                    showExportDialog = true
+                                                    viewModel.toggleToolsPanel(false)
+                                                }
                                             }
                                         }
-                                    }
-                                    2 -> {
-                                        // SETTINGS TAB (matches m2_04.png)
-                                        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                                            SettingsCheckboxRow(
-                                                title = "Stylus Mode",
-                                                subtitle = "Only allow stylus writing permitted",
-                                                checked = uiState.stylusOnly,
-                                                onCheckedChange = { viewModel.toggleStylusOnly(it) }
-                                            )
-                                            SettingsCheckboxRow(
-                                                title = "Show Pencase",
-                                                subtitle = "Display floating toolbar dock",
-                                                checked = uiState.showPencase,
-                                                onCheckedChange = { viewModel.toggleShowPencase(it) }
-                                            )
-                                            SettingsCheckboxRow(
-                                                title = "Double Page Mode",
-                                                subtitle = "Side-by-side pages on landscape",
-                                                checked = uiState.doublePageMode,
-                                                onCheckedChange = { viewModel.toggleDoublePageMode(it) }
-                                            )
-                                            SettingsCheckboxRow(
-                                                title = "Reading Mode",
-                                                subtitle = "Editing notes is not allowed",
-                                                checked = uiState.readingMode,
-                                                onCheckedChange = { viewModel.toggleReadingMode(it) }
-                                            )
+                                        2 -> {
+                                            // SETTINGS TAB (1-to-1 match with TouchNotes Screenshot_20261107-133240)
+                                            var showTabsState by remember { mutableStateOf(true) }
+                                            var fixPreviewPageState by remember { mutableStateOf(false) }
+                                            var penToolState by remember { mutableStateOf(true) }
 
-                                            Divider(color = Color(0xFFEEEEEE))
+                                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                                // 1. Stylus Mode
+                                                SettingsCheckboxRow(
+                                                    title = "Stylus Mode",
+                                                    subtitle = "Only allow stylus writing permitted",
+                                                    checked = uiState.stylusOnly,
+                                                    onCheckedChange = { viewModel.toggleStylusOnly(it) }
+                                                )
+                                                // 2. Show Pencase
+                                                SettingsCheckboxRow(
+                                                    title = "Show Pencase",
+                                                    subtitle = "",
+                                                    checked = uiState.showPencase,
+                                                    onCheckedChange = { viewModel.toggleShowPencase(it) }
+                                                )
+                                                // 3. Double Page Mode
+                                                SettingsCheckboxRow(
+                                                    title = "Double Page Mode",
+                                                    subtitle = "Only work for vertical continuous scroll",
+                                                    checked = uiState.doublePageMode,
+                                                    onCheckedChange = { viewModel.toggleDoublePageMode(it) }
+                                                )
+                                                // 4. Pen-Tool
+                                                SettingsCheckboxRow(
+                                                    title = "Pen-Tool",
+                                                    subtitle = "",
+                                                    checked = penToolState,
+                                                    onCheckedChange = {
+                                                        penToolState = it
+                                                        viewModel.toggleShowPencase(it)
+                                                    }
+                                                )
+                                                // 5. Reading Mode
+                                                SettingsCheckboxRow(
+                                                    title = "Reading Mode",
+                                                    subtitle = "Editing notes is not allowed",
+                                                    checked = uiState.readingMode,
+                                                    onCheckedChange = { viewModel.toggleReadingMode(it) }
+                                                )
+                                                // 6. Show tabs
+                                                SettingsCheckboxRow(
+                                                    title = "Show tabs",
+                                                    subtitle = "",
+                                                    checked = showTabsState,
+                                                    onCheckedChange = { showTabsState = it }
+                                                )
+                                                // 7. Fix preview page
+                                                SettingsCheckboxRow(
+                                                    title = "Fix preview page",
+                                                    subtitle = "",
+                                                    checked = fixPreviewPageState,
+                                                    onCheckedChange = { fixPreviewPageState = it }
+                                                )
 
-                                            val isInfiniteNote = (note?.pageType ?: "infinite") == "infinite"
+                                                Spacer(modifier = Modifier.height(6.dp))
 
-                                            // PAGE TURNING DIRECTION
-                                            Text("Page Turning Direction", fontWeight = FontWeight.Medium, fontSize = 13.sp, color = Color.DarkGray)
-                                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                                val isVert = uiState.pageTurningDirection == 0
-                                                Surface(
-                                                    shape = RoundedCornerShape(12.dp),
-                                                    color = if (isVert) OrangePrimary else Color(0xFFF0F0F0),
-                                                    modifier = Modifier
-                                                        .padding(vertical = 4.dp)
-                                                        .clickable { viewModel.setPageTurningDirection(0) }
-                                                ) {
-                                                    Text(
-                                                        "Vertical",
-                                                        color = if (isVert) Color.White else Color.DarkGray,
-                                                        fontSize = 12.sp,
-                                                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp)
-                                                    )
-                                                }
-                                                Surface(
-                                                    shape = RoundedCornerShape(12.dp),
-                                                    color = if (!isVert) OrangePrimary else Color(0xFFF0F0F0),
-                                                    modifier = Modifier
-                                                        .padding(vertical = 4.dp)
-                                                        .clickable { viewModel.setPageTurningDirection(1) }
-                                                ) {
-                                                    Text(
-                                                        "Horizontal",
-                                                        color = if (!isVert) Color.White else Color.DarkGray,
-                                                        fontSize = 12.sp,
-                                                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp)
-                                                    )
-                                                }
-                                            }
-
-                                            Spacer(modifier = Modifier.height(6.dp))
-
-                                            // PAGE TURNING MODE
-                                            Text("Page Turning Mode", fontWeight = FontWeight.Medium, fontSize = 13.sp, color = Color.DarkGray)
-                                            if (isInfiniteNote) {
+                                                // 8. PAGE TURNING DIRECTION
                                                 Text(
-                                                    "Continuous not required for infinite",
-                                                    fontSize = 11.sp,
-                                                    color = Color.Gray,
-                                                    modifier = Modifier.padding(bottom = 2.dp)
+                                                    text = "Page Turning Direction",
+                                                    fontSize = 14.sp,
+                                                    fontWeight = FontWeight.Normal,
+                                                    color = Color(0xFF333333),
+                                                    textAlign = TextAlign.Center,
+                                                    modifier = Modifier.fillMaxWidth()
                                                 )
-                                            }
-                                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                                Spacer(modifier = Modifier.height(2.dp))
+                                                val isVert = uiState.pageTurningDirection == 0
+                                                Box(
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .height(36.dp)
+                                                        .clip(RoundedCornerShape(18.dp))
+                                                        .border(1.5.dp, OrangePrimary, RoundedCornerShape(18.dp))
+                                                ) {
+                                                    Row(modifier = Modifier.fillMaxSize()) {
+                                                        // Vertical button (left half)
+                                                        Box(
+                                                            modifier = Modifier
+                                                                .weight(1f)
+                                                                .fillMaxHeight()
+                                                                .background(if (isVert) OrangePrimary else Color.White)
+                                                                .clickable { viewModel.setPageTurningDirection(0) },
+                                                            contentAlignment = Alignment.Center
+                                                        ) {
+                                                            Text(
+                                                                text = "Vertical",
+                                                                fontSize = 13.sp,
+                                                                fontWeight = if (isVert) FontWeight.Bold else FontWeight.Normal,
+                                                                color = if (isVert) Color.White else OrangePrimary
+                                                            )
+                                                        }
+                                                        // Horizontal button (right half)
+                                                        Box(
+                                                            modifier = Modifier
+                                                                .weight(1f)
+                                                                .fillMaxHeight()
+                                                                .background(if (!isVert) OrangePrimary else Color.White)
+                                                                .clickable { viewModel.setPageTurningDirection(1) },
+                                                            contentAlignment = Alignment.Center
+                                                        ) {
+                                                            Text(
+                                                                text = "Horizontal",
+                                                                fontSize = 13.sp,
+                                                                fontWeight = if (!isVert) FontWeight.Bold else FontWeight.Normal,
+                                                                color = if (!isVert) Color.White else OrangePrimary
+                                                            )
+                                                        }
+                                                    }
+                                                }
+
+                                                Spacer(modifier = Modifier.height(8.dp))
+
+                                                // 9. PAGE TURNING MODE
+                                                val isInfiniteNote = (note?.pageType ?: "infinite") == "infinite"
                                                 val isContinuousMode = !isInfiniteNote && uiState.pageTurningMode == 0
-                                                Surface(
-                                                    shape = RoundedCornerShape(12.dp),
-                                                    color = if (isContinuousMode) OrangePrimary else Color(0xFFF0F0F0),
+                                                val isSingleMode = isInfiniteNote || uiState.pageTurningMode == 1
+
+                                                Text(
+                                                    text = "Page Turning Mode",
+                                                    fontSize = 14.sp,
+                                                    fontWeight = FontWeight.Normal,
+                                                    color = Color(0xFF333333),
+                                                    textAlign = TextAlign.Center,
+                                                    modifier = Modifier.fillMaxWidth()
+                                                )
+                                                Spacer(modifier = Modifier.height(2.dp))
+                                                Box(
                                                     modifier = Modifier
-                                                        .padding(vertical = 4.dp)
-                                                        .clickable(enabled = !isInfiniteNote) {
-                                                            viewModel.setPageTurningMode(0)
-                                                        }
+                                                        .fillMaxWidth()
+                                                        .height(36.dp)
+                                                        .clip(RoundedCornerShape(18.dp))
+                                                        .border(1.5.dp, OrangePrimary, RoundedCornerShape(18.dp))
                                                 ) {
+                                                    Row(modifier = Modifier.fillMaxSize()) {
+                                                        // Continuous button (left half)
+                                                        Box(
+                                                            modifier = Modifier
+                                                                .weight(1f)
+                                                                .fillMaxHeight()
+                                                                .background(if (isContinuousMode) OrangePrimary else Color.White)
+                                                                .clickable(enabled = !isInfiniteNote) {
+                                                                    viewModel.setPageTurningMode(0)
+                                                                },
+                                                            contentAlignment = Alignment.Center
+                                                        ) {
+                                                            Text(
+                                                                text = "Continuous",
+                                                                fontSize = 13.sp,
+                                                                fontWeight = if (isContinuousMode) FontWeight.Bold else FontWeight.Normal,
+                                                                color = if (isInfiniteNote) Color.LightGray else if (isContinuousMode) Color.White else OrangePrimary
+                                                            )
+                                                        }
+                                                        // Single button (right half)
+                                                        Box(
+                                                            modifier = Modifier
+                                                                .weight(1f)
+                                                                .fillMaxHeight()
+                                                                .background(if (isSingleMode) OrangePrimary else Color.White)
+                                                                .clickable { viewModel.setPageTurningMode(1) },
+                                                            contentAlignment = Alignment.Center
+                                                        ) {
+                                                            Text(
+                                                                text = "Single",
+                                                                fontSize = 13.sp,
+                                                                fontWeight = if (isSingleMode) FontWeight.Bold else FontWeight.Normal,
+                                                                color = if (isSingleMode) Color.White else OrangePrimary
+                                                            )
+                                                        }
+                                                    }
+                                                }
+                                                if (isInfiniteNote) {
                                                     Text(
-                                                        "Continuous",
-                                                        color = if (isInfiniteNote) Color.LightGray else if (isContinuousMode) Color.White else Color.DarkGray,
-                                                        fontSize = 12.sp,
-                                                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp)
+                                                        text = "Continuous not required for infinite",
+                                                        fontSize = 10.sp,
+                                                        color = Color.Gray,
+                                                        textAlign = TextAlign.Center,
+                                                        modifier = Modifier
+                                                            .fillMaxWidth()
+                                                            .padding(top = 2.dp)
                                                     )
                                                 }
-                                                val isSingle = isInfiniteNote || uiState.pageTurningMode == 1
-                                                Surface(
-                                                    shape = RoundedCornerShape(12.dp),
-                                                    color = if (isSingle) OrangePrimary else Color(0xFFF0F0F0),
-                                                    modifier = Modifier
-                                                        .padding(vertical = 4.dp)
-                                                        .clickable {
-                                                            viewModel.setPageTurningMode(1)
-                                                        }
-                                                ) {
-                                                    Text(
-                                                        "Single",
-                                                        color = if (isSingle) Color.White else Color.DarkGray,
-                                                        fontSize = 12.sp,
-                                                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp)
-                                                    )
-                                                }
+
+                                                Spacer(modifier = Modifier.height(8.dp))
+
+                                                // 10. Horizontal Move Resistance
+                                                Text(
+                                                    text = "Horizontal Move Resistance(Double click for centering)",
+                                                    fontSize = 13.sp,
+                                                    fontWeight = FontWeight.Normal,
+                                                    color = Color(0xFF222222)
+                                                )
+                                                var resistanceVal by remember { mutableFloatStateOf(0.4f) }
+                                                Slider(
+                                                    value = resistanceVal,
+                                                    onValueChange = { resistanceVal = it },
+                                                    colors = SliderDefaults.colors(
+                                                        thumbColor = OrangePrimary,
+                                                        activeTrackColor = OrangePrimary,
+                                                        inactiveTrackColor = Color(0xFFEEEEEE)
+                                                    ),
+                                                    modifier = Modifier.height(28.dp)
+                                                )
+
+                                                Spacer(modifier = Modifier.height(6.dp))
+
+                                                // 11. Minimal Zoom of Infinite
+                                                var zoomVal by remember { mutableFloatStateOf(0.20f) }
+                                                Text(
+                                                    text = "Minimal Zoom of Infinite: ${(zoomVal * 100).toInt()}%",
+                                                    fontSize = 13.sp,
+                                                    fontWeight = FontWeight.Normal,
+                                                    color = Color(0xFF222222)
+                                                )
+                                                Slider(
+                                                    value = zoomVal,
+                                                    onValueChange = { zoomVal = it },
+                                                    valueRange = 0.05f..1.0f,
+                                                    colors = SliderDefaults.colors(
+                                                        thumbColor = OrangePrimary,
+                                                        activeTrackColor = OrangePrimary,
+                                                        inactiveTrackColor = Color(0xFFEEEEEE)
+                                                    ),
+                                                    modifier = Modifier.height(28.dp)
+                                                )
                                             }
-
-                                            Spacer(modifier = Modifier.height(4.dp))
-
-                                            Text("Horizontal Move Resistance", fontWeight = FontWeight.Medium, fontSize = 13.sp, color = Color.DarkGray)
-                                            var resistanceVal by remember { mutableFloatStateOf(0.4f) }
-                                            Slider(
-                                                value = resistanceVal,
-                                                onValueChange = { resistanceVal = it },
-                                                colors = SliderDefaults.colors(
-                                                    thumbColor = OrangePrimary,
-                                                    activeTrackColor = OrangePrimary
-                                                )
-                                            )
-
-                                            Text("Minimal Zoom of Infinite: 5%", fontWeight = FontWeight.Medium, fontSize = 13.sp, color = Color.DarkGray)
-                                            var zoomVal by remember { mutableFloatStateOf(0.05f) }
-                                            Slider(
-                                                value = zoomVal,
-                                                onValueChange = { zoomVal = it },
-                                                colors = SliderDefaults.colors(
-                                                    thumbColor = OrangePrimary,
-                                                    activeTrackColor = OrangePrimary
-                                                )
-                                            )
                                         }
-                                    }
-                                    3 -> {
-                                        // MANAGER TAB
-                                        Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                                            Text("Note Manager", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color.Gray)
-                                            ToolsPanelItem(Icons.Default.Edit, "Rename Note") {
-                                                newTitleText = note?.title ?: ""
-                                                showRenameDialog = true
-                                                viewModel.toggleToolsPanel(false)
-                                            }
-                                            ToolsPanelItem(Icons.Default.Layers, "Page Manager Dialog") {
-                                                viewModel.toggleThumbnailDrawer(true)
-                                                viewModel.toggleToolsPanel(false)
-                                            }
-                                            ToolsPanelItem(Icons.Default.Delete, "Delete Note") {
-                                                viewModel.deleteCurrentNote()
-                                                saveAndExit()
+                                        3 -> {
+                                            // MANAGER TAB
+                                            Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                                                Text("Note Manager", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color.Gray)
+                                                ToolsPanelItem(Icons.Default.Edit, "Rename Note") {
+                                                    newTitleText = note?.title ?: ""
+                                                    showRenameDialog = true
+                                                    viewModel.toggleToolsPanel(false)
+                                                }
+                                                ToolsPanelItem(Icons.Default.Layers, "Page Manager Dialog") {
+                                                    viewModel.toggleThumbnailDrawer(true)
+                                                    viewModel.toggleToolsPanel(false)
+                                                }
+                                                ToolsPanelItem(Icons.Default.Delete, "Delete Note") {
+                                                    viewModel.deleteCurrentNote()
+                                                    saveAndExit()
+                                                }
                                             }
                                         }
                                     }
@@ -3028,7 +3169,7 @@ fun ToolsPanelItem(
 @Composable
 fun SettingsCheckboxRow(
     title: String,
-    subtitle: String,
+    subtitle: String = "",
     checked: Boolean,
     onCheckedChange: (Boolean) -> Unit
 ) {
@@ -3036,29 +3177,34 @@ fun SettingsCheckboxRow(
         modifier = Modifier
             .fillMaxWidth()
             .clickable { onCheckedChange(!checked) }
-            .padding(vertical = 6.dp),
+            .padding(vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Checkbox(
             checked = checked,
             onCheckedChange = onCheckedChange,
             colors = CheckboxDefaults.colors(
-                checkedColor = OrangePrimary
+                checkedColor = OrangePrimary,
+                uncheckedColor = Color(0xFF888888),
+                checkmarkColor = Color.White
             )
         )
         Spacer(modifier = Modifier.width(8.dp))
-        Column {
+        Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = title,
                 fontSize = 14.sp,
-                fontWeight = FontWeight.Medium,
-                color = Color(0xFF212529)
+                fontWeight = FontWeight.Normal,
+                color = Color(0xFF222222)
             )
-            Text(
-                text = subtitle,
-                fontSize = 11.sp,
-                color = Color.Gray
-            )
+            if (subtitle.isNotEmpty()) {
+                Text(
+                    text = subtitle,
+                    fontSize = 11.sp,
+                    color = Color(0xFF888888),
+                    lineHeight = 13.sp
+                )
+            }
         }
     }
 }
