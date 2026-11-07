@@ -391,22 +391,32 @@ class CanvasViewModel(
         if (pageIsVectorPdf(index)) repository.loadPageStrokes(noteId, index)
         else repository.loadPageBitmap(noteId, index)
 
-    fun saveCurrentPageBitmap(bitmap: Bitmap) {
+    private var debouncedSaveJob: kotlinx.coroutines.Job? = null
+
+    fun scheduleDebouncedSave(bitmap: Bitmap, delayMs: Long = 1500L) {
+        debouncedSaveJob?.cancel()
+        debouncedSaveJob = viewModelScope.launch {
+            kotlinx.coroutines.delay(delayMs)
+            saveCurrentPageBitmapDirect(bitmap)
+        }
+    }
+
+    suspend fun saveCurrentPageBitmapDirect(bitmap: Bitmap) {
+        debouncedSaveJob?.cancel()
         val pageIdx = _currentPageIndex.value
-        // Blank-save guard: when this session never loaded an existing page
-        // layer into the view (pageLoadedFromDisk == false) while such a file
-        // is on disk, persisting the blank backing bitmap would overwrite
-        // good user content with empty pixels. Drop those writes; fresh notes
-        // (no page file yet) still save freely. Vector-PDF pages guard against
-        // their separate stroke file only.
         val guardFile = if (pageIsVectorPdf(pageIdx)) {
             fileStore.getStrokesFile(noteId, pageIdx)
         } else {
             fileStore.getPageFile(noteId, pageIdx)
         }
         if (!pageLoadedFromDisk && guardFile.exists()) return
+        saveContentLayer(pageIdx, bitmap)
+    }
+
+    fun saveCurrentPageBitmap(bitmap: Bitmap) {
+        debouncedSaveJob?.cancel()
         viewModelScope.launch {
-            saveContentLayer(pageIdx, bitmap)
+            saveCurrentPageBitmapDirect(bitmap)
         }
     }
 

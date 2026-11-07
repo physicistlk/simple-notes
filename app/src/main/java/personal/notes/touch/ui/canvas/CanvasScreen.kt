@@ -570,7 +570,7 @@ fun CanvasScreen(
         scope.launch {
             try {
                 canvasViewRef?.getBackingBitmap()?.let { bmp ->
-                    viewModel.saveCurrentPageBitmap(bmp)
+                    viewModel.saveCurrentPageBitmapDirect(bmp)
                 }
                 // Layer save is disk I/O (PNG compress + JSON write):
                 // run it on Dispatchers.IO and await it, then navigate.
@@ -1242,7 +1242,7 @@ fun CanvasScreen(
                             }
                             onStrokeFinishedListener = {
                                 getBackingBitmap()?.let { bmp ->
-                                    viewModel.saveCurrentPageBitmap(bmp)
+                                    viewModel.scheduleDebouncedSave(bmp)
                                 }
                             }
                             // Initial load, bound to THIS view instance: the
@@ -3267,6 +3267,16 @@ fun ContinuousPageView(
         mutableStateOf<android.graphics.Bitmap?>(null)
     }
 
+    androidx.compose.runtime.DisposableEffect(page.id, page.pdfSourcePath, page.pdfPageIndex, page.updatedAt) {
+        onDispose {
+            val oldBmp = pageBitmapState.value
+            if (oldBmp != null && !oldBmp.isRecycled) {
+                oldBmp.recycle()
+            }
+            pageBitmapState.value = null
+        }
+    }
+
     val pageRatio = remember(page.id, page.pdfSourcePath, page.pdfPageIndex) {
         if (isVector) {
             val doc = pdfDocCache.document(page.pdfSourcePath)
@@ -3315,6 +3325,10 @@ fun ContinuousPageView(
                 e.printStackTrace()
                 null
             }
+        }
+        val prev = pageBitmapState.value
+        if (prev != null && prev !== bmp && !prev.isRecycled) {
+            prev.recycle()
         }
         pageBitmapState.value = bmp
     }

@@ -623,8 +623,8 @@ class DrawingCanvasView @JvmOverloads constructor(
 
     private val bitmapPaint = Paint(Paint.DITHER_FLAG or Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
 
-    // Undo / Redo
-    private val maxUndoSnapshots = 20
+    // Undo / Redo - bounded to 6 snapshots to prevent OOM on high-DPI canvases
+    private val maxUndoSnapshots = 6
     private val undoStack = ArrayDeque<Bitmap>()
     private val redoStack = ArrayDeque<Bitmap>()
 
@@ -824,14 +824,22 @@ class DrawingCanvasView @JvmOverloads constructor(
     }
 
     fun loadBitmap(bitmap: Bitmap) {
-        val w = if (width > 0) width else bitmap.width
-        val h = if (height > 0) height else bitmap.height
-        val scaled = Bitmap.createScaledBitmap(bitmap, w, h, true)
-        backingBitmap = scaled.copy(Bitmap.Config.ARGB_8888, true)
+        val old = backingBitmap
+        backingBitmap = if (bitmap.isMutable && bitmap.config == Bitmap.Config.ARGB_8888) {
+            bitmap
+        } else {
+            bitmap.copy(Bitmap.Config.ARGB_8888, true)
+        }
+        if (old != null && old !== backingBitmap && !old.isRecycled) {
+            old.recycle()
+        }
         bitmapCanvas = Canvas(backingBitmap!!)
         undoStack.clear()
         clearRedoStack()
         notifyUndoRedo()
+        if (autoCenter && width > 0 && height > 0) {
+            centerTransform(backingBitmap!!.width, backingBitmap!!.height)
+        }
         invalidate()
     }
 
@@ -1375,11 +1383,28 @@ class DrawingCanvasView @JvmOverloads constructor(
 
     private fun drawPaperPattern(canvas: Canvas) {
         if (backgroundBitmap != null) return
-        val w = width.toFloat()
-        val h = height.toFloat()
-        if (w <= 0 || h <= 0) return
+
+        val pageW = (backingBitmap?.width?.toFloat() ?: pdfPageRectWidth()).takeIf { it > 0f } ?: width.toFloat()
+        val pageH = (backingBitmap?.height?.toFloat() ?: pdfPageRectHeight()).takeIf { it > 0f } ?: height.toFloat()
+        if (pageW <= 0 || pageH <= 0) return
+
+        // Compute visible viewport in page space so grid covers full view under pan/zoom
+        val viewCorners = floatArrayOf(0f, 0f, width.toFloat(), height.toFloat())
+        pageInverseMatrix.mapPoints(viewCorners)
+        val viewLeft = minOf(viewCorners[0], viewCorners[2])
+        val viewTop = minOf(viewCorners[1], viewCorners[3])
+        val viewRight = maxOf(viewCorners[0], viewCorners[2])
+        val viewBottom = maxOf(viewCorners[1], viewCorners[3])
+
+        val isUnbounded = beyondPaper || pageType == "infinite"
+        val left = if (isUnbounded) minOf(0f, viewLeft) else 0f
+        val top = if (isUnbounded) minOf(0f, viewTop) else 0f
+        val right = if (isUnbounded) maxOf(pageW, viewRight) else pageW
+        val bottom = if (isUnbounded) maxOf(pageH, viewBottom) else pageH
 
         val step = backgroundDensity.toFloat().coerceIn(20f, 80f)
+        val startX = (Math.floor((left / step).toDouble()) * step).toFloat()
+        val startY = (Math.floor((top / step).toDouble()) * step).toFloat()
 
         // The Template (Paper Pattern) tool is the primary driver: GRID=square
         // grid, LINES=horizontal lines, DOTTED=dot grid. It is remapped onto
@@ -1399,30 +1424,30 @@ class DrawingCanvasView @JvmOverloads constructor(
         }
         when (mode) {
             1 -> { // lined
-                var y = step
-                while (y < h) {
-                    canvas.drawLine(0f, y, w, y, patternPaint)
+                var y = startY
+                while (y <= bottom) {
+                    canvas.drawLine(left, y, right, y, patternPaint)
                     y += step
                 }
             }
             2 -> { // grid
-                var x = step
-                while (x < w) {
-                    canvas.drawLine(x, 0f, x, h, patternPaint)
+                var x = startX
+                while (x <= right) {
+                    canvas.drawLine(x, top, x, bottom, patternPaint)
                     x += step
                 }
-                var y = step
-                while (y < h) {
-                    canvas.drawLine(0f, y, w, y, patternPaint)
+                var y = startY
+                while (y <= bottom) {
+                    canvas.drawLine(left, y, right, y, patternPaint)
                     y += step
                 }
             }
             3 -> { // dotted
                 val dotRadius = 2f
-                var x = step
-                while (x < w) {
-                    var y = step
-                    while (y < h) {
+                var x = startX
+                while (x <= right) {
+                    var y = startY
+                    while (y <= bottom) {
                         canvas.drawCircle(x, y, dotRadius, patternPaint)
                         y += step
                     }
@@ -2018,10 +2043,18 @@ class DrawingCanvasView @JvmOverloads constructor(
         commitLassoSelection()
         if (undoStack.isNotEmpty()) {
             backingBitmap?.let { current ->
+                if (redoStack.size >= maxUndoSnapshots) {
+                    val oldest = redoStack.removeFirst()
+                    if (!oldest.isRecycled) oldest.recycle()
+                }
                 redoStack.addLast(current.copy(Bitmap.Config.ARGB_8888, true))
             }
             val previous = undoStack.removeLast()
-            backingBitmap = previous.copy(Bitmap.Config.ARGB_8888, true)
+            val oldBacking = backingBitmap
+            backingBitmap = previous
+            if (oldBacking != null && oldBacking !== backingBitmap && !oldBacking.isRecycled) {
+                oldBacking.recycle()
+            }
             bitmapCanvas = Canvas(backingBitmap!!)
             notifyUndoRedo()
             invalidate()
@@ -2033,10 +2066,18 @@ class DrawingCanvasView @JvmOverloads constructor(
         commitLassoSelection()
         if (redoStack.isNotEmpty()) {
             backingBitmap?.let { current ->
+                if (undoStack.size >= maxUndoSnapshots) {
+                    val oldest = undoStack.removeFirst()
+                    if (!oldest.isRecycled) oldest.recycle()
+                }
                 undoStack.addLast(current.copy(Bitmap.Config.ARGB_8888, true))
             }
             val next = redoStack.removeLast()
-            backingBitmap = next.copy(Bitmap.Config.ARGB_8888, true)
+            val oldBacking = backingBitmap
+            backingBitmap = next
+            if (oldBacking != null && oldBacking !== backingBitmap && !oldBacking.isRecycled) {
+                oldBacking.recycle()
+            }
             bitmapCanvas = Canvas(backingBitmap!!)
             notifyUndoRedo()
             invalidate()

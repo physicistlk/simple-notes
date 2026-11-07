@@ -102,8 +102,11 @@ fun TouchNotesNavHost(
                 },
                 openNotes = openNotes.toList(),
                 onSwitchNote = { id ->
-                    navController.navigate(Screen.Canvas.createRoute(id)) {
-                        launchSingleTop = true
+                    if (id != noteId) {
+                        navController.navigate(Screen.Canvas.createRoute(id)) {
+                            popUpTo(Screen.Canvas.route) { inclusive = true }
+                            launchSingleTop = true
+                        }
                     }
                 },
                 onCloseTab = { id ->

@@ -132,8 +132,19 @@ object ExportManager {
             val bitmap = if (pageIdx == currentPageIndex && currentEditingBitmap != null) {
                 flattenBitmap(currentEditingBitmap, currentEditingBackground, currentEditingImageLayers)
             } else {
-                val file = fileStore.getPageFile(note.id, pageIdx)
-                BitmapUtils.loadBitmapFromFile(file)
+                val pageFile = fileStore.getPageFile(note.id, pageIdx)
+                val strokesFile = fileStore.getStrokesFile(note.id, pageIdx)
+                if (strokesFile.exists()) {
+                    val baseBmp = BitmapUtils.loadBitmapFromFile(pageFile)
+                    val strokeBmp = BitmapUtils.loadBitmapFromFile(strokesFile)
+                    if (baseBmp != null && strokeBmp != null) {
+                        flattenBitmap(strokeBmp, baseBmp)
+                    } else {
+                        strokeBmp ?: baseBmp
+                    }
+                } else {
+                    BitmapUtils.loadBitmapFromFile(pageFile)
+                }
             }
 
             val pageInfo = PdfDocument.PageInfo.Builder(pdfPageWidth, pdfPageHeight, pdfPageNumber++).create()

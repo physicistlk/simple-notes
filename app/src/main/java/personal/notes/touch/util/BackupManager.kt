@@ -61,17 +61,23 @@ object BackupManager {
                 totalBytes += manifestBytes.size
                 onProgress("manifest.json", fileCount)
 
-                // 3. Write database file
+                // 3. Write database file and WAL sidecars if present
                 val dbFile = context.getDatabasePath("touchnotes.db")
-                if (dbFile.exists()) {
-                    zos.putNextEntry(ZipEntry("database/${dbFile.name}"))
-                    FileInputStream(dbFile).use { fis ->
+                val dbParent = dbFile.parentFile
+                val dbFiles = listOfNotNull(
+                    dbFile.takeIf { it.exists() },
+                    File(dbParent, "touchnotes.db-wal").takeIf { it.exists() && it.length() > 0 },
+                    File(dbParent, "touchnotes.db-shm").takeIf { it.exists() && it.length() > 0 }
+                )
+                for (f in dbFiles) {
+                    zos.putNextEntry(ZipEntry("database/${f.name}"))
+                    FileInputStream(f).use { fis ->
                         val copied = fis.copyTo(zos)
                         totalBytes += copied
                     }
                     zos.closeEntry()
                     fileCount++
-                    onProgress(dbFile.name, fileCount)
+                    onProgress(f.name, fileCount)
                 }
 
                 // 4. Write all files under files/note/
@@ -167,6 +173,14 @@ object BackupManager {
                 File(targetDb.parentFile, "touchnotes.db-wal").delete()
                 File(targetDb.parentFile, "touchnotes.db-shm").delete()
                 stagedDb.copyTo(targetDb, overwrite = true)
+                val stagedWal = File(stagingDir, "database/touchnotes.db-wal")
+                if (stagedWal.exists()) {
+                    stagedWal.copyTo(File(targetDb.parentFile, "touchnotes.db-wal"), overwrite = true)
+                }
+                val stagedShm = File(stagingDir, "database/touchnotes.db-shm")
+                if (stagedShm.exists()) {
+                    stagedShm.copyTo(File(targetDb.parentFile, "touchnotes.db-shm"), overwrite = true)
+                }
             }
 
             // 5. Overwrite files/note/ directory with staged files

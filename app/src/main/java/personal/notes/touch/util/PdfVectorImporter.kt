@@ -114,7 +114,11 @@ object PdfVectorImporter {
             if (sourcePath != null) {
                 repository.setPagePdfSource(noteId, pageIndex, sourcePath, i)
             }
-            if (firstPage == null) firstPage = bitmap
+            if (firstPage == null) {
+                firstPage = bitmap
+            } else {
+                bitmap.recycle()
+            }
         }
         return firstPage
     }

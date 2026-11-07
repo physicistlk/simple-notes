@@ -132,7 +132,7 @@ object BitmapUtils {
         }
     }
 
-    fun createSafeBitmap(width: Int, height: Int, maxWidth: Int = 2048, maxHeight: Int = 2048): Bitmap {
+    fun createSafeBitmap(width: Int, height: Int, maxWidth: Int = 4096, maxHeight: Int = 4096): Bitmap {
         val w = width.coerceIn(1, maxWidth)
         val h = height.coerceIn(1, maxHeight)
         return Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
