@@ -364,6 +364,9 @@ fun CanvasScreen(
         val continuousReading = (note?.pageType ?: "infinite") != "infinite" &&
             uiState.pageTurningMode == 0
         if (continuousReading) return@LaunchedEffect
+        // From here the canvas holds currentPageIndex, so saves triggered
+        // before the next page flip must be filed under this index.
+        viewModel.setCanvasPageIndex(currentPageIndex)
         // F-10: vector PDF pages load their stroke-only layer and get the live
         // pdfium background; every other page keeps the raster path.
         val vectorPage = vectorPdfPage(currentPageIndex)
@@ -1212,8 +1215,11 @@ fun CanvasScreen(
                     else -> 3f
                 }
 
-                // When entering continuous mode, scroll to the current page index
-                LaunchedEffect(isContinuous) {
+                // When entering continuous mode — or flipping the reading
+                // direction while in it — scroll to the current page index.
+                // Without the direction key the new Lazy list started at page
+                // 1 while the rest of the UI still pointed at page N.
+                LaunchedEffect(isContinuous, isHorizontal) {
                     if (isContinuous) {
                         continuousScale = 1f
                         continuousPanX = 0f
@@ -1284,6 +1290,7 @@ fun CanvasScreen(
                             scope.launch {
                                 try {
                                     val pageIdx = viewModel.currentPageIndex.value
+                                    viewModel.setCanvasPageIndex(pageIdx)
                                     val vectorPage = vectorPdfPage(pageIdx)
                                     if (vectorPage != null) {
                                         backgroundBitmap = null
@@ -1383,10 +1390,14 @@ fun CanvasScreen(
                                         zoom = continuousZoomBucket,
                                         modifier = androidx.compose.ui.Modifier.fillParentMaxHeight(),
                                         onClick = {
+                                            // Let the page-change effect do the
+                                            // one load: it also restores the
+                                            // page's image/text layers, which a
+                                            // direct goToPage callback skipped
+                                            // (and it would have decoded the
+                                            // page twice).
+                                            viewModel.setCurrentPageIndex(idx)
                                             viewModel.setPageTurningMode(1)
-                                            viewModel.goToPage(idx, null, forceReload = true) { newBmp ->
-                                                applyLoadedPage(idx, newBmp)
-                                            }
                                         }
                                     )
                                 }
@@ -1409,10 +1420,14 @@ fun CanvasScreen(
                                         zoom = continuousZoomBucket,
                                         modifier = androidx.compose.ui.Modifier.fillMaxWidth(),
                                         onClick = {
+                                            // Let the page-change effect do the
+                                            // one load: it also restores the
+                                            // page's image/text layers, which a
+                                            // direct goToPage callback skipped
+                                            // (and it would have decoded the
+                                            // page twice).
+                                            viewModel.setCurrentPageIndex(idx)
                                             viewModel.setPageTurningMode(1)
-                                            viewModel.goToPage(idx, null, forceReload = true) { newBmp ->
-                                                applyLoadedPage(idx, newBmp)
-                                            }
                                         }
                                     )
                                 }

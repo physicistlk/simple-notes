@@ -369,6 +369,22 @@ class CanvasViewModel(
         pageLoadedFromDisk = loaded
     }
 
+    /**
+     * Index of the page whose content the drawing canvas currently holds.
+     *
+     * This is NOT always [_currentPageIndex]: in continuous reading mode,
+     * scrolling keeps updating the current page while the hidden canvas keeps
+     * whatever page was loaded into it last. A save must name the page the
+     * bitmap actually holds, or leaving the note would write e.g. page 1's
+     * strokes over the page the reader had scrolled to.
+     */
+    private var canvasPageIndex = 0
+
+    /** Records the page whose content the canvas is holding right now. */
+    fun setCanvasPageIndex(index: Int) {
+        canvasPageIndex = index
+    }
+
     /** F-10: true when [index] is a page rendered from a vector PDF source. */
     private fun pageIsVectorPdf(index: Int): Boolean {
         val page = pages.value.getOrNull(index) ?: return false
@@ -393,36 +409,54 @@ class CanvasViewModel(
 
     private var debouncedSaveJob: kotlinx.coroutines.Job? = null
 
-    fun scheduleDebouncedSave(bitmap: Bitmap, delayMs: Long = 1500L) {
+    /**
+     * [pageIndex] defaults to the page the canvas is holding right now and is
+     * evaluated at the call site. Both halves matter: a debounced save runs up
+     * to 1.5 s later, and in continuous reading the "current" page moves with
+     * scrolling while the canvas keeps its own page. Capturing the canvas page
+     * here is what keeps page N's strokes out of page N+1's file.
+     */
+    fun scheduleDebouncedSave(
+        bitmap: Bitmap,
+        delayMs: Long = 1500L,
+        pageIndex: Int = canvasPageIndex
+    ) {
         debouncedSaveJob?.cancel()
         debouncedSaveJob = viewModelScope.launch {
             kotlinx.coroutines.delay(delayMs)
             // Do NOT call the public save here: it cancels the pending job,
             // and this coroutine IS that job (the save would cancel itself
             // before the write and silently drop the stroke).
-            persistPageBitmap(bitmap)
+            persistPageBitmap(pageIndex, bitmap)
         }
     }
 
     /** Cancels any pending debounced save and writes [bitmap] now. */
-    suspend fun saveCurrentPageBitmapDirect(bitmap: Bitmap) {
+    suspend fun saveCurrentPageBitmapDirect(
+        bitmap: Bitmap,
+        pageIndex: Int = canvasPageIndex
+    ) {
         debouncedSaveJob?.cancel()
         debouncedSaveJob = null
-        persistPageBitmap(bitmap)
+        persistPageBitmap(pageIndex, bitmap)
     }
 
-    fun saveCurrentPageBitmap(bitmap: Bitmap) {
+    fun saveCurrentPageBitmap(
+        bitmap: Bitmap,
+        pageIndex: Int = canvasPageIndex
+    ) {
         debouncedSaveJob?.cancel()
         viewModelScope.launch {
-            persistPageBitmap(bitmap)
+            persistPageBitmap(pageIndex, bitmap)
         }
     }
 
-    private suspend fun persistPageBitmap(bitmap: Bitmap) {
+    private suspend fun persistPageBitmap(pageIdx: Int, bitmap: Bitmap) {
         // The view no longer recycles backing bitmaps, but a stale job can
         // still outlive one; never hand a recycled bitmap to the encoder.
         if (bitmap.isRecycled) return
-        val pageIdx = _currentPageIndex.value
+        val totalPages = note.value?.pageCount ?: 1
+        if (pageIdx !in 0 until totalPages) return
         val guardFile = if (pageIsVectorPdf(pageIdx)) {
             fileStore.getStrokesFile(noteId, pageIdx)
         } else {
@@ -459,6 +493,7 @@ class CanvasViewModel(
                 saveContentLayer(_currentPageIndex.value, currentBitmap)
             }
             _currentPageIndex.value = index
+            canvasPageIndex = index
             val newBitmap = loadContentLayer(index)
             // The save above guarded the OLD page with the OLD flag state;
             // from here on the flag describes the NEW page's load result.
@@ -488,6 +523,7 @@ class CanvasViewModel(
             }
             val newPage = repository.addPage(noteId)
             _currentPageIndex.value = newPage.index
+            canvasPageIndex = newPage.index
             pageLoadedFromDisk = false // new page starts blank, no disk load
             onBitmapLoaded(null) // New page starts blank
         }
@@ -507,6 +543,7 @@ class CanvasViewModel(
                 }.coerceAtLeast(0)
 
                 _currentPageIndex.value = newIndex
+                canvasPageIndex = newIndex
                 val newBitmap = loadContentLayer(newIndex)
                 pageLoadedFromDisk = newBitmap != null
                 onBitmapLoaded(newBitmap)
