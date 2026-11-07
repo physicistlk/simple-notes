@@ -825,20 +825,21 @@ class DrawingCanvasView @JvmOverloads constructor(
 
     fun loadBitmap(bitmap: Bitmap) {
         val old = backingBitmap
-        backingBitmap = if (bitmap.isMutable && bitmap.config == Bitmap.Config.ARGB_8888) {
+        val loaded = if (bitmap.isMutable && bitmap.config == Bitmap.Config.ARGB_8888) {
             bitmap
         } else {
             bitmap.copy(Bitmap.Config.ARGB_8888, true)
         }
-        if (old != null && old !== backingBitmap && !old.isRecycled) {
+        backingBitmap = loaded
+        if (old != null && old !== loaded && !old.isRecycled) {
             old.recycle()
         }
-        bitmapCanvas = Canvas(backingBitmap!!)
+        bitmapCanvas = Canvas(loaded)
         undoStack.clear()
         clearRedoStack()
         notifyUndoRedo()
         if (autoCenter && width > 0 && height > 0) {
-            centerTransform(backingBitmap!!.width, backingBitmap!!.height)
+            centerTransform(loaded.width, loaded.height)
         }
         invalidate()
     }
