@@ -15,7 +15,8 @@ import personal.notes.touch.data.repo.NoteRepository
 import personal.notes.touch.data.repo.SettingsRepository
 
 class TouchNotesApp : Application() {
-    private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    /** Outlives any screen's ViewModel: used for writes that must finish after navigation. */
+    val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     @Volatile
     private var _database: AppDatabase? = null

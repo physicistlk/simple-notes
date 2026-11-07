@@ -422,6 +422,7 @@ class CanvasViewModel(
         pageIndex: Int = canvasPageIndex
     ) {
         debouncedSaveJob?.cancel()
+        pendingSave = pageIndex to bitmap
         debouncedSaveJob = viewModelScope.launch {
             kotlinx.coroutines.delay(delayMs)
             // Do NOT call the public save here: it cancels the pending job,
@@ -431,6 +432,26 @@ class CanvasViewModel(
         }
     }
 
+    /** Content of the debounced save that has not been written yet. */
+    private var pendingSave: Pair<Int, Bitmap>? = null
+
+    /**
+     * Writes a pending debounced save on a caller-provided scope.
+     *
+     * Used when the screen leaves composition (system back, tab close, note
+     * switch, opening the text editor): `viewModelScope` is cancelled at that
+     * moment, so the pending job would never write. Called with the bitmap and
+     * page index captured when the stroke finished, so the write still lands on
+     * the right page even though the screen is already gone.
+     */
+    fun flushPendingSave(scope: kotlinx.coroutines.CoroutineScope) {
+        val pending = pendingSave ?: return
+        pendingSave = null
+        debouncedSaveJob?.cancel()
+        debouncedSaveJob = null
+        scope.launch { persistPageBitmap(pending.first, pending.second) }
+    }
+
     /** Cancels any pending debounced save and writes [bitmap] now. */
     suspend fun saveCurrentPageBitmapDirect(
         bitmap: Bitmap,
@@ -438,6 +459,7 @@ class CanvasViewModel(
     ) {
         debouncedSaveJob?.cancel()
         debouncedSaveJob = null
+        pendingSave = null
         persistPageBitmap(pageIndex, bitmap)
     }
 
@@ -446,6 +468,7 @@ class CanvasViewModel(
         pageIndex: Int = canvasPageIndex
     ) {
         debouncedSaveJob?.cancel()
+        pendingSave = null
         viewModelScope.launch {
             persistPageBitmap(pageIndex, bitmap)
         }
@@ -464,6 +487,7 @@ class CanvasViewModel(
         }
         if (!pageLoadedFromDisk && guardFile.exists()) return
         saveContentLayer(pageIdx, bitmap)
+        if (pendingSave?.second === bitmap) pendingSave = null
     }
 
     fun setCurrentPageIndex(index: Int) {
@@ -488,9 +512,10 @@ class CanvasViewModel(
         if (index == _currentPageIndex.value && !forceReload) return
 
         viewModelScope.launch {
-            // Save current page
+            // Save the page the canvas holds (not necessarily the scrolled
+            // page in continuous reading mode).
             if (currentBitmap != null) {
-                saveContentLayer(_currentPageIndex.value, currentBitmap)
+                saveContentLayer(canvasPageIndex, currentBitmap)
             }
             _currentPageIndex.value = index
             canvasPageIndex = index
@@ -517,9 +542,9 @@ class CanvasViewModel(
 
     fun addNewPage(currentBitmap: Bitmap?, onBitmapLoaded: (Bitmap?) -> Unit) {
         viewModelScope.launch {
-            // Save current page first
+            // Save the page the canvas holds first.
             if (currentBitmap != null) {
-                saveContentLayer(_currentPageIndex.value, currentBitmap)
+                saveContentLayer(canvasPageIndex, currentBitmap)
             }
             val newPage = repository.addPage(noteId)
             _currentPageIndex.value = newPage.index

@@ -141,6 +141,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
 import personal.notes.touch.R
+import personal.notes.touch.TouchNotesApp
 import personal.notes.touch.data.db.entity.PageEntity
 import personal.notes.touch.ui.theme.OrangePrimary
 import personal.notes.touch.util.ClipboardHelper
@@ -575,6 +576,18 @@ fun CanvasScreen(
             val item = ClipboardHelper.pasteFromClipboard(context)
             val extracted = ClipboardHelper.extractContent(context, item)
             handleExtractedContent(extracted)
+        }
+    }
+
+    // Navigation (system back, tab close, note switch, opening the text
+    // editor) disposes this screen, which cancels viewModelScope. A stroke
+    // finished less than the 1.5 s debounce before that would never be
+    // written, so hand the pending save to the application scope, which
+    // outlives the screen.
+    DisposableEffect(viewModel) {
+        onDispose {
+            val app = context.applicationContext as? TouchNotesApp
+            if (app != null) viewModel.flushPendingSave(app.appScope)
         }
     }
 
@@ -3355,7 +3368,10 @@ fun ContinuousPageView(
         var pageBitmap by remember(page.id, page.updatedAt) {
             mutableStateOf<android.graphics.Bitmap?>(null)
         }
-        LaunchedEffect(page.id, page.updatedAt, desiredWidthPx, noteId) {
+        // A raster page is a fixed-size PNG: re-decoding it for every zoom
+        // bucket buys nothing, so only vector pages key on the render width.
+        val renderWidthKey = if (isVector) desiredWidthPx else 0
+        LaunchedEffect(page.id, page.updatedAt, renderWidthKey, noteId) {
             // Let a pinch settle on its final bucket before allocating a
             // full-page bitmap; an intermediate key cancels this coroutine
             // while it is still cancellable (a native pdfium render is not).
