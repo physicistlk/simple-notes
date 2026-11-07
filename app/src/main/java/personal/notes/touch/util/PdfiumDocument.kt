@@ -91,18 +91,28 @@ class PdfiumDocument : AutoCloseable {
             e.printStackTrace()
             return null
         }
-        val ok = synchronized(lock) {
+        if (!renderPageInto(pageIndex, bitmap, pxPerPt)) {
+            bitmap.recycle()
+            return null
+        }
+        return bitmap
+    }
+
+    /**
+     * Renders [pageIndex] into an existing ARGB_8888 [bitmap] at [pxPerPt],
+     * filling the whole bitmap white first. Lets callers composite PDF and
+     * annotation layers into a single allocation instead of holding two
+     * full-page bitmaps at once.
+     */
+    fun renderPageInto(pageIndex: Int, bitmap: Bitmap, pxPerPt: Float): Boolean {
+        if (pxPerPt <= 0f || bitmap.isRecycled) return false
+        return synchronized(lock) {
             if (handle == 0L || pageIndex !in 0 until pageCount) {
                 false
             } else {
                 PdfiumBridge.render(handle, pageIndex, bitmap, 0f, 0f, pxPerPt, true)
             }
         }
-        if (!ok) {
-            bitmap.recycle()
-            return null
-        }
-        return bitmap
     }
 
     /** Number of extractable characters on the page (0 for image-only PDFs). */

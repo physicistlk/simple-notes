@@ -18,6 +18,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -111,6 +112,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -127,6 +129,7 @@ import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -349,11 +352,18 @@ fun CanvasScreen(
     // effect therefore skips its first (initial-composition) run — page 0 is
     // applied exactly once — and only handles real page flips.
     var pageEffectFirstRun by remember { mutableStateOf(true) }
-    LaunchedEffect(currentPageIndex) {
+    LaunchedEffect(currentPageIndex, uiState.pageTurningMode) {
         if (pageEffectFirstRun) {
             pageEffectFirstRun = false
             return@LaunchedEffect
         }
+        // Continuous reading renders every page itself; mirroring the scrolled
+        // page into the hidden canvas as well would decode each scrolled page
+        // twice, so leave the canvas alone until the reader returns to single
+        // page mode (P1 audit).
+        val continuousReading = (note?.pageType ?: "infinite") != "infinite" &&
+            uiState.pageTurningMode == 0
+        if (continuousReading) return@LaunchedEffect
         // F-10: vector PDF pages load their stroke-only layer and get the live
         // pdfium background; every other page keeps the raster path.
         val vectorPage = vectorPdfPage(currentPageIndex)
@@ -1192,6 +1202,16 @@ fun CanvasScreen(
                 var continuousPanX by remember { mutableFloatStateOf(0f) }
                 var continuousPanY by remember { mutableFloatStateOf(0f) }
 
+                // Rendering key for the page bitmaps. Quantising the zoom keeps
+                // a pinch gesture from launching a PDF render per frame while
+                // still upgrading resolution as the user zooms in (P1 audit).
+                val continuousZoomBucket = when {
+                    continuousScale < 1.25f -> 1f
+                    continuousScale < 1.75f -> 1.5f
+                    continuousScale < 2.5f -> 2f
+                    else -> 3f
+                }
+
                 // When entering continuous mode, scroll to the current page index
                 LaunchedEffect(isContinuous) {
                     if (isContinuous) {
@@ -1311,11 +1331,26 @@ fun CanvasScreen(
                             .pointerInput(Unit) {
                                 detectTransformGestures { centroid, pan, zoom, _ ->
                                     val oldScale = continuousScale
-                                    val newScale = (continuousScale * zoom).coerceIn(0.5f, 4f)
+                                    val newScale = (continuousScale * zoom).coerceIn(1f, 4f)
                                     val factor = newScale / oldScale
-                                    continuousPanX = centroid.x - (centroid.x - continuousPanX) * factor + pan.x
-                                    continuousPanY = centroid.y - (centroid.y - continuousPanY) * factor + pan.y
+                                    // The Lazy list keeps ownership of scrolling
+                                    // (so off-screen pages are still composed and
+                                    // reachable); the layer translation is clamped
+                                    // to the zoomed content so it can never push a
+                                    // page completely out of view.
+                                    val maxPanX = size.width * (newScale - 1f)
+                                    val maxPanY = size.height * (newScale - 1f)
+                                    continuousPanX = (centroid.x - (centroid.x - continuousPanX) * factor + pan.x)
+                                        .coerceIn(-maxPanX, 0f)
+                                    continuousPanY = (centroid.y - (centroid.y - continuousPanY) * factor + pan.y)
+                                        .coerceIn(-maxPanY, 0f)
                                     continuousScale = newScale
+                                    // Back at fit-to-width: drop the offsets so
+                                    // pages sit centred again.
+                                    if (newScale <= 1.02f) {
+                                        continuousPanX = 0f
+                                        continuousPanY = 0f
+                                    }
                                 }
                             }
                             .graphicsLayer {
@@ -1341,6 +1376,7 @@ fun CanvasScreen(
                                         noteId = viewModel.noteId,
                                         pdfDocCache = pdfDocCache,
                                         repository = viewModel.repository,
+                                        zoom = continuousZoomBucket,
                                         modifier = androidx.compose.ui.Modifier.fillParentMaxHeight(),
                                         onClick = {
                                             viewModel.setPageTurningMode(1)
@@ -1366,6 +1402,7 @@ fun CanvasScreen(
                                         noteId = viewModel.noteId,
                                         pdfDocCache = pdfDocCache,
                                         repository = viewModel.repository,
+                                        zoom = continuousZoomBucket,
                                         modifier = androidx.compose.ui.Modifier.fillMaxWidth(),
                                         onClick = {
                                             viewModel.setPageTurningMode(1)
@@ -3259,86 +3296,68 @@ fun ContinuousPageView(
     noteId: String,
     pdfDocCache: personal.notes.touch.util.PdfDocumentCache,
     repository: personal.notes.touch.data.repo.NoteRepository,
+    zoom: Float,
     modifier: Modifier = Modifier,
     onClick: () -> Unit
 ) {
     val isVector = page.pdfSourcePath.isNotEmpty() && page.pdfPageIndex >= 0
-    val pageBitmapState = remember(page.id, page.pdfSourcePath, page.pdfPageIndex, page.updatedAt) {
-        mutableStateOf<android.graphics.Bitmap?>(null)
-    }
 
-    androidx.compose.runtime.DisposableEffect(page.id, page.pdfSourcePath, page.pdfPageIndex, page.updatedAt) {
-        onDispose {
-            val oldBmp = pageBitmapState.value
-            if (oldBmp != null && !oldBmp.isRecycled) {
-                oldBmp.recycle()
-            }
-            pageBitmapState.value = null
-        }
-    }
-
-    val pageRatio = remember(page.id, page.pdfSourcePath, page.pdfPageIndex) {
-        if (isVector) {
-            val doc = pdfDocCache.document(page.pdfSourcePath)
-            if (doc != null) {
-                val size = doc.pageSize(page.pdfPageIndex)
-                val pW = size[0].coerceAtLeast(1f)
-                val pH = size[1].coerceAtLeast(1f)
-                pW / pH
-            } else 0.707f
-        } else 0.707f
-    }
-
-    LaunchedEffect(page.id, page.pdfSourcePath, page.pdfPageIndex, page.updatedAt) {
-        val bmp = withContext(Dispatchers.IO) {
-            try {
-                if (isVector) {
-                    val doc = pdfDocCache.document(page.pdfSourcePath)
-                    if (doc != null) {
-                        val size = doc.pageSize(page.pdfPageIndex)
-                        val pW = size[0].coerceAtLeast(1f)
-                        val pH = size[1].coerceAtLeast(1f)
-                        val targetW = 1600
-                        val renderScale = targetW / pW
-                        val outW = targetW
-                        val outH = (pH * renderScale).roundToInt().coerceAtLeast(1)
-                        val pdfBmp = doc.renderPageAt(page.pdfPageIndex, renderScale, outW, outH)
-                        val strokes = repository.loadPageStrokes(noteId, pageIndex)
-                        if (pdfBmp != null && strokes != null) {
-                            val composite = android.graphics.Bitmap.createBitmap(outW, outH, android.graphics.Bitmap.Config.ARGB_8888)
-                            val canvas = android.graphics.Canvas(composite)
-                            val paint = android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG or android.graphics.Paint.ANTI_ALIAS_FLAG)
-                            canvas.drawBitmap(pdfBmp, 0f, 0f, paint)
-                            canvas.drawBitmap(strokes, null, android.graphics.Rect(0, 0, outW, outH), paint)
-                            pdfBmp.recycle()
-                            composite
-                        } else {
-                            pdfBmp ?: strokes ?: repository.loadPageBitmap(noteId, pageIndex)
-                        }
-                    } else {
-                        repository.loadPageBitmap(noteId, pageIndex)
-                    }
-                } else {
-                    repository.loadPageBitmap(noteId, pageIndex)
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-                null
+    // Opening the PDF (read + parse in pdfium) has to happen off the main
+    // thread, so the page lays out at the A4 ratio until the real one arrives.
+    val pageRatio by produceState(
+        initialValue = 0.707f,
+        page.id, page.pdfSourcePath, page.pdfPageIndex
+    ) {
+        value = withContext(Dispatchers.IO) {
+            if (!isVector) {
+                0.707f
+            } else {
+                val size = pdfDocCache.document(page.pdfSourcePath)?.pageSize(page.pdfPageIndex)
+                if (size != null && size[0] > 0f && size[1] > 0f) size[0] / size[1] else 0.707f
             }
         }
-        val prev = pageBitmapState.value
-        if (prev != null && prev !== bmp && !prev.isRecycled) {
-            prev.recycle()
-        }
-        pageBitmapState.value = bmp
     }
 
-    val bmp = pageBitmapState.value
-    Box(
+    BoxWithConstraints(
         modifier = modifier
             .aspectRatio(pageRatio)
             .clickable { onClick() }
     ) {
+        val displayWidthPx = with(LocalDensity.current) { maxWidth.toPx() }
+        // The page is drawn at displayWidthPx * zoom screen pixels, so the PDF
+        // is rendered at that width: pinching up reveals detail instead of
+        // upscaling a fixed low-resolution bitmap (P1 audit). The caller
+        // quantises zoom, so this key changes a few times per gesture rather
+        // than on every frame.
+        val desiredWidthPx = (displayWidthPx * zoom).roundToInt().coerceAtLeast(1)
+
+        // Keep the previous bitmap on screen while a zoom bucket re-renders,
+        // so pinching never flashes a placeholder.
+        var pageBitmap by remember(page.id, page.updatedAt) {
+            mutableStateOf<android.graphics.Bitmap?>(null)
+        }
+        LaunchedEffect(page.id, page.updatedAt, desiredWidthPx, noteId) {
+            // Let a pinch settle on its final bucket before allocating a
+            // full-page bitmap; an intermediate key cancels this coroutine
+            // while it is still cancellable (a native pdfium render is not).
+            kotlinx.coroutines.delay(80)
+            pageBitmap = withContext(Dispatchers.IO) {
+                try {
+                    if (isVector) {
+                        renderContinuousPage(
+                            page, pageIndex, noteId, pdfDocCache, repository, desiredWidthPx
+                        )
+                    } else {
+                        repository.loadPageBitmap(noteId, pageIndex)
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    null
+                }
+            }
+        }
+
+        val bmp = pageBitmap
         if (bmp != null && !bmp.isRecycled) {
             androidx.compose.foundation.Image(
                 bitmap = bmp.asImageBitmap(),
@@ -3376,4 +3395,56 @@ fun ContinuousPageView(
             )
         }
     }
+}
+
+/**
+ * Composites one vector-PDF page for continuous reading: the page is rendered
+ * directly into the output bitmap (pdfium fills it white) and the annotation
+ * layer is drawn on top, so only one full-page allocation exists per page.
+ *
+ * Bitmaps are deliberately not recycled here: the composable cannot know when
+ * Compose has finished drawing a frame, and recycling a bitmap still
+ * referenced by an ImageBitmap crashes ("trying to use a recycled bitmap").
+ * The GC reclaims them once the composable drops its reference.
+ */
+private suspend fun renderContinuousPage(
+    page: personal.notes.touch.data.db.entity.PageEntity,
+    pageIndex: Int,
+    noteId: String,
+    pdfDocCache: personal.notes.touch.util.PdfDocumentCache,
+    repository: personal.notes.touch.data.repo.NoteRepository,
+    desiredWidthPx: Int
+): android.graphics.Bitmap? {
+    val document = pdfDocCache.document(page.pdfSourcePath)
+        ?: return repository.loadPageBitmap(noteId, pageIndex)
+    val size = document.pageSize(page.pdfPageIndex)
+    if (size[0] <= 0f || size[1] <= 0f) return repository.loadPageBitmap(noteId, pageIndex)
+
+    val width = personal.notes.touch.util.PdfRenderPolicy
+        .continuousRenderWidth(size[0], size[1], desiredWidthPx)
+    if (width <= 0) return repository.loadPageBitmap(noteId, pageIndex)
+    val height = (width * size[1] / size[0]).roundToInt().coerceAtLeast(1)
+
+    val composite = try {
+        android.graphics.Bitmap.createBitmap(
+            width, height, android.graphics.Bitmap.Config.ARGB_8888
+        )
+    } catch (e: OutOfMemoryError) {
+        e.printStackTrace()
+        return null
+    }
+    if (!document.renderPageInto(page.pdfPageIndex, composite, width / size[0])) {
+        composite.recycle()
+        return repository.loadPageBitmap(noteId, pageIndex)
+    }
+    val strokes = repository.loadPageStrokes(noteId, pageIndex)
+    if (strokes != null && !strokes.isRecycled) {
+        val canvas = android.graphics.Canvas(composite)
+        val paint = android.graphics.Paint(
+            android.graphics.Paint.FILTER_BITMAP_FLAG or
+                android.graphics.Paint.ANTI_ALIAS_FLAG
+        )
+        canvas.drawBitmap(strokes, null, android.graphics.Rect(0, 0, width, height), paint)
+    }
+    return composite
 }

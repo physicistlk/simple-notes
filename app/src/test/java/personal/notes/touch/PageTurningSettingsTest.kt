@@ -35,6 +35,24 @@ class PageTurningSettingsTest {
     }
 
     @Test
+    fun continuousRenderWidthStaysWithinItsBudget() {
+        val width = PdfRenderPolicy.continuousRenderWidth(595.28f, 841.89f, desiredWidthPx = 4096)
+        assertTrue("width $width", width in 2800..3000)
+        val size = PdfRenderPolicy.outputSize(595.28f, 841.89f, width / 595.28f)
+        assertTrue(size[0].toLong() * size[1] <= PdfRenderPolicy.CONTINUOUS_MAX_PIXELS)
+        assertTrue(size[0] <= PdfRenderPolicy.MAX_DIMENSION)
+    }
+
+    @Test
+    fun continuousRenderWidthGrowsWithZoomUntilCapped() {
+        val fitToWidth = PdfRenderPolicy.continuousRenderWidth(595f, 842f, 1500)
+        val zoomed = PdfRenderPolicy.continuousRenderWidth(595f, 842f, 4000)
+        assertEquals(1500, fitToWidth)
+        assertTrue(zoomed > fitToWidth)
+        assertTrue(zoomed < 4000) // area cap kicks in before the requested width
+    }
+
+    @Test
     fun pdfRenderPolicyHighResBudget() {
         assertEquals(18_000_000L, PdfRenderPolicy.MAX_PIXELS)
         assertEquals(1.15f, PdfRenderPolicy.HYSTERESIS, 1e-4f)

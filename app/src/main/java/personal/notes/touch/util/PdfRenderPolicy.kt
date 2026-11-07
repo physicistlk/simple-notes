@@ -26,6 +26,13 @@ object PdfRenderPolicy {
      */
     const val MAX_PIXELS = 18_000_000L
 
+    /**
+     * Area budget for one page in continuous reading mode. Several pages are
+     * held at once while scrolling, so the per-page budget is lower than the
+     * single-page background budget (12 MPx ≈ 48 MB, ≈ 2900 px wide on A4).
+     */
+    const val CONTINUOUS_MAX_PIXELS = 12_000_000L
+
     /** Re-render when the needed scale exceeds current by 15% for smooth vector sharpness. */
     const val HYSTERESIS = 1.15f
 
@@ -49,11 +56,17 @@ object PdfRenderPolicy {
      * the exact area limit rounds up to 2,378 × 3,365 = 8,001,970 px), so the
      * scale is nudged down until the integer size really fits.
      */
-    fun capPxPerPt(pageWidthPts: Float, pageHeightPts: Float, requestedPxPerPt: Float): Float {
+    fun capPxPerPt(
+        pageWidthPts: Float,
+        pageHeightPts: Float,
+        requestedPxPerPt: Float,
+        maxPixels: Long = MAX_PIXELS,
+        maxDimension: Int = MAX_DIMENSION
+    ): Float {
         if (pageWidthPts <= 0f || pageHeightPts <= 0f || requestedPxPerPt <= 0f) return 0f
-        val byDimension = min(MAX_DIMENSION / pageWidthPts, MAX_DIMENSION / pageHeightPts)
+        val byDimension = min(maxDimension / pageWidthPts, maxDimension / pageHeightPts)
         val byArea = sqrt(
-            MAX_PIXELS.toDouble() / (pageWidthPts.toDouble() * pageHeightPts.toDouble())
+            maxPixels.toDouble() / (pageWidthPts.toDouble() * pageHeightPts.toDouble())
         ).toFloat()
         var scale = min(requestedPxPerPt, min(byDimension, byArea))
         // At most a couple of iterations: the ceil overshoot is sub-pixel, so
@@ -61,17 +74,40 @@ object PdfRenderPolicy {
         repeat(8) {
             val size = outputSize(pageWidthPts, pageHeightPts, scale)
             val area = size[0].toLong() * size[1].toLong()
-            val overArea = area > MAX_PIXELS
+            val overArea = area > maxPixels
             val longest = maxOf(size[0], size[1])
-            val overDimension = longest > MAX_DIMENSION
+            val overDimension = longest > maxDimension
             if (!overArea && !overDimension) return scale
             val shrink = min(
-                if (overArea) MAX_PIXELS.toDouble() / area.toDouble() else 1.0,
-                if (overDimension) MAX_DIMENSION.toDouble() / longest.toDouble() else 1.0
+                if (overArea) maxPixels.toDouble() / area.toDouble() else 1.0,
+                if (overDimension) maxDimension.toDouble() / longest.toDouble() else 1.0
             )
             scale *= (shrink * 0.999).toFloat()
         }
         return if (scale > 0f) scale else 0f
+    }
+
+    /**
+     * Pixel width for one continuous-reading page that is displayed
+     * [desiredWidthPx] wide (already multiplied by the reader's zoom). The
+     * height follows the page aspect ratio and both sides are capped by
+     * [CONTINUOUS_MAX_PIXELS] / [MAX_DIMENSION]. Returns 0 for degenerate
+     * pages.
+     */
+    fun continuousRenderWidth(
+        pageWidthPts: Float,
+        pageHeightPts: Float,
+        desiredWidthPx: Int
+    ): Int {
+        if (pageWidthPts <= 0f || pageHeightPts <= 0f || desiredWidthPx <= 0) return 0
+        val scale = capPxPerPt(
+            pageWidthPts,
+            pageHeightPts,
+            desiredWidthPx / pageWidthPts,
+            CONTINUOUS_MAX_PIXELS
+        )
+        if (scale <= 0f) return 0
+        return outputSize(pageWidthPts, pageHeightPts, scale)[0]
     }
 
     /** Output bitmap size for a render; both sides ≥ 1. */
