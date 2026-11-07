@@ -52,9 +52,9 @@ object PdfRenderPolicy {
      * [MAX_PIXELS]. Returns 0 for degenerate pages.
      *
      * The result is verified against [outputSize] rather than the unrounded
-     * product: `ceil` can push a bitmap just past the budget (an A4 page at
-     * the exact area limit rounds up to 2,378 × 3,365 = 8,001,970 px), so the
-     * scale is nudged down until the integer size really fits.
+     * product: `ceil` can push a bitmap just past the budget (a page sized at
+     * the exact area limit rounds up to one row too many), so the scale is
+     * nudged down until the integer size really fits.
      */
     fun capPxPerPt(
         pageWidthPts: Float,

@@ -1218,6 +1218,10 @@ fun CanvasScreen(
                         continuousScale = 1f
                         continuousPanX = 0f
                         continuousPanY = 0f
+                        // The canvas sits behind the reader, so drop its vector
+                        // background (up to 72 MB) for the duration. Returning
+                        // to single-page mode re-installs it via applyLoadedPage.
+                        canvasViewRef?.backgroundBitmap = null
                         val target = currentPageIndex.coerceIn(0, (pages.size - 1).coerceAtLeast(0))
                         if (isHorizontal) {
                             continuousRowState.scrollToItem(target)

@@ -64,10 +64,11 @@ object BackupManager {
                 // 3. Write database file and WAL sidecars if present
                 val dbFile = context.getDatabasePath("touchnotes.db")
                 val dbParent = dbFile.parentFile
+                // The shared-memory index (-shm) is derived state and is
+                // rebuilt by SQLite on open, so it is never archived.
                 val dbFiles = listOfNotNull(
                     dbFile.takeIf { it.exists() },
-                    File(dbParent, "touchnotes.db-wal").takeIf { it.exists() && it.length() > 0 },
-                    File(dbParent, "touchnotes.db-shm").takeIf { it.exists() && it.length() > 0 }
+                    File(dbParent, "touchnotes.db-wal").takeIf { it.exists() && it.length() > 0 }
                 )
                 for (f in dbFiles) {
                     zos.putNextEntry(ZipEntry("database/${f.name}"))
@@ -176,10 +177,6 @@ object BackupManager {
                 val stagedWal = File(stagingDir, "database/touchnotes.db-wal")
                 if (stagedWal.exists()) {
                     stagedWal.copyTo(File(targetDb.parentFile, "touchnotes.db-wal"), overwrite = true)
-                }
-                val stagedShm = File(stagingDir, "database/touchnotes.db-shm")
-                if (stagedShm.exists()) {
-                    stagedShm.copyTo(File(targetDb.parentFile, "touchnotes.db-shm"), overwrite = true)
                 }
             }
 

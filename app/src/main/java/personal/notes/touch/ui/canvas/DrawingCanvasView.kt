@@ -124,6 +124,16 @@ class DrawingCanvasView @JvmOverloads constructor(
     private var pdfRenderer: ((pxPerPt: Float, outW: Int, outH: Int) -> Bitmap?)? = null
     private var pdfRenderInFlight = false
     private var pdfSessionBackground: Bitmap? = null
+
+    /**
+     * Pixel budget for one pdfium background, scaled to the heap the process
+     * was given (ARGB_8888 ⇒ 4 bytes/px). On a large-heap tablet this stays at
+     * [PdfRenderPolicy.MAX_PIXELS]; a 256 MB device gets roughly half, which
+     * keeps a re-render (old + new bitmap) out of OOM territory.
+     */
+    private val pdfPixelBudget: Long =
+        (Runtime.getRuntime().maxMemory() / 24)
+            .coerceIn(4_000_000L, PdfRenderPolicy.MAX_PIXELS)
     private val pdfRenderHandler = Handler(Looper.getMainLooper())
     private val pdfRenderTask = Runnable { renderPdfBackgroundNow() }
 
@@ -356,7 +366,9 @@ class DrawingCanvasView @JvmOverloads constructor(
         if (pdfPageWidthPts <= 0f) return
         val needed = pdfPageRectWidth() * scale / pdfPageWidthPts
         if (!PdfRenderPolicy.shouldRender(needed, pdfRenderScale)) return
-        val capped = PdfRenderPolicy.capPxPerPt(pdfPageWidthPts, pdfPageHeightPts, needed)
+        val capped = PdfRenderPolicy.capPxPerPt(
+            pdfPageWidthPts, pdfPageHeightPts, needed, maxPixels = pdfPixelBudget
+        )
         if (capped <= 0f || capped <= pdfRenderScale) return
         val size = PdfRenderPolicy.outputSize(pdfPageWidthPts, pdfPageHeightPts, capped)
         val outW = size[0]
@@ -393,13 +405,6 @@ class DrawingCanvasView @JvmOverloads constructor(
             }
         }
     }
-
-    // Overflow layer for drawing outside the PDF page (moves with pan/zoom)
-    var overflowBitmap: Bitmap? = null
-        set(value) {
-            field = value
-            invalidate()
-        }
 
     // Page type
     var beyondPaper: Boolean = true
@@ -623,8 +628,20 @@ class DrawingCanvasView @JvmOverloads constructor(
 
     private val bitmapPaint = Paint(Paint.DITHER_FLAG or Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
 
-    // Undo / Redo - bounded to 6 snapshots to prevent OOM on high-DPI canvases
-    private val maxUndoSnapshots = 6
+    /**
+     * Undo/redo depth derived from the heap and the page size. A 2160×3056
+     * page snapshot is ~26 MB, so a fixed depth of 6 could hold ~158 MB on
+     * its own; keep history inside roughly a sixth of the heap while still
+     * allowing 3–6 steps for typical pages.
+     */
+    private val maxUndoSnapshots: Int
+        get() {
+            val bmp = backingBitmap ?: return 4
+            if (bmp.width <= 0 || bmp.height <= 0) return 4
+            val snapshotBytes = bmp.width.toLong() * bmp.height.toLong() * 4L
+            val budget = Runtime.getRuntime().maxMemory() / 6
+            return (budget / snapshotBytes).toInt().coerceIn(3, 6)
+        }
     private val undoStack = ArrayDeque<Bitmap>()
     private val redoStack = ArrayDeque<Bitmap>()
 
@@ -807,14 +824,6 @@ class DrawingCanvasView @JvmOverloads constructor(
         val bmp = BitmapUtils.createSafeBitmap(targetWidth, safeHeight)
         backingBitmap = bmp
         bitmapCanvas = Canvas(bmp)
-        // Initialize overflow layer sized 2x the page area so drawing outside
-        // the PDF page has room; stays sticky during pan/zoom (drawn in onDraw
-        // under the same viewMatrix; overflow pixels are trimmed on export).
-        if (backgroundBitmap != null && overflowBitmap == null) {
-            val ovW = (targetWidth * 2).coerceIn(1, 4096)
-            val ovH = (safeHeight * 2).coerceIn(1, 4096)
-            overflowBitmap = BitmapUtils.createSafeBitmap(ovW, ovH)
-        }
         if (autoCenter) centerTransform(targetWidth, safeHeight)
     }
 
@@ -824,16 +833,14 @@ class DrawingCanvasView @JvmOverloads constructor(
     }
 
     fun loadBitmap(bitmap: Bitmap) {
-        val old = backingBitmap
         val loaded = if (bitmap.isMutable && bitmap.config == Bitmap.Config.ARGB_8888) {
             bitmap
         } else {
             bitmap.copy(Bitmap.Config.ARGB_8888, true)
         }
         backingBitmap = loaded
-        if (old != null && old !== loaded && !old.isRecycled) {
-            old.recycle()
-        }
+        // Keep the previous bitmap alive for the GC: a debounced stroke save
+        // may still hold a reference to it (recycling would abort that save).
         bitmapCanvas = Canvas(loaded)
         undoStack.clear()
         clearRedoStack()
@@ -1254,11 +1261,6 @@ class DrawingCanvasView @JvmOverloads constructor(
                     canvas.drawBitmap(bmp, 0f, 0f, bitmapPaint)
                 }
             }
-        }
-
-        // 0b. Draw overflow layer (drawing outside the PDF page; sticky with pan/zoom)
-        overflowBitmap?.let { bmp ->
-            if (!bmp.isRecycled) canvas.drawBitmap(bmp, 0f, 0f, bitmapPaint)
         }
 
         // 1. Draw paper background (only when no background bitmap)
@@ -2051,11 +2053,7 @@ class DrawingCanvasView @JvmOverloads constructor(
                 redoStack.addLast(current.copy(Bitmap.Config.ARGB_8888, true))
             }
             val previous = undoStack.removeLast()
-            val oldBacking = backingBitmap
             backingBitmap = previous
-            if (oldBacking != null && oldBacking !== backingBitmap && !oldBacking.isRecycled) {
-                oldBacking.recycle()
-            }
             bitmapCanvas = Canvas(backingBitmap!!)
             notifyUndoRedo()
             invalidate()
@@ -2074,11 +2072,7 @@ class DrawingCanvasView @JvmOverloads constructor(
                 undoStack.addLast(current.copy(Bitmap.Config.ARGB_8888, true))
             }
             val next = redoStack.removeLast()
-            val oldBacking = backingBitmap
             backingBitmap = next
-            if (oldBacking != null && oldBacking !== backingBitmap && !oldBacking.isRecycled) {
-                oldBacking.recycle()
-            }
             bitmapCanvas = Canvas(backingBitmap!!)
             notifyUndoRedo()
             invalidate()
@@ -2090,13 +2084,6 @@ class DrawingCanvasView @JvmOverloads constructor(
         commitLassoSelection()
         saveUndoState()
         bitmapCanvas?.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
-        // Clear overflow too (non-destructive PDF background is preserved).
-        overflowBitmap?.let { ov ->
-            try {
-                val c = android.graphics.Canvas(ov)
-                c.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
-            } catch (_: Exception) { /* ignore */ }
-        }
         invalidate()
         onStrokeFinishedListener?.invoke()
     }

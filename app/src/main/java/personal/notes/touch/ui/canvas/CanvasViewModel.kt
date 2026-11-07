@@ -397,12 +397,31 @@ class CanvasViewModel(
         debouncedSaveJob?.cancel()
         debouncedSaveJob = viewModelScope.launch {
             kotlinx.coroutines.delay(delayMs)
-            saveCurrentPageBitmapDirect(bitmap)
+            // Do NOT call the public save here: it cancels the pending job,
+            // and this coroutine IS that job (the save would cancel itself
+            // before the write and silently drop the stroke).
+            persistPageBitmap(bitmap)
         }
     }
 
+    /** Cancels any pending debounced save and writes [bitmap] now. */
     suspend fun saveCurrentPageBitmapDirect(bitmap: Bitmap) {
         debouncedSaveJob?.cancel()
+        debouncedSaveJob = null
+        persistPageBitmap(bitmap)
+    }
+
+    fun saveCurrentPageBitmap(bitmap: Bitmap) {
+        debouncedSaveJob?.cancel()
+        viewModelScope.launch {
+            persistPageBitmap(bitmap)
+        }
+    }
+
+    private suspend fun persistPageBitmap(bitmap: Bitmap) {
+        // The view no longer recycles backing bitmaps, but a stale job can
+        // still outlive one; never hand a recycled bitmap to the encoder.
+        if (bitmap.isRecycled) return
         val pageIdx = _currentPageIndex.value
         val guardFile = if (pageIsVectorPdf(pageIdx)) {
             fileStore.getStrokesFile(noteId, pageIdx)
@@ -411,13 +430,6 @@ class CanvasViewModel(
         }
         if (!pageLoadedFromDisk && guardFile.exists()) return
         saveContentLayer(pageIdx, bitmap)
-    }
-
-    fun saveCurrentPageBitmap(bitmap: Bitmap) {
-        debouncedSaveJob?.cancel()
-        viewModelScope.launch {
-            saveCurrentPageBitmapDirect(bitmap)
-        }
     }
 
     fun setCurrentPageIndex(index: Int) {
