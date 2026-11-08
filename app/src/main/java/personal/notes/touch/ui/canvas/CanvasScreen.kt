@@ -173,6 +173,22 @@ val TouchNotesWidthPresets = listOf(
 
 val WidthPresets = TouchNotesWidthPresets
 
+/**
+ * Eraser sizes are in canvas pixels like the pen, but much larger: the eraser
+ * has to clear a visible swath, not a hairline. Default (36) stays in the list
+ * so the selected chip is always one of them.
+ */
+val TouchNotesEraserPresets = listOf(
+    12f to "Thin",
+    24f to "Medium",
+    36f to "Thick",
+    56f to "X-Thick"
+)
+
+/** Continuous reader zoom limits: below 1 the pages are smaller than fit. */
+private const val MIN_CONTINUOUS_SCALE = 0.4f
+private const val MAX_CONTINUOUS_SCALE = 4f
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun CanvasScreen(
@@ -1389,6 +1405,7 @@ fun CanvasScreen(
                         view.currentTool = uiState.selectedTool
                         view.strokeColor = uiState.selectedColor.toArgb()
                         view.strokeWidthPx = uiState.strokeWidth
+                        view.eraserWidthPx = uiState.eraserWidth
                         view.paperPattern = uiState.paperPattern
                         view.backgroundMode = uiState.backgroundMode
                         view.backgroundDensity = uiState.backgroundDensity
@@ -1411,26 +1428,38 @@ fun CanvasScreen(
                             .pointerInput(Unit) {
                                 detectTransformGestures { centroid, pan, zoom, _ ->
                                     val oldScale = continuousScale
-                                    val newScale = (continuousScale * zoom).coerceIn(1f, 4f)
+                                    val newScale = (continuousScale * zoom)
+                                        .coerceIn(MIN_CONTINUOUS_SCALE, MAX_CONTINUOUS_SCALE)
                                     val factor = newScale / oldScale
-                                    // The Lazy list keeps ownership of scrolling
-                                    // (so off-screen pages are still composed and
-                                    // reachable); the layer translation is clamped
-                                    // to the zoomed content so it can never push a
-                                    // page completely out of view.
-                                    val maxPanX = size.width * (newScale - 1f)
-                                    val maxPanY = size.height * (newScale - 1f)
-                                    continuousPanX = (centroid.x - (centroid.x - continuousPanX) * factor + pan.x)
-                                        .coerceIn(-maxPanX, 0f)
-                                    continuousPanY = (centroid.y - (centroid.y - continuousPanY) * factor + pan.y)
-                                        .coerceIn(-maxPanY, 0f)
-                                    continuousScale = newScale
-                                    // Back at fit-to-width: drop the offsets so
-                                    // pages sit centred again.
-                                    if (newScale <= 1.02f) {
-                                        continuousPanX = 0f
+                                    if (newScale < 1f) {
+                                        // Smaller than fit: the pages no longer
+                                        // fill the width, so centre them and stop
+                                        // panning (the list still owns scrolling).
+                                        // Without this branch the scale stopped at
+                                        // 1 and the reader could never show the
+                                        // area around a page.
+                                        continuousPanX = size.width * (1f - newScale) / 2f
                                         continuousPanY = 0f
+                                    } else {
+                                        // The Lazy list keeps ownership of scrolling
+                                        // (so off-screen pages are still composed and
+                                        // reachable); the layer translation is clamped
+                                        // to the zoomed content so it can never push a
+                                        // page completely out of view.
+                                        val maxPanX = size.width * (newScale - 1f)
+                                        val maxPanY = size.height * (newScale - 1f)
+                                        continuousPanX = (centroid.x - (centroid.x - continuousPanX) * factor + pan.x)
+                                            .coerceIn(-maxPanX, 0f)
+                                        continuousPanY = (centroid.y - (centroid.y - continuousPanY) * factor + pan.y)
+                                            .coerceIn(-maxPanY, 0f)
+                                        // Back at fit-to-width: drop the offsets so
+                                        // pages sit centred again.
+                                        if (newScale <= 1.02f) {
+                                            continuousPanX = 0f
+                                            continuousPanY = 0f
+                                        }
                                     }
+                                    continuousScale = newScale
                                 }
                             }
                             .graphicsLayer {
@@ -1803,8 +1832,12 @@ fun CanvasScreen(
                                 )
 
                                 // Width Presets
-                                TouchNotesWidthPresets.forEach { (widthPx, label) ->
-                                    val isSelected = uiState.strokeWidth == widthPx
+                                val widthPresets =
+                                    if (uiState.selectedTool == CanvasTool.ERASER) TouchNotesEraserPresets
+                                    else TouchNotesWidthPresets
+                                val activeWidth = uiState.activeStrokeWidth()
+                                widthPresets.forEach { (widthPx, label) ->
+                                    val isSelected = activeWidth == widthPx
                                     Box(
                                         modifier = Modifier
                                             .size(24.dp)
@@ -2016,8 +2049,12 @@ fun CanvasScreen(
                                 )
 
                                 // Width Presets (vertical dots)
-                                TouchNotesWidthPresets.take(3).forEach { (widthPx, _) ->
-                                    val isSelected = uiState.strokeWidth == widthPx
+                                val verticalPresets =
+                                    if (uiState.selectedTool == CanvasTool.ERASER) TouchNotesEraserPresets
+                                    else TouchNotesWidthPresets
+                                val verticalActive = uiState.activeStrokeWidth()
+                                verticalPresets.take(3).forEach { (widthPx, _) ->
+                                    val isSelected = verticalActive == widthPx
                                     Box(
                                         modifier = Modifier
                                             .size(22.dp)

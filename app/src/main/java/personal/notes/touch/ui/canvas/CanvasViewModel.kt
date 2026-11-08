@@ -60,6 +60,18 @@ data class CanvasUiState(
     val tocEntries: List<TocItem> = emptyList()
 )
 
+/**
+ * The size chips act on the tool that is currently selected. The eraser has
+ * its own (much larger) range, so storing its size in [strokeWidth] would
+ * either make the pen unusable or the eraser invisible.
+ */
+fun CanvasUiState.withStrokeWidth(width: Float): CanvasUiState =
+    if (selectedTool == CanvasTool.ERASER) copy(eraserWidth = width) else copy(strokeWidth = width)
+
+/** Size the chips should highlight and the canvas should apply for the active tool. */
+fun CanvasUiState.activeStrokeWidth(): Float =
+    if (selectedTool == CanvasTool.ERASER) eraserWidth else strokeWidth
+
 class CanvasViewModel(
     val noteId: String,
     val repository: NoteRepository,
@@ -138,7 +150,7 @@ class CanvasViewModel(
     }
 
     fun setStrokeWidth(width: Float) {
-        _uiState.value = _uiState.value.copy(strokeWidth = width)
+        _uiState.value = _uiState.value.withStrokeWidth(width)
     }
 
     fun setPaperPattern(pattern: PaperPattern) {
