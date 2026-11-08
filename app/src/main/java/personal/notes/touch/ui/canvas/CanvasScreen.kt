@@ -1166,9 +1166,24 @@ fun CanvasScreen(
                 .fillMaxSize()
                 .padding(innerPadding)
                 .onKeyEvent { event: androidx.compose.ui.input.key.KeyEvent ->
+                    val continuousReading = (note?.pageType ?: "infinite") != "infinite" &&
+                        uiState.pageTurningMode == 0
+                    val isHorizontalReading = uiState.pageTurningDirection == 1
                     if (uiState.volumeForPageEnabled && event.nativeKeyEvent.action == android.view.KeyEvent.ACTION_DOWN) {
                         when (event.nativeKeyEvent.keyCode) {
                             android.view.KeyEvent.KEYCODE_VOLUME_UP -> {
+                                // Continuous reading has no "next page" to
+                                // load: move the reader by one page instead.
+                                // The hidden canvas is not touched, so a volume
+                                // press cannot decode a page nobody sees.
+                                if (continuousReading) {
+                                    scope.launch {
+                                        val state = if (isHorizontalReading) continuousRowState else continuousColState
+                                        val from = state.firstVisibleItemIndex
+                                        state.animateScrollToItem((from - 1).coerceAtLeast(0))
+                                    }
+                                    return@onKeyEvent true
+                                }
                                 // Save current layers and backing; the page
                                 // switch is issued from the same coroutine
                                 // only after the awaited layer save (IO) has
@@ -1190,6 +1205,16 @@ fun CanvasScreen(
                                 true
                             }
                             android.view.KeyEvent.KEYCODE_VOLUME_DOWN -> {
+                                if (continuousReading) {
+                                    scope.launch {
+                                        val state = if (isHorizontalReading) continuousRowState else continuousColState
+                                        val from = state.firstVisibleItemIndex
+                                        state.animateScrollToItem(
+                                            (from + 1).coerceAtMost((pages.size - 1).coerceAtLeast(0))
+                                        )
+                                    }
+                                    return@onKeyEvent true
+                                }
                                 scope.launch {
                                     try {
                                         canvasViewRef?.getBackingBitmap()?.let { bmp ->
