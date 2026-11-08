@@ -417,6 +417,17 @@ class DrawingCanvasView @JvmOverloads constructor(
 
     // Transformable image layers
     val imageLayers: MutableList<ImageLayer> = mutableListOf()
+
+    /**
+     * True when a layer's geometry or content changed since the last
+     * [saveImageLayers]. Layer edits are not part of the backing bitmap, so
+     * this is what tells the screen a layer write is still owed when it is
+     * disposed (system back, tab close) rather than left through
+     * `saveAndExit`.
+     */
+    @Volatile
+    var layersDirty: Boolean = false
+        private set
     var selectedImageIndex: Int = -1
         set(value) {
             field = value
@@ -910,6 +921,7 @@ class DrawingCanvasView @JvmOverloads constructor(
         val left = (w - dstW) / 2f
         val top = (h - dstH) / 2f
         imageLayers.add(ImageLayer(image, left, top, scale, 0f, 1f, null, true, "Layer ${imageLayers.size + 1}"))
+        layersDirty = true
         selectedImageIndex = imageLayers.lastIndex
         invalidate()
         return true
@@ -1026,6 +1038,7 @@ class DrawingCanvasView @JvmOverloads constructor(
         if (layers == null) return
         imageLayers.clear()
         imageLayers.addAll(layers)
+        layersDirty = false
         selectedImageIndex = -1
         invalidate()
     }
@@ -1084,6 +1097,7 @@ class DrawingCanvasView @JvmOverloads constructor(
                 arr.put(obj)
             }
             infoFile.writeText(arr.toString())
+            layersDirty = false
         } catch (e: Exception) {
             e.printStackTrace()
         }
@@ -1092,6 +1106,7 @@ class DrawingCanvasView @JvmOverloads constructor(
     fun setLayerVisible(index: Int, visible: Boolean) {
         if (index in imageLayers.indices) {
             imageLayers[index].visible = visible
+            layersDirty = true
             invalidate()
         }
     }
@@ -1101,6 +1116,7 @@ class DrawingCanvasView @JvmOverloads constructor(
     fun deleteImageLayer(index: Int) {
         if (index in imageLayers.indices) {
             imageLayers.removeAt(index)
+            layersDirty = true
             if (selectedImageIndex == index) selectedImageIndex = -1
             else if (selectedImageIndex > index) selectedImageIndex -= 1
             invalidate()
@@ -1112,6 +1128,7 @@ class DrawingCanvasView @JvmOverloads constructor(
         if (fromIndex !in imageLayers.indices || toIndex !in imageLayers.indices || fromIndex == toIndex) return false
         val layer = imageLayers.removeAt(fromIndex)
         imageLayers.add(toIndex, layer)
+        layersDirty = true
         if (selectedImageIndex == fromIndex) selectedImageIndex = toIndex
         else if (selectedImageIndex > fromIndex && selectedImageIndex <= toIndex) selectedImageIndex -= 1
         else if (selectedImageIndex < fromIndex && selectedImageIndex >= toIndex) selectedImageIndex += 1
@@ -1146,6 +1163,7 @@ class DrawingCanvasView @JvmOverloads constructor(
             c.restore()
         }
         imageLayers.clear()
+        layersDirty = true
         selectedImageIndex = -1
         invalidate()
         onStrokeFinishedListener?.invoke()
@@ -1156,6 +1174,7 @@ class DrawingCanvasView @JvmOverloads constructor(
     fun setLayerOpacity(index: Int, value: Float) {
         if (index in imageLayers.indices) {
             imageLayers[index].opacity = value.coerceIn(0f, 1f)
+            layersDirty = true
             invalidate()
         }
     }
@@ -1528,6 +1547,7 @@ class DrawingCanvasView @JvmOverloads constructor(
                     imageInteractionMode = if (event.pointerCount <= 1) 0 else imageInteractionMode
                     if (event.actionMasked == MotionEvent.ACTION_UP || event.actionMasked == MotionEvent.ACTION_CANCEL) {
                         imageInteractionMode = 0
+                        layersDirty = true
                         onStrokeFinishedListener?.invoke()
                     }
                     return true

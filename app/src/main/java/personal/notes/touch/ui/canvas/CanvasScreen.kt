@@ -390,10 +390,15 @@ fun CanvasScreen(
             // Layer PNG decode is file I/O: read on Dispatchers.IO, apply
             // on main via applyLoadedLayers (invalidate() included).
             canvasViewRef?.let { view ->
-                val layers = withContext(Dispatchers.IO) {
-                    view.readLayersFromDisk(viewModel.fileStore, viewModel.noteId)
+                // Layers belong to the note, not the page, so a reload here is
+                // only a safety net. Skip it while edits are unsaved: applying
+                // the on-disk copy would silently undo a just-dragged image.
+                if (!view.layersDirty) {
+                    val layers = withContext(Dispatchers.IO) {
+                        view.readLayersFromDisk(viewModel.fileStore, viewModel.noteId)
+                    }
+                    view.applyLoadedLayers(layers)
                 }
-                view.applyLoadedLayers(layers)
             }
         } catch (e: Exception) {
             e.printStackTrace()
@@ -586,8 +591,18 @@ fun CanvasScreen(
     // outlives the screen.
     DisposableEffect(viewModel) {
         onDispose {
-            val app = context.applicationContext as? TouchNotesApp
-            if (app != null) viewModel.flushPendingSave(app.appScope)
+            val app = context.applicationContext as? TouchNotesApp ?: return@onDispose
+            viewModel.flushPendingSave(app.appScope)
+            // Layer edits live outside the backing bitmap, so a moved or
+            // hidden image would otherwise be lost on a system back (only the
+            // toolbar path calls saveAndExit). `layersDirty` keeps unchanged
+            // notes from re-writing their PNGs on every exit.
+            val canvas = canvasViewRef
+            if (canvas != null && canvas.layersDirty && canvas.imageLayers.isNotEmpty()) {
+                app.appScope.launch {
+                    canvas.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                }
+            }
         }
     }
 
