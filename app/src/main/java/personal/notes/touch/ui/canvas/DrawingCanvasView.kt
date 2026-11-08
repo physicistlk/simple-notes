@@ -2381,6 +2381,21 @@ class DrawingCanvasView @JvmOverloads constructor(
         DebugGestureInjector.register(this)
     }
 
+    /**
+     * A hidden window (screen locked, app behind the keyguard) must not spend
+     * a PDF render: the vector pass can allocate the whole pixel budget and
+     * render for seconds. The debounced task is cancelled while invisible and
+     * re-armed when the window comes back.
+     */
+    override fun onWindowVisibilityChanged(visibility: Int) {
+        super.onWindowVisibilityChanged(visibility)
+        if (visibility != VISIBLE) {
+            pdfRenderHandler.removeCallbacks(pdfRenderTask)
+        } else if (pdfRenderer != null) {
+            schedulePdfBackgroundRefresh()
+        }
+    }
+
     override fun onDetachedFromWindow() {
         super.onDetachedFromWindow()
         pdfRenderHandler.removeCallbacks(pdfRenderTask)
