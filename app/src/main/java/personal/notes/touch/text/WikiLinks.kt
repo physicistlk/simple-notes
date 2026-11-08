@@ -29,7 +29,8 @@ object WikiLinks {
         val seen = LinkedHashMap<String, WikiRef>()
         for (line in MarkdownText.outsideFences(content).split('\n')) {
             for (ref in parseLine(line)) {
-                seen.putIfAbsent(ref.key, ref)
+                // First occurrence wins (putIfAbsent is API 24, minSdk 21).
+                if (!seen.containsKey(ref.key)) seen[ref.key] = ref
             }
         }
         return seen.values.toList()

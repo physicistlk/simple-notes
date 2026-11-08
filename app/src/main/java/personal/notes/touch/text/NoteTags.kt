@@ -26,7 +26,8 @@ object NoteTags {
         val seen = LinkedHashMap<String, String>()
         for (line in MarkdownText.outsideFences(content).split('\n')) {
             for (tag in parseLine(line)) {
-                seen.putIfAbsent(tag.key, tag.display)
+                // First occurrence wins (putIfAbsent is API 24, minSdk 21).
+                if (!seen.containsKey(tag.key)) seen[tag.key] = tag.display
             }
         }
         return seen.map { (key, display) -> NoteTag(key, display) }

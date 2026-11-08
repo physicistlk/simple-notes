@@ -639,6 +639,20 @@ class DrawingCanvasView @JvmOverloads constructor(
 
     private val bitmapPaint = Paint(Paint.DITHER_FLAG or Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
 
+    // Everything onDraw needs, allocated once: onDraw runs for every frame of
+    // a stroke, so a RectF/Paint per frame is GC churn during writing.
+    private val pdfPageDestRect = RectF()
+    private val layerPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
+    private val shapePreviewRect = RectF()
+    private val doublePageDividerPaint = Paint().apply {
+        color = Color.parseColor("#808080")
+        strokeWidth = 2f
+        alpha = 80
+    }
+    private val handlePoint = FloatArray(2)
+    private val dividerPoint = FloatArray(2)
+    private val lassoCornerPoints = FloatArray(8)
+
     /**
      * Undo/redo depth derived from the heap and the page size. A 2160×3056
      * page snapshot is ~26 MB, so a fixed depth of 6 could hold ~158 MB on
@@ -1148,9 +1162,7 @@ class DrawingCanvasView @JvmOverloads constructor(
         for (layer in imageLayers) {
             if (!layer.visible) continue
             if (layer.bitmap.isRecycled) continue
-            val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG).apply {
-                alpha = (layer.opacity * 255f).toInt().coerceIn(0, 255)
-            }
+            layerPaint.alpha = (layer.opacity * 255f).toInt().coerceIn(0, 255)
             val w = layer.bitmap.width
             val h = layer.bitmap.height
             val cx = layer.x + w * layer.scale / 2f
@@ -1159,7 +1171,7 @@ class DrawingCanvasView @JvmOverloads constructor(
             c.translate(cx, cy)
             c.rotate(layer.rotation)
             c.scale(layer.scale, layer.scale)
-            c.drawBitmap(layer.bitmap, -w / 2f, -h / 2f, paint)
+            c.drawBitmap(layer.bitmap, -w / 2f, -h / 2f, layerPaint)
             c.restore()
         }
         imageLayers.clear()
@@ -1271,11 +1283,8 @@ class DrawingCanvasView @JvmOverloads constructor(
                     // Stretch the vector render into the page rect (the same
                     // rect the page raster occupies) so annotations, which
                     // live in backing-bitmap space, stay aligned.
-                    canvas.drawBitmap(
-                        bmp, null,
-                        RectF(0f, 0f, pdfPageRectWidth(), pdfPageRectHeight()),
-                        bitmapPaint
-                    )
+                    pdfPageDestRect.set(0f, 0f, pdfPageRectWidth(), pdfPageRectHeight())
+                    canvas.drawBitmap(bmp, null, pdfPageDestRect, bitmapPaint)
                 } else {
                     canvas.drawBitmap(bmp, 0f, 0f, bitmapPaint)
                 }
@@ -1306,9 +1315,7 @@ class DrawingCanvasView @JvmOverloads constructor(
             val layer = imageLayers[i]
             if (!layer.visible) continue
             if (layer.bitmap.isRecycled) continue
-            val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG).apply {
-                alpha = (layer.opacity * 255f).toInt().coerceIn(0, 255)
-            }
+            layerPaint.alpha = (layer.opacity * 255f).toInt().coerceIn(0, 255)
             val w = layer.bitmap.width
             val h = layer.bitmap.height
             val cx = layer.x + w * layer.scale / 2f
@@ -1317,7 +1324,7 @@ class DrawingCanvasView @JvmOverloads constructor(
             canvas.translate(cx, cy)
             canvas.rotate(layer.rotation)
             canvas.scale(layer.scale, layer.scale)
-            canvas.drawBitmap(layer.bitmap, -w / 2f, -h / 2f, paint)
+            canvas.drawBitmap(layer.bitmap, -w / 2f, -h / 2f, layerPaint)
             canvas.restore()
         }
 
@@ -1325,13 +1332,13 @@ class DrawingCanvasView @JvmOverloads constructor(
         if (isDrawingShape) {
             when (currentTool) {
                 CanvasTool.SHAPE_RECT -> {
-                    val rect = RectF(
+                    shapePreviewRect.set(
                         minOf(startTouchX, currentTouchX),
                         minOf(startTouchY, currentTouchY),
                         maxOf(startTouchX, currentTouchX),
                         maxOf(startTouchY, currentTouchY)
                     )
-                    canvas.drawRect(rect, shapePreviewPaint)
+                    canvas.drawRect(shapePreviewRect, shapePreviewPaint)
                 }
                 CanvasTool.SHAPE_CIRCLE -> {
                     val radius = Math.hypot(
@@ -1370,14 +1377,12 @@ class DrawingCanvasView @JvmOverloads constructor(
 
         if (doublePage) {
             val bmpW = (backingBitmap?.width ?: width).toFloat()
-            val pts = floatArrayOf(bmpW / 2f, 0f)
-            viewMatrix.mapPoints(pts)
-            val linePaint = Paint().apply {
-                color = Color.parseColor("#808080")
-                strokeWidth = 2f
-                alpha = 80
-            }
-            canvas.drawLine(pts[0], 0f, pts[0], height.toFloat(), linePaint)
+            dividerPoint[0] = bmpW / 2f
+            dividerPoint[1] = 0f
+            viewMatrix.mapPoints(dividerPoint)
+            canvas.drawLine(
+                dividerPoint[0], 0f, dividerPoint[0], height.toFloat(), doublePageDividerPaint
+            )
         }
 
         // Selection handles in view space
@@ -1388,17 +1393,27 @@ class DrawingCanvasView @JvmOverloads constructor(
                 val h = layer.bitmap.height
                 val cx = layer.x + w * layer.scale / 2f
                 val cy = layer.y + h * layer.scale / 2f
-                val pts = floatArrayOf(cx, cy)
-                viewMatrix.mapPoints(pts)
-                canvas.drawCircle(pts[0], pts[1], handleRadius, handlePaint)
+                handlePoint[0] = cx
+                handlePoint[1] = cy
+                viewMatrix.mapPoints(handlePoint)
+                canvas.drawCircle(handlePoint[0], handlePoint[1], handleRadius, handlePaint)
             }
         }
         if (lassoState in listOf(LassoState.SELECTED, LassoState.DRAGGING, LassoState.RESIZING)) {
-            val corners = floatArrayOf(lassoBounds.left, lassoBounds.top, lassoBounds.right, lassoBounds.top, lassoBounds.left, lassoBounds.bottom, lassoBounds.right, lassoBounds.bottom)
-            viewMatrix.mapPoints(corners)
-            for (i in 0 until corners.size step 2) {
-                canvas.drawCircle(corners[i], corners[i+1], handleRadius, handlePaint)
-                canvas.drawCircle(corners[i], corners[i+1], handleRadius, handleBorderPaint)
+            lassoCornerPoints[0] = lassoBounds.left
+            lassoCornerPoints[1] = lassoBounds.top
+            lassoCornerPoints[2] = lassoBounds.right
+            lassoCornerPoints[3] = lassoBounds.top
+            lassoCornerPoints[4] = lassoBounds.left
+            lassoCornerPoints[5] = lassoBounds.bottom
+            lassoCornerPoints[6] = lassoBounds.right
+            lassoCornerPoints[7] = lassoBounds.bottom
+            viewMatrix.mapPoints(lassoCornerPoints)
+            for (i in 0 until lassoCornerPoints.size step 2) {
+                canvas.drawCircle(lassoCornerPoints[i], lassoCornerPoints[i + 1], handleRadius, handlePaint)
+                canvas.drawCircle(
+                    lassoCornerPoints[i], lassoCornerPoints[i + 1], handleRadius, handleBorderPaint
+                )
             }
         }
     }
@@ -1558,12 +1573,27 @@ class DrawingCanvasView @JvmOverloads constructor(
         return false
     }
 
+    /**
+     * Drawing apps still need a click action for accessibility services and
+     * keyboard/D-pad activation; a tap on the canvas is the natural one. See
+     * the single-pointer tap detection at the end of [onTouchEvent]'s gesture
+     * bookkeeping.
+     */
+    override fun performClick(): Boolean {
+        super.performClick()
+        return true
+    }
+
     override fun onTouchEvent(event: MotionEvent): Boolean {
         if (readingMode) return false
 
         // Track multi-finger taps (3-finger paste) before other handling.
         when (event.actionMasked) {
             MotionEvent.ACTION_POINTER_DOWN, MotionEvent.ACTION_DOWN -> {
+                if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+                    tapDownX = event.x
+                    tapDownY = event.y
+                }
                 if (event.pointerCount >= 2) {
                     if (multiTouchStartMs == 0L) multiTouchStartMs = event.eventTime
                     multiTouchMaxPointers = maxOf(multiTouchMaxPointers, event.pointerCount)
@@ -1582,6 +1612,15 @@ class DrawingCanvasView @JvmOverloads constructor(
                     val dur = event.eventTime - multiTouchStartMs
                     if (multiTouchStartMs != 0L && dur in 1..500) {
                         onThreeFingerTap?.invoke()
+                    }
+                }
+                // A single-pointer tap that did not move is also a click, so
+                // accessibility services and D-pad activation get an action
+                // (the canvas otherwise only ever handles raw touches).
+                if (event.actionMasked == MotionEvent.ACTION_UP && multiTouchMaxPointers <= 1) {
+                    val slop = touchSlopPx
+                    if (Math.abs(event.x - tapDownX) <= slop && Math.abs(event.y - tapDownY) <= slop) {
+                        performClick()
                     }
                 }
                 multiTouchStartMs = 0L
@@ -2287,6 +2326,10 @@ class DrawingCanvasView @JvmOverloads constructor(
      */
     var onThreeFingerTap: (() -> Unit)? = null
     private var multiTouchStartMs = 0L
+    private var tapDownX = 0f
+    private var tapDownY = 0f
+    private val touchSlopPx: Float =
+        android.view.ViewConfiguration.get(context).scaledTouchSlop.toFloat()
     private var multiTouchMaxPointers = 0
 
     /**

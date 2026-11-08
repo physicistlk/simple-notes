@@ -48,7 +48,9 @@ object BlockRefs {
         val seen = LinkedHashMap<String, BlockRef>()
         for (line in MarkdownText.outsideFences(content).split('\n')) {
             for (ref in parseLine(line)) {
-                seen.putIfAbsent(ref.target, ref)
+                // First occurrence wins. (HashMap.putIfAbsent is API 24;
+                // this file must run on minSdk 21.)
+                if (!seen.containsKey(ref.target)) seen[ref.target] = ref
             }
         }
         return seen.values.toList()
