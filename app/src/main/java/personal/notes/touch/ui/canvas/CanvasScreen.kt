@@ -247,6 +247,19 @@ fun CanvasScreen(
         return if (page.pdfSourcePath.isNotEmpty() && page.pdfPageIndex >= 0) page else null
     }
 
+    /**
+     * Opens (and parses) a vector source off the main thread.
+     *
+     * `applyPdfBackground` has to read pages of the open document synchronously
+     * so the page rect is installed before the stroke layer lands, and opening
+     * a large PDF in pdfium can take a while. Suspend callers therefore warm
+     * the one-document cache here first; the apply itself is then a cache hit.
+     */
+    suspend fun preloadPdfSource(relativePath: String) {
+        if (relativePath.isEmpty()) return
+        withContext(Dispatchers.IO) { pdfDocCache.document(relativePath) }
+    }
+
     // Installs the live pdfium background of a vector PDF page. The renderer
     // runs on the canvas render thread and re-renders at higher resolution as
     // the user zooms in; the page rect stays fixed at the import geometry so
@@ -372,6 +385,7 @@ fun CanvasScreen(
         // pdfium background; every other page keeps the raster path.
         val vectorPage = vectorPdfPage(currentPageIndex)
         if (vectorPage != null) {
+            preloadPdfSource(vectorPage.pdfSourcePath)
             val strokes = withContext(Dispatchers.IO) { viewModel.loadPageStrokes(currentPageIndex) }
             val canvas = canvasViewRef
             if (canvas != null) {
@@ -496,6 +510,7 @@ fun CanvasScreen(
                     val canvas = canvasViewRef
                     val curIdx = viewModel.currentPageIndex.value
                     val curPage = vectorPdfPage(curIdx)
+                    if (curPage != null) preloadPdfSource(curPage.pdfSourcePath)
                     if (canvas != null && curPage != null) {
                         applyPdfBackground(canvas, curPage)
                     } else if (firstPageBitmap != null) {
@@ -1346,6 +1361,7 @@ fun CanvasScreen(
                                     viewModel.setCanvasPageIndex(pageIdx)
                                     val vectorPage = vectorPdfPage(pageIdx)
                                     if (vectorPage != null) {
+                                        preloadPdfSource(vectorPage.pdfSourcePath)
                                         backgroundBitmap = null
                                         viewModel.setPageLoadedFromDisk(true)
                                         applyPdfBackground(this@apply, vectorPage)
