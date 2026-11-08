@@ -58,6 +58,44 @@ object BitmapUtils {
         }
     }
 
+    /**
+     * Same downsampling as [loadThumbnail] but keeps the alpha channel.
+     *
+     * [loadThumbnail] decodes RGB_565 for memory, which flattens transparency
+     * to black — fine for a page, wrong for an overlay such as the saved ink
+     * layer. Cached under a distinct key so the two configs cannot collide.
+     */
+    suspend fun loadAlphaThumbnail(
+        file: File,
+        targetWidth: Int = 360,
+        targetHeight: Int = 500
+    ): Bitmap? = withContext(Dispatchers.IO) {
+        val cacheKey = "alpha:${file.absolutePath}:${file.lastModified()}"
+        getCachedThumbnail(cacheKey)?.let { return@withContext it }
+        try {
+            if (!file.exists()) return@withContext null
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(file.absolutePath, bounds)
+            val w = bounds.outWidth
+            val h = bounds.outHeight
+            if (w <= 0 || h <= 0) return@withContext null
+            var sample = 1
+            while ((w / (sample * 2)) >= targetWidth && (h / (sample * 2)) >= targetHeight) {
+                sample *= 2
+            }
+            val opts = BitmapFactory.Options().apply {
+                inSampleSize = sample
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+            val decoded = BitmapFactory.decodeFile(file.absolutePath, opts) ?: return@withContext null
+            putCachedThumbnail(cacheKey, decoded)
+            decoded
+        } catch (e: Exception) {
+            e.printStackTrace()
+            null
+        }
+    }
+
     private val imageCache: MutableMap<String, Bitmap> =
         Collections.synchronizedMap(object : LinkedHashMap<String, Bitmap>(12, 0.75f, true) {
             override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Bitmap>?): Boolean {

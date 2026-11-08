@@ -1846,18 +1846,48 @@ fun DrawerMenuItem(
     }
 }
 
+/**
+ * Draws the page's saved ink (a transparent, full-page PNG) onto the page
+ * thumbnail. Both images share the page aspect ratio. Returns [base] when the
+ * ink cannot be decoded.
+ */
+private suspend fun composeThumbnailWithInk(
+    base: android.graphics.Bitmap,
+    strokesFile: File
+): android.graphics.Bitmap {
+    val strokes = BitmapUtils.loadAlphaThumbnail(strokesFile, 360, 500) ?: return base
+    val composite = base.copy(android.graphics.Bitmap.Config.ARGB_8888, true) ?: return base
+    android.graphics.Canvas(composite).drawBitmap(
+        strokes,
+        null,
+        android.graphics.Rect(0, 0, composite.width, composite.height),
+        android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG)
+    )
+    return composite
+}
+
 @Composable
 fun NoteInsidePreview(
     note: NoteEntity,
     modifier: Modifier = Modifier
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
+    val firstPageFile = remember(note.id) {
+        File(File(context.filesDir, "note"), "${note.id}/page_0.png")
+    }
+    // Vector PDF pages keep the clean page render in page_0.png and the ink in
+    // strokes_0.png, so the card has to compose them (the original shows the
+    // annotated page). Raster pages have no strokes file: their page PNG
+    // already contains the writing.
+    val firstStrokesFile = remember(note.id) {
+        File(File(context.filesDir, "note"), "${note.id}/strokes_0.png")
+    }
     val targetFile = remember(note.id, note.coverPath) {
         val cover = note.coverPath?.let { File(it) }
         if (cover != null && cover.exists()) {
             cover
         } else {
-            File(File(context.filesDir, "note"), "${note.id}/page_0.png")
+            firstPageFile
         }
     }
 
@@ -1869,11 +1899,12 @@ fun NoteInsidePreview(
     }
 
     LaunchedEffect(note.id, note.updatedAt) {
-        if (thumbnailBitmap == null && targetFile.exists()) {
-            val bmp = BitmapUtils.loadThumbnail(targetFile, targetWidth = 360, targetHeight = 500)
-            if (bmp != null) {
-                thumbnailBitmap = bmp
-            }
+        val base = BitmapUtils.loadThumbnail(targetFile, targetWidth = 360, targetHeight = 500)
+            ?: return@LaunchedEffect
+        thumbnailBitmap = if (targetFile == firstPageFile && firstStrokesFile.exists()) {
+            composeThumbnailWithInk(base, firstStrokesFile)
+        } else {
+            base
         }
     }
 
