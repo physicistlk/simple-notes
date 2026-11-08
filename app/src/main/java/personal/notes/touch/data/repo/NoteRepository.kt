@@ -604,6 +604,29 @@ class NoteRepository(
         personal.notes.touch.util.BitmapUtils.loadBitmapFromFile(file)
     }
 
+    /**
+     * Loads a legacy raster page downsampled for on-screen display.
+     *
+     * Page PNGs are written at full canvas size (2160×3056 ≈ 26 MB decoded)
+     * and continuous reading keeps several alive while scrolling; the library
+     * view only needs a few hundred pixels. Vector pages never use this — they
+     * re-render through pdfium.
+     */
+    suspend fun loadPageBitmapForDisplay(
+        noteId: String,
+        pageIndex: Int,
+        displayWidthPx: Int
+    ): android.graphics.Bitmap? = withContext(Dispatchers.IO) {
+        val file = fileStore.getPageFile(noteId, pageIndex)
+        if (displayWidthPx <= 0) {
+            personal.notes.touch.util.BitmapUtils.loadBitmapFromFile(file)
+        } else {
+            personal.notes.touch.util.BitmapUtils.loadImage(
+                file, maxDimension = displayWidthPx.coerceAtLeast(360)
+            )
+        }
+    }
+
     /** F-10: loads the stroke-only layer of a vector-PDF page (null = none yet). */
     suspend fun loadPageStrokes(noteId: String, pageIndex: Int): android.graphics.Bitmap? = withContext(Dispatchers.IO) {
         personal.notes.touch.util.BitmapUtils.loadBitmapFromFile(fileStore.getStrokesFile(noteId, pageIndex))

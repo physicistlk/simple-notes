@@ -3439,7 +3439,11 @@ fun ContinuousPageView(
                             page, pageIndex, noteId, pdfDocCache, repository, desiredWidthPx
                         )
                     } else {
-                        repository.loadPageBitmap(noteId, pageIndex)
+                        // Legacy raster page: decode at the width actually
+                        // shown instead of the full canvas size.
+                        repository.loadPageBitmapForDisplay(
+                            noteId, pageIndex, displayWidthPx.roundToInt()
+                        )
                     }
                 } catch (e: Exception) {
                     e.printStackTrace()
