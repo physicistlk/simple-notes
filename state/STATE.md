@@ -140,3 +140,9 @@
 - Floating Pen Dock Handle Gesture: updated the drag handle pill (`—` / `|`) with a unified gesture detector (`awaitEachGesture` with `awaitFirstDown`). Single tap (< touch slop) flips the dock orientation between horizontal top dock and vertical left dock via `viewModel.toggleDockOrientation()` (and resets custom offsets). Tap & hold / drag (>= touch slop) smoothly moves the toolbar anywhere across the screen, clamped safely to screen bounds via `screenWidthPx` and `screenHeightPx`.
 - Redundant Rotate/Chevron Button Removal: removed the separate `IconButton` between Lasso and the tool divider from both the horizontal and vertical docks since the drag handle now inherently serves as the orientation toggle.
 - Pushed updated APK to connected tablet (`230b89f8`) and verified with 291 passing unit tests.
+
+## Decisions appended 59        59. 2026-11-09 (auditor): Top-bar "Insert Page" button and seamless multi-format page insertion:
+- Top-bar TOC -> Insert Page button: replaced the redundant `MenuBook` button between Text and Search with an `IconButton` using `Icons.Default.NoteAdd` ("Insert Page").
+- Multi-format Page Insertion (`insertPage` / `insertNewPage`): implemented inserting a new blank sheet immediately after the current page (`currentPageIndex + 1`) across Infinite, A4, and PDF notes. For PDF notes, inserting a page injects a pure blank raster/vector canvas sheet between PDF pages with subsequent pages cleanly shifted up; for Infinite notes, inserts a new unbounded sheet; for A4 notes, inserts a new A4 sheet.
+- Bookmarks and TOC index shifting: automatically shifts bookmark indices and TOC chapter page indices `>= targetIndex` by `+1` and persists to `bookmarks.json` and `catalog.json`.
+- Verified with 291 passing unit tests and installed APK over wireless ADB (`192.168.1.3:40573`).

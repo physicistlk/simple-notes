@@ -551,23 +551,55 @@ class NoteRepository(
     // Pages (M4)
     fun getPagesForNote(noteId: String): Flow<List<PageEntity>> = pageDao.getPagesForNote(noteId)
 
-    suspend fun addPage(noteId: String): PageEntity = withContext(Dispatchers.IO) {
-        val existing = pageDao.getPagesForNoteSync(noteId)
-        val newIndex = existing.size
-        val pageFile = fileStore.getPageFile(noteId, newIndex)
+    suspend fun insertPage(noteId: String, atIndex: Int): PageEntity = withContext(Dispatchers.IO) {
+        val existing = pageDao.getPagesForNoteSync(noteId).sortedBy { it.index }
+        val targetIndex = atIndex.coerceIn(0, existing.size)
+
+        // If targetIndex < existing.size, shift existing pages backwards
+        if (targetIndex < existing.size) {
+            // 1. Shift files backwards from last down to targetIndex
+            for (idx in (existing.size - 1) downTo targetIndex) {
+                fileStore.renamePageFile(noteId, idx, idx + 1)
+            }
+            // 2. Shift database PageEntity rows backwards
+            for (page in existing.filter { it.index >= targetIndex }.sortedByDescending { it.index }) {
+                val shiftedIndex = page.index + 1
+                val updated = page.copy(
+                    index = shiftedIndex,
+                    bitmapPath = fileStore.getPageFile(noteId, shiftedIndex).absolutePath,
+                    updatedAt = System.currentTimeMillis()
+                )
+                pageDao.update(updated)
+            }
+        }
+
+        // Clean any leftover files at targetIndex
+        fileStore.deletePageFile(noteId, targetIndex)
+
+        // Create and insert the new blank page
+        val pageFile = fileStore.getPageFile(noteId, targetIndex)
         val newPage = PageEntity(
             id = UUID.randomUUID().toString(),
             noteId = noteId,
-            index = newIndex,
+            index = targetIndex,
             bitmapPath = pageFile.absolutePath,
+            paperPattern = 0,
+            pdfSourcePath = "",
+            pdfPageIndex = -1,
             updatedAt = System.currentTimeMillis()
         )
         pageDao.insert(newPage)
+
         val note = noteDao.getById(noteId)
         if (note != null) {
-            noteDao.update(note.copy(pageCount = newIndex + 1, updatedAt = System.currentTimeMillis()))
+            noteDao.update(note.copy(pageCount = existing.size + 1, updatedAt = System.currentTimeMillis()))
         }
         newPage
+    }
+
+    suspend fun addPage(noteId: String): PageEntity = withContext(Dispatchers.IO) {
+        val existing = pageDao.getPagesForNoteSync(noteId)
+        insertPage(noteId, existing.size)
     }
 
     suspend fun deletePage(noteId: String, pageIndex: Int): Boolean = withContext(Dispatchers.IO) {

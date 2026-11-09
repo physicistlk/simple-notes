@@ -68,6 +68,7 @@ import androidx.compose.material.icons.filled.FormatShapes
 import androidx.compose.material.icons.filled.GridOn
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.NoteAdd
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Layers
@@ -1442,14 +1443,36 @@ fun CanvasScreen(
                                 )
                             }
 
-                            // Document Outline / List
+                            // Insert New Page (Works for infinite, A4, and PDF; inserts a blank sheet after current page)
                             IconButton(onClick = {
-                                viewModel.setDrawerTab(DrawerTab.OUTLINE)
-                                viewModel.toggleThumbnailDrawer(true)
+                                scope.launch {
+                                    if (isContinuous) {
+                                        inkController.flushCurrentSuspend()
+                                        inkController.releaseSessionSuspend()
+                                    }
+                                    val currentBmp = if (isContinuous) null else canvasViewRef?.getBackingBitmap()
+                                    viewModel.insertNewPage(
+                                        atIndex = currentPageIndex + 1,
+                                        isContinuous = isContinuous,
+                                        currentBitmap = currentBmp
+                                    ) { newBmp ->
+                                        if (!isContinuous) {
+                                            applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
+                                        } else {
+                                            savedPageGenerations.clear()
+                                            scrollToContinuousPage(viewModel.currentPageIndex.value)
+                                        }
+                                        android.widget.Toast.makeText(
+                                            context,
+                                            "Inserted blank page ${viewModel.currentPageIndex.value + 1}",
+                                            android.widget.Toast.LENGTH_SHORT
+                                        ).show()
+                                    }
+                                }
                             }) {
                                 Icon(
-                                    imageVector = Icons.AutoMirrored.Filled.MenuBook,
-                                    contentDescription = "Outline",
+                                    imageVector = Icons.Default.NoteAdd,
+                                    contentDescription = "Insert Page",
                                     tint = Color(0xFF555555)
                                 )
                             }
@@ -3273,12 +3296,18 @@ fun CanvasScreen(
                                                     scope.launch {
                                                         if (isContinuous) {
                                                             inkController.flushCurrentSuspend()
+                                                            inkController.releaseSessionSuspend()
                                                         }
                                                         val currentBmp = if (isContinuous) null else canvasViewRef?.getBackingBitmap()
-                                                        viewModel.addNewPage(currentBmp) { newBmp ->
+                                                        viewModel.insertNewPage(
+                                                            atIndex = currentPageIndex + 1,
+                                                            isContinuous = isContinuous,
+                                                            currentBitmap = currentBmp
+                                                        ) { newBmp ->
                                                             if (!isContinuous) {
                                                                 applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
                                                             } else {
+                                                                savedPageGenerations.clear()
                                                                 scrollToContinuousPage(viewModel.currentPageIndex.value)
                                                             }
                                                         }
@@ -3891,12 +3920,18 @@ fun CanvasScreen(
                                                             scope.launch {
                                                                 if (isContinuous) {
                                                                     inkController.flushCurrentSuspend()
+                                                                    inkController.releaseSessionSuspend()
                                                                 }
                                                                 val currentBmp = if (isContinuous) null else canvasViewRef?.getBackingBitmap()
-                                                                viewModel.addNewPage(currentBmp) { newBmp ->
+                                                                viewModel.insertNewPage(
+                                                                    atIndex = currentPageIndex + 1,
+                                                                    isContinuous = isContinuous,
+                                                                    currentBitmap = currentBmp
+                                                                ) { newBmp ->
                                                                     if (!isContinuous) {
                                                                         applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
                                                                     } else {
+                                                                        savedPageGenerations.clear()
                                                                         scrollToContinuousPage(viewModel.currentPageIndex.value)
                                                                     }
                                                                 }

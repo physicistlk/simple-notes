@@ -667,18 +667,57 @@ class CanvasViewModel(
         }
     }
 
-    fun addNewPage(currentBitmap: Bitmap?, onBitmapLoaded: (Bitmap?) -> Unit) {
+    fun insertNewPage(
+        atIndex: Int? = null,
+        isContinuous: Boolean = false,
+        currentBitmap: Bitmap? = null,
+        onBitmapLoaded: (Bitmap?) -> Unit
+    ) {
         viewModelScope.launch {
-            // Save the page the canvas holds first.
-            if (currentBitmap != null) {
+            // Cancel any pending debounced save
+            debouncedSaveJob?.cancel()
+            debouncedSaveJob = null
+            pendingSave = null
+
+            // Save the page the canvas holds in single-page mode
+            if (!isContinuous && currentBitmap != null && canvasPageIndex >= 0) {
                 saveContentLayer(canvasPageIndex, currentBitmap)
             }
-            val newPage = repository.addPage(noteId)
+
+            val totalPages = note.value?.pageCount ?: 1
+            val targetIndex = (atIndex ?: (_currentPageIndex.value + 1)).coerceIn(0, totalPages)
+            val newPage = repository.insertPage(noteId, targetIndex)
+
+            // Shift bookmarks at or after targetIndex
+            val oldBookmarks = _uiState.value.bookmarkedPages
+            val newBookmarks = oldBookmarks.map { bIdx ->
+                if (bIdx >= targetIndex) bIdx + 1 else bIdx
+            }.toSet()
+            _uiState.value = _uiState.value.copy(bookmarkedPages = newBookmarks)
+            saveBookmarksJson(newBookmarks)
+
+            // Shift TOC entries at or after targetIndex
+            val oldToc = _uiState.value.tocEntries
+            val newToc = oldToc.map { item ->
+                if (item.pageIndex >= targetIndex) item.copy(pageIndex = item.pageIndex + 1) else item
+            }
+            _uiState.value = _uiState.value.copy(tocEntries = newToc)
+            saveCatalogJson(newToc)
+
             _currentPageIndex.value = newPage.index
             canvasPageIndex = newPage.index
-            pageLoadedFromDisk = false // new page starts blank, no disk load
-            onBitmapLoaded(null) // New page starts blank
+            pageLoadedFromDisk = false // New page starts blank
+            onBitmapLoaded(null)
         }
+    }
+
+    fun addNewPage(currentBitmap: Bitmap?, onBitmapLoaded: (Bitmap?) -> Unit) {
+        insertNewPage(
+            atIndex = null,
+            isContinuous = false,
+            currentBitmap = currentBitmap,
+            onBitmapLoaded = onBitmapLoaded
+        )
     }
 
     fun deletePage(
