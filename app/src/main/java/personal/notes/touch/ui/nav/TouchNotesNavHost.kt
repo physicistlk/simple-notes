@@ -110,8 +110,20 @@ fun TouchNotesNavHost(
                     }
                 },
                 onCloseTab = { id ->
+                    val idx = openNotes.indexOf(id)
                     openNotes.remove(id)
-                    if (id == noteId) navController.popBackStack()
+                    if (id == noteId) {
+                        if (openNotes.isNotEmpty()) {
+                            val targetIdx = (idx - 1).coerceAtLeast(0).coerceAtMost(openNotes.size - 1)
+                            val nextNoteId = openNotes[targetIdx]
+                            navController.navigate(Screen.Canvas.createRoute(nextNoteId)) {
+                                popUpTo(Screen.Canvas.route) { inclusive = true }
+                                launchSingleTop = true
+                            }
+                        } else {
+                            navController.popBackStack()
+                        }
+                    }
                 },
                 onSettingsClick = { navController.navigate(Screen.Settings.route) },
                 onFlashcardsClick = { navController.navigate(Screen.Flashcards.route) }

@@ -64,6 +64,23 @@ data class ImageLayer(
     var name: String = "Layer"
 )
 
+data class LayerStateSnapshot(
+    val bitmap: Bitmap,
+    val x: Float,
+    val y: Float,
+    val scale: Float = 1f,
+    val rotation: Float = 0f,
+    val opacity: Float = 1f,
+    val cropRect: Rect? = null,
+    val visible: Boolean = true,
+    val name: String = "Layer"
+)
+
+data class UndoSnapshot(
+    val bitmap: Bitmap,
+    val layers: List<LayerStateSnapshot>
+)
+
 class DrawingCanvasView @JvmOverloads constructor(
     context: Context,
     attrs: AttributeSet? = null,
@@ -488,8 +505,8 @@ class DrawingCanvasView @JvmOverloads constructor(
 
     private var lassoState = LassoState.IDLE
 
-    // Image layer interaction state
-    private var imageInteractionMode = 0 // 0 none, 1 move, 2 pinch
+    // Image layer interaction state: 0 none, 1 move, 2 pinch, 3 resize, 4 rotate
+    private var imageInteractionMode = 0
     private var imageDragStartX = 0f
     private var imageDragStartY = 0f
     private var imageLayerStartX = 0f
@@ -498,6 +515,32 @@ class DrawingCanvasView @JvmOverloads constructor(
     private var pinchStartAngle = 0f
     private var pinchStartScale = 1f
     private var pinchStartRotation = 0f
+    private var initialTouchDist = 0f
+    private var initialTouchAngle = 0f
+    private var initialLayerScale = 1f
+    private var initialLayerRotation = 0f
+
+    private val layerBboxPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        color = Color.parseColor("#2196F3")
+        strokeWidth = 2.5f
+    }
+    private val layerHandleFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+    }
+    private val layerHandleStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        color = Color.WHITE
+        strokeWidth = 2.5f
+    }
+    private val layerHandleTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        textSize = 20f
+        isFakeBoldText = true
+        textAlign = Paint.Align.CENTER
+    }
+
+    var onZoomOutToContinuous: (() -> Unit)? = null
     private val lassoPath = Path()
     private val lassoBounds = RectF()
     private var selectedBitmap: Bitmap? = null
@@ -691,8 +734,8 @@ class DrawingCanvasView @JvmOverloads constructor(
             val budget = Runtime.getRuntime().maxMemory() / 6
             return (budget / snapshotBytes).toInt().coerceIn(3, 6)
         }
-    private val undoStack = ArrayDeque<Bitmap>()
-    private val redoStack = ArrayDeque<Bitmap>()
+    private val undoStack = ArrayDeque<UndoSnapshot>()
+    private val redoStack = ArrayDeque<UndoSnapshot>()
 
     var onUndoRedoListener: ((canUndo: Boolean, canRedo: Boolean) -> Unit)? = null
     var onStrokeFinishedListener: (() -> Unit)? = null
@@ -821,6 +864,9 @@ class DrawingCanvasView @JvmOverloads constructor(
                     val dist = Math.hypot((x1 - x0).toDouble(), (y1 - y0).toDouble()).toFloat()
                     if (gestureStartDist > 0f) {
                         val newScale = (gestureStartScale * (dist / gestureStartDist)).coerceIn(minZoom, 8f)
+                        if (newScale < 0.75f && onZoomOutToContinuous != null) {
+                            onZoomOutToContinuous?.invoke()
+                        }
                         scale = newScale
                         panX = midX - gestureStartFocalCanvasX * scale
                         panY = midY - gestureStartFocalCanvasY * scale
@@ -978,21 +1024,41 @@ class DrawingCanvasView @JvmOverloads constructor(
 
     fun getBackingBitmap(): Bitmap? = backingBitmap
 
-    fun addImageLayer(image: Bitmap): Boolean {
-        if (imageLayers.size >= 3) return false
-        val w = width.toFloat().coerceAtLeast(400f)
-        val h = height.toFloat().coerceAtLeast(400f)
-        val maxImgW = w * 0.7f
-        val maxImgH = h * 0.7f
+    fun addImageLayer(image: Bitmap): Boolean = addImageLayerDirect(image, null, null)
+
+    fun addImageLayerDirect(image: Bitmap, posX: Float? = null, posY: Float? = null): Boolean {
+        if (imageLayers.size >= 8) return false
+        saveUndoState()
+        val w = if (pdfPageWidthPts > 0f && pdfBasePxPerPt > 0f) {
+            pdfPageWidthPts * pdfBasePxPerPt
+        } else if (pageType == "a4" || pageType == "pdf") {
+            2160f
+        } else if (width > 0) width.toFloat() else 1080f
+        val h = if (pdfPageHeightPts > 0f && pdfBasePxPerPt > 0f) {
+            pdfPageHeightPts * pdfBasePxPerPt
+        } else if (pageType == "a4" || pageType == "pdf") {
+            3056f
+        } else if (height > 0) height.toFloat() else 1920f
+        val maxImgW = w * 0.75f
+        val maxImgH = h * 0.75f
         val scale = minOf(maxImgW / image.width, maxImgH / image.height, 1.0f)
         val dstW = image.width * scale
         val dstH = image.height * scale
-        val left = (w - dstW) / 2f
-        val top = (h - dstH) / 2f
+        val left = if (posX != null) posX else {
+            val centerPts = floatArrayOf(width / 2f, height / 2f)
+            pageInverseMatrix.mapPoints(centerPts)
+            centerPts[0] - dstW / 2f
+        }
+        val top = if (posY != null) posY else {
+            val centerPts = floatArrayOf(width / 2f, height / 2f)
+            pageInverseMatrix.mapPoints(centerPts)
+            centerPts[1] - dstH / 2f
+        }
         imageLayers.add(ImageLayer(image, left, top, scale, 0f, 1f, null, true, "Layer ${imageLayers.size + 1}"))
         layersDirty = true
         selectedImageIndex = imageLayers.lastIndex
         invalidate()
+        onStrokeFinishedListener?.invoke()
         return true
     }
 
@@ -1000,10 +1066,16 @@ class DrawingCanvasView @JvmOverloads constructor(
      * Add a pasted / dropped text block as a rendered text layer.
      * Wraps at [maxLineW] using greedy word wrap:
      * draws each line with a bold paint into a high-DPI bitmap, then adds it
-     * centered as an image layer (existing transformable layer machinery).
+     * at [posX]/[posY] (or centered in viewport) as an image layer.
      * Returns true on success.
      */
-    fun addTextBlock(text: String, color: Int = Color.BLACK, fontSizeSp: Float = 24f): Boolean {
+    fun addTextBlock(
+        text: String,
+        color: Int = Color.BLACK,
+        fontSizeSp: Float = 24f,
+        posX: Float? = null,
+        posY: Float? = null
+    ): Boolean {
         val clean = text.trim()
         if (clean.isEmpty()) return false
         val w = if (pdfPageWidthPts > 0f && pdfBasePxPerPt > 0f) {
@@ -1035,17 +1107,18 @@ class DrawingCanvasView @JvmOverloads constructor(
             }
             if (cur.isNotEmpty()) lines.add(cur)
         }
-        val lineH = paint.fontMetrics.descent - paint.fontMetrics.ascent + (textPx * 0.25f)
+        val fm = paint.fontMetrics
+        val lineH = fm.descent - fm.ascent + (textPx * 0.25f)
         val bmpW = lines.maxOfOrNull { paint.measureText(it).toInt() + 32 }?.coerceIn(60, 2400) ?: 200
         val bmpH = (lineH * lines.size + 24f).toInt().coerceIn(60, 3200)
         val bmp = BitmapUtils.createSafeBitmap(bmpW, bmpH)
         val c = Canvas(bmp)
-        var y = lineH - paint.fontMetrics.ascent
+        var y = -fm.ascent + 12f
         for (line in lines) {
             c.drawText(line, 16f, y, paint)
             y += lineH
         }
-        return addImageLayer(bmp)
+        return addImageLayerDirect(bmp, posX, posY)
     }
 
     /**
@@ -1194,6 +1267,7 @@ class DrawingCanvasView @JvmOverloads constructor(
 
     fun deleteImageLayer(index: Int) {
         if (index in imageLayers.indices) {
+            saveUndoState()
             imageLayers.removeAt(index)
             layersDirty = true
             if (selectedImageIndex == index) selectedImageIndex = -1
@@ -1299,7 +1373,8 @@ class DrawingCanvasView @JvmOverloads constructor(
             val ang = Math.toRadians((-layer.rotation).toDouble())
             val lx = dx * Math.cos(ang) - dy * Math.sin(ang)
             val ly = dx * Math.sin(ang) + dy * Math.cos(ang)
-            if (Math.abs(lx) <= w / 2f && Math.abs(ly) <= h / 2f) return i
+            val slop = 16f
+            if (Math.abs(lx) <= (w / 2f + slop) && Math.abs(ly) <= (h / 2f + slop)) return i
         }
         return -1
     }
@@ -1483,14 +1558,75 @@ class DrawingCanvasView @JvmOverloads constructor(
         if (selectedImageIndex in imageLayers.indices) {
             val layer = imageLayers[selectedImageIndex]
             if (!layer.bitmap.isRecycled) {
-                val w = layer.bitmap.width
-                val h = layer.bitmap.height
-                val cx = layer.x + w * layer.scale / 2f
-                val cy = layer.y + h * layer.scale / 2f
-                handlePoint[0] = cx
-                handlePoint[1] = cy
-                viewMatrix.mapPoints(handlePoint)
-                canvas.drawCircle(handlePoint[0], handlePoint[1], handleRadius, handlePaint)
+                val w = layer.bitmap.width * layer.scale
+                val h = layer.bitmap.height * layer.scale
+                val cx = layer.x + w / 2f
+                val cy = layer.y + h / 2f
+                val halfW = w / 2f
+                val halfH = h / 2f
+                val rad = Math.toRadians(layer.rotation.toDouble())
+                val cos = Math.cos(rad).toFloat()
+                val sin = Math.sin(rad).toFloat()
+                fun rotPt(dx: Float, dy: Float): Pair<Float, Float> {
+                    return Pair(cx + dx * cos - dy * sin, cy + dx * sin + dy * cos)
+                }
+                val pTL = rotPt(-halfW, -halfH)
+                val pTR = rotPt(halfW, -halfH)
+                val pBR = rotPt(halfW, halfH)
+                val pBL = rotPt(-halfW, halfH)
+                val pTC = rotPt(0f, -halfH)
+                val pRot = rotPt(0f, -halfH - 45f)
+                val pts = floatArrayOf(
+                    pTL.first, pTL.second,
+                    pTR.first, pTR.second,
+                    pBR.first, pBR.second,
+                    pBL.first, pBL.second,
+                    pTC.first, pTC.second,
+                    pRot.first, pRot.second
+                )
+                viewMatrix.mapPoints(pts)
+                val vTLx = pts[0]; val vTLy = pts[1]
+                val vTRx = pts[2]; val vTRy = pts[3]
+                val vBRx = pts[4]; val vBRy = pts[5]
+                val vBLx = pts[6]; val vBLy = pts[7]
+                val vTCx = pts[8]; val vTCy = pts[9]
+                val vRotX = pts[10]; val vRotY = pts[11]
+
+                // Bounding box border
+                val bboxPath = Path().apply {
+                    moveTo(vTLx, vTLy)
+                    lineTo(vTRx, vTRy)
+                    lineTo(vBRx, vBRy)
+                    lineTo(vBLx, vBLy)
+                    close()
+                }
+                canvas.drawPath(bboxPath, layerBboxPaint)
+
+                // Rotate stem line
+                canvas.drawLine(vTCx, vTCy, vRotX, vRotY, layerBboxPaint)
+
+                val handleR = 18f
+
+                // Rotate handle (Top, Green)
+                layerHandleFillPaint.color = android.graphics.Color.rgb(0x4C, 0xAF, 0x50)
+                canvas.drawCircle(vRotX, vRotY, handleR, layerHandleFillPaint)
+                canvas.drawCircle(vRotX, vRotY, handleR, layerHandleStrokePaint)
+                layerHandleTextPaint.textSize = 20f
+                canvas.drawText("↻", vRotX, vRotY + 7f, layerHandleTextPaint)
+
+                // Delete handle (Top-Left, Red)
+                layerHandleFillPaint.color = android.graphics.Color.rgb(0xE5, 0x39, 0x35)
+                canvas.drawCircle(vTLx, vTLy, handleR, layerHandleFillPaint)
+                canvas.drawCircle(vTLx, vTLy, handleR, layerHandleStrokePaint)
+                layerHandleTextPaint.textSize = 18f
+                canvas.drawText("✕", vTLx, vTLy + 6f, layerHandleTextPaint)
+
+                // Resize handle (Bottom-Right, Blue)
+                layerHandleFillPaint.color = android.graphics.Color.rgb(0x21, 0x96, 0xF3)
+                canvas.drawCircle(vBRx, vBRy, handleR, layerHandleFillPaint)
+                canvas.drawCircle(vBRx, vBRy, handleR, layerHandleStrokePaint)
+                layerHandleTextPaint.textSize = 18f
+                canvas.drawText("⤡", vBRx, vBRy + 6f, layerHandleTextPaint)
             }
         }
         if (lassoState in listOf(LassoState.SELECTED, LassoState.DRAGGING, LassoState.RESIZING)) {
@@ -1592,13 +1728,75 @@ class DrawingCanvasView @JvmOverloads constructor(
     private fun handleImageLayerTouchEvent(event: MotionEvent, x: Float, y: Float): Boolean {
         if (imageLayers.isEmpty()) return false
 
+        var vTLx = 0f; var vTLy = 0f
+        var vBRx = 0f; var vBRy = 0f
+        var vRotX = 0f; var vRotY = 0f
+        var vCX = 0f; var vCY = 0f
+        val selected = imageLayers.getOrNull(selectedImageIndex)
+        if (selected != null && !selected.bitmap.isRecycled) {
+            val w = selected.bitmap.width * selected.scale
+            val h = selected.bitmap.height * selected.scale
+            val cx = selected.x + w / 2f
+            val cy = selected.y + h / 2f
+            val halfW = w / 2f
+            val halfH = h / 2f
+            val rad = Math.toRadians(selected.rotation.toDouble())
+            val cos = Math.cos(rad).toFloat()
+            val sin = Math.sin(rad).toFloat()
+            fun rotPt(dx: Float, dy: Float): Pair<Float, Float> {
+                return Pair(cx + dx * cos - dy * sin, cy + dx * sin + dy * cos)
+            }
+            val pTL = rotPt(-halfW, -halfH)
+            val pBR = rotPt(halfW, halfH)
+            val pRot = rotPt(0f, -halfH - 45f)
+            val pts = floatArrayOf(
+                pTL.first, pTL.second,
+                pBR.first, pBR.second,
+                pRot.first, pRot.second,
+                cx, cy
+            )
+            viewMatrix.mapPoints(pts)
+            vTLx = pts[0]; vTLy = pts[1]
+            vBRx = pts[2]; vBRy = pts[3]
+            vRotX = pts[4]; vRotY = pts[5]
+            vCX = pts[6]; vCY = pts[7]
+        }
+
+        val handleTouchSlop = 48f
+
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                if (selected != null) {
+                    // 1. Check Delete handle (Top-Left, Red ✕)
+                    if (Math.hypot((event.x - vTLx).toDouble(), (event.y - vTLy).toDouble()) <= handleTouchSlop) {
+                        deleteImageLayer(selectedImageIndex)
+                        return true
+                    }
+                    // 2. Check Rotate handle (Top stem, Green ↻)
+                    if (Math.hypot((event.x - vRotX).toDouble(), (event.y - vRotY).toDouble()) <= handleTouchSlop) {
+                        saveUndoState()
+                        imageInteractionMode = 4 // ROTATE
+                        initialTouchAngle = Math.toDegrees(Math.atan2((event.y - vCY).toDouble(), (event.x - vCX).toDouble())).toFloat()
+                        initialLayerRotation = selected.rotation
+                        return true
+                    }
+                    // 3. Check Resize handle (Bottom-Right, Blue ⤡)
+                    if (Math.hypot((event.x - vBRx).toDouble(), (event.y - vBRy).toDouble()) <= handleTouchSlop) {
+                        saveUndoState()
+                        imageInteractionMode = 3 // RESIZE
+                        initialTouchDist = Math.hypot((event.x - vCX).toDouble(), (event.y - vCY).toDouble()).toFloat()
+                        initialLayerScale = selected.scale
+                        return true
+                    }
+                }
+
+                // 4. Check hit on any layer body to select & start drag/drop
                 val idx = topmostImageLayerIndex(x, y)
                 if (idx >= 0) {
+                    saveUndoState()
                     selectedImageIndex = idx
                     val layer = imageLayers[idx]
-                    imageInteractionMode = 1
+                    imageInteractionMode = 1 // MOVE
                     imageDragStartX = x
                     imageDragStartY = y
                     imageLayerStartX = layer.x
@@ -1606,21 +1804,24 @@ class DrawingCanvasView @JvmOverloads constructor(
                     invalidate()
                     return true
                 }
-                // outside layers: if selected exists, deselect? keep selection; normal drawing proceeds
+
+                // Clicked outside any layer: deselect if previously selected
+                if (selectedImageIndex >= 0) {
+                    selectedImageIndex = -1
+                    invalidate()
+                }
                 return false
             }
             MotionEvent.ACTION_POINTER_DOWN -> {
                 if (selectedImageIndex in imageLayers.indices && event.pointerCount >= 2) {
-                    val i0 = 0
-                    val i1 = 1
-                    val x0 = event.getX(i0); val y0 = event.getY(i0)
-                    val x1 = event.getX(i1); val y1 = event.getY(i1)
+                    val x0 = event.getX(0); val y0 = event.getY(0)
+                    val x1 = event.getX(1); val y1 = event.getY(1)
                     pinchStartDist = Math.hypot((x1 - x0).toDouble(), (y1 - y0).toDouble()).toFloat()
                     pinchStartAngle = Math.toDegrees(Math.atan2((y1 - y0).toDouble(), (x1 - x0).toDouble())).toFloat()
                     val layer = imageLayers[selectedImageIndex]
                     pinchStartScale = layer.scale
                     pinchStartRotation = layer.rotation
-                    imageInteractionMode = 2
+                    imageInteractionMode = 2 // PINCH
                     return true
                 }
                 return false
@@ -1628,26 +1829,45 @@ class DrawingCanvasView @JvmOverloads constructor(
             MotionEvent.ACTION_MOVE -> {
                 if (selectedImageIndex !in imageLayers.indices) return false
                 val layer = imageLayers[selectedImageIndex]
-                if (imageInteractionMode == 2 && event.pointerCount >= 2) {
-                    val x0 = event.getX(0); val y0 = event.getY(0)
-                    val x1 = event.getX(1); val y1 = event.getY(1)
-                    val dist = Math.hypot((x1 - x0).toDouble(), (y1 - y0).toDouble()).toFloat()
-                    val angle = Math.toDegrees(Math.atan2((y1 - y0).toDouble(), (x1 - x0).toDouble())).toFloat()
-                    if (pinchStartDist > 0f) {
-                        val scaleRatio = dist / pinchStartDist
-                        layer.scale = (pinchStartScale * scaleRatio).coerceIn(0.1f, 10f)
-                        layer.rotation = pinchStartRotation + (angle - pinchStartAngle)
+                when (imageInteractionMode) {
+                    4 -> { // ROTATE
+                        val curAngle = Math.toDegrees(Math.atan2((event.y - vCY).toDouble(), (event.x - vCX).toDouble())).toFloat()
+                        layer.rotation = initialLayerRotation + (curAngle - initialTouchAngle)
+                        invalidate()
+                        return true
                     }
-                    invalidate()
-                    return true
-                }
-                if (imageInteractionMode == 1 && event.pointerCount == 1) {
-                    val dx = x - imageDragStartX
-                    val dy = y - imageDragStartY
-                    layer.x = imageLayerStartX + dx
-                    layer.y = imageLayerStartY + dy
-                    invalidate()
-                    return true
+                    3 -> { // RESIZE
+                        val curDist = Math.hypot((event.x - vCX).toDouble(), (event.y - vCY).toDouble()).toFloat()
+                        if (initialTouchDist > 5f) {
+                            layer.scale = (initialLayerScale * (curDist / initialTouchDist)).coerceIn(0.1f, 10f)
+                        }
+                        invalidate()
+                        return true
+                    }
+                    2 -> { // PINCH
+                        if (event.pointerCount >= 2) {
+                            val x0 = event.getX(0); val y0 = event.getY(0)
+                            val x1 = event.getX(1); val y1 = event.getY(1)
+                            val dist = Math.hypot((x1 - x0).toDouble(), (y1 - y0).toDouble()).toFloat()
+                            val angle = Math.toDegrees(Math.atan2((y1 - y0).toDouble(), (x1 - x0).toDouble())).toFloat()
+                            if (pinchStartDist > 0f) {
+                                layer.scale = (pinchStartScale * (dist / pinchStartDist)).coerceIn(0.1f, 10f)
+                                layer.rotation = pinchStartRotation + (angle - pinchStartAngle)
+                            }
+                            invalidate()
+                            return true
+                        }
+                    }
+                    1 -> { // MOVE
+                        if (event.pointerCount == 1) {
+                            val dx = x - imageDragStartX
+                            val dy = y - imageDragStartY
+                            layer.x = imageLayerStartX + dx
+                            layer.y = imageLayerStartY + dy
+                            invalidate()
+                            return true
+                        }
+                    }
                 }
                 return false
             }
@@ -2196,9 +2416,12 @@ class DrawingCanvasView @JvmOverloads constructor(
         backingBitmap?.let { bmp ->
             if (undoStack.size >= maxUndoSnapshots) {
                 val oldest = undoStack.removeFirst()
-                if (!oldest.isRecycled) oldest.recycle()
+                if (!oldest.bitmap.isRecycled) oldest.bitmap.recycle()
             }
-            undoStack.addLast(bmp.copy(Bitmap.Config.ARGB_8888, true))
+            val layerSnapshots = imageLayers.map {
+                LayerStateSnapshot(it.bitmap, it.x, it.y, it.scale, it.rotation, it.opacity, it.cropRect, it.visible, it.name)
+            }
+            undoStack.addLast(UndoSnapshot(bmp.copy(Bitmap.Config.ARGB_8888, true), layerSnapshots))
             clearRedoStack()
             notifyUndoRedo()
         }
@@ -2210,13 +2433,22 @@ class DrawingCanvasView @JvmOverloads constructor(
             backingBitmap?.let { current ->
                 if (redoStack.size >= maxUndoSnapshots) {
                     val oldest = redoStack.removeFirst()
-                    if (!oldest.isRecycled) oldest.recycle()
+                    if (!oldest.bitmap.isRecycled) oldest.bitmap.recycle()
                 }
-                redoStack.addLast(current.copy(Bitmap.Config.ARGB_8888, true))
+                val currentLayers = imageLayers.map {
+                    LayerStateSnapshot(it.bitmap, it.x, it.y, it.scale, it.rotation, it.opacity, it.cropRect, it.visible, it.name)
+                }
+                redoStack.addLast(UndoSnapshot(current.copy(Bitmap.Config.ARGB_8888, true), currentLayers))
             }
             val previous = undoStack.removeLast()
-            backingBitmap = previous
-            bitmapCanvas = if (previous != null && !previous.isRecycled) Canvas(previous) else null
+            backingBitmap = previous.bitmap
+            bitmapCanvas = if (previous.bitmap != null && !previous.bitmap.isRecycled) Canvas(previous.bitmap) else null
+            imageLayers.clear()
+            imageLayers.addAll(previous.layers.map {
+                ImageLayer(it.bitmap, it.x, it.y, it.scale, it.rotation, it.opacity, it.cropRect, it.visible, it.name)
+            })
+            selectedImageIndex = -1
+            layersDirty = true
             notifyUndoRedo()
             invalidate()
             onStrokeFinishedListener?.invoke()
@@ -2229,13 +2461,22 @@ class DrawingCanvasView @JvmOverloads constructor(
             backingBitmap?.let { current ->
                 if (undoStack.size >= maxUndoSnapshots) {
                     val oldest = undoStack.removeFirst()
-                    if (!oldest.isRecycled) oldest.recycle()
+                    if (!oldest.bitmap.isRecycled) oldest.bitmap.recycle()
                 }
-                undoStack.addLast(current.copy(Bitmap.Config.ARGB_8888, true))
+                val currentLayers = imageLayers.map {
+                    LayerStateSnapshot(it.bitmap, it.x, it.y, it.scale, it.rotation, it.opacity, it.cropRect, it.visible, it.name)
+                }
+                undoStack.addLast(UndoSnapshot(current.copy(Bitmap.Config.ARGB_8888, true), currentLayers))
             }
             val next = redoStack.removeLast()
-            backingBitmap = next
-            bitmapCanvas = if (next != null && !next.isRecycled) Canvas(next) else null
+            backingBitmap = next.bitmap
+            bitmapCanvas = if (next.bitmap != null && !next.bitmap.isRecycled) Canvas(next.bitmap) else null
+            imageLayers.clear()
+            imageLayers.addAll(next.layers.map {
+                ImageLayer(it.bitmap, it.x, it.y, it.scale, it.rotation, it.opacity, it.cropRect, it.visible, it.name)
+            })
+            selectedImageIndex = -1
+            layersDirty = true
             notifyUndoRedo()
             invalidate()
             onStrokeFinishedListener?.invoke()
@@ -2252,8 +2493,8 @@ class DrawingCanvasView @JvmOverloads constructor(
 
     private fun clearRedoStack() {
         while (redoStack.isNotEmpty()) {
-            val bmp = redoStack.removeLast()
-            if (!bmp.isRecycled) bmp.recycle()
+            val snapshot = redoStack.removeLast()
+            if (!snapshot.bitmap.isRecycled) snapshot.bitmap.recycle()
         }
     }
 
@@ -2294,7 +2535,7 @@ class DrawingCanvasView @JvmOverloads constructor(
         // real strokes.
         if (undoStack.isNotEmpty()) {
             val snapshot = undoStack.removeLast()
-            if (!snapshot.isRecycled) snapshot.recycle()
+            if (!snapshot.bitmap.isRecycled) snapshot.bitmap.recycle()
         }
         notifyUndoRedo()
         invalidate()
@@ -2509,8 +2750,8 @@ class DrawingCanvasView @JvmOverloads constructor(
         setOnDragListener(null)
         clearRedoStack()
         while (undoStack.isNotEmpty()) {
-            val bmp = undoStack.removeLast()
-            if (!bmp.isRecycled) bmp.recycle()
+            val snapshot = undoStack.removeLast()
+            if (!snapshot.bitmap.isRecycled) snapshot.bitmap.recycle()
         }
     }
 

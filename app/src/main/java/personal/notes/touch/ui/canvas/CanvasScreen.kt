@@ -282,7 +282,7 @@ fun CanvasScreen(
     var pencaseOffsetY by remember { mutableFloatStateOf(0f) }
 
     val isInfinite = (note?.pageType ?: "infinite") == "infinite"
-    val isContinuous = !isInfinite && uiState.pageTurningMode == 0
+    val isContinuous = uiState.pageTurningMode == 0
     val isHorizontal = uiState.pageTurningDirection == 1
 
     var continuousScale by remember { mutableFloatStateOf(1f) }
@@ -1742,6 +1742,11 @@ fun CanvasScreen(
                             onCanvasTouchStart = { dismissCanvasOverlays() }
                             onImageSelectionChanged = { selectedImageIndex = it }
                             onPdfSelectionChanged = { selection -> pdfSelection = selection }
+                            onZoomOutToContinuous = {
+                                if (pages.size > 1) {
+                                    viewModel.setPageTurningMode(0)
+                                }
+                            }
                             onUndoRedoListener = { canUndo, canRedo ->
                                 viewModel.updateUndoRedo(canUndo, canRedo)
                             }
@@ -1873,12 +1878,28 @@ fun CanvasScreen(
                                         continuousScale = newScale
                                     }
                                 }
+                                .then(
+                                    if (continuousScale < 1f) {
+                                        val invScale = 1f / continuousScale.coerceAtLeast(0.15f)
+                                        if (isHorizontal) {
+                                            Modifier.fillMaxHeight().width(with(density) { (screenWidthPx * invScale).toDp() })
+                                        } else {
+                                            Modifier.fillMaxWidth().height(with(density) { (screenHeightPx * invScale).toDp() })
+                                        }
+                                    } else {
+                                        Modifier.fillMaxSize()
+                                    }
+                                )
                                 .graphicsLayer {
                                     scaleX = continuousScale
                                     scaleY = continuousScale
                                     translationX = continuousPanX
                                     translationY = continuousPanY
-                                    transformOrigin = androidx.compose.ui.graphics.TransformOrigin(0f, 0f)
+                                    transformOrigin = if (isHorizontal) {
+                                        androidx.compose.ui.graphics.TransformOrigin(0f, 0.5f)
+                                    } else {
+                                        androidx.compose.ui.graphics.TransformOrigin(0.5f, 0f)
+                                    }
                                 }
                         ) {
                             if (isHorizontal) {
@@ -2418,12 +2439,20 @@ fun CanvasScreen(
                                             onClick = {
                                                 val text = liveTextContent.trim()
                                                 if (text.isNotEmpty()) {
+                                                    val boxViewX = (screenWidthPx - with(density) { 360.dp.toPx() }) / 2f + liveTextOffsetX
+                                                    val boxViewY = (screenHeightPx - with(density) { 240.dp.toPx() }) / 2f + liveTextOffsetY
+                                                    val pts = floatArrayOf(boxViewX, boxViewY)
+                                                    canvasViewRef?.pageInverseMatrix?.mapPoints(pts)
+                                                    val targetX = pts[0]
+                                                    val targetY = pts[1]
                                                     scope.launch {
                                                         val inserted = insertLayerInCurrentNote {
                                                             it.addTextBlock(
                                                                 text = text,
                                                                 color = liveTextColor.toArgb(),
-                                                                fontSizeSp = liveTextSizeSp
+                                                                fontSizeSp = liveTextSizeSp,
+                                                                posX = targetX,
+                                                                posY = targetY
                                                             )
                                                         }
                                                         if (!inserted) {
@@ -4356,9 +4385,8 @@ fun CanvasScreen(
                                                 Spacer(modifier = Modifier.height(6.dp))
 
                                                 // 9. PAGE TURNING MODE
-                                                val isInfiniteNote = (note?.pageType ?: "infinite") == "infinite"
-                                                val isContinuousMode = !isInfiniteNote && uiState.pageTurningMode == 0
-                                                val isSingleMode = isInfiniteNote || uiState.pageTurningMode == 1
+                                                val isContinuousMode = uiState.pageTurningMode == 0
+                                                val isSingleMode = uiState.pageTurningMode == 1
 
                                                 Text(
                                                     text = "Page Turning Mode",
@@ -4383,7 +4411,7 @@ fun CanvasScreen(
                                                                 .weight(1f)
                                                                 .fillMaxHeight()
                                                                 .background(if (isContinuousMode) OrangePrimary else Color.White)
-                                                                .clickable(enabled = !isInfiniteNote) {
+                                                                .clickable {
                                                                     if (!isContinuousMode) {
                                                                         scope.launch {
                                                                             canvasViewRef?.getBackingBitmap()?.let { bmp ->
@@ -4406,7 +4434,7 @@ fun CanvasScreen(
                                                                 text = "Continuous",
                                                                 fontSize = 12.sp,
                                                                 fontWeight = if (isContinuousMode) FontWeight.Bold else FontWeight.Normal,
-                                                                color = if (isInfiniteNote) Color.LightGray else if (isContinuousMode) Color.White else OrangePrimary
+                                                                color = if (isContinuousMode) Color.White else OrangePrimary
                                                             )
                                                         }
                                                         // Single button (right half)
@@ -4441,17 +4469,7 @@ fun CanvasScreen(
                                                         }
                                                     }
                                                 }
-                                                if (isInfiniteNote) {
-                                                    Text(
-                                                        text = "Continuous not required for infinite",
-                                                        fontSize = 10.sp,
-                                                        color = Color.Gray,
-                                                        textAlign = TextAlign.Center,
-                                                        modifier = Modifier
-                                                            .fillMaxWidth()
-                                                            .padding(top = 1.dp)
-                                                    )
-                                                }
+
 
                                                 Spacer(modifier = Modifier.height(6.dp))
 

@@ -153,3 +153,20 @@
 - Drag Handle & Quick Commit: includes an intuitive drag handle (`—`) to position the text box anywhere on the canvas before committing, a green `✓ Done` button that converts the text box into a persistent layer on the canvas, and a `✕` button to discard.
 - Scaling & Bounds: updated `DrawingCanvasView.addTextBlock` to respect the chosen `fontSizeSp` parameter and compute clean line wrapping and bounds.
 - Verified with 291 passing unit tests, built clean APK, pushed to wireless tablet (`192.168.1.3:40573`), and synced to GitHub repo.
+
+## Decisions appended 61        61. 2026-11-09 (auditor): Text rendering, layer Undo/Redo, bounding box with handles, multi-page zoom-out, and tab closing navigation:
+- Text Rendering Baseline & Placement: fixed baseline computation in `DrawingCanvasView.addTextBlock` using `-fm.ascent + 12f` so text is never pushed outside the bitmap or cut off; mapped live text box view coordinates to page coordinates so committed text lands exactly where the user positioned it.
+- Full Undo/Redo for Layers: expanded `undoStack` and `redoStack` with `UndoSnapshot` capturing both `backingBitmap` and `imageLayers` (`LayerStateSnapshot`); operations on layers (insert text, delete, move, resize, rotate) push undo states, enabling full undo/redo.
+- Bounding Box & Handles: rendered an interactive bounding box when clicking on any layer/word:
+  - Top-left red `✕` handle to delete the layer (with undo recorded).
+  - Top-center green `↻` rotate handle with stem line allowing 1-finger/stylus free-form rotation.
+  - Bottom-right blue `⤡` handle for proportional scaling.
+  - Dragging inside the box moves the layer; clicking outside deselects.
+- Multi-page Zoom-Out across Infinite Canvas, A4, and PDF:
+  - Unlocked Continuous Mode for Infinite Canvas notes (removed the artificial `!isInfinite` restriction).
+  - Scaled `LazyColumn` / `LazyRow` layout height/width when `continuousScale < 1f` (`invScale = 1f / continuousScale`), allowing multiple pages to be rendered and visible on screen simultaneously when zooming out.
+  - In Single-Page mode, pinch-to-zoom out below 0.75x auto-switches to Continuous mode.
+- Tab Closing Navigation:
+  - Updated `TouchNotesNavHost.kt` so closing the current tab switches to the previous open tab in the tab bar (or the first available tab).
+  - Navigates back to the home folder screen only when the last remaining open tab is closed.
+- Verified with 291 passing unit tests, built clean APK, pushed to wireless tablet (`192.168.1.3:34195`), and synced to GitHub repo.
