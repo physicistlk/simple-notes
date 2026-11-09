@@ -146,3 +146,10 @@
 - Multi-format Page Insertion (`insertPage` / `insertNewPage`): implemented inserting a new blank sheet immediately after the current page (`currentPageIndex + 1`) across Infinite, A4, and PDF notes. For PDF notes, inserting a page injects a pure blank raster/vector canvas sheet between PDF pages with subsequent pages cleanly shifted up; for Infinite notes, inserts a new unbounded sheet; for A4 notes, inserts a new A4 sheet.
 - Bookmarks and TOC index shifting: automatically shifts bookmark indices and TOC chapter page indices `>= targetIndex` by `+1` and persists to `bookmarks.json` and `catalog.json`.
 - Verified with 291 passing unit tests and installed APK over wireless ADB (`192.168.1.3:40573`).
+
+## Decisions appended 60        60. 2026-11-09 (auditor): MS OneNote-style live text preview & inline insertion:
+- Canvas Live Text Preview (`OneNoteLiveTextBox`): replaced the modal `AlertDialog` popup when clicking the Text `[T]` tool in the floating pen toolbar or `+ Text` in the Layers panel with an on-canvas floating, semi-transparent text box positioned directly over the note page.
+- Direct Canvas Feedback & Real-Time Typography: users type into a `BasicTextField` that renders text in real time with the active font size (adjustable via `A-` / `A+` buttons between 12sp and 72sp) and color (swatches: Black, OrangePrimary, Red, Blue).
+- Drag Handle & Quick Commit: includes an intuitive drag handle (`—`) to position the text box anywhere on the canvas before committing, a green `✓ Done` button that converts the text box into a persistent layer on the canvas, and a `✕` button to discard.
+- Scaling & Bounds: updated `DrawingCanvasView.addTextBlock` to respect the chosen `fontSizeSp` parameter and compute clean line wrapping and bounds.
+- Verified with 291 passing unit tests, built clean APK, pushed to wireless tablet (`192.168.1.3:40573`), and synced to GitHub repo.

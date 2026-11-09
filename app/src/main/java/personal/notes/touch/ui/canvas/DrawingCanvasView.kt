@@ -998,21 +998,24 @@ class DrawingCanvasView @JvmOverloads constructor(
 
     /**
      * Add a pasted / dropped text block as a rendered text layer.
-     * Wraps at [wrapWidthPx] (default ~70% of canvas width) using Android
-     * StaticLayout-free manual wrapping: splits on whitespace/newlines,
-     * draws each line with a bold paint into a small bitmap, then adds it
+     * Wraps at [maxLineW] using greedy word wrap:
+     * draws each line with a bold paint into a high-DPI bitmap, then adds it
      * centered as an image layer (existing transformable layer machinery).
      * Returns true on success.
      */
-    fun addTextBlock(text: String, color: Int = Color.BLACK): Boolean {
+    fun addTextBlock(text: String, color: Int = Color.BLACK, fontSizeSp: Float = 24f): Boolean {
         val clean = text.trim()
         if (clean.isEmpty()) return false
-        val w = width.toFloat().coerceAtLeast(400f)
-        val h = height.toFloat().coerceAtLeast(400f)
-        val maxLineW = (w * 0.66f).coerceAtLeast(120f)
+        val w = if (pdfPageWidthPts > 0f && pdfBasePxPerPt > 0f) {
+            pdfPageWidthPts * pdfBasePxPerPt
+        } else if (pageType == "a4" || pageType == "pdf") {
+            2160f
+        } else if (width > 0) width.toFloat() else 1080f
+        val maxLineW = (w * 0.75f).coerceAtLeast(160f)
+        val textPx = (fontSizeSp * 2.2f).coerceIn(24f, 120f)
         val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             this.color = color
-            textSize = 48f
+            textSize = textPx
             isFakeBoldText = true
         }
         // Manual greedy word wrap
@@ -1032,14 +1035,14 @@ class DrawingCanvasView @JvmOverloads constructor(
             }
             if (cur.isNotEmpty()) lines.add(cur)
         }
-        val lineH = paint.fontMetrics.descent - paint.fontMetrics.ascent + 10f
-        val bmpW = lines.maxOfOrNull { paint.measureText(it).toInt() + 24 }?.coerceIn(40, 2048) ?: 200
-        val bmpH = (lineH * lines.size + 16f).toInt().coerceIn(40, 2048)
+        val lineH = paint.fontMetrics.descent - paint.fontMetrics.ascent + (textPx * 0.25f)
+        val bmpW = lines.maxOfOrNull { paint.measureText(it).toInt() + 32 }?.coerceIn(60, 2400) ?: 200
+        val bmpH = (lineH * lines.size + 24f).toInt().coerceIn(60, 3200)
         val bmp = BitmapUtils.createSafeBitmap(bmpW, bmpH)
         val c = Canvas(bmp)
         var y = lineH - paint.fontMetrics.ascent
         for (line in lines) {
-            c.drawText(line, 12f, y, paint)
+            c.drawText(line, 16f, y, paint)
             y += lineH
         }
         return addImageLayer(bmp)

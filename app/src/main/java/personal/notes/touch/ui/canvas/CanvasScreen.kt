@@ -151,12 +151,19 @@ import androidx.compose.ui.input.pointer.PointerType
 import androidx.compose.ui.input.pointer.changedToUp
 import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntOffset
@@ -164,6 +171,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
@@ -260,8 +268,13 @@ fun CanvasScreen(
     var showAddChapterDialog by remember { mutableStateOf(false) }
     var newChapterTitle by remember { mutableStateOf("") }
     var newTitleText by remember { mutableStateOf("") }
-    var showTextInputDialog by remember { mutableStateOf(false) }
-    var textInputText by remember { mutableStateOf("") }
+    var isLiveTextActive by remember { mutableStateOf(false) }
+    var liveTextContent by remember { mutableStateOf("") }
+    var liveTextOffsetX by remember { mutableFloatStateOf(0f) }
+    var liveTextOffsetY by remember { mutableFloatStateOf(0f) }
+    var liveTextSizeSp by remember { mutableFloatStateOf(20f) }
+    var liveTextColor by remember { mutableStateOf(Color.Black) }
+    val liveTextFocusRequester = remember { FocusRequester() }
     var showGoToPageDialog by remember { mutableStateOf(false) }
     var pageToDeleteIndex by remember { mutableStateOf<Int?>(null) }
     var isPencaseCollapsed by remember { mutableStateOf(false) }
@@ -1061,46 +1074,16 @@ fun CanvasScreen(
         )
     }
 
-    // Text Input Dialog (insert text as a layer)
-    if (showTextInputDialog) {
-        androidx.compose.material3.AlertDialog(
-            onDismissRequest = { showTextInputDialog = false },
-            title = { androidx.compose.material3.Text("Insert text") },
-            text = {
-                androidx.compose.material3.OutlinedTextField(
-                    value = textInputText,
-                    onValueChange = { textInputText = it },
-                    label = { androidx.compose.material3.Text("Text") },
-                    minLines = 3,
-                    modifier = androidx.compose.ui.Modifier.fillMaxWidth()
-                )
-            },
-            confirmButton = {
-                androidx.compose.material3.TextButton(
-                    onClick = {
-                        val text = textInputText.trim()
-                        if (text.isNotEmpty()) {
-                            scope.launch {
-                                val inserted = insertLayerInCurrentNote { it.addTextBlock(text) }
-                                if (!inserted) {
-                                    android.widget.Toast.makeText(
-                                        context, "Could not insert text", android.widget.Toast.LENGTH_SHORT
-                                    ).show()
-                                }
-                            }
-                        }
-                        showTextInputDialog = false
-                    }
-                ) {
-                    androidx.compose.material3.Text("Insert")
-                }
-            },
-            dismissButton = {
-                androidx.compose.material3.TextButton(onClick = { showTextInputDialog = false }) {
-                    androidx.compose.material3.Text("Cancel")
-                }
+    // Auto-focus keyboard when OneNote live text box opens
+    LaunchedEffect(isLiveTextActive) {
+        if (isLiveTextActive) {
+            delay(150)
+            try {
+                liveTextFocusRequester.requestFocus()
+            } catch (e: Exception) {
+                // Ignore focus request failure
             }
-        )
+        }
     }
 
     // Dialog: Go to Page / Jump
@@ -2287,8 +2270,11 @@ fun CanvasScreen(
                                 OutlinedButton(
                                     onClick = {
                                         showLayersPanel = false
-                                        textInputText = ""
-                                        showTextInputDialog = true
+                                        liveTextContent = ""
+                                        liveTextOffsetX = 0f
+                                        liveTextOffsetY = 0f
+                                        liveTextColor = if (uiState.selectedColor == Color.White) Color.Black else uiState.selectedColor
+                                        isLiveTextActive = true
                                     },
                                     modifier = Modifier.weight(1f).height(32.dp),
                                     contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp)
@@ -2319,6 +2305,211 @@ fun CanvasScreen(
                                 ) {
                                     Text("Merge to base", fontSize = 11.sp, color = OrangePrimary)
                                 }
+                            }
+                        }
+                    }
+                }
+
+                // ==========================================
+                // ONENOTE-STYLE LIVE PREVIEW TEXT BOX
+                // ==========================================
+                if (isLiveTextActive) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(bottom = 50.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = Color.White.copy(alpha = 0.95f),
+                            shadowElevation = 8.dp,
+                            border = BorderStroke(1.5.dp, OrangePrimary),
+                            modifier = Modifier
+                                .offset { IntOffset(liveTextOffsetX.roundToInt(), liveTextOffsetY.roundToInt()) }
+                                .widthIn(min = 320.dp, max = 560.dp)
+                                .padding(8.dp)
+                        ) {
+                            Column(modifier = Modifier.padding(10.dp)) {
+                                // OneNote-style Top Bar: Drag handle + Formatting controls + Done/Cancel
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    // Drag Handle (Grabbable with finger/stylus to position live text on page)
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier
+                                            .pointerInput(Unit) {
+                                                detectDragGestures { change, dragAmount ->
+                                                    change.consume()
+                                                    liveTextOffsetX += dragAmount.x
+                                                    liveTextOffsetY += dragAmount.y
+                                                }
+                                            }
+                                            .padding(end = 6.dp)
+                                    ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .width(28.dp)
+                                                .height(6.dp)
+                                                .clip(RoundedCornerShape(3.dp))
+                                                .background(Color.Gray.copy(alpha = 0.5f))
+                                        )
+                                        Spacer(Modifier.width(6.dp))
+                                        Text(
+                                            "Text Box",
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = Color(0xFF444444)
+                                        )
+                                    }
+
+                                    // Formatting Toolbar
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                    ) {
+                                        // Font Size Controls (A- / A+)
+                                        IconButton(
+                                            onClick = { liveTextSizeSp = (liveTextSizeSp - 4f).coerceAtLeast(12f) },
+                                            modifier = Modifier.size(26.dp)
+                                        ) {
+                                            Text("A-", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color(0xFF555555))
+                                        }
+                                        Text(
+                                            "${liveTextSizeSp.roundToInt()}sp",
+                                            fontSize = 11.sp,
+                                            color = Color.Gray,
+                                            modifier = Modifier.padding(horizontal = 1.dp)
+                                        )
+                                        IconButton(
+                                            onClick = { liveTextSizeSp = (liveTextSizeSp + 4f).coerceAtMost(48f) },
+                                            modifier = Modifier.size(26.dp)
+                                        ) {
+                                            Text("A+", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFF555555))
+                                        }
+
+                                        Spacer(Modifier.width(2.dp))
+
+                                        // Color swatches (Black, Orange, Red, Blue)
+                                        val textSwatches = listOf(Color.Black, OrangePrimary, Color(0xFFD32F2F), Color(0xFF1565C0))
+                                        textSwatches.forEach { c ->
+                                            val isSelected = liveTextColor == c
+                                            Box(
+                                                modifier = Modifier
+                                                    .size(18.dp)
+                                                    .clip(CircleShape)
+                                                    .background(c)
+                                                    .border(
+                                                        if (isSelected) 2.dp else 0.5.dp,
+                                                        if (isSelected) OrangePrimary else Color.LightGray,
+                                                        CircleShape
+                                                    )
+                                                    .clickable { liveTextColor = c }
+                                            )
+                                        }
+
+                                        Spacer(Modifier.width(4.dp))
+
+                                        // Done button (Commit text layer to canvas)
+                                        IconButton(
+                                            onClick = {
+                                                val text = liveTextContent.trim()
+                                                if (text.isNotEmpty()) {
+                                                    scope.launch {
+                                                        val inserted = insertLayerInCurrentNote {
+                                                            it.addTextBlock(
+                                                                text = text,
+                                                                color = liveTextColor.toArgb(),
+                                                                fontSizeSp = liveTextSizeSp
+                                                            )
+                                                        }
+                                                        if (!inserted) {
+                                                            android.widget.Toast.makeText(
+                                                                context,
+                                                                "Could not insert text",
+                                                                android.widget.Toast.LENGTH_SHORT
+                                                            ).show()
+                                                        }
+                                                    }
+                                                }
+                                                isLiveTextActive = false
+                                                liveTextContent = ""
+                                            },
+                                            modifier = Modifier
+                                                .size(28.dp)
+                                                .background(Color(0xFF4CAF50), CircleShape)
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Check,
+                                                contentDescription = "Done",
+                                                tint = Color.White,
+                                                modifier = Modifier.size(16.dp)
+                                            )
+                                        }
+
+                                        // Cancel button
+                                        IconButton(
+                                            onClick = {
+                                                isLiveTextActive = false
+                                                liveTextContent = ""
+                                            },
+                                            modifier = Modifier
+                                                .size(28.dp)
+                                                .background(Color(0xFFEEEEEE), CircleShape)
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Close,
+                                                contentDescription = "Cancel",
+                                                tint = Color.DarkGray,
+                                                modifier = Modifier.size(14.dp)
+                                            )
+                                        }
+                                    }
+                                }
+
+                                Divider(
+                                    color = Color(0xFFEEEEEE),
+                                    thickness = 0.5.dp,
+                                    modifier = Modifier.padding(vertical = 6.dp)
+                                )
+
+                                // Live typing field directly on canvas
+                                BasicTextField(
+                                    value = liveTextContent,
+                                    onValueChange = { liveTextContent = it },
+                                    textStyle = TextStyle(
+                                        color = liveTextColor,
+                                        fontSize = liveTextSizeSp.sp,
+                                        fontWeight = FontWeight.Medium,
+                                        lineHeight = (liveTextSizeSp * 1.35f).sp
+                                    ),
+                                    cursorBrush = SolidColor(OrangePrimary),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .defaultMinSize(minHeight = 72.dp)
+                                        .focusRequester(liveTextFocusRequester),
+                                    decorationBox = { innerTextField ->
+                                        Box(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .background(Color.White.copy(alpha = 0.6f), RoundedCornerShape(6.dp))
+                                                .border(BorderStroke(1.dp, Color(0xFFE0E0E0)), RoundedCornerShape(6.dp))
+                                                .padding(8.dp)
+                                        ) {
+                                            if (liveTextContent.isEmpty()) {
+                                                Text(
+                                                    "Type text here...",
+                                                    color = Color.LightGray,
+                                                    fontSize = liveTextSizeSp.sp
+                                                )
+                                            }
+                                            innerTextField()
+                                        }
+                                    }
+                                )
                             }
                         }
                     }
@@ -2519,21 +2710,17 @@ fun CanvasScreen(
                                     onClick = { viewModel.selectTool(CanvasTool.ERASER) }
                                 )
 
-                                // Text Tool [T]
+                                // Text Tool [T] (OneNote-style live text preview)
                                 PencaseToolIcon(
                                     icon = Icons.Default.TextFields,
                                     label = "Text",
-                                    isSelected = pdfTextMode,
+                                    isSelected = isLiveTextActive || pdfTextMode,
                                     onClick = {
-                                        if (pdfTextAvailable && vectorPdfPage(viewModel.currentPageIndex.value) != null) {
-                                            val next = !pdfTextMode
-                                            pdfTextMode = next
-                                            if (!next) pdfSelection = null
-                                            canvasViewRef?.setPdfTextSelectionMode(next)
-                                        } else {
-                                            textInputText = ""
-                                            showTextInputDialog = true
-                                        }
+                                        liveTextContent = ""
+                                        liveTextOffsetX = 0f
+                                        liveTextOffsetY = 0f
+                                        liveTextColor = if (uiState.selectedColor == Color.White) Color.Black else uiState.selectedColor
+                                        isLiveTextActive = true
                                     }
                                 )
 
@@ -2796,21 +2983,17 @@ fun CanvasScreen(
                                     onClick = { viewModel.selectTool(CanvasTool.ERASER) }
                                 )
 
-                                // Text Tool [T]
+                                // Text Tool [T] (OneNote-style live text preview)
                                 PencaseToolIcon(
                                     icon = Icons.Default.TextFields,
                                     label = "Text",
-                                    isSelected = pdfTextMode,
+                                    isSelected = isLiveTextActive || pdfTextMode,
                                     onClick = {
-                                        if (pdfTextAvailable && vectorPdfPage(viewModel.currentPageIndex.value) != null) {
-                                            val next = !pdfTextMode
-                                            pdfTextMode = next
-                                            if (!next) pdfSelection = null
-                                            canvasViewRef?.setPdfTextSelectionMode(next)
-                                        } else {
-                                            textInputText = ""
-                                            showTextInputDialog = true
-                                        }
+                                        liveTextContent = ""
+                                        liveTextOffsetX = 0f
+                                        liveTextOffsetY = 0f
+                                        liveTextColor = if (uiState.selectedColor == Color.White) Color.Black else uiState.selectedColor
+                                        isLiveTextActive = true
                                     }
                                 )
 
