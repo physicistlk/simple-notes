@@ -147,14 +147,18 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.pointer.PointerType
+import androidx.compose.ui.input.pointer.changedToUp
 import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.layout.offset
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -260,6 +264,8 @@ fun CanvasScreen(
     var showGoToPageDialog by remember { mutableStateOf(false) }
     var pageToDeleteIndex by remember { mutableStateOf<Int?>(null) }
     var isPencaseCollapsed by remember { mutableStateOf(false) }
+    var pencaseOffsetX by remember { mutableFloatStateOf(0f) }
+    var pencaseOffsetY by remember { mutableFloatStateOf(0f) }
 
     val isInfinite = (note?.pageType ?: "infinite") == "infinite"
     val isContinuous = !isInfinite && uiState.pageTurningMode == 0
@@ -273,6 +279,11 @@ fun CanvasScreen(
     val fixPreviewPageState = uiState.fixPreviewPage
     val horizontalResistance = uiState.horizontalResistance
     val minimalInfiniteZoom = uiState.minimalInfiniteZoom
+
+    val configuration = LocalConfiguration.current
+    val density = LocalDensity.current
+    val screenWidthPx = with(density) { configuration.screenWidthDp.dp.toPx() }
+    val screenHeightPx = with(density) { configuration.screenHeightDp.dp.toPx() }
 
     // F-10 PDF text selection: whether the current vector page has extractable
     // text, whether the Text tool is in selection mode, and the live selection.
@@ -2360,6 +2371,7 @@ fun CanvasScreen(
                             shadowElevation = 4.dp,
                             modifier = Modifier
                                 .align(if (uiState.dockHorizontal) Alignment.TopCenter else Alignment.CenterStart)
+                                .offset { IntOffset(pencaseOffsetX.roundToInt(), pencaseOffsetY.roundToInt()) }
                                 .padding(top = if (uiState.dockHorizontal) 10.dp else 0.dp, start = if (!uiState.dockHorizontal) 12.dp else 0.dp)
                                 .border(1.dp, Color(0xFFEEEEEE), RoundedCornerShape(16.dp))
                                 .clickable { isPencaseCollapsed = false }
@@ -2391,6 +2403,7 @@ fun CanvasScreen(
                             shadowElevation = 6.dp,
                             modifier = Modifier
                                 .align(Alignment.TopCenter)
+                                .offset { IntOffset(pencaseOffsetX.roundToInt(), pencaseOffsetY.roundToInt()) }
                                 .padding(top = 10.dp)
                                 .border(1.dp, Color(0xFFEEEEEE), RoundedCornerShape(20.dp))
                         ) {
@@ -2399,15 +2412,55 @@ fun CanvasScreen(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
-                                // Drag handle pill (Tap to switch orientation)
+                                // Drag & Rotate Handle Pill (Tap to switch orientation, Tap & Hold to drag)
                                 Box(
                                     modifier = Modifier
-                                        .height(18.dp)
-                                        .width(4.dp)
-                                        .clip(RoundedCornerShape(2.dp))
-                                        .background(Color.LightGray)
-                                        .clickable { viewModel.toggleDockOrientation() }
-                                )
+                                        .size(width = 24.dp, height = 36.dp)
+                                        .pointerInput(Unit) {
+                                            awaitEachGesture {
+                                                val down = awaitFirstDown(requireUnconsumed = false)
+                                                var isDrag = false
+                                                val touchSlop = viewConfiguration.touchSlop
+                                                while (true) {
+                                                    val event = awaitPointerEvent()
+                                                    val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                                    if (change.changedToUp()) {
+                                                        if (!isDrag) {
+                                                            viewModel.toggleDockOrientation()
+                                                            pencaseOffsetX = 0f
+                                                            pencaseOffsetY = 0f
+                                                        }
+                                                        change.consume()
+                                                        break
+                                                    }
+                                                    val deltaX = change.position.x - down.position.x
+                                                    val deltaY = change.position.y - down.position.y
+                                                    if (!isDrag && kotlin.math.hypot(deltaX, deltaY) > touchSlop) {
+                                                        isDrag = true
+                                                    }
+                                                    if (isDrag) {
+                                                        val dragDelta = change.position - change.previousPosition
+                                                        change.consume()
+                                                        val minX = -screenWidthPx / 2f + 80f
+                                                        val maxX = screenWidthPx / 2f - 80f
+                                                        val minY = -10f
+                                                        val maxY = screenHeightPx - 150f
+                                                        pencaseOffsetX = (pencaseOffsetX + dragDelta.x).coerceIn(minX, maxX)
+                                                        pencaseOffsetY = (pencaseOffsetY + dragDelta.y).coerceIn(minY, maxY)
+                                                    }
+                                                }
+                                            }
+                                        },
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .height(18.dp)
+                                            .width(4.dp)
+                                            .clip(RoundedCornerShape(2.dp))
+                                            .background(Color.LightGray)
+                                    )
+                                }
 
                                 // Fountain Pen
                                 PencaseToolIcon(
@@ -2519,19 +2572,6 @@ fun CanvasScreen(
                                     onClick = selectLassoTool
                                 )
 
-                                // Collapse Chevron (<)
-                                IconButton(
-                                    onClick = { isPencaseCollapsed = true },
-                                    modifier = Modifier.size(30.dp)
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.KeyboardArrowUp,
-                                        contentDescription = "Collapse Dock",
-                                        tint = Color.Gray,
-                                        modifier = Modifier.size(18.dp)
-                                    )
-                                }
-
                                 Divider(
                                     modifier = Modifier
                                         .height(24.dp)
@@ -2640,6 +2680,7 @@ fun CanvasScreen(
                             shadowElevation = 6.dp,
                             modifier = Modifier
                                 .align(Alignment.CenterStart)
+                                .offset { IntOffset(pencaseOffsetX.roundToInt(), pencaseOffsetY.roundToInt()) }
                                 .padding(start = 12.dp)
                                 .border(1.dp, Color(0xFFEEEEEE), RoundedCornerShape(22.dp))
                         ) {
@@ -2648,15 +2689,55 @@ fun CanvasScreen(
                                 horizontalAlignment = Alignment.CenterHorizontally,
                                 verticalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
-                                // Drag handle pill (Tap to toggle orientation)
+                                // Drag & Rotate Handle Pill (Tap to toggle orientation, Tap & Hold to drag)
                                 Box(
                                     modifier = Modifier
-                                        .width(20.dp)
-                                        .height(4.dp)
-                                        .clip(RoundedCornerShape(2.dp))
-                                        .background(Color.LightGray)
-                                        .clickable { viewModel.toggleDockOrientation() }
-                                )
+                                        .size(width = 36.dp, height = 24.dp)
+                                        .pointerInput(Unit) {
+                                            awaitEachGesture {
+                                                val down = awaitFirstDown(requireUnconsumed = false)
+                                                var isDrag = false
+                                                val touchSlop = viewConfiguration.touchSlop
+                                                while (true) {
+                                                    val event = awaitPointerEvent()
+                                                    val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                                    if (change.changedToUp()) {
+                                                        if (!isDrag) {
+                                                            viewModel.toggleDockOrientation()
+                                                            pencaseOffsetX = 0f
+                                                            pencaseOffsetY = 0f
+                                                        }
+                                                        change.consume()
+                                                        break
+                                                    }
+                                                    val deltaX = change.position.x - down.position.x
+                                                    val deltaY = change.position.y - down.position.y
+                                                    if (!isDrag && kotlin.math.hypot(deltaX, deltaY) > touchSlop) {
+                                                        isDrag = true
+                                                    }
+                                                    if (isDrag) {
+                                                        val dragDelta = change.position - change.previousPosition
+                                                        change.consume()
+                                                        val minX = 0f
+                                                        val maxX = screenWidthPx - 100f
+                                                        val minY = -screenHeightPx / 2f + 80f
+                                                        val maxY = screenHeightPx / 2f - 80f
+                                                        pencaseOffsetX = (pencaseOffsetX + dragDelta.x).coerceIn(minX, maxX)
+                                                        pencaseOffsetY = (pencaseOffsetY + dragDelta.y).coerceIn(minY, maxY)
+                                                    }
+                                                }
+                                            }
+                                        },
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .width(20.dp)
+                                            .height(4.dp)
+                                            .clip(RoundedCornerShape(2.dp))
+                                            .background(Color.LightGray)
+                                    )
+                                }
 
                                 // Fountain Pen
                                 PencaseToolIcon(
@@ -2767,19 +2848,6 @@ fun CanvasScreen(
                                     selectedTint = OrangePrimary,
                                     onClick = selectLassoTool
                                 )
-
-                                // Collapse Chevron (^)
-                                IconButton(
-                                    onClick = { isPencaseCollapsed = true },
-                                    modifier = Modifier.size(28.dp)
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.AutoMirrored.Filled.KeyboardArrowLeft,
-                                        contentDescription = "Collapse Dock",
-                                        tint = Color.Gray,
-                                        modifier = Modifier.size(16.dp)
-                                    )
-                                }
 
                                 Divider(
                                     modifier = Modifier
