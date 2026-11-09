@@ -1831,6 +1831,9 @@ fun CanvasScreen(
 
                 // Continuous page overlay when continuous mode is active
                 if (isContinuous) {
+                    val pageWidthDp = with(density) { (screenWidthPx * continuousScale).toDp() }
+                    val pageHeightDp = with(density) { (screenHeightPx * continuousScale).toDp() }
+
                     Box(modifier = Modifier.fillMaxSize()) {
                         Box(
                             modifier = Modifier
@@ -1842,63 +1845,26 @@ fun CanvasScreen(
                                         val newScale = (continuousScale * zoom)
                                             .coerceIn(MIN_CONTINUOUS_SCALE, MAX_CONTINUOUS_SCALE)
                                         val factor = newScale / oldScale
-                                        if (newScale < 1f) {
-                                            continuousPanX = size.width * (1f - newScale) / 2f
-                                            continuousPanY = 0f
-                                            if (isHorizontal) {
-                                                continuousRowState.dispatchRawDelta(-pan.x)
+                                        if (isHorizontal) {
+                                            val scrollDelta = (centroid.x * (factor - 1f)) - pan.x
+                                            continuousRowState.dispatchRawDelta(scrollDelta)
+                                            if (newScale > 1f) {
+                                                val maxPanY = (screenHeightPx * (newScale - 1f)) / 2f
+                                                continuousPanY = (centroid.y - (centroid.y - continuousPanY) * factor + pan.y).coerceIn(-maxPanY, maxPanY)
                                             } else {
-                                                continuousColState.dispatchRawDelta(-pan.y)
+                                                continuousPanY = 0f
                                             }
                                         } else {
-                                            val maxPanX = size.width * (newScale - 1f)
-                                            val maxPanY = size.height * (newScale - 1f)
-                                            val prevPanX = continuousPanX
-                                            val prevPanY = continuousPanY
-                                            continuousPanX = (centroid.x - (centroid.x - continuousPanX) * factor + pan.x)
-                                                .coerceIn(-maxPanX, 0f)
-                                            continuousPanY = (centroid.y - (centroid.y - continuousPanY) * factor + pan.y)
-                                                .coerceIn(-maxPanY, 0f)
-                                            val consumedX = continuousPanX - prevPanX
-                                            val consumedY = continuousPanY - prevPanY
-                                            val unabsorbedX = pan.x - consumedX
-                                            val unabsorbedY = pan.y - consumedY
-                                            if (isHorizontal && unabsorbedX != 0f) {
-                                                continuousRowState.dispatchRawDelta(-unabsorbedX)
-                                            } else if (!isHorizontal && unabsorbedY != 0f) {
-                                                continuousColState.dispatchRawDelta(-unabsorbedY)
-                                            }
-                                            // Back at fit-to-width: drop the offsets so
-                                            // pages sit centred again.
-                                            if (newScale <= 1.02f) {
+                                            val scrollDelta = (centroid.y * (factor - 1f)) - pan.y
+                                            continuousColState.dispatchRawDelta(scrollDelta)
+                                            if (newScale > 1f) {
+                                                val maxPanX = (screenWidthPx * (newScale - 1f)) / 2f
+                                                continuousPanX = (centroid.x - (centroid.x - continuousPanX) * factor + pan.x).coerceIn(-maxPanX, maxPanX)
+                                            } else {
                                                 continuousPanX = 0f
-                                                continuousPanY = 0f
                                             }
                                         }
                                         continuousScale = newScale
-                                    }
-                                }
-                                .then(
-                                    if (continuousScale < 1f) {
-                                        val invScale = 1f / continuousScale.coerceAtLeast(0.15f)
-                                        if (isHorizontal) {
-                                            Modifier.fillMaxHeight().width(with(density) { (screenWidthPx * invScale).toDp() })
-                                        } else {
-                                            Modifier.fillMaxWidth().height(with(density) { (screenHeightPx * invScale).toDp() })
-                                        }
-                                    } else {
-                                        Modifier.fillMaxSize()
-                                    }
-                                )
-                                .graphicsLayer {
-                                    scaleX = continuousScale
-                                    scaleY = continuousScale
-                                    translationX = continuousPanX
-                                    translationY = continuousPanY
-                                    transformOrigin = if (isHorizontal) {
-                                        androidx.compose.ui.graphics.TransformOrigin(0f, 0.5f)
-                                    } else {
-                                        androidx.compose.ui.graphics.TransformOrigin(0.5f, 0f)
                                     }
                                 }
                         ) {
@@ -1906,35 +1872,39 @@ fun CanvasScreen(
                                 androidx.compose.foundation.lazy.LazyRow(
                                     state = continuousRowState,
                                     modifier = Modifier.fillMaxSize(),
-                                    // A pen down on a page must not be turned into
-                                    // a scroll: Compose's interop touch bridge does
-                                    // not consume the initial down, so the list
-                                    // would cancel the stroke and scroll instead.
                                     userScrollEnabled = !inkController.isDrawing,
+                                    verticalAlignment = Alignment.CenterVertically,
                                     horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(16.dp),
                                     contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp)
                                 ) {
                                     items(pages.size) { idx ->
                                         val page = pages[idx]
-                                        ContinuousPageView(
-                                            pageIndex = idx,
-                                            page = page,
-                                            noteId = viewModel.noteId,
-                                            pdfDocCache = pdfDocCache,
-                                            repository = viewModel.repository,
-                                            zoom = continuousZoomBucket,
-                                            ink = inkController,
-                                            inkSettings = inkSettings,
-                                            backgroundMode = uiState.backgroundMode,
-                                            backgroundDensity = uiState.backgroundDensity,
-                                            savedGeneration = savedPageGenerations[idx] ?: 0,
-                                            isCurrentPage = idx == currentPageIndex,
-                                            modifier = androidx.compose.ui.Modifier.fillParentMaxHeight(),
-                                            onClick = {
-                                                viewModel.setCurrentPageIndex(idx)
-                                                dismissCanvasOverlays()
-                                            }
-                                        )
+                                        Box(
+                                            modifier = Modifier
+                                                .height(pageHeightDp)
+                                                .offset { IntOffset(0, continuousPanY.roundToInt()) },
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            ContinuousPageView(
+                                                pageIndex = idx,
+                                                page = page,
+                                                noteId = viewModel.noteId,
+                                                pdfDocCache = pdfDocCache,
+                                                repository = viewModel.repository,
+                                                zoom = continuousZoomBucket,
+                                                ink = inkController,
+                                                inkSettings = inkSettings,
+                                                backgroundMode = uiState.backgroundMode,
+                                                backgroundDensity = uiState.backgroundDensity,
+                                                savedGeneration = savedPageGenerations[idx] ?: 0,
+                                                isCurrentPage = idx == currentPageIndex,
+                                                modifier = androidx.compose.ui.Modifier.fillMaxHeight(),
+                                                onClick = {
+                                                    viewModel.setCurrentPageIndex(idx)
+                                                    dismissCanvasOverlays()
+                                                }
+                                            )
+                                        }
                                     }
                                 }
                             } else if (uiState.doublePageMode) {
@@ -1943,13 +1913,16 @@ fun CanvasScreen(
                                     modifier = Modifier.fillMaxSize(),
                                     userScrollEnabled = !inkController.isDrawing,
                                     verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(16.dp),
-                                    contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 16.dp, horizontal = 16.dp)
+                                    contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 16.dp, horizontal = 16.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally
                                 ) {
                                     val pairs = (0 until pages.size).chunked(2)
                                     items(pairs.size) { pairIdx ->
                                         val pair = pairs[pairIdx]
                                         Row(
-                                            modifier = Modifier.fillMaxWidth(),
+                                            modifier = Modifier
+                                                .width(pageWidthDp)
+                                                .offset { IntOffset(continuousPanX.roundToInt(), 0) },
                                             horizontalArrangement = Arrangement.spacedBy(16.dp)
                                         ) {
                                             for (idx in pair) {
@@ -1988,29 +1961,37 @@ fun CanvasScreen(
                                     modifier = Modifier.fillMaxSize(),
                                     userScrollEnabled = !inkController.isDrawing,
                                     verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(16.dp),
-                                    contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 16.dp, horizontal = 32.dp)
+                                    contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 16.dp, horizontal = 16.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally
                                 ) {
                                     items(pages.size) { idx ->
                                         val page = pages[idx]
-                                        ContinuousPageView(
-                                            pageIndex = idx,
-                                            page = page,
-                                            noteId = viewModel.noteId,
-                                            pdfDocCache = pdfDocCache,
-                                            repository = viewModel.repository,
-                                            zoom = continuousZoomBucket,
-                                            ink = inkController,
-                                            inkSettings = inkSettings,
-                                            backgroundMode = uiState.backgroundMode,
-                                            backgroundDensity = uiState.backgroundDensity,
-                                            savedGeneration = savedPageGenerations[idx] ?: 0,
-                                            isCurrentPage = idx == currentPageIndex,
-                                            modifier = androidx.compose.ui.Modifier.fillMaxWidth(),
-                                            onClick = {
-                                                viewModel.setCurrentPageIndex(idx)
-                                                dismissCanvasOverlays()
-                                            }
-                                        )
+                                        Box(
+                                            modifier = Modifier
+                                                .width(pageWidthDp)
+                                                .offset { IntOffset(continuousPanX.roundToInt(), 0) },
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            ContinuousPageView(
+                                                pageIndex = idx,
+                                                page = page,
+                                                noteId = viewModel.noteId,
+                                                pdfDocCache = pdfDocCache,
+                                                repository = viewModel.repository,
+                                                zoom = continuousZoomBucket,
+                                                ink = inkController,
+                                                inkSettings = inkSettings,
+                                                backgroundMode = uiState.backgroundMode,
+                                                backgroundDensity = uiState.backgroundDensity,
+                                                savedGeneration = savedPageGenerations[idx] ?: 0,
+                                                isCurrentPage = idx == currentPageIndex,
+                                                modifier = androidx.compose.ui.Modifier.fillMaxWidth(),
+                                                onClick = {
+                                                    viewModel.setCurrentPageIndex(idx)
+                                                    dismissCanvasOverlays()
+                                                }
+                                            )
+                                        }
                                     }
                                 }
                             }

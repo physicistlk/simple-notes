@@ -170,3 +170,9 @@
   - Updated `TouchNotesNavHost.kt` so closing the current tab switches to the previous open tab in the tab bar (or the first available tab).
   - Navigates back to the home folder screen only when the last remaining open tab is closed.
 - Verified with 291 passing unit tests, built clean APK, pushed to wireless tablet (`192.168.1.3:34195`), and synced to GitHub repo.
+
+## Decisions appended 62        62. 2026-11-09 (auditor): Centroid-anchored pinch zoom & native multi-page layout rendering:
+- Centroid Pinch Zoom: updated `detectTransformGestures` in `CanvasScreen.kt` with exact centroid anchoring: `scrollDelta = (centroid * (factor - 1f)) - pan` dispatched to `continuousColState` / `continuousRowState`, and `continuousPanX` clamped smoothly. Zooming in or out now stays anchored directly at the intended touch site without drifting.
+- Native Page Sizing in Continuous Mode: replaced the outer `graphicsLayer` post-scale hack over `LazyColumn` / `LazyRow` with native item layout sizing (`pageWidthDp = screenWidth * continuousScale`). As center pages shrink on zoom out, Compose's layout pipeline naturally lays out and renders surrounding pages (previous pages above and next pages below) seamlessly.
+- Single-page Mode Smoothing: removed the mid-gesture interrupt in `DrawingCanvasView` so pinch zooming in single-page mode operates smoothly at the touch focal point.
+- Verified with 291 passing unit tests, built clean APK, and synced to GitHub repo.

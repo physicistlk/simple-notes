@@ -864,9 +864,6 @@ class DrawingCanvasView @JvmOverloads constructor(
                     val dist = Math.hypot((x1 - x0).toDouble(), (y1 - y0).toDouble()).toFloat()
                     if (gestureStartDist > 0f) {
                         val newScale = (gestureStartScale * (dist / gestureStartDist)).coerceIn(minZoom, 8f)
-                        if (newScale < 0.75f && onZoomOutToContinuous != null) {
-                            onZoomOutToContinuous?.invoke()
-                        }
                         scale = newScale
                         panX = midX - gestureStartFocalCanvasX * scale
                         panY = midY - gestureStartFocalCanvasY * scale
