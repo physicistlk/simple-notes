@@ -60,7 +60,7 @@ fun TouchNotesNavHost(
 
         composable(Screen.NoteList.route) {
             val viewModel = androidx.lifecycle.viewmodel.compose.viewModel<NoteListViewModel>(
-                factory = NoteListViewModel.Factory(app.noteRepository)
+                factory = NoteListViewModel.Factory(app.noteRepository, app.settingsRepository)
             )
             NoteListScreen(
                 viewModel = viewModel,
@@ -112,7 +112,9 @@ fun TouchNotesNavHost(
                 onCloseTab = { id ->
                     openNotes.remove(id)
                     if (id == noteId) navController.popBackStack()
-                }
+                },
+                onSettingsClick = { navController.navigate(Screen.Settings.route) },
+                onFlashcardsClick = { navController.navigate(Screen.Flashcards.route) }
             )
         }
 

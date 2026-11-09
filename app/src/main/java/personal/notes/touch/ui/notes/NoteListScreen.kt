@@ -43,6 +43,7 @@ import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBackIosNew
 import androidx.compose.material.icons.filled.ArrowForwardIos
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.CloudDone
 import androidx.compose.material.icons.filled.CloudQueue
@@ -150,6 +151,9 @@ import personal.notes.touch.ui.theme.TouchNotesSwatches
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
+import android.widget.Toast
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.graphics.toArgb
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
@@ -219,6 +223,7 @@ fun NoteListScreen(
     var moveNoteTarget by remember { mutableStateOf<NoteEntity?>(null) }
     var exportTargetNote by remember { mutableStateOf<NoteEntity?>(null) }
     var showThemeColorDialog by remember { mutableStateOf(false) }
+    var showSortMenu by remember { mutableStateOf(false) }
     var showEmptyRecycleDialog by remember { mutableStateOf(false) }
 
     // Templates + daily notes (schema 9)
@@ -574,6 +579,7 @@ fun NoteListScreen(
                                         .background(swatch.color)
                                         .border(1.dp, Color.LightGray, CircleShape)
                                         .clickable {
+                                            viewModel.setThemeColor(swatch.color.toArgb())
                                             showThemeColorDialog = false
                                         }
                                 )
@@ -607,9 +613,10 @@ fun NoteListScreen(
     }
 
     // Dialog: Export Note
-    if (exportTargetNote != null) {
+    val activeExportNote = exportTargetNote
+    if (activeExportNote != null) {
         personal.notes.touch.ui.export.ExportDialog(
-            note = exportTargetNote!!,
+            note = activeExportNote,
             repository = viewModel.repository,
             fileStore = viewModel.repository.fileStore,
             currentBitmap = null,
@@ -721,17 +728,29 @@ fun NoteListScreen(
                 ) {
                     // Header Category Pill
                     Surface(
+                        onClick = { isModalDrawerOpen = true },
                         shape = RoundedCornerShape(12.dp),
                         color = Color(0xFFFFF0EC),
                         modifier = Modifier.padding(bottom = 16.dp)
                     ) {
-                        Text(
-                            text = "Notes",
-                            color = OrangePrimary,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 14.sp,
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
                             modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp)
-                        )
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.AccountCircle,
+                                contentDescription = "Account & More",
+                                tint = OrangePrimary,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "Simple Notes",
+                                color = OrangePrimary,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 14.sp
+                            )
+                        }
                     }
 
                     // Navigation Rail Items
@@ -850,7 +869,7 @@ fun NoteListScreen(
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "Download CardsMind",
+                            text = "Collapse Sidebar",
                             fontSize = 12.sp,
                             color = Color.Gray
                         )
@@ -911,36 +930,67 @@ fun NoteListScreen(
                     ) {
                         // Left: Hamburger + Notes pill
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            IconButton(onClick = { isModalDrawerOpen = true }) {
+                            IconButton(onClick = { isLeftRailCollapsed = !isLeftRailCollapsed }) {
                                 Icon(
                                     imageVector = Icons.Default.Menu,
-                                    contentDescription = "Menu",
+                                    contentDescription = "Toggle Sidebar",
                                     tint = Color(0xFF333333)
                                 )
                             }
                             Spacer(modifier = Modifier.width(6.dp))
                             Surface(
+                                onClick = { isModalDrawerOpen = true },
                                 shape = RoundedCornerShape(12.dp),
                                 color = Color(0xFFFFF0EC)
                             ) {
-                                Text(
-                                    text = when (uiState.currentFilter) {
-                                        NoteFilter.FAVORITES -> "Favorites"
-                                        NoteFilter.RECYCLE_BIN -> "Trash"
-                                        else -> "Notes"
-                                    },
-                                    color = OrangePrimary,
-                                    fontWeight = FontWeight.Bold,
-                                    fontSize = 13.sp,
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
                                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 5.dp)
-                                )
+                                ) {
+                                    Text(
+                                        text = when (uiState.currentFilter) {
+                                            NoteFilter.FAVORITES -> "Favorites"
+                                            NoteFilter.RECYCLE_BIN -> "Trash"
+                                            else -> "Notes"
+                                        },
+                                        color = OrangePrimary,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 13.sp
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Icon(
+                                        imageVector = Icons.Default.AccountCircle,
+                                        contentDescription = "Account & More",
+                                        tint = OrangePrimary,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
                             }
                         }
 
                         // Right action buttons
                         Row(verticalAlignment = Alignment.CenterVertically) {
+                            if (uiState.currentFilter == NoteFilter.RECYCLE_BIN && notes.isNotEmpty()) {
+                                Surface(
+                                    onClick = { showEmptyRecycleDialog = true },
+                                    shape = RoundedCornerShape(12.dp),
+                                    color = Color(0xFFFFEBEE),
+                                    modifier = Modifier.padding(end = 6.dp)
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                    ) {
+                                        Icon(Icons.Default.Delete, contentDescription = null, tint = Color.Red, modifier = Modifier.size(16.dp))
+                                        Spacer(Modifier.width(4.dp))
+                                        Text("Empty Trash", color = Color.Red, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                    }
+                                }
+                            }
                             // Cloud icon
-                            IconButton(onClick = { /* Offline cloud placeholder */ }) {
+                            IconButton(onClick = {
+                                Toast.makeText(context, "All notes stored locally (100% offline & private)", Toast.LENGTH_SHORT).show()
+                            }) {
                                 Icon(
                                     imageVector = Icons.Default.CloudDone,
                                     contentDescription = "Sync",
@@ -948,13 +998,60 @@ fun NoteListScreen(
                                 )
                             }
 
-                            // Sort icon
-                            IconButton(onClick = { /* Sort */ }) {
-                                Icon(
-                                    imageVector = Icons.Default.Sort,
-                                    contentDescription = "Sort",
-                                    tint = Color(0xFF666666)
-                                )
+                            // Sort icon & dropdown
+                            Box {
+                                IconButton(onClick = { showSortMenu = true }) {
+                                    Icon(
+                                        imageVector = Icons.Default.Sort,
+                                        contentDescription = "Sort",
+                                        tint = Color(0xFF666666)
+                                    )
+                                }
+                                DropdownMenu(
+                                    expanded = showSortMenu,
+                                    onDismissRequest = { showSortMenu = false }
+                                ) {
+                                    DropdownMenuItem(
+                                        text = { Text("Updated: Newest First") },
+                                        onClick = {
+                                            viewModel.setSortOrder(NoteSortOrder.UPDATED_DESC)
+                                            showSortMenu = false
+                                        },
+                                        leadingIcon = if (uiState.sortOrder == NoteSortOrder.UPDATED_DESC) {
+                                            { Icon(Icons.Default.Check, contentDescription = null, tint = OrangePrimary) }
+                                        } else null
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("Updated: Oldest First") },
+                                        onClick = {
+                                            viewModel.setSortOrder(NoteSortOrder.UPDATED_ASC)
+                                            showSortMenu = false
+                                        },
+                                        leadingIcon = if (uiState.sortOrder == NoteSortOrder.UPDATED_ASC) {
+                                            { Icon(Icons.Default.Check, contentDescription = null, tint = OrangePrimary) }
+                                        } else null
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("Title: A to Z") },
+                                        onClick = {
+                                            viewModel.setSortOrder(NoteSortOrder.TITLE_ASC)
+                                            showSortMenu = false
+                                        },
+                                        leadingIcon = if (uiState.sortOrder == NoteSortOrder.TITLE_ASC) {
+                                            { Icon(Icons.Default.Check, contentDescription = null, tint = OrangePrimary) }
+                                        } else null
+                                    )
+                                    DropdownMenuItem(
+                                        text = { Text("Title: Z to A") },
+                                        onClick = {
+                                            viewModel.setSortOrder(NoteSortOrder.TITLE_DESC)
+                                            showSortMenu = false
+                                        },
+                                        leadingIcon = if (uiState.sortOrder == NoteSortOrder.TITLE_DESC) {
+                                            { Icon(Icons.Default.Check, contentDescription = null, tint = OrangePrimary) }
+                                        } else null
+                                    )
+                                }
                             }
 
                             // Search icon
@@ -967,7 +1064,9 @@ fun NoteListScreen(
                             }
 
                             // Multi-select icon
-                            IconButton(onClick = { /* Multi-select */ }) {
+                            IconButton(onClick = {
+                                android.widget.Toast.makeText(context, "${notes.size} note(s) shown", android.widget.Toast.LENGTH_SHORT).show()
+                            }) {
                                 Icon(
                                     imageVector = Icons.Default.SelectAll,
                                     contentDescription = "Select",
@@ -1149,6 +1248,10 @@ fun NoteListScreen(
                                 isSelected = isSelected,
                                 dateFormatter = dateFormatter,
                                 onCardClick = {
+                                    if (uiState.currentFilter == NoteFilter.RECYCLE_BIN) {
+                                        Toast.makeText(context, "Note is in trash. Use 'Restore' from menu to edit.", Toast.LENGTH_SHORT).show()
+                                        return@TouchNotesCard
+                                    }
                                     selectedNoteId = note.id
                                     // Route dispatch: "text" notes open in the
                                     // text (block) editor; canvas page types
@@ -1191,6 +1294,10 @@ fun NoteListScreen(
                                 isSelected = isSelected,
                                 dateFormatter = dateFormatter,
                                 onCardClick = {
+                                    if (uiState.currentFilter == NoteFilter.RECYCLE_BIN) {
+                                        Toast.makeText(context, "Note is in trash. Use 'Restore' from menu to edit.", Toast.LENGTH_SHORT).show()
+                                        return@TouchNotesCard
+                                    }
                                     selectedNoteId = note.id
                                     // Route dispatch: "text" notes open in the
                                     // text (block) editor; canvas page types
@@ -1913,9 +2020,10 @@ fun NoteInsidePreview(
             .fillMaxSize()
             .clipToBounds()
     ) {
-        if (thumbnailBitmap != null) {
+        val previewBmp = thumbnailBitmap
+        if (previewBmp != null && !previewBmp.isRecycled) {
             Image(
-                bitmap = thumbnailBitmap!!.asImageBitmap(),
+                bitmap = previewBmp.asImageBitmap(),
                 contentDescription = "Note preview",
                 modifier = Modifier.fillMaxSize(),
                 contentScale = ContentScale.Crop
@@ -2028,8 +2136,10 @@ fun extractPreviewLines(rawContent: String, maxLines: Int = 8): List<String> {
         if (trimmed.isEmpty()) continue
         var cleanedLine = trimmed
             .replace(Regex("^#{1,6}\\s*"), "")
-            .replace(Regex("^[-*+]\\s+\\[([ xX])\\]\\s*"), "☐ ")
-            .replace(Regex("^- \\[([ xX])\\]\\s*"), "☐ ")
+            .replace(Regex("^[-*+]\\s+\\[ \\]\\s*"), "☐ ")
+            .replace(Regex("^[-*+]\\s+\\[[xX]\\]\\s*"), "☑ ")
+            .replace(Regex("^- \\[ \\]\\s*"), "☐ ")
+            .replace(Regex("^- \\[[xX]\\]\\s*"), "☑ ")
             .replace(Regex("^[-*+]\\s+"), "• ")
             .replace(Regex("^\\d+\\.\\s+"), "")
             .replace(Regex("^>\\s*"), "")
@@ -2039,6 +2149,10 @@ fun extractPreviewLines(rawContent: String, maxLines: Int = 8): List<String> {
             .replace(Regex("`{1,3}(.*?)`{1,3}"), "$1")
             // [[Target|alias]] -> alias, [[Target]] -> Target
             .replace(Regex("\\[\\[([^\\[\\]|]+)(?:\\|([^\\[\\]\\n]+))?]]")) { m ->
+                m.groupValues[2].ifBlank { m.groupValues[1] }.trim()
+            }
+            // ((blockId|alias)) -> alias, ((blockId)) -> blockId
+            .replace(Regex("\\(\\(([^)|]+)(?:\\|([^)]+))?\\)\\)")) { m ->
                 m.groupValues[2].ifBlank { m.groupValues[1] }.trim()
             }
             .replace(Regex("!\\[.*?\\]\\(.*?\\)"), "[Image]")

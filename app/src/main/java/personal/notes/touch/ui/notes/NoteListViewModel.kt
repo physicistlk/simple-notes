@@ -20,6 +20,7 @@ import personal.notes.touch.data.db.entity.FolderEntity
 import personal.notes.touch.data.db.entity.NoteEntity
 import personal.notes.touch.data.db.entity.TemplateEntity
 import personal.notes.touch.data.repo.NoteRepository
+import personal.notes.touch.data.repo.SettingsRepository
 import personal.notes.touch.text.FolderTree
 import personal.notes.touch.text.NoteSearch
 import personal.notes.touch.text.SearchSnippet
@@ -35,6 +36,13 @@ enum class ViewMode {
     GRID
 }
 
+enum class NoteSortOrder {
+    UPDATED_DESC,
+    UPDATED_ASC,
+    TITLE_ASC,
+    TITLE_DESC
+}
+
 data class NoteListUiState(
     val currentFilter: NoteFilter = NoteFilter.ALL,
     val selectedFolderId: String? = null,
@@ -42,7 +50,8 @@ data class NoteListUiState(
     val searchQuery: String = "",
     val isSearchOpen: Boolean = false,
     /** Lowercased tag identity from the tag bar; null = all tags. */
-    val selectedTag: String? = null
+    val selectedTag: String? = null,
+    val sortOrder: NoteSortOrder = NoteSortOrder.UPDATED_DESC
 )
 
 /**
@@ -58,7 +67,8 @@ data class NoteRow(
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class NoteListViewModel(
-    val repository: NoteRepository
+    val repository: NoteRepository,
+    val settingsRepository: SettingsRepository? = null
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(NoteListUiState())
@@ -147,7 +157,7 @@ class NoteListViewModel(
                     NoteSearch.matches(tokens, note.title, note.content.orEmpty())
                 tagOk && queryOk
             }
-            filtered
+            val rows = filtered
                 .map { note ->
                     NoteRow(
                         note = note,
@@ -161,8 +171,20 @@ class NoteListViewModel(
                             NoteSearch.containsAll(note.title, tokens)
                     )
                 }
-                // Notes whose title matched come before content-only matches.
-                .sortedByDescending { it.titleMatch }
+            when (state.sortOrder) {
+                NoteSortOrder.UPDATED_DESC -> rows.sortedWith(
+                    compareByDescending<NoteRow> { it.titleMatch }.thenByDescending { it.note.updatedAt }
+                )
+                NoteSortOrder.UPDATED_ASC -> rows.sortedWith(
+                    compareByDescending<NoteRow> { it.titleMatch }.thenBy { it.note.updatedAt }
+                )
+                NoteSortOrder.TITLE_ASC -> rows.sortedWith(
+                    compareByDescending<NoteRow> { it.titleMatch }.thenBy(String.CASE_INSENSITIVE_ORDER) { it.note.title }
+                )
+                NoteSortOrder.TITLE_DESC -> rows.sortedWith(
+                    compareByDescending<NoteRow> { it.titleMatch }.thenByDescending(String.CASE_INSENSITIVE_ORDER) { it.note.title }
+                )
+            }
         }
             .stateIn(
                 scope = viewModelScope,
@@ -358,10 +380,23 @@ class NoteListViewModel(
         }
     }
 
-    class Factory(private val repository: NoteRepository) : ViewModelProvider.Factory {
+    fun setThemeColor(colorArgb: Int) {
+        viewModelScope.launch {
+            settingsRepository?.updateThemeColor(colorArgb)
+        }
+    }
+
+    fun setSortOrder(order: NoteSortOrder) {
+        _uiState.value = _uiState.value.copy(sortOrder = order)
+    }
+
+    class Factory(
+        private val repository: NoteRepository,
+        private val settingsRepository: SettingsRepository? = null
+    ) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : ViewModel> create(modelClass: Class<T>): T {
-            return NoteListViewModel(repository) as T
+            return NoteListViewModel(repository, settingsRepository) as T
         }
     }
 }

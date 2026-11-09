@@ -80,7 +80,7 @@ class DrawingCanvasView @JvmOverloads constructor(
         set(value) { field = value; updateViewMatrix() }
     var scale: Float = 1f
         set(value) {
-            field = value.coerceIn(0.15f, 8f)
+            field = value.coerceIn(minZoom.coerceAtMost(1f), 8f)
             updateViewMatrix()
             schedulePdfBackgroundRefresh()
         }
@@ -414,6 +414,14 @@ class DrawingCanvasView @JvmOverloads constructor(
             invalidate()
         }
     var pageType: String = "infinite"
+    var minZoom: Float = 0.20f
+    var horizontalResistance: Float = 0.4f
+    private val paperBedPaint = Paint().apply { style = Paint.Style.FILL }
+    private val pageBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 2f
+        color = android.graphics.Color.rgb(0xCC, 0xCC, 0xCC)
+    }
 
     // Transformable image layers
     val imageLayers: MutableList<ImageLayer> = mutableListOf()
@@ -427,7 +435,6 @@ class DrawingCanvasView @JvmOverloads constructor(
      */
     @Volatile
     var layersDirty: Boolean = false
-        private set
     var selectedImageIndex: Int = -1
         set(value) {
             field = value
@@ -509,6 +516,23 @@ class DrawingCanvasView @JvmOverloads constructor(
     private val lassoFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
         color = Color.parseColor("#1AFB6443")
+    }
+
+    private val lassoDonePillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xFF4CAF50.toInt()
+        style = Paint.Style.FILL
+    }
+
+    private val lassoDeletePillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xFFE53935.toInt()
+        style = Paint.Style.FILL
+    }
+
+    private val lassoPillTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        textSize = 28f
+        typeface = android.graphics.Typeface.DEFAULT_BOLD
+        textAlign = Paint.Align.CENTER
     }
 
     private val handlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -738,10 +762,34 @@ class DrawingCanvasView @JvmOverloads constructor(
         viewMatrix.invert(pageInverseMatrix)
     }
 
+    fun fitOrCenterPage() {
+        if (width <= 0 || height <= 0) return
+        val bmp = backingBitmap
+        val bmpW = bmp?.width ?: (if (pageType == "a4" || pageType == "pdf") 2160 else width)
+        val bmpH = bmp?.height ?: (if (pageType == "a4" || pageType == "pdf") 3056 else height)
+        val isFixedPage = pageType == "a4" || pageType == "pdf" || !beyondPaper
+        if (isFixedPage) {
+            val fitScale = minOf((width * 0.94f) / bmpW, (height * 0.94f) / bmpH, 1.0f)
+            scale = fitScale.coerceIn(minZoom, 8f)
+        } else {
+            scale = 1f
+        }
+        if (autoCenter) {
+            centerTransform(bmpW, bmpH)
+        } else {
+            panX = 0f
+            panY = 0f
+        }
+        invalidate()
+    }
+
     fun resetTransform() {
-        panX = 0f
-        panY = 0f
-        scale = 1f
+        fitOrCenterPage()
+    }
+
+    fun setZoomScale(targetScale: Float) {
+        scale = targetScale.coerceIn(minZoom, 8f)
+        updateViewMatrix()
         invalidate()
     }
 
@@ -772,7 +820,7 @@ class DrawingCanvasView @JvmOverloads constructor(
                     val midY = (y0 + y1) / 2f
                     val dist = Math.hypot((x1 - x0).toDouble(), (y1 - y0).toDouble()).toFloat()
                     if (gestureStartDist > 0f) {
-                        val newScale = (gestureStartScale * (dist / gestureStartDist)).coerceIn(0.15f, 8f)
+                        val newScale = (gestureStartScale * (dist / gestureStartDist)).coerceIn(minZoom, 8f)
                         scale = newScale
                         panX = midX - gestureStartFocalCanvasX * scale
                         panY = midY - gestureStartFocalCanvasY * scale
@@ -786,7 +834,7 @@ class DrawingCanvasView @JvmOverloads constructor(
                         val bmpH = backingBitmap?.height?.toFloat() ?: height.toFloat()
                         val scaledW = bmpW * scale
                         val scaledH = bmpH * scale
-                        val marginX = width * 0.4f
+                        val marginX = width * horizontalResistance
                         val marginY = height * 0.4f
                         val minPanX = if (scaledW > width) width - scaledW - marginX else (width - scaledW) / 2f - marginX
                         val maxPanX = if (scaledW > width) marginX else (width - scaledW) / 2f + marginX
@@ -838,6 +886,8 @@ class DrawingCanvasView @JvmOverloads constructor(
         if (w > 0 && h > 0) {
             if (backingBitmap == null) {
                 initBackingBitmap(w, h)
+            } else if (oldw == 0 || oldh == 0) {
+                fitOrCenterPage()
             }
         }
     }
@@ -871,6 +921,11 @@ class DrawingCanvasView @JvmOverloads constructor(
         clearRedoStack()
         notifyUndoRedo()
         if (autoCenter && width > 0 && height > 0) {
+            val isFixedPage = pageType == "a4" || pageType == "pdf" || !beyondPaper
+            if (isFixedPage && (scale == 1f || scale <= 0f)) {
+                val fitScale = minOf((width * 0.94f) / loaded.width, (height * 0.94f) / loaded.height, 1.0f)
+                scale = fitScale.coerceIn(minZoom, 8f)
+            }
             centerTransform(loaded.width, loaded.height)
         }
         invalidate()
@@ -1093,8 +1148,10 @@ class DrawingCanvasView @JvmOverloads constructor(
                 )
             }
             val arr = org.json.JSONArray()
+            val writtenFiles = mutableSetOf<String>()
             snapshot.forEachIndexed { index, layer ->
                 val fileName = "layer_$index.png"
+                writtenFiles.add(fileName)
                 val file = java.io.File(layersDir, fileName)
                 java.io.FileOutputStream(file).use { fos ->
                     layer.bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, fos)
@@ -1111,6 +1168,11 @@ class DrawingCanvasView @JvmOverloads constructor(
                 arr.put(obj)
             }
             infoFile.writeText(arr.toString())
+            layersDir.listFiles()?.forEach { file ->
+                if (file.name.startsWith("layer_") && file.name.endsWith(".png") && !writtenFiles.contains(file.name)) {
+                    file.delete()
+                }
+            }
             layersDirty = false
         } catch (e: Exception) {
             e.printStackTrace()
@@ -1271,8 +1333,23 @@ class DrawingCanvasView @JvmOverloads constructor(
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
 
+        val isPageBounded = pageType != "infinite"
+        if (isPageBounded) {
+            canvas.drawColor(android.graphics.Color.rgb(0xEE, 0xEE, 0xEE))
+        }
+
         canvas.save()
         canvas.concat(viewMatrix)
+
+        val pageW = (backingBitmap?.width?.toFloat() ?: pdfPageRectWidth()).takeIf { it > 0f } ?: 2160f
+        val pageH = (backingBitmap?.height?.toFloat() ?: pdfPageRectHeight()).takeIf { it > 0f } ?: 3056f
+
+        if (isPageBounded) {
+            paperBedPaint.color = paperColor
+            canvas.drawRect(0f, 0f, pageW, pageH, paperBedPaint)
+        } else if (backgroundBitmap == null) {
+            canvas.drawColor(paperColor)
+        }
 
         // 0. Draw non-destructive background (e.g. imported PDF page) first.
         // A vector-rendered background is drawn into the fixed page rect so a
@@ -1291,15 +1368,16 @@ class DrawingCanvasView @JvmOverloads constructor(
             }
         }
 
-        // 1. Draw paper background (only when no background bitmap)
-        if (backgroundBitmap == null) canvas.drawColor(paperColor)
-
         // 2. Draw paper pattern
         drawPaperPattern(canvas)
 
         // 3. Draw committed bitmap
         backingBitmap?.let { bmp ->
             canvas.drawBitmap(bmp, 0f, 0f, bitmapPaint)
+        }
+
+        if (isPageBounded) {
+            canvas.drawRect(0f, 0f, pageW, pageH, pageBorderPaint)
         }
 
         // 3a. F-10: PDF text selection highlight (cached rects, no native call
@@ -1371,6 +1449,19 @@ class DrawingCanvasView @JvmOverloads constructor(
                 }
             }
             canvas.drawRect(lassoBounds, lassoStrokePaint)
+
+            if (lassoState == LassoState.SELECTED) {
+                val pillTop = if (lassoBounds.top < 70f) lassoBounds.bottom + 15f else lassoBounds.top - 65f
+                val pillBottom = if (lassoBounds.top < 70f) lassoBounds.bottom + 65f else lassoBounds.top - 15f
+                val doneRect = RectF(lassoBounds.centerX() - 120f, pillTop, lassoBounds.centerX() - 10f, pillBottom)
+                val deleteRect = RectF(lassoBounds.centerX() + 10f, pillTop, lassoBounds.centerX() + 120f, pillBottom)
+
+                canvas.drawRoundRect(doneRect, 16f, 16f, lassoDonePillPaint)
+                canvas.drawText("✓ Done", doneRect.centerX(), doneRect.centerY() + 10f, lassoPillTextPaint)
+
+                canvas.drawRoundRect(deleteRect, 16f, 16f, lassoDeletePillPaint)
+                canvas.drawText("✕ Cut", deleteRect.centerX(), deleteRect.centerY() + 10f, lassoPillTextPaint)
+            }
         }
 
         canvas.restore()
@@ -1433,7 +1524,7 @@ class DrawingCanvasView @JvmOverloads constructor(
         val viewRight = maxOf(viewCorners[0], viewCorners[2])
         val viewBottom = maxOf(viewCorners[1], viewCorners[3])
 
-        val isUnbounded = beyondPaper || pageType == "infinite"
+        val isUnbounded = beyondPaper && pageType == "infinite"
         val left = if (isUnbounded) minOf(0f, viewLeft) else 0f
         val top = if (isUnbounded) minOf(0f, viewTop) else 0f
         val right = if (isUnbounded) maxOf(pageW, viewRight) else pageW
@@ -1585,9 +1676,7 @@ class DrawingCanvasView @JvmOverloads constructor(
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        if (readingMode) return false
-
-        // Track multi-finger taps (3-finger paste) before other handling.
+        // Track multi-finger taps (3-finger paste) and tap/double-tap detection.
         when (event.actionMasked) {
             MotionEvent.ACTION_POINTER_DOWN, MotionEvent.ACTION_DOWN -> {
                 if (event.actionMasked == MotionEvent.ACTION_DOWN) {
@@ -1615,12 +1704,21 @@ class DrawingCanvasView @JvmOverloads constructor(
                     }
                 }
                 // A single-pointer tap that did not move is also a click, so
-                // accessibility services and D-pad activation get an action
-                // (the canvas otherwise only ever handles raw touches).
+                // accessibility services and D-pad activation get an action.
                 if (event.actionMasked == MotionEvent.ACTION_UP && multiTouchMaxPointers <= 1) {
                     val slop = touchSlopPx
                     if (Math.abs(event.x - tapDownX) <= slop && Math.abs(event.y - tapDownY) <= slop) {
-                        performClick()
+                        val now = event.eventTime
+                        if (now - lastTapUpMs in 1..350 && Math.abs(event.x - lastTapUpX) <= slop * 2 && Math.abs(event.y - lastTapUpY) <= slop * 2) {
+                            // Double click / double tap: centering / fit page
+                            resetTransform()
+                            lastTapUpMs = 0L
+                        } else {
+                            lastTapUpMs = now
+                            lastTapUpX = event.x
+                            lastTapUpY = event.y
+                            performClick()
+                        }
                     }
                 }
                 multiTouchStartMs = 0L
@@ -1628,22 +1726,8 @@ class DrawingCanvasView @JvmOverloads constructor(
             }
         }
 
-        // Check stylus-only filter
-        if (stylusOnly && event.getToolType(0) != MotionEvent.TOOL_TYPE_STYLUS) {
-            return false
-        }
-
-        // First touch of a gesture: let the screen close its slide-over menus
-        // so the user does not need a separate "close" tap after configuring.
-        if (event.actionMasked == MotionEvent.ACTION_DOWN) {
-            onCanvasTouchStart?.invoke()
-        }
-
-        // A fresh gesture drops any stale multi-touch cancellation state.
-        if (event.actionMasked == MotionEvent.ACTION_DOWN) {
-            multiTouchCancelsStroke = false
-        }
-
+        // Multi-touch gestures (2-finger pinch zoom and pan):
+        // Always allowed in drawing mode, stylus-only mode, and reading mode!
         if (event.pointerCount >= 2) {
             if (event.actionMasked == MotionEvent.ACTION_POINTER_DOWN) {
                 // Pinch-zoom / two-finger pan: cancel any drawing
@@ -1653,6 +1737,20 @@ class DrawingCanvasView @JvmOverloads constructor(
             }
             handleCanvasGesture(event)
             return true
+        }
+
+        // Check if drawing / single-pointer editing is blocked (reading mode or non-stylus finger)
+        val isDrawingBlocked = readingMode || (stylusOnly && event.getToolType(0) != MotionEvent.TOOL_TYPE_STYLUS)
+        if (isDrawingBlocked) {
+            // Return true on ACTION_DOWN and moves so multi-touch pinch/pan or tap up is delivered
+            return true
+        }
+
+        // First touch of a gesture: let the screen close its slide-over menus
+        // so the user does not need a separate "close" tap after configuring.
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+            onCanvasTouchStart?.invoke()
+            multiTouchCancelsStroke = false
         }
 
         val pts = floatArrayOf(event.x, event.y)
@@ -1778,8 +1876,10 @@ class DrawingCanvasView @JvmOverloads constructor(
 
         // Lasso selection & transform tool
         if (currentTool == CanvasTool.LASSO) {
-            val pillDoneRect = RectF(lassoBounds.centerX() - 120f, lassoBounds.top - 65f, lassoBounds.centerX() - 10f, lassoBounds.top - 15f)
-            val pillDeleteRect = RectF(lassoBounds.centerX() + 10f, lassoBounds.top - 65f, lassoBounds.centerX() + 120f, lassoBounds.top - 15f)
+            val pillTop = if (lassoBounds.top < 70f) lassoBounds.bottom + 15f else lassoBounds.top - 65f
+            val pillBottom = if (lassoBounds.top < 70f) lassoBounds.bottom + 65f else lassoBounds.top - 15f
+            val pillDoneRect = RectF(lassoBounds.centerX() - 120f, pillTop, lassoBounds.centerX() - 10f, pillBottom)
+            val pillDeleteRect = RectF(lassoBounds.centerX() + 10f, pillTop, lassoBounds.centerX() + 120f, pillBottom)
             val resizeHandleX = lassoBounds.right
             val resizeHandleY = lassoBounds.bottom
 
@@ -2113,7 +2213,7 @@ class DrawingCanvasView @JvmOverloads constructor(
             }
             val previous = undoStack.removeLast()
             backingBitmap = previous
-            bitmapCanvas = Canvas(backingBitmap!!)
+            bitmapCanvas = if (previous != null && !previous.isRecycled) Canvas(previous) else null
             notifyUndoRedo()
             invalidate()
             onStrokeFinishedListener?.invoke()
@@ -2132,7 +2232,7 @@ class DrawingCanvasView @JvmOverloads constructor(
             }
             val next = redoStack.removeLast()
             backingBitmap = next
-            bitmapCanvas = Canvas(backingBitmap!!)
+            bitmapCanvas = if (next != null && !next.isRecycled) Canvas(next) else null
             notifyUndoRedo()
             invalidate()
             onStrokeFinishedListener?.invoke()
@@ -2328,6 +2428,9 @@ class DrawingCanvasView @JvmOverloads constructor(
     private var multiTouchStartMs = 0L
     private var tapDownX = 0f
     private var tapDownY = 0f
+    private var lastTapUpMs = 0L
+    private var lastTapUpX = 0f
+    private var lastTapUpY = 0f
     private val touchSlopPx: Float =
         android.view.ViewConfiguration.get(context).scaledTouchSlop.toFloat()
     private var multiTouchMaxPointers = 0

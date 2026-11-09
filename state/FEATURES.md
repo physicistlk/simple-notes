@@ -174,10 +174,122 @@ Status legend: Planned (not implemented), Implemented. Source cites analysis fil
 - **Image layers hide/show/reorder** — see S5 above (`setLayerVisible`, `moveImageLayer`, `setLayerOpacity`, layers panel).
 
 - **Page turning modes (schema 12)** — `settings.pageTurningMode` (`0 = Continuous`, the default; `1 = Single`) and `settings.pageTurningDirection` (`0 = Vertical`, `1 = Horizontal`), edited in Settings and in the canvas right-side panel; continuous mode is disabled for infinite-canvas notes. Single mode keeps the live 18 MPx (heap-capped) pdfium re-render, so text stays crisp at any zoom.
-- **Continuous reading** — a read-only overview overlay: a `LazyColumn`/`LazyRow` of pages, `ContinuousPageView` measures its laid-out width and renders each vector page at width × quantised zoom (1 / 1.5 / 2 / 3, area-capped at 12 MPx / 4096 px) via `PdfiumDocument.renderPageInto`, compositing the PDF and the page's stroke layer in one allocation. Pinch zooms with clamped pan; scrolling updates the current page; tapping a page enters single mode on that page. Raster (pre-F-10) pages are decoded once and scaled.
+- **Continuous reading & in-place inking** — a `LazyColumn`/`LazyRow` of pages where `ContinuousPageView` measures its laid-out width and renders each vector page at width × quantised zoom (1 / 1.5 / 2 / 3, area-capped at 12 MPx / 4096 px) via `PdfiumDocument.renderPageInto`, compositing the PDF and the page's stroke layer in one allocation. In-place drawing in Continuous Mode is handled by `ContinuousInkController` (with `ContinuousInkMath` coordinate mapping, multi-touch stroke cancellation, and per-page `strokes_<idx>.png` / `page_<idx>.png` persistence). Open post-implementation review items (#46–#62) are tracked in `state/AUDIT-2026-11-07.md`.
 - **Save targeting** — saves are filed under `CanvasViewModel.canvasPageIndex` ("the page the canvas holds"), not the scrolled/current page, and a debounced save captures its page index at schedule time; leaving a note in continuous mode therefore cannot overwrite another page's strokes.
 - **Annotated library cards for PDF notes** — a vector-PDF page keeps its clean render in `page_<i>.png` and the ink in `strokes_<i>.png`; the note card now composites the two (`BitmapUtils.loadAlphaThumbnail`, ARGB so transparent ink is not flattened to black) so the library shows the annotated page like the original, while export and raster pages are unchanged.
 - **Keep Screen On is lifecycle-scoped** — the window flag is held only while the setting is on, the activity is resumed and the display is on (`util/ScreenAwakeController`), and released on pause and on `ACTION_SCREEN_OFF`; the canvas also drops a pending PDF re-render while its window is hidden, so nothing runs with the screen locked.
 - **Eraser size** — the size chips act on the eraser while it is selected (`CanvasUiState.withStrokeWidth`), with its own 12/24/36/56 px presets; previously the chips always changed the pen width.
 - **Continuous reader zoom out** — the reader zooms out to 0.4× (previously it stopped at fit-to-width), centring the pages below 1× instead of clamping the pan.
+- 
+# Gaps & Next Features for Your TouchNotes-Inspired App
 
+Looking at your FEATURES.md, you have a very strong core (M1–M10 + S1–S8 + a large "newly added" list). Here's what's still missing or incomplete, grouped by priority.
+
+---
+
+## 1. Features You Marked "Planned" but Haven't Built
+
+| ID | Feature | Why it matters |
+|----|---------|----------------|
+| **S7** | Stickers / templates library | Currently a stub (`CanvasScreen.kt:2100`, empty handler). TouchNotes ships asset packs; without it the tools panel has a dead button. Needs: asset bundling, category browser, drag-to-place, scale/rotate, persistence in page layers. |
+| **S9** | Home-screen widget (quick note) | No `AppWidgetProvider`, no widget XML. A 1×1 / 2×1 "new note" widget is table-stakes for a note app. |
+| **S10** | Undo/redo across sessions | In-memory `ArrayDeque<Bitmap>` cap 20 only. Persist history to files so a crash/restart doesn't lose undo state. Ties into your AUDIT CH3 snapshot-memory concern. |
+
+---
+
+## 2. Missing Core Features (TouchNotes has these; you don't)
+
+### Editor / Canvas
+- **Highlighter tool** — separate from pen; semi-transparent, flat-cap stroke that draws *under* ink. You have `==highlight==` in markdown but no canvas highlighter.
+- **Shape tools** — rectangle, ellipse, arrow, line, triangle. You have auto-shape (S6) but no explicit shape insert. TouchNotes has a shape menu; your `CanvasMenus` mentions a "shapes menu" but FEATURES.md doesn't list the actual shapes.
+- **Text boxes on canvas** — place draggable/resizable text objects on a page (not just the rich-text note editor). Essential for annotating PDFs and diagrams.
+- **Fill / paint-bucket tool** — flood-fill on the bitmap (PorterDuff or manual BFS).
+- **Rectangle / magic-wand selection** — you only have lasso (S4). Add marquee select and "select all ink on layer".
+- **Copy / paste / duplicate** — between pages, notes, and layers. Not mentioned anywhere.
+- **Ruler / protractor / compass** — straight-edge guides for technical drawing.
+- **Palm rejection** — ignore touch input while stylus is active (`MotionEvent.TOOL_TYPE_STYLUS`). Critical for real handwriting.
+- **Stylus button mapping** — map the barrel button to eraser / lasso / undo.
+
+### PDF
+- **Text selection & copy** from PDF pages — currently you only render + ink. Users expect to highlight text.
+- **PDF text search** — search within an imported PDF.
+- **PDF outline / bookmark import** — pull the PDF's own TOC into your `catalog.json`.
+- **Dark-mode PDF rendering** — invert/recolor PDF pages for night reading (common in note apps).
+- **PDF page reorder / delete / rotate** — after import, currently one-shot.
+
+### Text Notes
+- **Full-text search across note bodies** — you have SQL `LIKE` on title only. Add FTS4/FTS5 virtual table on `NoteEntity.content` (and block text) with a search screen.
+- **Tags / labels UI** — `LabelEntity` + `NoteLabelCrossRef` exist in the schema but no screen is described. Needs: tag manager, tag filter chips in the list, tag autocomplete in the editor.
+- **Checklists / to-dos** — your PDF exporter handles tasks, but is there an interactive checkbox in the editor? Add a `- [ ]` / `- [x]` toggle that renders as a real checkbox.
+- **Tables in the editor** — markdown tables render in export but likely not editable inline.
+- **Note-to-note links** — you have block refs (`((blockId))`), but no `[[note title]]` wiki-links with a graph/backlink panel across notes.
+- **Version history / snapshots** — keep N autosave revisions per note with a diff/restore UI.
+
+### Library / Organization
+- **Recent notes / pinned notes** — a "Recent" section and pin-to-top in the list.
+- **Trash auto-purge** — delete recycled notes after N days (setting).
+- **Bookmarks UI** — `bookmarks.json` exists for TOC but no user-facing bookmark manager.
+- **Smart folders / saved searches** — e.g. "All PDFs", "Favorites", "Tagged #work".
+- **Storage dashboard** — show per-note disk usage, orphaned files, cache size, with "clean up" action.
+
+### Flashcards (S1)
+- **Review statistics / heatmap** — cards due today, streak calendar, retention curve.
+- **Deck management UI** — rename/delete/merge decks, move cards between decks.
+- **Export/import decks** — CSV or Anki-compatible `.apkg` export.
+- **Cloze deletion** — `{{c1::...}}` style cards, not just Q::A.
+
+---
+
+## 3. Security & Privacy (likely expected)
+
+- **Note encryption / password lock** — per-note or per-folder password with AES-GCM; unlock gate before opening.
+- **Biometric unlock** — `BiometricPrompt` for the app or locked notes.
+- **Encrypted backup** — optional password on the `.np` zip.
+
+---
+
+## 4. Platform / Integration
+
+- **Share-sheet target** — receive images/PDFs/text from other apps into a new note (`ACTION_SEND` intent filter).
+- **Quick-capture notification** — ongoing notification with "New note" action.
+- **Print support** — `PrintManager` for text notes and canvas pages (Android's print framework, separate from PDF export).
+- **Export to Markdown** — you export HTML and PDF; add `.md` (with assets folder) for interoperability with Obsidian/Logseq.
+- **Import from Markdown / plain text / images** — bulk import.
+- **Keyboard shortcuts** — Ctrl+B/I/U, Ctrl+S, Ctrl+Z/Y in the text editor; space+drag pan on canvas.
+- **Cloud sync (optional)** — WebDAV or S3-compatible backup target; keep local-first but allow sync. Even a "sync to folder" via SAF is useful.
+
+---
+
+## 5. Polish / UX
+
+- **Onboarding / empty states** — first-run tour, sample notebook, "create your first note" CTA.
+- **Search filters** — by type (text / canvas / PDF), date range, tag, favorite.
+- **Multi-select bulk actions** — move, tag, export, delete across many notes (you have multi-select in M1 but not the actions listed).
+- **Drag-and-drop reorder** for folders, pages, and tabs.
+- **Accessibility** — content descriptions, TalkBack, large-font support.
+- **Localization scaffolding** — even if English-only now, extract strings to `strings.xml` so it's not a rewrite later.
+
+---
+
+## 6. Quick Wins (small effort, high value)
+
+1. **Finish S7 stickers** — even 20 bundled SVGs + drag-to-place is a day's work.
+2. **Full-text search with FTS5** — biggest quality-of-life gap right now.
+3. **Tag filter chips in the note list** — schema already supports it.
+4. **Highlighter tool** — 30 lines in `DrawingCanvasView` (separate `Paint`, `alpha=0x60`, `StrokeCap.SQUARE`, draw before ink layer).
+5. **Shape insert menu** — rect/ellipse/arrow/line; commit to bitmap on release.
+6. **Text box on canvas** — `EditText` overlay committed to bitmap or stored as a layer object.
+7. **Palm rejection** — one `onTouchEvent` guard.
+8. **Recent + pinned** — two `ORDER BY` queries + a rail section.
+
+---
+
+## Suggested Build Order
+
+1. **S7 (stickers)** + **highlighter** + **shape tools** — rounds out the canvas toolbox.
+2. **FTS5 full-text search** + **tag UI** — makes the library actually usable at scale.
+3. **Text boxes on canvas** + **PDF text selection** — closes the biggest annotation gaps.
+4. **S10 (persistent undo)** + **version history** — reliability.
+5. **S9 (widget)** + **share-sheet target** — capture from outside the app.
+6. **Encryption + biometric lock** — trust.
+7. **Flashcard analytics + deck export** — completes S1.

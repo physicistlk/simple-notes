@@ -6,10 +6,12 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import org.json.JSONArray
@@ -57,7 +59,13 @@ data class CanvasUiState(
     val volumeForPageEnabled: Boolean = false,
     val drawerTab: DrawerTab = DrawerTab.THUMBNAILS,
     val bookmarkedPages: Set<Int> = emptySet(),
-    val tocEntries: List<TocItem> = emptyList()
+    val tocEntries: List<TocItem> = emptyList(),
+    val showTabs: Boolean = true,
+    val fixPreviewPage: Boolean = false,
+    val horizontalResistance: Float = 0.4f,
+    val minimalInfiniteZoom: Float = 0.20f,
+    val autoCenter: Boolean = true,
+    val autoSaveIntervalMs: Int = 1000
 )
 
 /**
@@ -79,40 +87,55 @@ class CanvasViewModel(
     val settingsRepository: SettingsRepository? = null
 ) : ViewModel() {
 
+    private var defaultPaperPattern: PaperPattern = PaperPattern.BLANK
+    private var lastPenDefaultsJson: String? = null
+
     init {
         if (settingsRepository != null) {
             viewModelScope.launch {
-                val settings = settingsRepository.getSettingsDirect()
-                val pattern = when (settings.defaultBackground) {
-                    1 -> PaperPattern.GRID
-                    2 -> PaperPattern.LINES
-                    3 -> PaperPattern.DOTTED
-                    else -> PaperPattern.BLANK
+                settingsRepository.getSettings().collect { nullableSettings ->
+                    val settings = nullableSettings ?: return@collect
+                    val pattern = when (settings.defaultBackground) {
+                        1 -> PaperPattern.GRID
+                        2 -> PaperPattern.LINES
+                        3 -> PaperPattern.DOTTED
+                        else -> PaperPattern.BLANK
+                    }
+                    defaultPaperPattern = pattern
+                    // Only seed from global settings until a page-owned pattern is
+                    // applied (syncPagePattern); the page row wins once it's known.
+                    if (!pagePatternHydrated) {
+                        _uiState.value = _uiState.value.copy(paperPattern = pattern)
+                    }
+                    val penDefaultsJson = settings.penDefaultsJson
+                    val penDefaultsChanged = penDefaultsJson != lastPenDefaultsJson
+                    if (penDefaultsChanged) {
+                        lastPenDefaultsJson = penDefaultsJson
+                        val pen = parsePenDefaults(penDefaultsJson)
+                        _uiState.value = _uiState.value.copy(
+                            selectedColor = Color(pen.color),
+                            strokeWidth = pen.strokeWidth,
+                            pressureSensitivity = pen.pressureSensitivity
+                        )
+                    }
+                    _uiState.value = _uiState.value.copy(
+                        pressureSizeEnabled = settings.pressureSizeEnabled,
+                        autoShapeEnabled = settings.autoShapeEnabled,
+                        volumeForPageEnabled = settings.volumeForPage,
+                        penBoxEnabled = settings.showPenBox,
+                        penSlot1Color = settings.penSlot1Color,
+                        penSlot1Width = settings.penSlot1Width,
+                        penSlot2Color = settings.penSlot2Color,
+                        penSlot2Width = settings.penSlot2Width,
+                        backgroundMode = settings.backgroundMode,
+                        backgroundDensity = settings.backgroundDensity,
+                        pageTurningDirection = settings.pageTurningDirection,
+                        pageTurningMode = settings.pageTurningMode,
+                        doublePageMode = settings.doublePage,
+                        autoCenter = settings.autoCenter,
+                        autoSaveIntervalMs = settings.autoSaveIntervalMs
+                    )
                 }
-                // Only seed from global settings until a page-owned pattern is
-                // applied (syncPagePattern); the page row wins once it's known.
-                if (!pagePatternHydrated) {
-                    _uiState.value = _uiState.value.copy(paperPattern = pattern)
-                }
-                val pen = parsePenDefaults(settings.penDefaultsJson)
-                _uiState.value = _uiState.value.copy(
-                    paperPattern = pattern,
-                    selectedColor = Color(pen.color),
-                    strokeWidth = pen.strokeWidth,
-                    pressureSensitivity = pen.pressureSensitivity,
-                    pressureSizeEnabled = settings.pressureSizeEnabled,
-                    autoShapeEnabled = settings.autoShapeEnabled,
-                    volumeForPageEnabled = settings.volumeForPage,
-                    penBoxEnabled = settings.showPenBox,
-                    penSlot1Color = settings.penSlot1Color,
-                    penSlot1Width = settings.penSlot1Width,
-                    penSlot2Color = settings.penSlot2Color,
-                    penSlot2Width = settings.penSlot2Width,
-                    backgroundMode = settings.backgroundMode,
-                    backgroundDensity = settings.backgroundDensity,
-                    pageTurningDirection = settings.pageTurningDirection,
-                    pageTurningMode = settings.pageTurningMode
-                )
             }
         }
         viewModelScope.launch(Dispatchers.IO) {
@@ -125,6 +148,16 @@ class CanvasViewModel(
             scope = viewModelScope,
             started = SharingStarted.WhileSubscribed(5000),
             initialValue = null
+        )
+
+    val allNotesMap: StateFlow<Map<String, String>> = repository.getAllNotes()
+        .map { list ->
+            list.associate { it.id to (it.title.ifBlank { "Untitled Note" }) }
+        }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyMap()
         )
 
     val pages: StateFlow<List<PageEntity>> = repository.getPagesForNote(noteId)
@@ -167,7 +200,12 @@ class CanvasViewModel(
      * owns its pattern (defect F9 persistence); 0 = unset → app default stays.
      */
     fun syncPagePattern(code: Int) {
-        if (code == 0) return
+        if (code == 0) {
+            if (_uiState.value.paperPattern != defaultPaperPattern) {
+                _uiState.value = _uiState.value.copy(paperPattern = defaultPaperPattern)
+            }
+            return
+        }
         pagePatternHydrated = true
         val pattern = PaperPattern.fromCode(code)
         if (_uiState.value.paperPattern != pattern) {
@@ -275,6 +313,12 @@ class CanvasViewModel(
     }
 
     fun setPageTurningMode(mode: Int) {
+        if (mode == 0) {
+            debouncedSaveJob?.cancel()
+            debouncedSaveJob = null
+            pendingSave = null
+            canvasPageIndex = -1
+        }
         _uiState.value = _uiState.value.copy(pageTurningMode = mode)
         viewModelScope.launch(Dispatchers.IO) {
             settingsRepository?.updatePageTurningMode(mode)
@@ -289,10 +333,14 @@ class CanvasViewModel(
             current.add(pageIndex)
         }
         _uiState.value = _uiState.value.copy(bookmarkedPages = current)
+        saveBookmarksJson(current)
+    }
+
+    private fun saveBookmarksJson(bookmarks: Set<Int>) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val arr = JSONArray()
-                current.sorted().forEach { arr.put(it) }
+                bookmarks.sorted().forEach { arr.put(it) }
                 getBookmarksFile().writeText(arr.toString())
             } catch (e: Exception) {
                 e.printStackTrace()
@@ -339,8 +387,24 @@ class CanvasViewModel(
         _uiState.value = _uiState.value.copy(showPencase = show ?: !_uiState.value.showPencase)
     }
 
+    fun togglePenBox(enabled: Boolean? = null) {
+        val next = enabled ?: !_uiState.value.penBoxEnabled
+        _uiState.value = _uiState.value.copy(penBoxEnabled = next)
+        viewModelScope.launch(Dispatchers.IO) {
+            settingsRepository?.updateShowPenBox(next)
+        }
+    }
+
     fun toggleStylusOnly(enabled: Boolean? = null) {
         _uiState.value = _uiState.value.copy(stylusOnly = enabled ?: !_uiState.value.stylusOnly)
+    }
+
+    fun toggleAutoShape(enabled: Boolean? = null) {
+        val next = enabled ?: !_uiState.value.autoShapeEnabled
+        _uiState.value = _uiState.value.copy(autoShapeEnabled = next)
+        viewModelScope.launch(Dispatchers.IO) {
+            settingsRepository?.updateAutoShapeEnabled(next)
+        }
     }
 
     fun toggleReadingMode(enabled: Boolean? = null) {
@@ -348,11 +412,48 @@ class CanvasViewModel(
     }
 
     fun toggleDoublePageMode(enabled: Boolean? = null) {
-        _uiState.value = _uiState.value.copy(doublePageMode = enabled ?: !_uiState.value.doublePageMode)
+        val next = enabled ?: !_uiState.value.doublePageMode
+        _uiState.value = _uiState.value.copy(doublePageMode = next)
+        viewModelScope.launch(Dispatchers.IO) {
+            settingsRepository?.updateDoublePage(next)
+        }
     }
 
+    fun setShowTabs(show: Boolean) {
+        _uiState.value = _uiState.value.copy(showTabs = show)
+    }
+
+    fun setFixPreviewPage(fix: Boolean) {
+        _uiState.value = _uiState.value.copy(fixPreviewPage = fix)
+    }
+
+    fun setHorizontalResistance(resistance: Float) {
+        _uiState.value = _uiState.value.copy(horizontalResistance = resistance)
+    }
+
+    fun setMinimalInfiniteZoom(zoom: Float) {
+        _uiState.value = _uiState.value.copy(minimalInfiniteZoom = zoom)
+    }
+
+    var isNoteDeleted: Boolean = false
+        private set
+
     fun deleteCurrentNote() {
+        isNoteDeleted = true
+        debouncedSaveJob?.cancel()
+        debouncedSaveJob = null
+        pendingSave = null
         viewModelScope.launch {
+            repository.softDeleteNote(noteId, true)
+        }
+    }
+
+    suspend fun deleteCurrentNoteSuspend() {
+        isNoteDeleted = true
+        debouncedSaveJob?.cancel()
+        debouncedSaveJob = null
+        pendingSave = null
+        withContext(Dispatchers.IO) {
             repository.softDeleteNote(noteId, true)
         }
     }
@@ -457,6 +558,12 @@ class CanvasViewModel(
      * the right page even though the screen is already gone.
      */
     fun flushPendingSave(scope: kotlinx.coroutines.CoroutineScope) {
+        if (isNoteDeleted) {
+            pendingSave = null
+            debouncedSaveJob?.cancel()
+            debouncedSaveJob = null
+            return
+        }
         val pending = pendingSave ?: return
         pendingSave = null
         debouncedSaveJob?.cancel()
@@ -467,12 +574,13 @@ class CanvasViewModel(
     /** Cancels any pending debounced save and writes [bitmap] now. */
     suspend fun saveCurrentPageBitmapDirect(
         bitmap: Bitmap,
-        pageIndex: Int = canvasPageIndex
+        pageIndex: Int = canvasPageIndex,
+        force: Boolean = false
     ) {
         debouncedSaveJob?.cancel()
         debouncedSaveJob = null
         pendingSave = null
-        persistPageBitmap(pageIndex, bitmap)
+        persistPageBitmap(pageIndex, bitmap, force = force)
     }
 
     fun saveCurrentPageBitmap(
@@ -486,10 +594,17 @@ class CanvasViewModel(
         }
     }
 
-    private suspend fun persistPageBitmap(pageIdx: Int, bitmap: Bitmap) {
+    private suspend fun persistPageBitmap(pageIdx: Int, bitmap: Bitmap, force: Boolean = false) {
         // The view no longer recycles backing bitmaps, but a stale job can
         // still outlive one; never hand a recycled bitmap to the encoder.
         if (bitmap.isRecycled) return
+
+        // In Continuous Mode, the hidden single-page DrawingCanvasView must never overwrite
+        // disk files; ContinuousMode ink is persisted exclusively by ContinuousInkController.
+        val isInfinite = (note.value?.pageType ?: "infinite") == "infinite"
+        val isContinuous = !isInfinite && _uiState.value.pageTurningMode == 0
+        if (!force && isContinuous) return
+
         val totalPages = note.value?.pageCount ?: 1
         if (pageIdx !in 0 until totalPages) return
         val guardFile = if (pageIsVectorPdf(pageIdx)) {
@@ -566,13 +681,52 @@ class CanvasViewModel(
         }
     }
 
-    fun deletePage(pageIndex: Int, onBitmapLoaded: (Bitmap?) -> Unit) {
+    fun deletePage(
+        pageIndex: Int,
+        isContinuous: Boolean = false,
+        currentBitmap: Bitmap? = null,
+        onBitmapLoaded: (Bitmap?) -> Unit
+    ) {
         viewModelScope.launch {
             val totalPages = note.value?.pageCount ?: 1
             if (totalPages <= 1) return@launch
 
+            // Cancel any pending debounced save so it doesn't write to stale indices
+            debouncedSaveJob?.cancel()
+            debouncedSaveJob = null
+            pendingSave = null
+
+            // If deleting another page while single-page canvas has content, persist it first
+            if (!isContinuous && currentBitmap != null && canvasPageIndex >= 0 && canvasPageIndex != pageIndex) {
+                saveContentLayer(canvasPageIndex, currentBitmap)
+            }
+
             val wasDeleted = repository.deletePage(noteId, pageIndex)
             if (wasDeleted) {
+                // Shift bookmarks
+                val oldBookmarks = _uiState.value.bookmarkedPages
+                val newBookmarks = oldBookmarks.mapNotNull { bIdx ->
+                    when {
+                        bIdx == pageIndex -> null
+                        bIdx > pageIndex -> bIdx - 1
+                        else -> bIdx
+                    }
+                }.toSet()
+                _uiState.value = _uiState.value.copy(bookmarkedPages = newBookmarks)
+                saveBookmarksJson(newBookmarks)
+
+                // Shift TOC entries
+                val oldToc = _uiState.value.tocEntries
+                val newToc = oldToc.mapNotNull { item ->
+                    when {
+                        item.pageIndex == pageIndex -> null
+                        item.pageIndex > pageIndex -> item.copy(pageIndex = item.pageIndex - 1)
+                        else -> item
+                    }
+                }
+                _uiState.value = _uiState.value.copy(tocEntries = newToc)
+                saveCatalogJson(newToc)
+
                 val newIndex = when {
                     _currentPageIndex.value >= totalPages - 1 -> totalPages - 2
                     _currentPageIndex.value > pageIndex -> _currentPageIndex.value - 1
@@ -580,10 +734,14 @@ class CanvasViewModel(
                 }.coerceAtLeast(0)
 
                 _currentPageIndex.value = newIndex
-                canvasPageIndex = newIndex
-                val newBitmap = loadContentLayer(newIndex)
-                pageLoadedFromDisk = newBitmap != null
-                onBitmapLoaded(newBitmap)
+                if (!isContinuous) {
+                    canvasPageIndex = newIndex
+                    val newBitmap = loadContentLayer(newIndex)
+                    pageLoadedFromDisk = newBitmap != null
+                    onBitmapLoaded(newBitmap)
+                } else {
+                    onBitmapLoaded(null)
+                }
             }
         }
     }

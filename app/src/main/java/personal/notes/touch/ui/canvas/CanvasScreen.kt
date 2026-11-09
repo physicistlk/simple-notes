@@ -2,6 +2,7 @@ package personal.notes.touch.ui.canvas
 
 import android.graphics.Bitmap
 import android.graphics.ImageDecoder
+import androidx.compose.runtime.mutableStateMapOf
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
@@ -12,7 +13,11 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
@@ -80,6 +85,19 @@ import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.TextFields
 import androidx.compose.material.icons.filled.Timeline
 import androidx.compose.material.icons.filled.ViewSidebar
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.AccountTree
+import androidx.compose.material.icons.filled.Cancel
+import androidx.compose.material.icons.filled.EmojiEmotions
+import androidx.compose.material.icons.filled.Fullscreen
+import androidx.compose.material.icons.filled.Highlight
+import androidx.compose.material.icons.filled.Language
+import androidx.compose.material.icons.filled.Style
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -122,10 +140,14 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.input.pointer.PointerType
+import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.ui.platform.LocalContext
@@ -197,10 +219,13 @@ fun CanvasScreen(
     onOpenEditorClick: (String) -> Unit,
     openNotes: List<String> = emptyList(),
     onSwitchNote: (String) -> Unit = {},
-    onCloseTab: (String) -> Unit = {}
+    onCloseTab: (String) -> Unit = {},
+    onSettingsClick: (() -> Unit)? = null,
+    onFlashcardsClick: (() -> Unit)? = null
 ) {
     val context = LocalContext.current
     val note by viewModel.note.collectAsState()
+    val noteTitlesMap by viewModel.allNotesMap.collectAsState()
     val pages by viewModel.pages.collectAsState()
     val currentPageIndex by viewModel.currentPageIndex.collectAsState()
     val uiState by viewModel.uiState.collectAsState()
@@ -217,6 +242,8 @@ fun CanvasScreen(
     var showRenameDialog by remember { mutableStateOf(false) }
     var showClearDialog by remember { mutableStateOf(false) }
     var showExportDialog by remember { mutableStateOf(false) }
+    var selectedExportTarget by remember { mutableStateOf<personal.notes.touch.ui.export.ExportTarget?>(null) }
+    var showDeleteNoteDialog by remember { mutableStateOf(false) }
     var showPdfPagePicker by remember { mutableStateOf(false) }
     var pendingPdfUri by remember { mutableStateOf<Uri?>(null) }
     var pendingPdfPageCount by remember { mutableStateOf(0) }
@@ -230,6 +257,22 @@ fun CanvasScreen(
     var newTitleText by remember { mutableStateOf("") }
     var showTextInputDialog by remember { mutableStateOf(false) }
     var textInputText by remember { mutableStateOf("") }
+    var showGoToPageDialog by remember { mutableStateOf(false) }
+    var pageToDeleteIndex by remember { mutableStateOf<Int?>(null) }
+    var isPencaseCollapsed by remember { mutableStateOf(false) }
+
+    val isInfinite = (note?.pageType ?: "infinite") == "infinite"
+    val isContinuous = !isInfinite && uiState.pageTurningMode == 0
+    val isHorizontal = uiState.pageTurningDirection == 1
+
+    var continuousScale by remember { mutableFloatStateOf(1f) }
+    var continuousPanX by remember { mutableFloatStateOf(0f) }
+    var continuousPanY by remember { mutableFloatStateOf(0f) }
+
+    val showTabsState = uiState.showTabs
+    val fixPreviewPageState = uiState.fixPreviewPage
+    val horizontalResistance = uiState.horizontalResistance
+    val minimalInfiniteZoom = uiState.minimalInfiniteZoom
 
     // F-10 PDF text selection: whether the current vector page has extractable
     // text, whether the Text tool is in selection mode, and the live selection.
@@ -255,6 +298,36 @@ fun CanvasScreen(
     val pdfDocCache = remember(viewModel.noteId) { PdfDocumentCache(context) }
     DisposableEffect(pdfDocCache) {
         onDispose { pdfDocCache.close() }
+    }
+
+    // Saved generation map to re-render pages when continuous inking finishes writing to disk
+    val savedPageGenerations = remember { mutableStateMapOf<Int, Int>() }
+
+    // In-place stylus inking for the continuous reader: one page layer at a
+    // time, saved through the same repository calls single-page mode uses.
+    val inkController = remember(viewModel.noteId) {
+        val app = context.applicationContext as? TouchNotesApp
+        ContinuousInkController(
+            noteId = viewModel.noteId,
+            repository = viewModel.repository,
+            pdfDocCache = pdfDocCache,
+            scope = scope,
+            appScope = app?.appScope ?: scope,
+            onSaved = { savedPage ->
+                savedPageGenerations[savedPage] = (savedPageGenerations[savedPage] ?: 0) + 1
+            },
+            onUndoRedoChanged = { canUndo, canRedo ->
+                viewModel.updateUndoRedo(canUndo, canRedo)
+            }
+        )
+    }
+    DisposableEffect(inkController) {
+        onDispose {
+            if (!viewModel.isNoteDeleted) {
+                val app = context.applicationContext as? TouchNotesApp
+                inkController.dispose(app?.appScope ?: scope)
+            }
+        }
     }
 
     // The page row when [index] renders from a vector PDF source.
@@ -394,6 +467,12 @@ fun CanvasScreen(
         val continuousReading = (note?.pageType ?: "infinite") != "infinite" &&
             uiState.pageTurningMode == 0
         if (continuousReading) return@LaunchedEffect
+
+        // When leaving continuous mode to single-page mode, flush and release
+        // any active continuous session first so the latest strokes are on disk
+        // before loadPageStrokes / loadCurrentPageBitmap reads them.
+        inkController.releaseSessionSuspend()
+
         // From here the canvas holds currentPageIndex, so saves triggered
         // before the next page flip must be filed under this index.
         viewModel.setCanvasPageIndex(currentPageIndex)
@@ -435,6 +514,48 @@ fun CanvasScreen(
         }
     }
 
+    val selectLassoTool: () -> Unit = {
+        if (isContinuous) {
+            scope.launch {
+                inkController.flushCurrentSuspend()
+                viewModel.setPageTurningMode(1)
+                viewModel.selectTool(CanvasTool.LASSO)
+                android.widget.Toast.makeText(context, "Switched to Single-Page Mode for Lasso", android.widget.Toast.LENGTH_SHORT).show()
+            }
+        } else {
+            viewModel.selectTool(CanvasTool.LASSO)
+        }
+    }
+
+    // Shared layer insertion helper: handles continuous mode flush, switch to
+    // single-page mode, disk hydration, and IO persistence safely.
+    val insertLayerInCurrentNote: suspend (action: (DrawingCanvasView) -> Boolean) -> Boolean = { action ->
+        val view = canvasViewRef
+        if (view != null) {
+            if (isContinuous) {
+                inkController.flushCurrentSuspend()
+                viewModel.setPageTurningMode(1)
+                if (view.imageLayers.isEmpty() && !view.layersDirty) {
+                    val diskLayers = withContext(Dispatchers.IO) {
+                        view.readLayersFromDisk(viewModel.fileStore, viewModel.noteId)
+                    }
+                    view.applyLoadedLayers(diskLayers)
+                }
+            }
+            val success = action(view)
+            if (success) {
+                try {
+                    withContext(Dispatchers.IO) {
+                        view.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            }
+            success
+        } else false
+    }
+
     // Image Picker Launcher (for Add -> Image in Tools panel)
     val imagePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
@@ -453,21 +574,12 @@ fun CanvasScreen(
                             MediaStore.Images.Media.getBitmap(context.contentResolver, it)
                         }
                     }
-                    // The decoded bitmap is applied on main and then owned by
-                    // the image layer (addImageLayer stores it as-is), so it
-                    // must not be recycled here.
                     bitmap?.let { bmp ->
-                        val added = canvasViewRef?.addImageLayer(bmp) == true
-                        if (added) {
-                            scope.launch {
-                                try {
-                                    withContext(Dispatchers.IO) {
-                                        canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                                    }
-                                } catch (e: Exception) {
-                                    e.printStackTrace()
-                                }
-                            }
+                        val added = insertLayerInCurrentNote { it.addImageLayer(bmp) }
+                        if (!added) {
+                            android.widget.Toast.makeText(
+                                context, "Max 3 image layers", android.widget.Toast.LENGTH_SHORT
+                            ).show()
                         }
                     }
                 } catch (e: Exception) {
@@ -555,40 +667,29 @@ fun CanvasScreen(
     val handleExtractedContent: (ClipboardHelper.ExtractedContent) -> Unit = { extracted ->
         when {
             extracted.bitmap != null -> {
-                val added = canvasViewRef?.addImageLayer(extracted.bitmap) == true
-                if (added) {
-                    scope.launch {
-                        try {
-                            withContext(Dispatchers.IO) {
-                                canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                            }
-                        } catch (e: Exception) {
-                            e.printStackTrace()
-                        }
+                scope.launch {
+                    val added = insertLayerInCurrentNote { it.addImageLayer(extracted.bitmap) }
+                    if (!added) {
+                        android.widget.Toast.makeText(
+                            context, "Max 3 image layers", android.widget.Toast.LENGTH_SHORT
+                        ).show()
                     }
-                } else {
-                    android.widget.Toast.makeText(
-                        context, "Max 3 image layers", android.widget.Toast.LENGTH_SHORT
-                    ).show()
                 }
             }
             !extracted.text.isNullOrBlank() -> {
-                val inserted = canvasViewRef?.addTextBlock(extracted.text) == true
-                if (inserted) {
-                    scope.launch {
-                        try {
-                            withContext(Dispatchers.IO) {
-                                canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                            }
-                        } catch (e: Exception) {
-                            e.printStackTrace()
-                        }
+                scope.launch {
+                    val inserted = insertLayerInCurrentNote { it.addTextBlock(extracted.text) }
+                    if (inserted) {
+                        val preview = extracted.text.trim().replace("\n", " ").take(60)
+                        android.widget.Toast.makeText(
+                            context, "Pasted text: $preview...", android.widget.Toast.LENGTH_SHORT
+                        ).show()
+                    } else {
+                        android.widget.Toast.makeText(
+                            context, "Could not insert text", android.widget.Toast.LENGTH_SHORT
+                        ).show()
                     }
                 }
-                val preview = extracted.text.trim().replace("\n", " ").take(60)
-                android.widget.Toast.makeText(
-                    context, "Pasted text: $preview...", android.widget.Toast.LENGTH_SHORT
-                ).show()
             }
             else -> android.widget.Toast.makeText(
                 context, "Nothing pasteable", android.widget.Toast.LENGTH_SHORT
@@ -622,6 +723,7 @@ fun CanvasScreen(
     // outlives the screen.
     DisposableEffect(viewModel) {
         onDispose {
+            if (viewModel.isNoteDeleted) return@onDispose
             val app = context.applicationContext as? TouchNotesApp ?: return@onDispose
             viewModel.flushPendingSave(app.appScope)
             // Layer edits live outside the backing bitmap, so a moved or
@@ -629,10 +731,28 @@ fun CanvasScreen(
             // toolbar path calls saveAndExit). `layersDirty` keeps unchanged
             // notes from re-writing their PNGs on every exit.
             val canvas = canvasViewRef
-            if (canvas != null && canvas.layersDirty && canvas.imageLayers.isNotEmpty()) {
+            if (canvas != null && canvas.layersDirty) {
                 app.appScope.launch {
                     canvas.saveImageLayers(viewModel.fileStore, viewModel.noteId)
                 }
+            }
+        }
+    }
+
+    val flushCurrentNote: suspend () -> Unit = {
+        val continuousReading = (note?.pageType ?: "infinite") != "infinite" &&
+            uiState.pageTurningMode == 0
+        if (continuousReading) {
+            inkController.flushCurrentSuspend()
+        } else {
+            canvasViewRef?.getBackingBitmap()?.let { bmp ->
+                viewModel.saveCurrentPageBitmapDirect(bmp)
+            }
+        }
+        val canvas = canvasViewRef
+        if (canvas != null && canvas.layersDirty) {
+            withContext(Dispatchers.IO) {
+                canvas.saveImageLayers(viewModel.fileStore, viewModel.noteId)
             }
         }
     }
@@ -641,23 +761,43 @@ fun CanvasScreen(
     val saveAndExit: () -> Unit = {
         scope.launch {
             try {
-                canvasViewRef?.getBackingBitmap()?.let { bmp ->
-                    viewModel.saveCurrentPageBitmapDirect(bmp)
-                }
-                // Layer save is disk I/O (PNG compress + JSON write):
-                // run it on Dispatchers.IO and await it, then navigate.
-                // Navigation lives inside the coroutine so the screen can
-                // not leave composition mid-save (the launcher scope is
-                // cancelled on disposal) — no lost layers on exit.
-                withContext(Dispatchers.IO) {
-                    canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                }
+                flushCurrentNote()
             } catch (e: Exception) {
                 e.printStackTrace()
             }
             onBackClick()
         }
     }
+
+
+    val scrollToContinuousPage: (Int) -> Unit = { targetIndex ->
+        scope.launch {
+            val safeIndex = targetIndex.coerceAtLeast(0)
+            if (safeIndex >= pages.size) {
+                // Yield for Room emission & Compose layout of newly added page
+                kotlinx.coroutines.delay(60)
+            }
+            val maxIdx = (pages.size - 1).coerceAtLeast(0)
+            val finalIndex = safeIndex.coerceIn(0, maxIdx)
+            if (isHorizontal) {
+                continuousRowState.animateScrollToItem(finalIndex)
+            } else if (uiState.doublePageMode) {
+                continuousColState.animateScrollToItem(finalIndex / 2)
+            } else {
+                continuousColState.animateScrollToItem(finalIndex)
+            }
+        }
+    }
+
+    androidx.activity.compose.BackHandler(onBack = {
+        when {
+            uiState.isThumbnailDrawerOpen -> viewModel.toggleThumbnailDrawer(false)
+            uiState.isToolsPanelOpen -> viewModel.toggleToolsPanel(false)
+            showLayersPanel -> showLayersPanel = false
+            showShapesMenu -> showShapesMenu = false
+            else -> saveAndExit()
+        }
+    })
 
     // Dialog: "Change note name" (matches Screenshot_20261102-184531_TouchNotes.png)
     if (showRenameDialog) {
@@ -735,7 +875,11 @@ fun CanvasScreen(
             text = { Text("Clear all drawings on page ${currentPageIndex + 1}? (Undo is still available)") },
             confirmButton = {
                 TextButton(onClick = {
-                    canvasViewRef?.clearCanvas()
+                    if (isContinuous) {
+                        inkController.clearPage(currentPageIndex, pages.getOrNull(currentPageIndex), renderWidthPx = 2160)
+                    } else {
+                        canvasViewRef?.clearCanvas()
+                    }
                     showClearDialog = false
                 }) {
                     Text("Clear", color = Color.Red, fontWeight = FontWeight.Bold)
@@ -743,6 +887,64 @@ fun CanvasScreen(
             },
             dismissButton = {
                 TextButton(onClick = { showClearDialog = false }) { Text("Cancel") }
+            }
+        )
+    }
+
+    // Dialog: Delete Page Confirmation
+    pageToDeleteIndex?.let { targetIndex ->
+        AlertDialog(
+            onDismissRequest = { pageToDeleteIndex = null },
+            title = { Text("Delete Page") },
+            text = { Text("Are you sure you want to delete page ${targetIndex + 1}? This cannot be undone.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    val idx = targetIndex
+                    pageToDeleteIndex = null
+                    scope.launch {
+                        if (isContinuous) {
+                            inkController.releaseSessionSuspend()
+                        }
+                        val currentBmp = if (isContinuous) null else canvasViewRef?.getBackingBitmap()
+                        viewModel.deletePage(idx, isContinuous = isContinuous, currentBitmap = currentBmp) { newBmp ->
+                            if (!isContinuous) {
+                                applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
+                            } else {
+                                savedPageGenerations.clear()
+                            }
+                        }
+                    }
+                }) {
+                    Text("Delete", color = Color.Red, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pageToDeleteIndex = null }) { Text("Cancel") }
+            }
+        )
+    }
+
+    // Dialog: Delete Note Confirmation
+    if (showDeleteNoteDialog) {
+        AlertDialog(
+            onDismissRequest = { showDeleteNoteDialog = false },
+            title = { Text("Delete Note") },
+            text = { Text("Move this note to the recycle bin?") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showDeleteNoteDialog = false
+                    scope.launch {
+                        inkController.discardAll()
+                        canvasViewRef?.layersDirty = false
+                        viewModel.deleteCurrentNoteSuspend()
+                        onCloseTab(viewModel.noteId)
+                    }
+                }) {
+                    Text("Delete", color = Color.Red, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteNoteDialog = false }) { Text("Cancel") }
             }
         )
     }
@@ -800,7 +1002,17 @@ fun CanvasScreen(
                             }
                             if (bmp != null) {
                                 // Non-destructive: set background only, leave strokes alone.
-                                canvasViewRef?.let { it.backgroundBitmap = bmp }
+                                if (isContinuous) {
+                                    inkController.flushCurrentSuspend()
+                                    viewModel.saveCurrentPageBitmapDirect(bmp, force = true)
+                                    val cur = viewModel.currentPageIndex.value
+                                    savedPageGenerations[cur] = (savedPageGenerations[cur] ?: 0) + 1
+                                } else {
+                                    canvasViewRef?.let { it.backgroundBitmap = bmp }
+                                    viewModel.saveCurrentPageBitmapDirect(bmp, force = true)
+                                    val cur = viewModel.currentPageIndex.value
+                                    savedPageGenerations[cur] = (savedPageGenerations[cur] ?: 0) + 1
+                                }
                             } else {
                                 android.widget.Toast.makeText(context, "Failed to render PDF page", android.widget.Toast.LENGTH_SHORT).show()
                             }
@@ -819,16 +1031,21 @@ fun CanvasScreen(
     }
 
     // Dialog: Export Dialog
-    if (showExportDialog && note != null) {
+    val exportTargetNote = note
+    if (showExportDialog && exportTargetNote != null) {
         personal.notes.touch.ui.export.ExportDialog(
-            note = note!!,
+            note = exportTargetNote,
             repository = viewModel.repository,
             fileStore = viewModel.fileStore,
-            currentBitmap = canvasViewRef?.getBackingBitmap(),
-            backgroundBitmap = canvasViewRef?.backgroundBitmap,
-            imageLayers = canvasViewRef?.imageLayers ?: emptyList(),
+            currentBitmap = if (isContinuous) null else canvasViewRef?.getBackingBitmap(),
+            backgroundBitmap = if (isContinuous) null else canvasViewRef?.backgroundBitmap,
+            imageLayers = if (isContinuous) emptyList() else (canvasViewRef?.imageLayers ?: emptyList()),
             currentPageIndex = currentPageIndex,
-            onDismiss = { showExportDialog = false }
+            initialTarget = selectedExportTarget,
+            onDismiss = {
+                showExportDialog = false
+                selectedExportTarget = null
+            }
         )
     }
 
@@ -851,24 +1068,13 @@ fun CanvasScreen(
                     onClick = {
                         val text = textInputText.trim()
                         if (text.isNotEmpty()) {
-                            canvasViewRef?.getBackingBitmap()?.let { bmp ->
-                                viewModel.saveCurrentPageBitmap(bmp)
-                            }
-                            val inserted = canvasViewRef?.addTextBlock(text) == true
-                            if (inserted) {
-                                scope.launch {
-                                    try {
-                                        withContext(Dispatchers.IO) {
-                                            canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                                        }
-                                    } catch (e: Exception) {
-                                        e.printStackTrace()
-                                    }
+                            scope.launch {
+                                val inserted = insertLayerInCurrentNote { it.addTextBlock(text) }
+                                if (!inserted) {
+                                    android.widget.Toast.makeText(
+                                        context, "Could not insert text", android.widget.Toast.LENGTH_SHORT
+                                    ).show()
                                 }
-                            } else {
-                                android.widget.Toast.makeText(
-                                    context, "Could not insert text", android.widget.Toast.LENGTH_SHORT
-                                ).show()
                             }
                         }
                         showTextInputDialog = false
@@ -881,6 +1087,60 @@ fun CanvasScreen(
                 androidx.compose.material3.TextButton(onClick = { showTextInputDialog = false }) {
                     androidx.compose.material3.Text("Cancel")
                 }
+            }
+        )
+    }
+
+    // Dialog: Go to Page / Jump
+    if (showGoToPageDialog) {
+        var pageTargetStr by remember { mutableStateOf((currentPageIndex + 1).toString()) }
+        AlertDialog(
+            onDismissRequest = { showGoToPageDialog = false },
+            title = { Text("Go to Page") },
+            text = {
+                Column {
+                    Text("Enter page number (1 to $totalPages):", fontSize = 13.sp)
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = pageTargetStr,
+                        onValueChange = { pageTargetStr = it },
+                        singleLine = true,
+                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                            keyboardType = androidx.compose.ui.text.input.KeyboardType.Number
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val targetPage = (pageTargetStr.toIntOrNull() ?: 1) - 1
+                    val clamped = targetPage.coerceIn(0, totalPages - 1)
+                    if (isContinuous) {
+                        viewModel.setCurrentPageIndex(clamped)
+                        scrollToContinuousPage(clamped)
+                    } else {
+                        scope.launch {
+                            canvasViewRef?.getBackingBitmap()?.let { bmp ->
+                                viewModel.saveCurrentPageBitmap(bmp)
+                            }
+                            if (canvasViewRef?.layersDirty == true) {
+                                withContext(Dispatchers.IO) {
+                                    canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                                }
+                            }
+                            viewModel.goToPage(clamped, canvasViewRef?.getBackingBitmap()) { newBmp ->
+                                applyLoadedPage(clamped, newBmp)
+                            }
+                        }
+                    }
+                    showGoToPageDialog = false
+                }) {
+                    Text("Jump", color = OrangePrimary, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showGoToPageDialog = false }) { Text("Cancel") }
             }
         )
     }
@@ -988,43 +1248,6 @@ fun CanvasScreen(
     Scaffold(
         topBar = {
             Column {
-                // Tab bar for open notes
-                if (openNotes.isNotEmpty()) {
-                    val scrollState = rememberScrollState()
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .horizontalScroll(scrollState)
-                            .background(Color(0xFFEEEEEE))
-                            .padding(horizontal = 4.dp, vertical = 4.dp),
-                        horizontalArrangement = Arrangement.spacedBy(4.dp)
-                    ) {
-                        openNotes.forEach { id ->
-                            val title = if (id == viewModel.noteId) (note?.title?.ifBlank { null } ?: id.take(8)) else id.take(8)
-                            Surface(
-                                shape = RoundedCornerShape(8.dp),
-                                color = if (id == viewModel.noteId) Color.White else Color(0xFFDDDDDD),
-                                modifier = Modifier.clickable { onSwitchNote(id) }
-                            ) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-                                ) {
-                                    Text(text = title, fontSize = 12.sp, maxLines = 1)
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Icon(
-                                        imageVector = Icons.Default.Close,
-                                        contentDescription = "Close tab",
-                                        tint = Color.Gray,
-                                        modifier = Modifier
-                                            .size(14.dp)
-                                            .clickable { onCloseTab(id) }
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
                 // ==========================================
                 // 1. AUTHENTIC TOUCHNOTES TOP BAR
                 // ==========================================
@@ -1032,180 +1255,314 @@ fun CanvasScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(56.dp),
-                color = Color.White,
-                shadowElevation = 2.dp
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(horizontal = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
+                    color = Color.White,
+                    shadowElevation = 2.dp
                 ) {
-                    // Left Action Group
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        // Back / Menu
-                        IconButton(onClick = saveAndExit) {
-                            Icon(
-                                imageVector = Icons.Default.Menu,
-                                contentDescription = "Back / Menu",
-                                tint = Color(0xFF333333)
-                            )
-                        }
+                    Row(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(horizontal = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        // Left Action Group
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            // Back
+                            IconButton(onClick = saveAndExit) {
+                                Icon(
+                                    imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                                    contentDescription = "Back to Notes",
+                                    tint = Color(0xFF333333)
+                                )
+                            }
 
-                        // Left Thumbnail Sidebar Toggle
-                        IconButton(onClick = { viewModel.toggleThumbnailDrawer() }) {
-                            Icon(
-                                imageVector = Icons.Default.ViewSidebar,
-                                contentDescription = "Page Thumbnails",
-                                tint = if (uiState.isThumbnailDrawerOpen) OrangePrimary else Color(0xFF555555)
-                            )
-                        }
+                            // Left Thumbnail Sidebar Toggle
+                            IconButton(onClick = { viewModel.toggleThumbnailDrawer() }) {
+                                Icon(
+                                    imageVector = Icons.Default.ViewSidebar,
+                                    contentDescription = "Page Thumbnails",
+                                    tint = if (uiState.isThumbnailDrawerOpen) OrangePrimary else Color(0xFF555555)
+                                )
+                            }
 
-                        // Undo
-                        IconButton(
-                            onClick = { canvasViewRef?.undo() },
-                            enabled = uiState.canUndo
-                        ) {
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Filled.Undo,
-                                contentDescription = "Undo",
-                                tint = if (uiState.canUndo) Color(0xFF333333) else Color(0xFFCCCCCC)
-                            )
-                        }
-
-                        // Redo
-                        IconButton(
-                            onClick = { canvasViewRef?.redo() },
-                            enabled = uiState.canRedo
-                        ) {
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Filled.Redo,
-                                contentDescription = "Redo",
-                                tint = if (uiState.canRedo) Color(0xFF333333) else Color(0xFFCCCCCC)
-                            )
-                        }
-
-                        // Reset zoom/pan
-                        IconButton(onClick = { canvasViewRef?.resetTransform() }) {
-                            Icon(
-                                imageVector = Icons.Default.Refresh,
-                                contentDescription = "Reset zoom",
-                                tint = Color(0xFF555555)
-                            )
-                        }
-
-                        Spacer(modifier = Modifier.width(8.dp))
-
-                        // Note Title Pill (Clickable -> Change note name)
-                        Surface(
-                            shape = RoundedCornerShape(16.dp),
-                            color = Color(0xFFF1F3F4),
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(16.dp))
-                                .clickable {
-                                    newTitleText = note?.title ?: ""
-                                    showRenameDialog = true
-                                }
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
-                                verticalAlignment = Alignment.CenterVertically
+                            // Undo
+                            IconButton(
+                                onClick = {
+                                    val continuous = (note?.pageType ?: "infinite") != "infinite" &&
+                                        uiState.pageTurningMode == 0
+                                    if (!continuous || !inkController.undo()) {
+                                        if (!continuous) canvasViewRef?.undo()
+                                    }
+                                },
+                                enabled = uiState.canUndo
                             ) {
-                                Text(
-                                    text = note?.title?.ifBlank { "gemni_note" } ?: "Note",
-                                    fontSize = 14.sp,
-                                    fontWeight = FontWeight.Medium,
-                                    color = Color(0xFF202124)
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
                                 Icon(
-                                    imageVector = Icons.Default.Create,
-                                    contentDescription = "Edit title",
-                                    tint = Color(0xFF757575),
-                                    modifier = Modifier.size(14.dp)
+                                    imageVector = Icons.AutoMirrored.Filled.Undo,
+                                    contentDescription = "Undo",
+                                    tint = if (uiState.canUndo) Color(0xFF333333) else Color(0xFFCCCCCC)
                                 )
-                                Spacer(modifier = Modifier.width(4.dp))
+                            }
+
+                            // Redo
+                            IconButton(
+                                onClick = {
+                                    val continuous = (note?.pageType ?: "infinite") != "infinite" &&
+                                        uiState.pageTurningMode == 0
+                                    if (!continuous || !inkController.redo()) {
+                                        if (!continuous) canvasViewRef?.redo()
+                                    }
+                                },
+                                enabled = uiState.canRedo
+                            ) {
                                 Icon(
-                                    imageVector = Icons.Default.ArrowDropDown,
-                                    contentDescription = "Options",
-                                    tint = Color(0xFF757575),
-                                    modifier = Modifier.size(16.dp)
+                                    imageVector = Icons.AutoMirrored.Filled.Redo,
+                                    contentDescription = "Redo",
+                                    tint = if (uiState.canRedo) Color(0xFF333333) else Color(0xFFCCCCCC)
+                                )
+                            }
+
+                            // Reset zoom/pan
+                            IconButton(onClick = {
+                                if (isContinuous) {
+                                    continuousScale = 1f
+                                    continuousPanX = 0f
+                                    continuousPanY = 0f
+                                } else {
+                                    canvasViewRef?.resetTransform()
+                                }
+                            }) {
+                                Icon(
+                                    imageVector = Icons.Default.Refresh,
+                                    contentDescription = "Reset zoom",
+                                    tint = Color(0xFF555555)
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.width(8.dp))
+
+                            // Note Title Pill (Clickable -> Change note name)
+                            Surface(
+                                shape = RoundedCornerShape(16.dp),
+                                color = Color(0xFFF1F3F4),
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(16.dp))
+                                    .clickable {
+                                        newTitleText = note?.title ?: ""
+                                        showRenameDialog = true
+                                    }
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = note?.title?.ifBlank { "Untitled Note" } ?: "Untitled Note",
+                                        fontSize = 14.sp,
+                                        fontWeight = FontWeight.Medium,
+                                        color = Color(0xFF202124)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Icon(
+                                        imageVector = Icons.Default.Create,
+                                        contentDescription = "Edit title",
+                                        tint = Color(0xFF757575),
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                }
+                            }
+
+                            // One-tap tabs collapse / expand toggle arrow (▲ / ▼)
+                            IconButton(
+                                onClick = { viewModel.setShowTabs(!showTabsState) },
+                                modifier = Modifier.size(28.dp).padding(start = 2.dp)
+                            ) {
+                                Icon(
+                                    imageVector = if (showTabsState) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                                    contentDescription = if (showTabsState) "Hide tabs" else "Show tabs",
+                                    tint = Color(0xFF555555),
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
+
+                            if (uiState.readingMode) {
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Surface(
+                                    shape = RoundedCornerShape(12.dp),
+                                    color = OrangePrimary.copy(alpha = 0.14f),
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .clickable { viewModel.toggleReadingMode(false) }
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = "Reading Mode",
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = OrangePrimary
+                                        )
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Icon(
+                                            imageVector = Icons.Default.Close,
+                                            contentDescription = "Exit Reading Mode",
+                                            tint = OrangePrimary,
+                                            modifier = Modifier.size(12.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        // Right Action Group
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            // Switch to Text Editor
+                            IconButton(onClick = {
+                                scope.launch {
+                                    flushCurrentNote()
+                                    onOpenEditorClick(viewModel.noteId)
+                                }
+                            }) {
+                                Icon(
+                                    imageVector = Icons.Default.TextFields,
+                                    contentDescription = "Text Note",
+                                    tint = Color(0xFF555555)
+                                )
+                            }
+
+                            // Document Outline / List
+                            IconButton(onClick = {
+                                viewModel.setDrawerTab(DrawerTab.OUTLINE)
+                                viewModel.toggleThumbnailDrawer(true)
+                            }) {
+                                Icon(
+                                    imageVector = Icons.AutoMirrored.Filled.MenuBook,
+                                    contentDescription = "Outline",
+                                    tint = Color(0xFF555555)
+                                )
+                            }
+
+                            // Search Outline / Chapters / Go to Page
+                            IconButton(onClick = { showGoToPageDialog = true }) {
+                                Icon(
+                                    imageVector = Icons.Default.Search,
+                                    contentDescription = "Go to Page",
+                                    tint = Color(0xFF555555)
+                                )
+                            }
+
+                            // History / Clock
+                            IconButton(onClick = {
+                                android.widget.Toast.makeText(context, "Note history: All changes are saved locally", android.widget.Toast.LENGTH_SHORT).show()
+                            }) {
+                                Icon(
+                                    imageVector = Icons.Default.History,
+                                    contentDescription = "History",
+                                    tint = Color(0xFF555555)
+                                )
+                            }
+
+                            // Layers panel toggle
+                            IconButton(onClick = { showLayersPanel = !showLayersPanel }) {
+                                Icon(imageVector = Icons.Default.Layers, contentDescription = "Layers", tint = if (showLayersPanel) OrangePrimary else Color(0xFF555555))
+                            }
+
+                            // Import Image
+                            IconButton(onClick = { imagePickerLauncher.launch("image/*") }) {
+                                Icon(
+                                    imageVector = Icons.Default.Image,
+                                    contentDescription = "Import Image",
+                                    tint = Color(0xFF555555)
+                                )
+                            }
+
+                            // Tools & Settings (Right Drawer Toggle)
+                            IconButton(onClick = { viewModel.toggleToolsPanel() }) {
+                                Icon(
+                                    imageVector = Icons.Default.Settings,
+                                    contentDescription = "Tools & Settings",
+                                    tint = if (uiState.isToolsPanelOpen) OrangePrimary else Color(0xFF555555)
                                 )
                             }
                         }
                     }
+                }
 
-                    // Right Action Group
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        // Switch to Text Editor
-                        IconButton(onClick = {
-                            canvasViewRef?.getBackingBitmap()?.let { bmp ->
-                                viewModel.saveCurrentPageBitmap(bmp)
+                // Tab bar for open notes (positioned below Top Bar matching TouchNotes)
+                val visibleOpenNotes = openNotes.filter { it == viewModel.noteId || noteTitlesMap.containsKey(it) }
+                if (visibleOpenNotes.isNotEmpty() && showTabsState) {
+                    val scrollState = rememberScrollState()
+                    Surface(
+                        modifier = Modifier.fillMaxWidth().height(36.dp),
+                        color = Color.White,
+                        border = BorderStroke(0.5.dp, Color(0xFFEAEAEA))
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .horizontalScroll(scrollState),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            visibleOpenNotes.forEachIndexed { tabIdx, id ->
+                                val isSelected = id == viewModel.noteId
+                                val title = noteTitlesMap[id]
+                                    ?: if (isSelected) (note?.title?.ifBlank { "Untitled Note" } ?: "Untitled Note") else id.take(8)
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier
+                                        .fillMaxHeight()
+                                        .background(if (isSelected) Color(0xFFFFF7F2) else Color.White)
+                                        .clickable {
+                                            if (id != viewModel.noteId) {
+                                                scope.launch {
+                                                    try { flushCurrentNote() } catch (e: Exception) { e.printStackTrace() }
+                                                    onSwitchNote(id)
+                                                }
+                                            }
+                                        }
+                                        .padding(horizontal = 12.dp)
+                                ) {
+                                    Text(
+                                        text = title,
+                                        fontSize = 12.sp,
+                                        fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
+                                        color = if (isSelected) OrangePrimary else Color(0xFF444444),
+                                        maxLines = 1
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Icon(
+                                        imageVector = Icons.Default.Cancel,
+                                        contentDescription = "Close tab",
+                                        tint = if (isSelected) OrangePrimary.copy(alpha = 0.7f) else Color.LightGray,
+                                        modifier = Modifier
+                                            .size(15.dp)
+                                            .clickable {
+                                                if (id == viewModel.noteId) {
+                                                    scope.launch {
+                                                        try { flushCurrentNote() } catch (e: Exception) { e.printStackTrace() }
+                                                        onCloseTab(id)
+                                                    }
+                                                } else {
+                                                    onCloseTab(id)
+                                                }
+                                            }
+                                    )
+                                }
+                                if (tabIdx < visibleOpenNotes.size - 1) {
+                                    Divider(
+                                        modifier = Modifier
+                                            .height(18.dp)
+                                            .width(1.dp),
+                                        color = Color(0xFFEAEAEA)
+                                    )
+                                }
                             }
-                            onOpenEditorClick(viewModel.noteId)
-                        }) {
-                            Icon(
-                                imageVector = Icons.Default.TextFields,
-                                contentDescription = "Text Note",
-                                tint = Color(0xFF555555)
-                            )
-                        }
-
-                        // Document Outline / List
-                        IconButton(onClick = { viewModel.toggleThumbnailDrawer(true) }) {
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Filled.MenuBook,
-                                contentDescription = "Outline",
-                                tint = Color(0xFF555555)
-                            )
-                        }
-
-                        // Search
-                        IconButton(onClick = { /* Search within note */ }) {
-                            Icon(
-                                imageVector = Icons.Default.Search,
-                                contentDescription = "Search",
-                                tint = Color(0xFF555555)
-                            )
-                        }
-
-                        // History / Clock
-                        IconButton(onClick = { /* History */ }) {
-                            Icon(
-                                imageVector = Icons.Default.History,
-                                contentDescription = "History",
-                                tint = Color(0xFF555555)
-                            )
-                        }
-
-                        // Layers panel toggle
-                        IconButton(onClick = { showLayersPanel = !showLayersPanel }) {
-                            Icon(imageVector = Icons.Default.Layers, contentDescription = "Layers", tint = if (showLayersPanel) OrangePrimary else Color(0xFF555555))
-                        }
-
-                        // Import Image
-                        IconButton(onClick = { imagePickerLauncher.launch("image/*") }) {
-                            Icon(
-                                imageVector = Icons.Default.Image,
-                                contentDescription = "Import Image",
-                                tint = Color(0xFF555555)
-                            )
-                        }
-
-                        // Tools & Settings (Right Drawer Toggle)
-                        IconButton(onClick = { viewModel.toggleToolsPanel() }) {
-                            Icon(
-                                imageVector = Icons.Default.Settings,
-                                contentDescription = "Tools & Settings",
-                                tint = if (uiState.isToolsPanelOpen) OrangePrimary else Color(0xFF555555)
-                            )
                         }
                     }
                 }
             }
         }
-    }
     ) { innerPadding ->
         Box(
             modifier = Modifier
@@ -1255,8 +1612,9 @@ fun CanvasScreen(
                                     scope.launch {
                                         val state = if (isHorizontalReading) continuousRowState else continuousColState
                                         val from = state.firstVisibleItemIndex
+                                        val maxItems = if (isHorizontalReading) pages.size else if (uiState.doublePageMode) (pages.size + 1) / 2 else pages.size
                                         state.animateScrollToItem(
-                                            (from + 1).coerceAtMost((pages.size - 1).coerceAtLeast(0))
+                                            (from + 1).coerceAtMost((maxItems - 1).coerceAtLeast(0))
                                         )
                                     }
                                     return@onKeyEvent true
@@ -1281,14 +1639,6 @@ fun CanvasScreen(
                     } else false
                 }
         ) {
-                val isInfinite = (note?.pageType ?: "infinite") == "infinite"
-                val isContinuous = !isInfinite && uiState.pageTurningMode == 0
-                val isHorizontal = uiState.pageTurningDirection == 1
-
-                var continuousScale by remember { mutableFloatStateOf(1f) }
-                var continuousPanX by remember { mutableFloatStateOf(0f) }
-                var continuousPanY by remember { mutableFloatStateOf(0f) }
-
                 // Rendering key for the page bitmaps. Quantising the zoom keeps
                 // a pinch gesture from launching a PDF render per frame while
                 // still upgrading resolution as the user zooms in (P1 audit).
@@ -1303,7 +1653,21 @@ fun CanvasScreen(
                 // direction while in it — scroll to the current page index.
                 // Without the direction key the new Lazy list started at page
                 // 1 while the rest of the UI still pointed at page N.
-                LaunchedEffect(isContinuous, isHorizontal) {
+                // Tool settings the reader's ink engine draws with.
+                val inkSettings = InkToolSettings(
+                    tool = uiState.selectedTool,
+                    color = uiState.selectedColor.toArgb(),
+                    strokeWidthPx = uiState.strokeWidth,
+                    eraserWidthPx = uiState.eraserWidth,
+                    pressureSensitivity = uiState.pressureSensitivity,
+                    pressureSizeEnabled = uiState.pressureSizeEnabled,
+                    stylusOnly = uiState.stylusOnly,
+                    readingMode = uiState.readingMode,
+                    autoShapeEnabled = uiState.autoShapeEnabled
+                )
+
+
+                LaunchedEffect(isContinuous, isHorizontal, uiState.doublePageMode) {
                     if (isContinuous) {
                         continuousScale = 1f
                         continuousPanX = 0f
@@ -1315,6 +1679,8 @@ fun CanvasScreen(
                         val target = currentPageIndex.coerceIn(0, (pages.size - 1).coerceAtLeast(0))
                         if (isHorizontal) {
                             continuousRowState.scrollToItem(target)
+                        } else if (uiState.doublePageMode) {
+                            continuousColState.scrollToItem(target / 2)
                         } else {
                             continuousColState.scrollToItem(target)
                         }
@@ -1324,6 +1690,14 @@ fun CanvasScreen(
                 // Sync current visible item index in continuous mode to viewModel
                 val currentContinuousVisible = if (isHorizontal) {
                     continuousRowState.firstVisibleItemIndex
+                } else if (uiState.doublePageMode) {
+                    val pairIdx = continuousColState.firstVisibleItemIndex
+                    val firstPageInPair = pairIdx * 2
+                    if (currentPageIndex == firstPageInPair || currentPageIndex == firstPageInPair + 1) {
+                        currentPageIndex
+                    } else {
+                        firstPageInPair
+                    }
                 } else {
                     continuousColState.firstVisibleItemIndex
                 }
@@ -1373,6 +1747,15 @@ fun CanvasScreen(
                             // and get the live pdfium background instead.
                             scope.launch {
                                 try {
+                                    if (isContinuous) {
+                                        viewModel.setCanvasPageIndex(-1)
+                                        viewModel.setPageLoadedFromDisk(false)
+                                        val layers = withContext(Dispatchers.IO) {
+                                            readLayersFromDisk(viewModel.fileStore, viewModel.noteId)
+                                        }
+                                        applyLoadedLayers(layers)
+                                        return@launch
+                                    }
                                     val pageIdx = viewModel.currentPageIndex.value
                                     viewModel.setCanvasPageIndex(pageIdx)
                                     val vectorPage = vectorPdfPage(pageIdx)
@@ -1402,6 +1785,8 @@ fun CanvasScreen(
                         }
                     },
                     update = { view ->
+                        view.pageType = note?.pageType ?: "infinite"
+                        view.beyondPaper = (note?.pageType == "infinite") && !uiState.fixPreviewPage
                         view.currentTool = uiState.selectedTool
                         view.strokeColor = uiState.selectedColor.toArgb()
                         view.strokeWidthPx = uiState.strokeWidth
@@ -1415,118 +1800,247 @@ fun CanvasScreen(
                         view.pressureSizeEnabled = uiState.pressureSizeEnabled
                         view.autoShapeEnabled = uiState.autoShapeEnabled
                         view.doublePage = uiState.doublePageMode
+                        view.minZoom = uiState.minimalInfiniteZoom
+                        view.horizontalResistance = uiState.horizontalResistance
+                        view.autoCenter = uiState.autoCenter
                     },
                     modifier = Modifier.fillMaxSize()
                 )
 
                 // Continuous page overlay when continuous mode is active
                 if (isContinuous) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .background(Color(0xFFEEEEEE))
-                            .pointerInput(Unit) {
-                                detectTransformGestures { centroid, pan, zoom, _ ->
-                                    val oldScale = continuousScale
-                                    val newScale = (continuousScale * zoom)
-                                        .coerceIn(MIN_CONTINUOUS_SCALE, MAX_CONTINUOUS_SCALE)
-                                    val factor = newScale / oldScale
-                                    if (newScale < 1f) {
-                                        // Smaller than fit: the pages no longer
-                                        // fill the width, so centre them and stop
-                                        // panning (the list still owns scrolling).
-                                        // Without this branch the scale stopped at
-                                        // 1 and the reader could never show the
-                                        // area around a page.
-                                        continuousPanX = size.width * (1f - newScale) / 2f
-                                        continuousPanY = 0f
-                                    } else {
-                                        // The Lazy list keeps ownership of scrolling
-                                        // (so off-screen pages are still composed and
-                                        // reachable); the layer translation is clamped
-                                        // to the zoomed content so it can never push a
-                                        // page completely out of view.
-                                        val maxPanX = size.width * (newScale - 1f)
-                                        val maxPanY = size.height * (newScale - 1f)
-                                        continuousPanX = (centroid.x - (centroid.x - continuousPanX) * factor + pan.x)
-                                            .coerceIn(-maxPanX, 0f)
-                                        continuousPanY = (centroid.y - (centroid.y - continuousPanY) * factor + pan.y)
-                                            .coerceIn(-maxPanY, 0f)
-                                        // Back at fit-to-width: drop the offsets so
-                                        // pages sit centred again.
-                                        if (newScale <= 1.02f) {
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .background(Color(0xFFEEEEEE))
+                                .pointerInput(Unit) {
+                                    detectTransformGestures { centroid, pan, zoom, _ ->
+                                        val oldScale = continuousScale
+                                        val newScale = (continuousScale * zoom)
+                                            .coerceIn(MIN_CONTINUOUS_SCALE, MAX_CONTINUOUS_SCALE)
+                                        val factor = newScale / oldScale
+                                        if (newScale < 1f) {
+                                            continuousPanX = size.width * (1f - newScale) / 2f
+                                            continuousPanY = 0f
+                                            if (isHorizontal) {
+                                                continuousRowState.dispatchRawDelta(-pan.x)
+                                            } else {
+                                                continuousColState.dispatchRawDelta(-pan.y)
+                                            }
+                                        } else {
+                                            val maxPanX = size.width * (newScale - 1f)
+                                            val maxPanY = size.height * (newScale - 1f)
+                                            val prevPanX = continuousPanX
+                                            val prevPanY = continuousPanY
+                                            continuousPanX = (centroid.x - (centroid.x - continuousPanX) * factor + pan.x)
+                                                .coerceIn(-maxPanX, 0f)
+                                            continuousPanY = (centroid.y - (centroid.y - continuousPanY) * factor + pan.y)
+                                                .coerceIn(-maxPanY, 0f)
+                                            val consumedX = continuousPanX - prevPanX
+                                            val consumedY = continuousPanY - prevPanY
+                                            val unabsorbedX = pan.x - consumedX
+                                            val unabsorbedY = pan.y - consumedY
+                                            if (isHorizontal && unabsorbedX != 0f) {
+                                                continuousRowState.dispatchRawDelta(-unabsorbedX)
+                                            } else if (!isHorizontal && unabsorbedY != 0f) {
+                                                continuousColState.dispatchRawDelta(-unabsorbedY)
+                                            }
+                                            // Back at fit-to-width: drop the offsets so
+                                            // pages sit centred again.
+                                            if (newScale <= 1.02f) {
+                                                continuousPanX = 0f
+                                                continuousPanY = 0f
+                                            }
+                                        }
+                                        continuousScale = newScale
+                                    }
+                                }
+                                .graphicsLayer {
+                                    scaleX = continuousScale
+                                    scaleY = continuousScale
+                                    translationX = continuousPanX
+                                    translationY = continuousPanY
+                                    transformOrigin = androidx.compose.ui.graphics.TransformOrigin(0f, 0f)
+                                }
+                        ) {
+                            if (isHorizontal) {
+                                androidx.compose.foundation.lazy.LazyRow(
+                                    state = continuousRowState,
+                                    modifier = Modifier.fillMaxSize(),
+                                    // A pen down on a page must not be turned into
+                                    // a scroll: Compose's interop touch bridge does
+                                    // not consume the initial down, so the list
+                                    // would cancel the stroke and scroll instead.
+                                    userScrollEnabled = !inkController.isDrawing,
+                                    horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(16.dp),
+                                    contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp)
+                                ) {
+                                    items(pages.size) { idx ->
+                                        val page = pages[idx]
+                                        ContinuousPageView(
+                                            pageIndex = idx,
+                                            page = page,
+                                            noteId = viewModel.noteId,
+                                            pdfDocCache = pdfDocCache,
+                                            repository = viewModel.repository,
+                                            zoom = continuousZoomBucket,
+                                            ink = inkController,
+                                            inkSettings = inkSettings,
+                                            backgroundMode = uiState.backgroundMode,
+                                            backgroundDensity = uiState.backgroundDensity,
+                                            savedGeneration = savedPageGenerations[idx] ?: 0,
+                                            isCurrentPage = idx == currentPageIndex,
+                                            modifier = androidx.compose.ui.Modifier.fillParentMaxHeight(),
+                                            onClick = {
+                                                viewModel.setCurrentPageIndex(idx)
+                                                dismissCanvasOverlays()
+                                            }
+                                        )
+                                    }
+                                }
+                            } else if (uiState.doublePageMode) {
+                                androidx.compose.foundation.lazy.LazyColumn(
+                                    state = continuousColState,
+                                    modifier = Modifier.fillMaxSize(),
+                                    userScrollEnabled = !inkController.isDrawing,
+                                    verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(16.dp),
+                                    contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 16.dp, horizontal = 16.dp)
+                                ) {
+                                    val pairs = (0 until pages.size).chunked(2)
+                                    items(pairs.size) { pairIdx ->
+                                        val pair = pairs[pairIdx]
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.spacedBy(16.dp)
+                                        ) {
+                                            for (idx in pair) {
+                                                val page = pages[idx]
+                                                Box(modifier = Modifier.weight(1f)) {
+                                                    ContinuousPageView(
+                                                        pageIndex = idx,
+                                                        page = page,
+                                                        noteId = viewModel.noteId,
+                                                        pdfDocCache = pdfDocCache,
+                                                        repository = viewModel.repository,
+                                                        zoom = continuousZoomBucket,
+                                                        ink = inkController,
+                                                        inkSettings = inkSettings,
+                                                        backgroundMode = uiState.backgroundMode,
+                                                        backgroundDensity = uiState.backgroundDensity,
+                                                        savedGeneration = savedPageGenerations[idx] ?: 0,
+                                                        isCurrentPage = idx == currentPageIndex,
+                                                        modifier = androidx.compose.ui.Modifier.fillMaxWidth(),
+                                                        onClick = {
+                                                            viewModel.setCurrentPageIndex(idx)
+                                                            dismissCanvasOverlays()
+                                                        }
+                                                    )
+                                                }
+                                            }
+                                            if (pair.size == 1) {
+                                                Spacer(modifier = Modifier.weight(1f))
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                androidx.compose.foundation.lazy.LazyColumn(
+                                    state = continuousColState,
+                                    modifier = Modifier.fillMaxSize(),
+                                    userScrollEnabled = !inkController.isDrawing,
+                                    verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(16.dp),
+                                    contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 16.dp, horizontal = 32.dp)
+                                ) {
+                                    items(pages.size) { idx ->
+                                        val page = pages[idx]
+                                        ContinuousPageView(
+                                            pageIndex = idx,
+                                            page = page,
+                                            noteId = viewModel.noteId,
+                                            pdfDocCache = pdfDocCache,
+                                            repository = viewModel.repository,
+                                            zoom = continuousZoomBucket,
+                                            ink = inkController,
+                                            inkSettings = inkSettings,
+                                            backgroundMode = uiState.backgroundMode,
+                                            backgroundDensity = uiState.backgroundDensity,
+                                            savedGeneration = savedPageGenerations[idx] ?: 0,
+                                            isCurrentPage = idx == currentPageIndex,
+                                            modifier = androidx.compose.ui.Modifier.fillMaxWidth(),
+                                            onClick = {
+                                                viewModel.setCurrentPageIndex(idx)
+                                                dismissCanvasOverlays()
+                                            }
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        // Continuous Mode Floating HUD: Stylus/Finger Mode toggle and Zoom Reset pill
+                        // Placed outside graphicsLayer so it stays fixed at TopCenter at 1x scale
+                        Row(
+                            modifier = Modifier
+                                .align(Alignment.TopCenter)
+                                .padding(top = 10.dp),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            if (uiState.stylusOnly) {
+                                Surface(
+                                    shape = RoundedCornerShape(16.dp),
+                                    color = Color.Black.copy(alpha = 0.65f),
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(16.dp))
+                                        .clickable {
+                                            viewModel.toggleStylusOnly()
+                                            android.widget.Toast.makeText(
+                                                context,
+                                                "Finger Draw ON: 2 fingers to scroll",
+                                                android.widget.Toast.LENGTH_SHORT
+                                            ).show()
+                                        }
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Edit,
+                                            contentDescription = null,
+                                            tint = Color.White,
+                                            modifier = Modifier.size(12.dp)
+                                        )
+                                        Text(
+                                            text = "Stylus Mode",
+                                            color = Color.White,
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.Medium
+                                        )
+                                    }
+                                }
+                            }
+
+                            if (kotlin.math.abs(continuousScale - 1f) > 0.05f) {
+                                Surface(
+                                    shape = RoundedCornerShape(16.dp),
+                                    color = Color.Black.copy(alpha = 0.72f),
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(16.dp))
+                                        .clickable {
+                                            continuousScale = 1f
                                             continuousPanX = 0f
                                             continuousPanY = 0f
                                         }
-                                    }
-                                    continuousScale = newScale
-                                }
-                            }
-                            .graphicsLayer {
-                                scaleX = continuousScale
-                                scaleY = continuousScale
-                                translationX = continuousPanX
-                                translationY = continuousPanY
-                                transformOrigin = androidx.compose.ui.graphics.TransformOrigin(0f, 0f)
-                            }
-                    ) {
-                        if (isHorizontal) {
-                            androidx.compose.foundation.lazy.LazyRow(
-                                state = continuousRowState,
-                                modifier = Modifier.fillMaxSize(),
-                                horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(16.dp),
-                                contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp)
-                            ) {
-                                items(pages.size) { idx ->
-                                    val page = pages[idx]
-                                    ContinuousPageView(
-                                        pageIndex = idx,
-                                        page = page,
-                                        noteId = viewModel.noteId,
-                                        pdfDocCache = pdfDocCache,
-                                        repository = viewModel.repository,
-                                        zoom = continuousZoomBucket,
-                                        modifier = androidx.compose.ui.Modifier.fillParentMaxHeight(),
-                                        onClick = {
-                                            // Let the page-change effect do the
-                                            // one load: it also restores the
-                                            // page's image/text layers, which a
-                                            // direct goToPage callback skipped
-                                            // (and it would have decoded the
-                                            // page twice).
-                                            viewModel.setCurrentPageIndex(idx)
-                                            viewModel.setPageTurningMode(1)
-                                        }
-                                    )
-                                }
-                            }
-                        } else {
-                            androidx.compose.foundation.lazy.LazyColumn(
-                                state = continuousColState,
-                                modifier = Modifier.fillMaxSize(),
-                                verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(16.dp),
-                                contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 16.dp, horizontal = 32.dp)
-                            ) {
-                                items(pages.size) { idx ->
-                                    val page = pages[idx]
-                                    ContinuousPageView(
-                                        pageIndex = idx,
-                                        page = page,
-                                        noteId = viewModel.noteId,
-                                        pdfDocCache = pdfDocCache,
-                                        repository = viewModel.repository,
-                                        zoom = continuousZoomBucket,
-                                        modifier = androidx.compose.ui.Modifier.fillMaxWidth(),
-                                        onClick = {
-                                            // Let the page-change effect do the
-                                            // one load: it also restores the
-                                            // page's image/text layers, which a
-                                            // direct goToPage callback skipped
-                                            // (and it would have decoded the
-                                            // page twice).
-                                            viewModel.setCurrentPageIndex(idx)
-                                            viewModel.setPageTurningMode(1)
-                                        }
+                                ) {
+                                    Text(
+                                        text = "${(continuousScale * 100).roundToInt()}% · Reset",
+                                        color = Color.White,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Medium,
+                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
                                     )
                                 }
                             }
@@ -1564,6 +2078,13 @@ fun CanvasScreen(
                             IconButton(onClick = {
                                 canvasViewRef?.deleteSelectedImageLayer()
                                 selectedImageIndex = -1
+                                scope.launch {
+                                    try {
+                                        withContext(Dispatchers.IO) {
+                                            canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                                        }
+                                    } catch (e: Exception) { e.printStackTrace() }
+                                }
                             }) {
                                 Icon(Icons.Default.Delete, contentDescription = "Delete layer", tint = Color.Red)
                             }
@@ -1581,47 +2102,190 @@ fun CanvasScreen(
                     val _tick = layersTick
                     val layers = canvasViewRef?.imageLayers ?: emptyList()
                     Surface(
-                        shape = RoundedCornerShape(12.dp),
-                        color = Color.White.copy(alpha = 0.96f),
-                        shadowElevation = 6.dp,
-                        modifier = Modifier.align(Alignment.TopEnd).padding(top = 8.dp, end = 8.dp)
+                        shape = RoundedCornerShape(14.dp),
+                        color = Color.White.copy(alpha = 0.98f),
+                        shadowElevation = 8.dp,
+                        border = BorderStroke(1.dp, Color(0xFFE5E5E5)),
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(top = 10.dp, end = 12.dp)
+                            .widthIn(min = 220.dp, max = 280.dp)
                     ) {
-                        Column(modifier = Modifier.padding(8.dp)) {
-                            Text("Layers ${layers.size}/3", fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                            layers.forEachIndexed { idx, layer ->
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    IconButton(onClick = {
-                                        canvasViewRef?.setLayerVisible(idx, !layer.visible)
-                                        layersTick++
-                                    }) {
-                                        Icon(if (layer.visible) Icons.Default.Visibility else Icons.Default.VisibilityOff, contentDescription = "visibility")
-                                    }
-                                    Text("Layer ${idx + 1}", fontSize = 12.sp)
-                                    IconButton(onClick = {
-                                        if (idx > 0) canvasViewRef?.moveImageLayer(idx, idx - 1)
-                                        layersTick++
-                                    }, enabled = idx > 0) {
-                                        Icon(Icons.Default.KeyboardArrowUp, contentDescription = "move up")
-                                    }
-                                    IconButton(onClick = {
-                                        if (idx < layers.size - 1) canvasViewRef?.moveImageLayer(idx, idx + 1)
-                                        layersTick++
-                                    }, enabled = idx < layers.size - 1) {
-                                        Icon(Icons.Default.KeyboardArrowDown, contentDescription = "move down")
-                                    }
-                                    IconButton(onClick = {
-                                        canvasViewRef?.deleteImageLayer(idx)
-                                        layersTick++
-                                    }) {
-                                        Icon(Icons.Default.Delete, contentDescription = "delete", tint = Color.Red)
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Layers (${layers.size}/3)",
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 13.sp,
+                                    color = Color(0xFF222222)
+                                )
+                                IconButton(
+                                    onClick = { showLayersPanel = false },
+                                    modifier = Modifier.size(24.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Close,
+                                        contentDescription = "Close",
+                                        tint = Color.Gray,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
+                            }
+
+                            if (layers.isEmpty()) {
+                                Spacer(Modifier.height(6.dp))
+                                Text(
+                                    text = if (isContinuous) "Switch to Single-Page to edit layers." else "No floating layers on this page.",
+                                    fontSize = 11.sp,
+                                    color = Color.Gray
+                                )
+                            } else {
+                                Spacer(Modifier.height(4.dp))
+                                layers.forEachIndexed { idx, layer ->
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)
+                                    ) {
+                                        IconButton(
+                                            onClick = {
+                                                canvasViewRef?.setLayerVisible(idx, !layer.visible)
+                                                layersTick++
+                                                scope.launch {
+                                                    try {
+                                                        withContext(Dispatchers.IO) {
+                                                            canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                                                        }
+                                                    } catch (e: Exception) { e.printStackTrace() }
+                                                }
+                                            },
+                                            modifier = Modifier.size(24.dp)
+                                        ) {
+                                            Icon(
+                                                if (layer.visible) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                                                contentDescription = "visibility",
+                                                tint = Color.DarkGray,
+                                                modifier = Modifier.size(16.dp)
+                                            )
+                                        }
+                                        Spacer(Modifier.width(4.dp))
+                                        Text("Layer ${idx + 1}", fontSize = 12.sp, modifier = Modifier.weight(1f))
+                                        IconButton(
+                                            onClick = {
+                                                if (idx > 0) {
+                                                    canvasViewRef?.moveImageLayer(idx, idx - 1)
+                                                    layersTick++
+                                                    scope.launch {
+                                                        try {
+                                                            withContext(Dispatchers.IO) {
+                                                                canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                                                            }
+                                                        } catch (e: Exception) { e.printStackTrace() }
+                                                    }
+                                                }
+                                            },
+                                            enabled = idx > 0,
+                                            modifier = Modifier.size(24.dp)
+                                        ) {
+                                            Icon(Icons.Default.KeyboardArrowUp, contentDescription = "move up", modifier = Modifier.size(16.dp))
+                                        }
+                                        IconButton(
+                                            onClick = {
+                                                if (idx < layers.size - 1) {
+                                                    canvasViewRef?.moveImageLayer(idx, idx + 1)
+                                                    layersTick++
+                                                    scope.launch {
+                                                        try {
+                                                            withContext(Dispatchers.IO) {
+                                                                canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                                                            }
+                                                        } catch (e: Exception) { e.printStackTrace() }
+                                                    }
+                                                }
+                                            },
+                                            enabled = idx < layers.size - 1,
+                                            modifier = Modifier.size(24.dp)
+                                        ) {
+                                            Icon(Icons.Default.KeyboardArrowDown, contentDescription = "move down", modifier = Modifier.size(16.dp))
+                                        }
+                                        IconButton(
+                                            onClick = {
+                                                canvasViewRef?.deleteImageLayer(idx)
+                                                layersTick++
+                                                scope.launch {
+                                                    try {
+                                                        withContext(Dispatchers.IO) {
+                                                            canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                                                        }
+                                                    } catch (e: Exception) { e.printStackTrace() }
+                                                }
+                                            },
+                                            modifier = Modifier.size(24.dp)
+                                        ) {
+                                            Icon(Icons.Default.Delete, contentDescription = "delete", tint = Color.Red, modifier = Modifier.size(16.dp))
+                                        }
                                     }
                                 }
                             }
+
+                            Spacer(Modifier.height(8.dp))
+                            Divider(color = Color(0xFFEEEEEE))
                             Spacer(Modifier.height(4.dp))
-                            TextButton(onClick = {
-                                canvasViewRef?.mergeAllLayersToBase()
-                                layersTick++
-                            }) { Text("Merge to base", fontSize = 11.sp) }
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                OutlinedButton(
+                                    onClick = {
+                                        showLayersPanel = false
+                                        imagePickerLauncher.launch("image/*")
+                                    },
+                                    modifier = Modifier.weight(1f).height(32.dp),
+                                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp)
+                                ) {
+                                    Text("+ Image", fontSize = 11.sp, color = OrangePrimary)
+                                }
+                                OutlinedButton(
+                                    onClick = {
+                                        showLayersPanel = false
+                                        textInputText = ""
+                                        showTextInputDialog = true
+                                    },
+                                    modifier = Modifier.weight(1f).height(32.dp),
+                                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp)
+                                ) {
+                                    Text("+ Text", fontSize = 11.sp, color = OrangePrimary)
+                                }
+                            }
+
+                            if (layers.isNotEmpty()) {
+                                Spacer(Modifier.height(4.dp))
+                                TextButton(
+                                    onClick = {
+                                        canvasViewRef?.mergeAllLayersToBase()
+                                        layersTick++
+                                        scope.launch {
+                                            try {
+                                                canvasViewRef?.getBackingBitmap()?.let { bmp ->
+                                                    viewModel.saveCurrentPageBitmapDirect(bmp)
+                                                }
+                                                withContext(Dispatchers.IO) {
+                                                    canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                                                }
+                                            } catch (e: Exception) { e.printStackTrace() }
+                                        }
+                                    },
+                                    modifier = Modifier.fillMaxWidth().height(32.dp),
+                                    contentPadding = PaddingValues(0.dp)
+                                ) {
+                                    Text("Merge to base", fontSize = 11.sp, color = OrangePrimary)
+                                }
+                            }
                         }
                     }
                 }
@@ -1687,8 +2351,39 @@ fun CanvasScreen(
                     }
                 }
 
-                if (uiState.showPencase) {
-                    if (uiState.dockHorizontal) {
+                if (uiState.showPencase && !uiState.readingMode) {
+                    if (isPencaseCollapsed) {
+                        // Collapsed mini restore pill
+                        Surface(
+                            shape = RoundedCornerShape(16.dp),
+                            color = Color.White.copy(alpha = 0.95f),
+                            shadowElevation = 4.dp,
+                            modifier = Modifier
+                                .align(if (uiState.dockHorizontal) Alignment.TopCenter else Alignment.CenterStart)
+                                .padding(top = if (uiState.dockHorizontal) 10.dp else 0.dp, start = if (!uiState.dockHorizontal) 12.dp else 0.dp)
+                                .border(1.dp, Color(0xFFEEEEEE), RoundedCornerShape(16.dp))
+                                .clickable { isPencaseCollapsed = false }
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Icon(
+                                    painter = painterResource(id = R.drawable.ic_tool_fineliner),
+                                    contentDescription = "Expand Pens",
+                                    tint = OrangePrimary,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Icon(
+                                    imageVector = if (uiState.dockHorizontal) Icons.Default.KeyboardArrowDown else Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                                    contentDescription = "Expand",
+                                    tint = Color.Gray,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                            }
+                        }
+                    } else if (uiState.dockHorizontal) {
                         // Horizontal Dock (Top under bar)
                         Surface(
                             shape = RoundedCornerShape(20.dp),
@@ -1704,6 +2399,16 @@ fun CanvasScreen(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
+                                // Drag handle pill (Tap to switch orientation)
+                                Box(
+                                    modifier = Modifier
+                                        .height(18.dp)
+                                        .width(4.dp)
+                                        .clip(RoundedCornerShape(2.dp))
+                                        .background(Color.LightGray)
+                                        .clickable { viewModel.toggleDockOrientation() }
+                                )
+
                                 // Fountain Pen
                                 PencaseToolIcon(
                                     drawableRes = R.drawable.ic_tool_fountain_pen,
@@ -1738,10 +2443,7 @@ fun CanvasScreen(
                                     onClick = { viewModel.selectTool(CanvasTool.ERASER) }
                                 )
 
-                                // Text Tool [T] — on a vector PDF page with a
-                                // text layer this toggles PDF text selection
-                                // (copy / mark / underline); everywhere else it
-                                // opens the text note editor as before.
+                                // Text Tool [T]
                                 PencaseToolIcon(
                                     icon = Icons.Default.TextFields,
                                     label = "Text",
@@ -1760,9 +2462,15 @@ fun CanvasScreen(
                                 )
 
                                 // Shapes Tool
+                                val shapeIconHoriz = when (uiState.selectedTool) {
+                                    CanvasTool.SHAPE_RECT -> Icons.Default.CropSquare
+                                    CanvasTool.SHAPE_CIRCLE -> Icons.Default.RadioButtonUnchecked
+                                    CanvasTool.SHAPE_LINE -> Icons.Default.Timeline
+                                    else -> Icons.Default.FormatShapes
+                                }
                                 Box {
                                     PencaseToolIcon(
-                                        icon = Icons.Default.FormatShapes,
+                                        icon = shapeIconHoriz,
                                         label = "Shapes",
                                         isSelected = uiState.selectedTool in listOf(
                                             CanvasTool.SHAPE_RECT,
@@ -1808,17 +2516,17 @@ fun CanvasScreen(
                                     label = "Lasso",
                                     isSelected = uiState.selectedTool == CanvasTool.LASSO,
                                     selectedTint = OrangePrimary,
-                                    onClick = { viewModel.selectTool(CanvasTool.LASSO) }
+                                    onClick = selectLassoTool
                                 )
 
-                                // Dock Orientation Toggle
+                                // Collapse Chevron (<)
                                 IconButton(
-                                    onClick = { viewModel.toggleDockOrientation() },
-                                    modifier = Modifier.size(32.dp)
+                                    onClick = { isPencaseCollapsed = true },
+                                    modifier = Modifier.size(30.dp)
                                 ) {
                                     Icon(
-                                        imageVector = Icons.Default.ChangeCircle,
-                                        contentDescription = "Dock Left",
+                                        imageVector = Icons.Default.KeyboardArrowUp,
+                                        contentDescription = "Collapse Dock",
                                         tint = Color.Gray,
                                         modifier = Modifier.size(18.dp)
                                     )
@@ -1831,26 +2539,37 @@ fun CanvasScreen(
                                     color = Color.LightGray
                                 )
 
-                                // Width Presets
+                                // 3 Stroke Width Presets (Horizontal bar line thickness)
                                 val widthPresets =
                                     if (uiState.selectedTool == CanvasTool.ERASER) TouchNotesEraserPresets
                                     else TouchNotesWidthPresets
                                 val activeWidth = uiState.activeStrokeWidth()
-                                widthPresets.forEach { (widthPx, label) ->
+                                widthPresets.take(3).forEachIndexed { wIdx, (widthPx, _) ->
                                     val isSelected = activeWidth == widthPx
+                                    val barHeight = when (wIdx) {
+                                        0 -> 2.dp
+                                        1 -> 4.dp
+                                        else -> 6.dp
+                                    }
                                     Box(
                                         modifier = Modifier
-                                            .size(24.dp)
+                                            .size(26.dp)
                                             .clip(CircleShape)
-                                            .background(if (isSelected) OrangePrimary else Color(0xFFF0F0F0))
+                                            .background(if (isSelected) OrangePrimary.copy(alpha = 0.12f) else Color.Transparent)
+                                            .border(
+                                                if (isSelected) 1.5.dp else 0.dp,
+                                                if (isSelected) OrangePrimary else Color.Transparent,
+                                                CircleShape
+                                            )
                                             .clickable { viewModel.setStrokeWidth(widthPx) },
                                         contentAlignment = Alignment.Center
                                     ) {
                                         Box(
                                             modifier = Modifier
-                                                .size((widthPx / 3f).coerceIn(4f, 16f).dp)
-                                                .clip(CircleShape)
-                                                .background(if (isSelected) Color.White else Color.DarkGray)
+                                                .width(14.dp)
+                                                .height(barHeight)
+                                                .clip(RoundedCornerShape(1.dp))
+                                                .background(if (isSelected) OrangePrimary else Color(0xFF444444))
                                         )
                                     }
                                 }
@@ -1862,29 +2581,45 @@ fun CanvasScreen(
                                     color = Color.LightGray
                                 )
 
-                                // Color Swatches
-                                TouchNotesColors.take(4).forEach { c ->
+                                // 3 Rounded-Square Color Swatches with checkmark
+                                TouchNotesColors.take(3).forEach { c ->
                                     val isSelected = uiState.selectedColor == c
                                     Box(
                                         modifier = Modifier
-                                            .size(if (isSelected) 26.dp else 22.dp)
-                                            .clip(CircleShape)
+                                            .size(24.dp)
+                                            .clip(RoundedCornerShape(6.dp))
                                             .background(c)
                                             .border(
-                                                if (isSelected) 2.5.dp else 1.dp,
+                                                if (isSelected) 2.dp else 0.5.dp,
                                                 if (isSelected) OrangePrimary else Color.LightGray,
-                                                CircleShape
+                                                RoundedCornerShape(6.dp)
                                             )
-                                            .clickable { viewModel.selectColor(c) }
-                                    )
+                                            .clickable { viewModel.selectColor(c) },
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        if (isSelected) {
+                                            Icon(
+                                                imageVector = Icons.Default.Check,
+                                                contentDescription = "Selected",
+                                                tint = Color.White,
+                                                modifier = Modifier.size(14.dp)
+                                            )
+                                        }
+                                    }
                                 }
 
                                 // Color Picker (+) Button
+                                val isCustomColorActive = uiState.selectedColor !in TouchNotesColors.take(3)
                                 Box(
                                     modifier = Modifier
-                                        .size(22.dp)
+                                        .size(24.dp)
                                         .clip(CircleShape)
-                                        .background(OrangePrimary)
+                                        .background(if (isCustomColorActive) uiState.selectedColor else OrangePrimary)
+                                        .border(
+                                            if (isCustomColorActive) 2.dp else 0.dp,
+                                            if (isCustomColorActive) OrangePrimary else Color.Transparent,
+                                            CircleShape
+                                        )
                                         .clickable { showCustomColorDialog = true },
                                     contentAlignment = Alignment.Center
                                 ) {
@@ -1911,14 +2646,16 @@ fun CanvasScreen(
                             Column(
                                 modifier = Modifier.padding(horizontal = 8.dp, vertical = 12.dp),
                                 horizontalAlignment = Alignment.CenterHorizontally,
-                                verticalArrangement = Arrangement.spacedBy(10.dp)
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
-                                // Drag handle pill
+                                // Drag handle pill (Tap to toggle orientation)
                                 Box(
                                     modifier = Modifier
                                         .width(20.dp)
                                         .height(4.dp)
-                                        .background(Color.LightGray, RoundedCornerShape(2.dp))
+                                        .clip(RoundedCornerShape(2.dp))
+                                        .background(Color.LightGray)
+                                        .clickable { viewModel.toggleDockOrientation() }
                                 )
 
                                 // Fountain Pen
@@ -1955,10 +2692,7 @@ fun CanvasScreen(
                                     onClick = { viewModel.selectTool(CanvasTool.ERASER) }
                                 )
 
-                                // Text Tool [T] — on a vector PDF page with a
-                                // text layer this toggles PDF text selection
-                                // (copy / mark / underline); everywhere else it
-                                // opens the text note editor as before.
+                                // Text Tool [T]
                                 PencaseToolIcon(
                                     icon = Icons.Default.TextFields,
                                     label = "Text",
@@ -1977,9 +2711,15 @@ fun CanvasScreen(
                                 )
 
                                 // Shapes Tool
+                                val shapeIconHoriz = when (uiState.selectedTool) {
+                                    CanvasTool.SHAPE_RECT -> Icons.Default.CropSquare
+                                    CanvasTool.SHAPE_CIRCLE -> Icons.Default.RadioButtonUnchecked
+                                    CanvasTool.SHAPE_LINE -> Icons.Default.Timeline
+                                    else -> Icons.Default.FormatShapes
+                                }
                                 Box {
                                     PencaseToolIcon(
-                                        icon = Icons.Default.FormatShapes,
+                                        icon = shapeIconHoriz,
                                         label = "Shapes",
                                         isSelected = uiState.selectedTool in listOf(
                                             CanvasTool.SHAPE_RECT,
@@ -2025,17 +2765,17 @@ fun CanvasScreen(
                                     label = "Lasso",
                                     isSelected = uiState.selectedTool == CanvasTool.LASSO,
                                     selectedTint = OrangePrimary,
-                                    onClick = { viewModel.selectTool(CanvasTool.LASSO) }
+                                    onClick = selectLassoTool
                                 )
 
-                                // Dock Orientation Toggle
+                                // Collapse Chevron (^)
                                 IconButton(
-                                    onClick = { viewModel.toggleDockOrientation() },
-                                    modifier = Modifier.size(30.dp)
+                                    onClick = { isPencaseCollapsed = true },
+                                    modifier = Modifier.size(28.dp)
                                 ) {
                                     Icon(
-                                        imageVector = Icons.Default.ChangeCircle,
-                                        contentDescription = "Dock Top",
+                                        imageVector = Icons.AutoMirrored.Filled.KeyboardArrowLeft,
+                                        contentDescription = "Collapse Dock",
                                         tint = Color.Gray,
                                         modifier = Modifier.size(16.dp)
                                     )
@@ -2048,26 +2788,37 @@ fun CanvasScreen(
                                     color = Color.LightGray
                                 )
 
-                                // Width Presets (vertical dots)
+                                // 3 Stroke Width Presets (vertical line thickness bars)
                                 val verticalPresets =
                                     if (uiState.selectedTool == CanvasTool.ERASER) TouchNotesEraserPresets
                                     else TouchNotesWidthPresets
                                 val verticalActive = uiState.activeStrokeWidth()
-                                verticalPresets.take(3).forEach { (widthPx, _) ->
+                                verticalPresets.take(3).forEachIndexed { vIdx, (widthPx, _) ->
                                     val isSelected = verticalActive == widthPx
+                                    val barH = when (vIdx) {
+                                        0 -> 2.dp
+                                        1 -> 4.dp
+                                        else -> 6.dp
+                                    }
                                     Box(
                                         modifier = Modifier
-                                            .size(22.dp)
+                                            .size(24.dp)
                                             .clip(CircleShape)
-                                            .background(if (isSelected) OrangePrimary else Color(0xFFF0F0F0))
+                                            .background(if (isSelected) OrangePrimary.copy(alpha = 0.12f) else Color.Transparent)
+                                            .border(
+                                                if (isSelected) 1.5.dp else 0.dp,
+                                                if (isSelected) OrangePrimary else Color.Transparent,
+                                                CircleShape
+                                            )
                                             .clickable { viewModel.setStrokeWidth(widthPx) },
                                         contentAlignment = Alignment.Center
                                     ) {
                                         Box(
                                             modifier = Modifier
-                                                .size((widthPx / 3f).coerceIn(3f, 12f).dp)
-                                                .clip(CircleShape)
-                                                .background(if (isSelected) Color.White else Color.DarkGray)
+                                                .width(13.dp)
+                                                .height(barH)
+                                                .clip(RoundedCornerShape(1.dp))
+                                                .background(if (isSelected) OrangePrimary else Color(0xFF444444))
                                         )
                                     }
                                 }
@@ -2079,29 +2830,45 @@ fun CanvasScreen(
                                     color = Color.LightGray
                                 )
 
-                                // Color Swatches (vertical)
+                                // 3 Rounded-Square Color Swatches with checkmark
                                 TouchNotesColors.take(3).forEach { c ->
                                     val isSelected = uiState.selectedColor == c
                                     Box(
                                         modifier = Modifier
-                                            .size(if (isSelected) 24.dp else 20.dp)
-                                            .clip(CircleShape)
+                                            .size(22.dp)
+                                            .clip(RoundedCornerShape(6.dp))
                                             .background(c)
                                             .border(
-                                                if (isSelected) 2.5.dp else 1.dp,
+                                                if (isSelected) 2.dp else 0.5.dp,
                                                 if (isSelected) OrangePrimary else Color.LightGray,
-                                                CircleShape
+                                                RoundedCornerShape(6.dp)
                                             )
-                                            .clickable { viewModel.selectColor(c) }
-                                    )
+                                            .clickable { viewModel.selectColor(c) },
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        if (isSelected) {
+                                            Icon(
+                                                imageVector = Icons.Default.Check,
+                                                contentDescription = "Selected",
+                                                tint = Color.White,
+                                                modifier = Modifier.size(13.dp)
+                                            )
+                                        }
+                                    }
                                 }
 
                                 // Color Picker (+) Button
+                                val isCustomColorActiveVert = uiState.selectedColor !in TouchNotesColors.take(3)
                                 Box(
                                     modifier = Modifier
-                                        .size(20.dp)
+                                        .size(22.dp)
                                         .clip(CircleShape)
-                                        .background(OrangePrimary)
+                                        .background(if (isCustomColorActiveVert) uiState.selectedColor else OrangePrimary)
+                                        .border(
+                                            if (isCustomColorActiveVert) 2.dp else 0.dp,
+                                            if (isCustomColorActiveVert) OrangePrimary else Color.Transparent,
+                                            CircleShape
+                                        )
                                         .clickable { showCustomColorDialog = true },
                                     contentAlignment = Alignment.Center
                                 ) {
@@ -2120,7 +2887,8 @@ fun CanvasScreen(
                 // ==========================================
                 // 4. FLOATING VERTICAL PAGE STRIP (Right Edge)
                 // ==========================================
-                Surface(
+                if (!uiState.isToolsPanelOpen && !uiState.readingMode) {
+                    Surface(
                     shape = RoundedCornerShape(16.dp),
                     color = Color.White.copy(alpha = 0.95f),
                     shadowElevation = 4.dp,
@@ -2133,24 +2901,40 @@ fun CanvasScreen(
                         modifier = Modifier.padding(vertical = 8.dp, horizontal = 4.dp),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
+                        // Drag handle pill
+                        Box(
+                            modifier = Modifier
+                                .width(14.dp)
+                                .height(3.dp)
+                                .background(Color(0xFFCCCCCC), RoundedCornerShape(1.5.dp))
+                        )
+
+                        Spacer(modifier = Modifier.height(4.dp))
+
                         // Previous Page Arrow
                         IconButton(
                             onClick = {
-                                scope.launch {
-                                    try {
-                                        canvasViewRef?.getBackingBitmap()?.let { bmp ->
-                                            viewModel.saveCurrentPageBitmap(bmp)
+                                if (isContinuous) {
+                                    val target = (currentPageIndex - 1).coerceAtLeast(0)
+                                    viewModel.setCurrentPageIndex(target)
+                                    scrollToContinuousPage(target)
+                                } else {
+                                    scope.launch {
+                                        try {
+                                            canvasViewRef?.getBackingBitmap()?.let { bmp ->
+                                                viewModel.saveCurrentPageBitmap(bmp)
+                                            }
+                                            // Await the layer save (IO) so nothing
+                                            // writes layers while the page switch
+                                            // below reloads them.
+                                            withContext(Dispatchers.IO) {
+                                                canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                                            }
+                                        } catch (e: Exception) { e.printStackTrace() }
+                                        val currentBmp = canvasViewRef?.getBackingBitmap()
+                                        viewModel.previousPage(currentBmp) { newBmp ->
+                                            applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
                                         }
-                                        // Await the layer save (IO) so nothing
-                                        // writes layers while the page switch
-                                        // below reloads them.
-                                        withContext(Dispatchers.IO) {
-                                            canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                                        }
-                                    } catch (e: Exception) { e.printStackTrace() }
-                                    val currentBmp = canvasViewRef?.getBackingBitmap()
-                                    viewModel.previousPage(currentBmp) { newBmp ->
-                                        applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
                                     }
                                 }
                             },
@@ -2165,12 +2949,15 @@ fun CanvasScreen(
                             )
                         }
 
-                        // Current Page Number
+                        // Current Page Number (Clickable to open drawer)
                         Text(
                             text = "${currentPageIndex + 1}",
                             fontSize = 13.sp,
                             fontWeight = FontWeight.Bold,
-                            color = OrangePrimary
+                            color = OrangePrimary,
+                            modifier = Modifier
+                                .clickable { viewModel.toggleThumbnailDrawer(true) }
+                                .padding(horizontal = 4.dp, vertical = 2.dp)
                         )
 
                         Divider(
@@ -2180,31 +2967,40 @@ fun CanvasScreen(
                             color = Color.LightGray
                         )
 
-                        // Total Pages
+                        // Total Pages (Clickable to open drawer)
                         Text(
                             text = "$totalPages",
                             fontSize = 11.sp,
-                            color = Color.Gray
+                            color = Color.Gray,
+                            modifier = Modifier
+                                .clickable { viewModel.toggleThumbnailDrawer(true) }
+                                .padding(horizontal = 4.dp, vertical = 2.dp)
                         )
 
                         // Next Page Arrow
                         IconButton(
                             onClick = {
-                                scope.launch {
-                                    try {
-                                        canvasViewRef?.getBackingBitmap()?.let { bmp ->
-                                            viewModel.saveCurrentPageBitmap(bmp)
+                                if (isContinuous) {
+                                    val target = (currentPageIndex + 1).coerceAtMost(totalPages - 1)
+                                    viewModel.setCurrentPageIndex(target)
+                                    scrollToContinuousPage(target)
+                                } else {
+                                    scope.launch {
+                                        try {
+                                            canvasViewRef?.getBackingBitmap()?.let { bmp ->
+                                                viewModel.saveCurrentPageBitmap(bmp)
+                                            }
+                                            // Await the layer save (IO) so nothing
+                                            // writes layers while the page switch
+                                            // below reloads them.
+                                            withContext(Dispatchers.IO) {
+                                                canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                                            }
+                                        } catch (e: Exception) { e.printStackTrace() }
+                                        val currentBmp = canvasViewRef?.getBackingBitmap()
+                                        viewModel.nextPage(currentBmp) { newBmp ->
+                                            applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
                                         }
-                                        // Await the layer save (IO) so nothing
-                                        // writes layers while the page switch
-                                        // below reloads them.
-                                        withContext(Dispatchers.IO) {
-                                            canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                                        }
-                                    } catch (e: Exception) { e.printStackTrace() }
-                                    val currentBmp = canvasViewRef?.getBackingBitmap()
-                                    viewModel.nextPage(currentBmp) { newBmp ->
-                                        applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
                                     }
                                 }
                             },
@@ -2226,25 +3022,27 @@ fun CanvasScreen(
                             color = Color.LightGray
                         )
 
-                        // Layers / Outline Toggle
+                        // Layers popover toggle inside right-edge capsule
                         IconButton(
-                            onClick = { viewModel.toggleThumbnailDrawer() },
+                            onClick = { showLayersPanel = !showLayersPanel },
                             modifier = Modifier.size(32.dp)
                         ) {
                             Icon(
                                 imageVector = Icons.Default.Layers,
                                 contentDescription = "Layers",
-                                tint = if (uiState.isThumbnailDrawerOpen) OrangePrimary else Color.DarkGray,
+                                tint = if (showLayersPanel) OrangePrimary else Color.DarkGray,
                                 modifier = Modifier.size(18.dp)
                             )
                         }
                     }
                 }
+            }
 
                 // ==========================================
-                // 5. BOTTOM-LEFT FLOATING PAGE JUMPER
+                // 5. BOTTOM-LEFT FLOATING PAGE JUMPER (< | > split pill)
                 // ==========================================
-                Surface(
+                if (totalPages > 1 && !uiState.isThumbnailDrawerOpen && !uiState.readingMode) {
+                    Surface(
                     shape = RoundedCornerShape(16.dp),
                     color = Color.White.copy(alpha = 0.95f),
                     shadowElevation = 3.dp,
@@ -2254,37 +3052,80 @@ fun CanvasScreen(
                         .border(1.dp, Color(0xFFE0E0E0), RoundedCornerShape(16.dp))
                 ) {
                     Row(
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(
-                            text = "<  ${currentPageIndex + 1}  >",
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Medium,
-                            color = Color.DarkGray,
-                            modifier = Modifier
-                                .clickable { viewModel.toggleThumbnailDrawer(true) }
-                                .padding(horizontal = 6.dp, vertical = 2.dp)
-                        )
-                        // Layers panel toggle next to page number
                         IconButton(
-                            onClick = { showLayersPanel = !showLayersPanel },
-                            modifier = Modifier.size(24.dp)
+                            onClick = {
+                                if (isContinuous) {
+                                    val target = (currentPageIndex - 1).coerceAtLeast(0)
+                                    viewModel.setCurrentPageIndex(target)
+                                    scrollToContinuousPage(target)
+                                } else {
+                                    scope.launch {
+                                        canvasViewRef?.getBackingBitmap()?.let { bmp ->
+                                            viewModel.saveCurrentPageBitmap(bmp)
+                                        }
+                                        if (canvasViewRef?.layersDirty == true) {
+                                            withContext(Dispatchers.IO) {
+                                                canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                                            }
+                                        }
+                                        viewModel.previousPage(canvasViewRef?.getBackingBitmap()) { newBmp ->
+                                            applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
+                                        }
+                                    }
+                                }
+                            },
+                            enabled = currentPageIndex > 0,
+                            modifier = Modifier.size(28.dp)
                         ) {
-                            Icon(
-                                imageVector = Icons.Default.Layers,
-                                contentDescription = "Layers",
-                                tint = if (showLayersPanel) OrangePrimary else Color.DarkGray,
-                                modifier = Modifier.size(16.dp)
-                            )
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Previous page", modifier = Modifier.size(14.dp), tint = if (currentPageIndex > 0) Color.DarkGray else Color.LightGray)
+                        }
+
+                        Divider(
+                            modifier = Modifier
+                                .height(16.dp)
+                                .width(1.dp)
+                                .padding(horizontal = 2.dp),
+                            color = Color(0xFFEEEEEE)
+                        )
+
+                        IconButton(
+                            onClick = {
+                                if (isContinuous) {
+                                    val target = (currentPageIndex + 1).coerceAtMost(totalPages - 1)
+                                    viewModel.setCurrentPageIndex(target)
+                                    scrollToContinuousPage(target)
+                                } else {
+                                    scope.launch {
+                                        canvasViewRef?.getBackingBitmap()?.let { bmp ->
+                                            viewModel.saveCurrentPageBitmap(bmp)
+                                        }
+                                        if (canvasViewRef?.layersDirty == true) {
+                                            withContext(Dispatchers.IO) {
+                                                canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                                            }
+                                        }
+                                        viewModel.nextPage(canvasViewRef?.getBackingBitmap()) { newBmp ->
+                                            applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
+                                        }
+                                    }
+                                }
+                            },
+                            enabled = currentPageIndex < totalPages - 1,
+                            modifier = Modifier.size(28.dp)
+                        ) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowForward, contentDescription = "Next page", modifier = Modifier.size(14.dp), tint = if (currentPageIndex < totalPages - 1) Color.DarkGray else Color.LightGray)
                         }
                     }
                 }
+            }
 
                 // ==========================================
                 // 5b. FLOATING PEN BOX
                 // ==========================================
-                if (uiState.penBoxEnabled) {
+                if (uiState.penBoxEnabled && !uiState.readingMode && !uiState.isThumbnailDrawerOpen) {
                     Surface(
                         shape = RoundedCornerShape(16.dp),
                         color = Color.White.copy(alpha = 0.95f),
@@ -2345,43 +3186,6 @@ fun CanvasScreen(
                                     .fillMaxHeight()
                                     .padding(start = 14.dp, top = 16.dp, end = 10.dp, bottom = 16.dp)
                             ) {
-                                // Header: Back to Notes & Close
-                                Row(
-                                    modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.SpaceBetween
-                                ) {
-                                    Row(
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        modifier = Modifier.clickable { saveAndExit() }
-                                    ) {
-                                        Icon(
-                                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                                            contentDescription = "Back",
-                                            tint = Color(0xFF333333),
-                                            modifier = Modifier.size(18.dp)
-                                        )
-                                        Spacer(modifier = Modifier.width(4.dp))
-                                        Text(
-                                            text = "Back",
-                                            fontSize = 13.sp,
-                                            color = Color(0xFF333333),
-                                            fontWeight = FontWeight.Medium
-                                        )
-                                    }
-                                    IconButton(
-                                        onClick = { viewModel.toggleThumbnailDrawer(false) },
-                                        modifier = Modifier.size(28.dp)
-                                    ) {
-                                        Icon(
-                                            imageVector = Icons.Default.Close,
-                                            contentDescription = "Close Menu",
-                                            tint = Color.Gray,
-                                            modifier = Modifier.size(18.dp)
-                                        )
-                                    }
-                                }
-
                                 when (uiState.drawerTab) {
                                     DrawerTab.THUMBNAILS -> {
                                         // Header
@@ -2398,9 +3202,18 @@ fun CanvasScreen(
                                             )
                                             IconButton(
                                                 onClick = {
-                                                    val currentBmp = canvasViewRef?.getBackingBitmap()
-                                                    viewModel.addNewPage(currentBmp) { newBmp ->
-                                                        applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
+                                                    scope.launch {
+                                                        if (isContinuous) {
+                                                            inkController.flushCurrentSuspend()
+                                                        }
+                                                        val currentBmp = if (isContinuous) null else canvasViewRef?.getBackingBitmap()
+                                                        viewModel.addNewPage(currentBmp) { newBmp ->
+                                                            if (!isContinuous) {
+                                                                applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
+                                                            } else {
+                                                                scrollToContinuousPage(viewModel.currentPageIndex.value)
+                                                            }
+                                                        }
                                                     }
                                                 },
                                                 modifier = Modifier.size(32.dp)
@@ -2427,9 +3240,21 @@ fun CanvasScreen(
                                                         .fillMaxWidth()
                                                         .clickable {
                                                             if (pageItem.index != currentPageIndex) {
-                                                                val currentBmp = canvasViewRef?.getBackingBitmap()
-                                                                viewModel.goToPage(pageItem.index, currentBmp) { newBmp ->
-                                                                    applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
+                                                                if (isContinuous) {
+                                                                    viewModel.setCurrentPageIndex(pageItem.index)
+                                                                    scrollToContinuousPage(pageItem.index)
+                                                                } else {
+                                                                    scope.launch {
+                                                                        if (canvasViewRef?.layersDirty == true) {
+                                                                            withContext(Dispatchers.IO) {
+                                                                                canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                                                                            }
+                                                                        }
+                                                                        val currentBmp = canvasViewRef?.getBackingBitmap()
+                                                                        viewModel.goToPage(pageItem.index, currentBmp) { newBmp ->
+                                                                            applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
+                                                                        }
+                                                                    }
                                                                 }
                                                             }
                                                             viewModel.toggleThumbnailDrawer(false)
@@ -2440,55 +3265,20 @@ fun CanvasScreen(
                                                     ),
                                                     border = if (isSelected) androidx.compose.foundation.BorderStroke(2.dp, OrangePrimary) else androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFE0E0E0))
                                                 ) {
-                                                    Column(modifier = Modifier.padding(8.dp)) {
-                                                        Row(
-                                                            modifier = Modifier.fillMaxWidth(),
-                                                            horizontalArrangement = Arrangement.SpaceBetween,
-                                                            verticalAlignment = Alignment.CenterVertically
-                                                        ) {
-                                                            IconButton(
-                                                                onClick = { viewModel.toggleBookmark(pageItem.index) },
-                                                                modifier = Modifier.size(24.dp)
-                                                            ) {
-                                                                Icon(
-                                                                    imageVector = if (isBookmarked) Icons.Default.Bookmark else Icons.Default.BookmarkBorder,
-                                                                    contentDescription = if (isBookmarked) "Remove Bookmark" else "Bookmark",
-                                                                    tint = if (isBookmarked) OrangePrimary else Color.Gray,
-                                                                    modifier = Modifier.size(16.dp)
-                                                                )
-                                                            }
-                                                            Text(
-                                                                text = "${pageItem.index + 1}",
-                                                                fontSize = 13.sp,
-                                                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
-                                                                color = if (isSelected) OrangePrimary else Color.DarkGray
-                                                            )
-                                                            Icon(
-                                                                imageVector = Icons.Default.MoreVert,
-                                                                contentDescription = "More",
-                                                                tint = Color.Gray,
-                                                                modifier = Modifier.size(16.dp)
-                                                            )
+                                                PageThumbnailCard(
+                                                        noteId = viewModel.noteId,
+                                                        fileStore = viewModel.fileStore,
+                                                        pageItem = pageItem,
+                                                        pdfDocCache = pdfDocCache,
+                                                        isSelected = isSelected,
+                                                        isBookmarked = isBookmarked,
+                                                        totalPages = totalPages,
+                                                        savedGeneration = savedPageGenerations[pageItem.index] ?: 0,
+                                                        onToggleBookmark = { viewModel.toggleBookmark(pageItem.index) },
+                                                        onDeletePage = {
+                                                            pageToDeleteIndex = pageItem.index
                                                         }
-
-                                                        Spacer(modifier = Modifier.height(4.dp))
-
-                                                        // Page paper thumbnail representation
-                                                        Box(
-                                                            modifier = Modifier
-                                                                .fillMaxWidth()
-                                                                .height(110.dp)
-                                                                .background(Color.White, RoundedCornerShape(4.dp))
-                                                                .border(0.5.dp, Color(0xFFEAEAEA), RoundedCornerShape(4.dp)),
-                                                            contentAlignment = Alignment.Center
-                                                        ) {
-                                                            Text(
-                                                                text = "Page ${pageItem.index + 1}",
-                                                                fontSize = 12.sp,
-                                                                color = Color.LightGray
-                                                            )
-                                                        }
-                                                    }
+                                                    )
                                                 }
                                             }
                                         }
@@ -2554,9 +3344,21 @@ fun CanvasScreen(
                                                             .fillMaxWidth()
                                                             .clickable {
                                                                 if (pageItem.index != currentPageIndex) {
-                                                                    val currentBmp = canvasViewRef?.getBackingBitmap()
-                                                                    viewModel.goToPage(pageItem.index, currentBmp) { newBmp ->
-                                                                        applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
+                                                                    if (isContinuous) {
+                                                                        viewModel.setCurrentPageIndex(pageItem.index)
+                                                                        scrollToContinuousPage(pageItem.index)
+                                                                    } else {
+                                                                        scope.launch {
+                                                                            if (canvasViewRef?.layersDirty == true) {
+                                                                                withContext(Dispatchers.IO) {
+                                                                                    canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                                                                                }
+                                                                            }
+                                                                            val currentBmp = canvasViewRef?.getBackingBitmap()
+                                                                            viewModel.goToPage(pageItem.index, currentBmp) { newBmp ->
+                                                                                applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
+                                                                            }
+                                                                        }
                                                                     }
                                                                 }
                                                                 viewModel.toggleThumbnailDrawer(false)
@@ -2567,49 +3369,20 @@ fun CanvasScreen(
                                                         ),
                                                         border = if (isSelected) androidx.compose.foundation.BorderStroke(2.dp, OrangePrimary) else androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFE0E0E0))
                                                     ) {
-                                                        Column(modifier = Modifier.padding(8.dp)) {
-                                                            Row(
-                                                                modifier = Modifier.fillMaxWidth(),
-                                                                horizontalArrangement = Arrangement.SpaceBetween,
-                                                                verticalAlignment = Alignment.CenterVertically
-                                                            ) {
-                                                                IconButton(
-                                                                    onClick = { viewModel.toggleBookmark(pageItem.index) },
-                                                                    modifier = Modifier.size(24.dp)
-                                                                ) {
-                                                                    Icon(
-                                                                        imageVector = Icons.Default.Bookmark,
-                                                                        contentDescription = "Remove Bookmark",
-                                                                        tint = OrangePrimary,
-                                                                        modifier = Modifier.size(16.dp)
-                                                                    )
-                                                                }
-                                                                Text(
-                                                                    text = "Page ${pageItem.index + 1}",
-                                                                    fontSize = 13.sp,
-                                                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
-                                                                    color = if (isSelected) OrangePrimary else Color.DarkGray
-                                                                )
-                                                                Spacer(modifier = Modifier.width(16.dp))
+                                                        PageThumbnailCard(
+                                                            noteId = viewModel.noteId,
+                                                            fileStore = viewModel.fileStore,
+                                                            pageItem = pageItem,
+                                                            pdfDocCache = pdfDocCache,
+                                                            isSelected = isSelected,
+                                                            isBookmarked = true,
+                                                            totalPages = totalPages,
+                                                            savedGeneration = savedPageGenerations[pageItem.index] ?: 0,
+                                                            onToggleBookmark = { viewModel.toggleBookmark(pageItem.index) },
+                                                            onDeletePage = {
+                                                                pageToDeleteIndex = pageItem.index
                                                             }
-
-                                                            Spacer(modifier = Modifier.height(4.dp))
-
-                                                            Box(
-                                                                modifier = Modifier
-                                                                    .fillMaxWidth()
-                                                                    .height(100.dp)
-                                                                    .background(Color.White, RoundedCornerShape(4.dp))
-                                                                    .border(0.5.dp, Color(0xFFEAEAEA), RoundedCornerShape(4.dp)),
-                                                                contentAlignment = Alignment.Center
-                                                            ) {
-                                                                Text(
-                                                                    text = "Page ${pageItem.index + 1}",
-                                                                    fontSize = 12.sp,
-                                                                    color = Color.LightGray
-                                                                )
-                                                            }
-                                                        }
+                                                        )
                                                     }
                                                 }
                                             }
@@ -2694,9 +3467,21 @@ fun CanvasScreen(
                                                             .fillMaxWidth()
                                                             .clickable {
                                                                 if (tocEntry.pageIndex != currentPageIndex) {
-                                                                    val currentBmp = canvasViewRef?.getBackingBitmap()
-                                                                    viewModel.goToPage(tocEntry.pageIndex, currentBmp) { newBmp ->
-                                                                        applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
+                                                                    if (isContinuous) {
+                                                                        viewModel.setCurrentPageIndex(tocEntry.pageIndex)
+                                                                        scrollToContinuousPage(tocEntry.pageIndex)
+                                                                    } else {
+                                                                        scope.launch {
+                                                                            if (canvasViewRef?.layersDirty == true) {
+                                                                                withContext(Dispatchers.IO) {
+                                                                                    canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                                                                                }
+                                                                            }
+                                                                            val currentBmp = canvasViewRef?.getBackingBitmap()
+                                                                            viewModel.goToPage(tocEntry.pageIndex, currentBmp) { newBmp ->
+                                                                                applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
+                                                                            }
+                                                                        }
                                                                     }
                                                                 }
                                                                 viewModel.toggleThumbnailDrawer(false)
@@ -2913,6 +3698,15 @@ fun CanvasScreen(
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .height(42.dp)
+                                        .clip(RoundedCornerShape(16.dp))
+                                        .clickable {
+                                            if (onSettingsClick != null) {
+                                                viewModel.toggleToolsPanel(false)
+                                                onSettingsClick()
+                                            } else {
+                                                android.widget.Toast.makeText(context, "Settings accessible from Note List", android.widget.Toast.LENGTH_SHORT).show()
+                                            }
+                                        }
                                 ) {
                                     Row(
                                         modifier = Modifier
@@ -2944,63 +3738,185 @@ fun CanvasScreen(
                                 ) {
                                     when (uiState.activeToolsTab) {
                                         0 -> {
-                                            // TOOLS TAB
-                                            Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                                            // TOOLS TAB (Grouped cards matching TouchNotes Screenshot_20261107-132752)
+                                            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                                                 // Productivity Integration
                                                 Text("Productivity Integration", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = Color.Gray)
-                                                ToolsPanelItem(Icons.Default.Category, "Web Excerpt") { /* Web excerpt */ }
-                                                ToolsPanelItem(Icons.Default.Category, "Open in CardsMind") { /* CardsMind */ }
+                                                Surface(
+                                                    shape = RoundedCornerShape(12.dp),
+                                                    color = Color(0xFFFBFBFB),
+                                                    border = BorderStroke(1.dp, Color(0xFFEBEBEB)),
+                                                    modifier = Modifier.fillMaxWidth()
+                                                ) {
+                                                    Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 2.dp)) {
+                                                        ToolsPanelItem(Icons.Default.Language, "Web Excerpt") {
+                                                            android.widget.Toast.makeText(context, "Web Excerpt: Share text or images directly to this note from browser or any app", android.widget.Toast.LENGTH_SHORT).show()
+                                                        }
+                                                        Divider(color = Color(0xFFEEEEEE), thickness = 0.5.dp)
+                                                        ToolsPanelItem(Icons.Default.AccountTree, "Open in CardsMind") {
+                                                            viewModel.toggleThumbnailDrawer(true)
+                                                            viewModel.setDrawerTab(DrawerTab.OUTLINE)
+                                                            viewModel.toggleToolsPanel(false)
+                                                        }
+                                                    }
+                                                }
 
                                                 // Add Section
                                                 Text("Add", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = Color.Gray)
-                                                ToolsPanelItem(Icons.Default.Image, "Image") {
-                                                    imagePickerLauncher.launch("image/*")
-                                                    viewModel.toggleToolsPanel(false)
+                                                Surface(
+                                                    shape = RoundedCornerShape(12.dp),
+                                                    color = Color(0xFFFBFBFB),
+                                                    border = BorderStroke(1.dp, Color(0xFFEBEBEB)),
+                                                    modifier = Modifier.fillMaxWidth()
+                                                ) {
+                                                    Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 2.dp)) {
+                                                        ToolsPanelItem(Icons.Default.Image, "Image") {
+                                                            imagePickerLauncher.launch("image/*")
+                                                            viewModel.toggleToolsPanel(false)
+                                                        }
+                                                        Divider(color = Color(0xFFEEEEEE), thickness = 0.5.dp)
+                                                        ToolsPanelItem(Icons.Default.Description, "Import PDF") {
+                                                            scope.launch {
+                                                                if (!isContinuous) {
+                                                                    canvasViewRef?.getBackingBitmap()?.let { bmp ->
+                                                                        viewModel.saveCurrentPageBitmap(bmp)
+                                                                    }
+                                                                } else {
+                                                                    inkController.flushCurrentSuspend()
+                                                                }
+                                                                pdfPickerLauncher.launch(arrayOf("application/pdf"))
+                                                                viewModel.toggleToolsPanel(false)
+                                                            }
+                                                        }
+                                                        Divider(color = Color(0xFFEEEEEE), thickness = 0.5.dp)
+                                                        ToolsPanelItem(Icons.Default.EmojiEmotions, "Sticker") {
+                                                            scope.launch {
+                                                                insertLayerInCurrentNote { it.addTextBlock("★") }
+                                                                viewModel.toggleToolsPanel(false)
+                                                            }
+                                                        }
+                                                        Divider(color = Color(0xFFEEEEEE), thickness = 0.5.dp)
+                                                        ToolsPanelItem(Icons.Default.Timeline, "Add Mind Map") {
+                                                            scope.launch {
+                                                                insertLayerInCurrentNote { it.addTextBlock("○ Central Topic\n  ├ Idea 1\n  └ Idea 2") }
+                                                                viewModel.toggleToolsPanel(false)
+                                                            }
+                                                        }
+                                                        Divider(color = Color(0xFFEEEEEE), thickness = 0.5.dp)
+                                                        ToolsPanelItem(Icons.Default.Style, "Flashcard") {
+                                                            viewModel.toggleToolsPanel(false)
+                                                            onFlashcardsClick?.invoke()
+                                                        }
+                                                    }
                                                 }
-                                                ToolsPanelItem(Icons.Default.Description, "Import PDF") {
-                                                    pdfPickerLauncher.launch(arrayOf("application/pdf"))
-                                                    viewModel.toggleToolsPanel(false)
-                                                }
-                                                ToolsPanelItem(Icons.Default.Category, "Sticker") { /* Sticker */ }
-                                                ToolsPanelItem(Icons.Default.Timeline, "Add Mind Map") { /* MindMap */ }
-                                                ToolsPanelItem(Icons.Default.Category, "Flashcard") { /* Flashcard */ }
 
                                                 // Page Section
                                                 Text("Page", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = Color.Gray)
-                                                ToolsPanelItem(Icons.Default.Add, "Add Page") {
-                                                    val currentBmp = canvasViewRef?.getBackingBitmap()
-                                                    viewModel.addNewPage(currentBmp) { newBmp ->
-                                                        applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
+                                                Surface(
+                                                    shape = RoundedCornerShape(12.dp),
+                                                    color = Color(0xFFFBFBFB),
+                                                    border = BorderStroke(1.dp, Color(0xFFEBEBEB)),
+                                                    modifier = Modifier.fillMaxWidth()
+                                                ) {
+                                                    Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 2.dp)) {
+                                                        ToolsPanelItem(Icons.Default.Add, "Add Page") {
+                                                            scope.launch {
+                                                                if (isContinuous) {
+                                                                    inkController.flushCurrentSuspend()
+                                                                }
+                                                                val currentBmp = if (isContinuous) null else canvasViewRef?.getBackingBitmap()
+                                                                viewModel.addNewPage(currentBmp) { newBmp ->
+                                                                    if (!isContinuous) {
+                                                                        applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
+                                                                    } else {
+                                                                        scrollToContinuousPage(viewModel.currentPageIndex.value)
+                                                                    }
+                                                                }
+                                                            }
+                                                            viewModel.toggleToolsPanel(false)
+                                                        }
+                                                        Divider(color = Color(0xFFEEEEEE), thickness = 0.5.dp)
+                                                        ToolsPanelItem(Icons.Default.GridOn, "Template (${uiState.paperPattern.name})") {
+                                                            val nextPattern = when (uiState.paperPattern) {
+                                                                PaperPattern.BLANK -> PaperPattern.GRID
+                                                                PaperPattern.GRID -> PaperPattern.LINES
+                                                                PaperPattern.LINES -> PaperPattern.DOTTED
+                                                                PaperPattern.DOTTED -> PaperPattern.BLANK
+                                                            }
+                                                            viewModel.setPaperPattern(nextPattern)
+                                                            android.widget.Toast.makeText(context, "Paper pattern: ${nextPattern.name}", android.widget.Toast.LENGTH_SHORT).show()
+                                                        }
+                                                        Divider(color = Color(0xFFEEEEEE), thickness = 0.5.dp)
+                                                        ToolsPanelItem(Icons.Default.Layers, "Layer") {
+                                                            showLayersPanel = true
+                                                            viewModel.toggleToolsPanel(false)
+                                                        }
                                                     }
-                                                    viewModel.toggleToolsPanel(false)
-                                                }
-                                                ToolsPanelItem(Icons.Default.GridOn, "Template (Paper Pattern)") {
-                                                    val nextPattern = when (uiState.paperPattern) {
-                                                        PaperPattern.BLANK -> PaperPattern.GRID
-                                                        PaperPattern.GRID -> PaperPattern.LINES
-                                                        PaperPattern.LINES -> PaperPattern.DOTTED
-                                                        PaperPattern.DOTTED -> PaperPattern.BLANK
-                                                    }
-                                                    viewModel.setPaperPattern(nextPattern)
                                                 }
 
                                                 // Write Section
                                                 Text("Write", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = Color.Gray)
-                                                ToolsPanelItem(Icons.Default.Brush, "Zoom Write") { /* Zoom write */ }
-                                                ToolsPanelItem(Icons.Default.AutoFixHigh, "Auto Recognition") { /* OCR */ }
-                                                ToolsPanelItem(Icons.Default.Timeline, "Laser Pointer") { /* Pointer */ }
+                                                Surface(
+                                                    shape = RoundedCornerShape(12.dp),
+                                                    color = Color(0xFFFBFBFB),
+                                                    border = BorderStroke(1.dp, Color(0xFFEBEBEB)),
+                                                    modifier = Modifier.fillMaxWidth()
+                                                ) {
+                                                    Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 2.dp)) {
+                                                        ToolsPanelItem(Icons.Default.Brush, "Zoom Write") {
+                                                            if (isContinuous) {
+                                                                continuousScale = 2.0f
+                                                            } else {
+                                                                canvasViewRef?.setZoomScale(2.0f)
+                                                            }
+                                                            viewModel.toggleToolsPanel(false)
+                                                            android.widget.Toast.makeText(context, "Zoom Write: 200% detail view", android.widget.Toast.LENGTH_SHORT).show()
+                                                        }
+                                                        Divider(color = Color(0xFFEEEEEE), thickness = 0.5.dp)
+                                                        ToolsPanelItem(Icons.Default.AutoFixHigh, "Auto Recognition") {
+                                                            viewModel.toggleAutoShape()
+                                                            android.widget.Toast.makeText(
+                                                                context,
+                                                                if (!uiState.autoShapeEnabled) "Auto shape recognition enabled" else "Auto shape recognition disabled",
+                                                                android.widget.Toast.LENGTH_SHORT
+                                                            ).show()
+                                                        }
+                                                        Divider(color = Color(0xFFEEEEEE), thickness = 0.5.dp)
+                                                        ToolsPanelItem(Icons.Default.Highlight, "Laser Pointer") {
+                                                            viewModel.selectTool(CanvasTool.HIGHLIGHTER)
+                                                            viewModel.toggleToolsPanel(false)
+                                                            android.widget.Toast.makeText(context, "Highlighter pointer active", android.widget.Toast.LENGTH_SHORT).show()
+                                                        }
+                                                    }
+                                                }
 
                                                 // Other Section
                                                 Text("Other", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = Color.Gray)
-                                                ToolsPanelItem(Icons.Default.Save, "Save Note") {
-                                                    canvasViewRef?.getBackingBitmap()?.let { bmp ->
-                                                        viewModel.saveCurrentPageBitmap(bmp)
+                                                Surface(
+                                                    shape = RoundedCornerShape(12.dp),
+                                                    color = Color(0xFFFBFBFB),
+                                                    border = BorderStroke(1.dp, Color(0xFFEBEBEB)),
+                                                    modifier = Modifier.fillMaxWidth()
+                                                ) {
+                                                    Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 2.dp)) {
+                                                        ToolsPanelItem(Icons.Default.Fullscreen, "FullScreen (Reading Mode)") {
+                                                            viewModel.toggleReadingMode(true)
+                                                            viewModel.toggleToolsPanel(false)
+                                                        }
+                                                        Divider(color = Color(0xFFEEEEEE), thickness = 0.5.dp)
+                                                        ToolsPanelItem(Icons.Default.Save, "Save Note") {
+                                                            scope.launch {
+                                                                flushCurrentNote()
+                                                                viewModel.toggleToolsPanel(false)
+                                                                android.widget.Toast.makeText(context, "Note saved", android.widget.Toast.LENGTH_SHORT).show()
+                                                            }
+                                                        }
+                                                        Divider(color = Color(0xFFEEEEEE), thickness = 0.5.dp)
+                                                        ToolsPanelItem(Icons.Default.Delete, "Clear Canvas") {
+                                                            showClearDialog = true
+                                                            viewModel.toggleToolsPanel(false)
+                                                        }
                                                     }
-                                                    viewModel.toggleToolsPanel(false)
-                                                }
-                                                ToolsPanelItem(Icons.Default.Delete, "Clear Canvas") {
-                                                    showClearDialog = true
-                                                    viewModel.toggleToolsPanel(false)
                                                 }
                                             }
                                         }
@@ -3009,36 +3925,42 @@ fun CanvasScreen(
                                             Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
                                                 Text("Document Export", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color.Gray)
                                                 ToolsPanelItem(Icons.Default.Description, "Export as Multi-Page PDF") {
-                                                    canvasViewRef?.getBackingBitmap()?.let { bmp ->
-                                                        viewModel.saveCurrentPageBitmap(bmp)
+                                                    scope.launch {
+                                                        flushCurrentNote()
+                                                        selectedExportTarget = personal.notes.touch.ui.export.ExportTarget.PDF
+                                                        showExportDialog = true
+                                                        viewModel.toggleToolsPanel(false)
                                                     }
-                                                    showExportDialog = true
-                                                    viewModel.toggleToolsPanel(false)
                                                 }
                                                 ToolsPanelItem(Icons.Default.Image, "Export Current Page as PNG") {
-                                                    canvasViewRef?.getBackingBitmap()?.let { bmp ->
-                                                        viewModel.saveCurrentPageBitmap(bmp)
+                                                    scope.launch {
+                                                        flushCurrentNote()
+                                                        selectedExportTarget = personal.notes.touch.ui.export.ExportTarget.PNG_CURRENT_PAGE
+                                                        showExportDialog = true
+                                                        viewModel.toggleToolsPanel(false)
                                                     }
-                                                    showExportDialog = true
-                                                    viewModel.toggleToolsPanel(false)
                                                 }
                                                 ToolsPanelItem(Icons.Default.TextFields, "Export Plain Text / Markdown") {
-                                                    showExportDialog = true
-                                                    viewModel.toggleToolsPanel(false)
+                                                    scope.launch {
+                                                        flushCurrentNote()
+                                                        selectedExportTarget = personal.notes.touch.ui.export.ExportTarget.MARKDOWN
+                                                        showExportDialog = true
+                                                        viewModel.toggleToolsPanel(false)
+                                                    }
                                                 }
                                                 ToolsPanelItem(Icons.Default.Share, "Share via Android Sheet") {
-                                                    showExportDialog = true
-                                                    viewModel.toggleToolsPanel(false)
+                                                    scope.launch {
+                                                        flushCurrentNote()
+                                                        selectedExportTarget = null
+                                                        showExportDialog = true
+                                                        viewModel.toggleToolsPanel(false)
+                                                    }
                                                 }
                                             }
                                         }
                                         2 -> {
                                             // SETTINGS TAB (1-to-1 match with TouchNotes Screenshot_20261107-133240)
-                                            var showTabsState by remember { mutableStateOf(true) }
-                                            var fixPreviewPageState by remember { mutableStateOf(false) }
-                                            var penToolState by remember { mutableStateOf(true) }
-
-                                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                                 // 1. Stylus Mode
                                                 SettingsCheckboxRow(
                                                     title = "Stylus Mode",
@@ -3064,11 +3986,8 @@ fun CanvasScreen(
                                                 SettingsCheckboxRow(
                                                     title = "Pen-Tool",
                                                     subtitle = "",
-                                                    checked = penToolState,
-                                                    onCheckedChange = {
-                                                        penToolState = it
-                                                        viewModel.toggleShowPencase(it)
-                                                    }
+                                                    checked = uiState.penBoxEnabled,
+                                                    onCheckedChange = { viewModel.togglePenBox(it) }
                                                 )
                                                 // 5. Reading Mode
                                                 SettingsCheckboxRow(
@@ -3082,22 +4001,22 @@ fun CanvasScreen(
                                                     title = "Show tabs",
                                                     subtitle = "",
                                                     checked = showTabsState,
-                                                    onCheckedChange = { showTabsState = it }
+                                                    onCheckedChange = { viewModel.setShowTabs(it) }
                                                 )
                                                 // 7. Fix preview page
                                                 SettingsCheckboxRow(
                                                     title = "Fix preview page",
                                                     subtitle = "",
                                                     checked = fixPreviewPageState,
-                                                    onCheckedChange = { fixPreviewPageState = it }
+                                                    onCheckedChange = { viewModel.setFixPreviewPage(it) }
                                                 )
 
-                                                Spacer(modifier = Modifier.height(6.dp))
+                                                Spacer(modifier = Modifier.height(4.dp))
 
                                                 // 8. PAGE TURNING DIRECTION
                                                 Text(
                                                     text = "Page Turning Direction",
-                                                    fontSize = 14.sp,
+                                                    fontSize = 13.sp,
                                                     fontWeight = FontWeight.Normal,
                                                     color = Color(0xFF333333),
                                                     textAlign = TextAlign.Center,
@@ -3108,9 +4027,9 @@ fun CanvasScreen(
                                                 Box(
                                                     modifier = Modifier
                                                         .fillMaxWidth()
-                                                        .height(36.dp)
-                                                        .clip(RoundedCornerShape(18.dp))
-                                                        .border(1.5.dp, OrangePrimary, RoundedCornerShape(18.dp))
+                                                        .height(32.dp)
+                                                        .clip(RoundedCornerShape(16.dp))
+                                                        .border(1.5.dp, OrangePrimary, RoundedCornerShape(16.dp))
                                                 ) {
                                                     Row(modifier = Modifier.fillMaxSize()) {
                                                         // Vertical button (left half)
@@ -3124,7 +4043,7 @@ fun CanvasScreen(
                                                         ) {
                                                             Text(
                                                                 text = "Vertical",
-                                                                fontSize = 13.sp,
+                                                                fontSize = 12.sp,
                                                                 fontWeight = if (isVert) FontWeight.Bold else FontWeight.Normal,
                                                                 color = if (isVert) Color.White else OrangePrimary
                                                             )
@@ -3140,7 +4059,7 @@ fun CanvasScreen(
                                                         ) {
                                                             Text(
                                                                 text = "Horizontal",
-                                                                fontSize = 13.sp,
+                                                                fontSize = 12.sp,
                                                                 fontWeight = if (!isVert) FontWeight.Bold else FontWeight.Normal,
                                                                 color = if (!isVert) Color.White else OrangePrimary
                                                             )
@@ -3148,7 +4067,7 @@ fun CanvasScreen(
                                                     }
                                                 }
 
-                                                Spacer(modifier = Modifier.height(8.dp))
+                                                Spacer(modifier = Modifier.height(6.dp))
 
                                                 // 9. PAGE TURNING MODE
                                                 val isInfiniteNote = (note?.pageType ?: "infinite") == "infinite"
@@ -3157,7 +4076,7 @@ fun CanvasScreen(
 
                                                 Text(
                                                     text = "Page Turning Mode",
-                                                    fontSize = 14.sp,
+                                                    fontSize = 13.sp,
                                                     fontWeight = FontWeight.Normal,
                                                     color = Color(0xFF333333),
                                                     textAlign = TextAlign.Center,
@@ -3167,9 +4086,9 @@ fun CanvasScreen(
                                                 Box(
                                                     modifier = Modifier
                                                         .fillMaxWidth()
-                                                        .height(36.dp)
-                                                        .clip(RoundedCornerShape(18.dp))
-                                                        .border(1.5.dp, OrangePrimary, RoundedCornerShape(18.dp))
+                                                        .height(32.dp)
+                                                        .clip(RoundedCornerShape(16.dp))
+                                                        .border(1.5.dp, OrangePrimary, RoundedCornerShape(16.dp))
                                                 ) {
                                                     Row(modifier = Modifier.fillMaxSize()) {
                                                         // Continuous button (left half)
@@ -3180,17 +4099,26 @@ fun CanvasScreen(
                                                                 .background(if (isContinuousMode) OrangePrimary else Color.White)
                                                                 .clickable(enabled = !isInfiniteNote) {
                                                                     if (!isContinuousMode) {
-                                                                        canvasViewRef?.getBackingBitmap()?.let { bmp ->
-                                                                            viewModel.saveCurrentPageBitmap(bmp)
+                                                                        scope.launch {
+                                                                            canvasViewRef?.getBackingBitmap()?.let { bmp ->
+                                                                                viewModel.saveCurrentPageBitmapDirect(bmp, force = true)
+                                                                            }
+                                                                            if (canvasViewRef?.layersDirty == true) {
+                                                                                withContext(Dispatchers.IO) {
+                                                                                    canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                                                                                }
+                                                                            }
+                                                                            viewModel.setPageTurningMode(0)
+                                                                            val cur = viewModel.currentPageIndex.value
+                                                                            savedPageGenerations[cur] = (savedPageGenerations[cur] ?: 0) + 1
                                                                         }
-                                                                        viewModel.setPageTurningMode(0)
                                                                     }
                                                                 },
                                                             contentAlignment = Alignment.Center
                                                         ) {
                                                             Text(
                                                                 text = "Continuous",
-                                                                fontSize = 13.sp,
+                                                                fontSize = 12.sp,
                                                                 fontWeight = if (isContinuousMode) FontWeight.Bold else FontWeight.Normal,
                                                                 color = if (isInfiniteNote) Color.LightGray else if (isContinuousMode) Color.White else OrangePrimary
                                                             )
@@ -3203,19 +4131,24 @@ fun CanvasScreen(
                                                                 .background(if (isSingleMode) OrangePrimary else Color.White)
                                                                 .clickable {
                                                                     if (!isSingleMode) {
-                                                                        val targetIdx = (if (uiState.pageTurningDirection == 1) continuousRowState.firstVisibleItemIndex else continuousColState.firstVisibleItemIndex)
-                                                                            .coerceIn(0, (pages.size - 1).coerceAtLeast(0))
+                                                                        val targetIdx = (if (uiState.pageTurningDirection == 1) {
+                                                                            continuousRowState.firstVisibleItemIndex
+                                                                        } else if (uiState.doublePageMode) {
+                                                                            val pairIdx = continuousColState.firstVisibleItemIndex
+                                                                            val first = pairIdx * 2
+                                                                            if (currentPageIndex == first || currentPageIndex == first + 1) currentPageIndex else first
+                                                                        } else {
+                                                                            continuousColState.firstVisibleItemIndex
+                                                                        }).coerceIn(0, (pages.size - 1).coerceAtLeast(0))
+                                                                        viewModel.setCurrentPageIndex(targetIdx)
                                                                         viewModel.setPageTurningMode(1)
-                                                                        viewModel.goToPage(targetIdx, null, forceReload = true) { newBmp ->
-                                                                            applyLoadedPage(targetIdx, newBmp)
-                                                                        }
                                                                     }
                                                                 },
                                                             contentAlignment = Alignment.Center
                                                         ) {
                                                             Text(
                                                                 text = "Single",
-                                                                fontSize = 13.sp,
+                                                                fontSize = 12.sp,
                                                                 fontWeight = if (isSingleMode) FontWeight.Bold else FontWeight.Normal,
                                                                 color = if (isSingleMode) Color.White else OrangePrimary
                                                             )
@@ -3230,70 +4163,79 @@ fun CanvasScreen(
                                                         textAlign = TextAlign.Center,
                                                         modifier = Modifier
                                                             .fillMaxWidth()
-                                                            .padding(top = 2.dp)
+                                                            .padding(top = 1.dp)
                                                     )
                                                 }
 
-                                                Spacer(modifier = Modifier.height(8.dp))
+                                                Spacer(modifier = Modifier.height(6.dp))
 
                                                 // 10. Horizontal Move Resistance
                                                 Text(
                                                     text = "Horizontal Move Resistance(Double click for centering)",
-                                                    fontSize = 13.sp,
+                                                    fontSize = 12.sp,
                                                     fontWeight = FontWeight.Normal,
                                                     color = Color(0xFF222222)
                                                 )
-                                                var resistanceVal by remember { mutableFloatStateOf(0.4f) }
                                                 Slider(
-                                                    value = resistanceVal,
-                                                    onValueChange = { resistanceVal = it },
+                                                    value = horizontalResistance,
+                                                    onValueChange = { viewModel.setHorizontalResistance(it) },
                                                     colors = SliderDefaults.colors(
                                                         thumbColor = OrangePrimary,
                                                         activeTrackColor = OrangePrimary,
                                                         inactiveTrackColor = Color(0xFFEEEEEE)
                                                     ),
-                                                    modifier = Modifier.height(28.dp)
+                                                    modifier = Modifier.height(24.dp)
                                                 )
 
-                                                Spacer(modifier = Modifier.height(6.dp))
+                                                Spacer(modifier = Modifier.height(4.dp))
 
                                                 // 11. Minimal Zoom of Infinite
-                                                var zoomVal by remember { mutableFloatStateOf(0.20f) }
                                                 Text(
-                                                    text = "Minimal Zoom of Infinite: ${(zoomVal * 100).toInt()}%",
-                                                    fontSize = 13.sp,
+                                                    text = "Minimal Zoom of Infinite: ${(minimalInfiniteZoom * 100).toInt()}%",
+                                                    fontSize = 12.sp,
                                                     fontWeight = FontWeight.Normal,
                                                     color = Color(0xFF222222)
                                                 )
                                                 Slider(
-                                                    value = zoomVal,
-                                                    onValueChange = { zoomVal = it },
+                                                    value = minimalInfiniteZoom,
+                                                    onValueChange = { viewModel.setMinimalInfiniteZoom(it) },
                                                     valueRange = 0.05f..1.0f,
                                                     colors = SliderDefaults.colors(
                                                         thumbColor = OrangePrimary,
                                                         activeTrackColor = OrangePrimary,
                                                         inactiveTrackColor = Color(0xFFEEEEEE)
                                                     ),
-                                                    modifier = Modifier.height(28.dp)
+                                                    modifier = Modifier.height(24.dp)
                                                 )
                                             }
                                         }
                                         3 -> {
-                                            // MANAGER TAB
-                                            Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                                                Text("Note Manager", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color.Gray)
-                                                ToolsPanelItem(Icons.Default.Edit, "Rename Note") {
-                                                    newTitleText = note?.title ?: ""
-                                                    showRenameDialog = true
-                                                    viewModel.toggleToolsPanel(false)
-                                                }
-                                                ToolsPanelItem(Icons.Default.Layers, "Page Manager Dialog") {
-                                                    viewModel.toggleThumbnailDrawer(true)
-                                                    viewModel.toggleToolsPanel(false)
-                                                }
-                                                ToolsPanelItem(Icons.Default.Delete, "Delete Note") {
-                                                    viewModel.deleteCurrentNote()
-                                                    saveAndExit()
+                                            // MANAGER TAB (Grouped card matching TouchNotes Screenshot_20261107-132818)
+                                            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                                                Text("Note Manager", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = Color.Gray)
+                                                Surface(
+                                                    shape = RoundedCornerShape(12.dp),
+                                                    color = Color(0xFFFBFBFB),
+                                                    border = BorderStroke(1.dp, Color(0xFFEBEBEB)),
+                                                    modifier = Modifier.fillMaxWidth()
+                                                ) {
+                                                    Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 2.dp)) {
+                                                        ToolsPanelItem(Icons.Default.Edit, "Rename Note") {
+                                                            newTitleText = note?.title ?: ""
+                                                            showRenameDialog = true
+                                                            viewModel.toggleToolsPanel(false)
+                                                        }
+                                                        Divider(color = Color(0xFFEEEEEE), thickness = 0.5.dp)
+                                                        ToolsPanelItem(Icons.Default.Layers, "Page Manager Dialog") {
+                                                            viewModel.toggleThumbnailDrawer(true)
+                                                            viewModel.toggleToolsPanel(false)
+                                                        }
+                                                        Divider(color = Color(0xFFEEEEEE), thickness = 0.5.dp)
+                                                        ToolsPanelItem(Icons.Default.Delete, "Delete Note") {
+                                                            viewModel.toggleToolsPanel(false)
+                                                            showDeleteNoteDialog = true
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
@@ -3382,12 +4324,13 @@ fun SettingsCheckboxRow(
         modifier = Modifier
             .fillMaxWidth()
             .clickable { onCheckedChange(!checked) }
-            .padding(vertical = 4.dp),
+            .padding(vertical = 1.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Checkbox(
             checked = checked,
             onCheckedChange = onCheckedChange,
+            modifier = Modifier.size(24.dp),
             colors = CheckboxDefaults.colors(
                 checkedColor = OrangePrimary,
                 uncheckedColor = Color(0xFF888888),
@@ -3395,25 +4338,31 @@ fun SettingsCheckboxRow(
             )
         )
         Spacer(modifier = Modifier.width(8.dp))
-        Column(modifier = Modifier.weight(1f)) {
+        Column(
+            modifier = Modifier.weight(1f),
+            horizontalAlignment = Alignment.End
+        ) {
             Text(
                 text = title,
-                fontSize = 14.sp,
+                fontSize = 13.sp,
                 fontWeight = FontWeight.Normal,
-                color = Color(0xFF222222)
+                color = Color(0xFF222222),
+                textAlign = TextAlign.End
             )
             if (subtitle.isNotEmpty()) {
                 Text(
                     text = subtitle,
-                    fontSize = 11.sp,
+                    fontSize = 10.sp,
                     color = Color(0xFF888888),
-                    lineHeight = 13.sp
+                    lineHeight = 12.sp,
+                    textAlign = TextAlign.End
                 )
             }
         }
     }
 }
 
+@OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
 @Composable
 fun ContinuousPageView(
     pageIndex: Int,
@@ -3422,6 +4371,12 @@ fun ContinuousPageView(
     pdfDocCache: personal.notes.touch.util.PdfDocumentCache,
     repository: personal.notes.touch.data.repo.NoteRepository,
     zoom: Float,
+    ink: ContinuousInkController,
+    inkSettings: InkToolSettings,
+    backgroundMode: Int = 0,
+    backgroundDensity: Int = 40,
+    savedGeneration: Int = 0,
+    isCurrentPage: Boolean = false,
     modifier: Modifier = Modifier,
     onClick: () -> Unit
 ) {
@@ -3461,10 +4416,28 @@ fun ContinuousPageView(
         var pageBitmap by remember(page.id, page.updatedAt) {
             mutableStateOf<android.graphics.Bitmap?>(null)
         }
+        var loadCompleted by remember(page.id, page.updatedAt) {
+            mutableStateOf(false)
+        }
         // A raster page is a fixed-size PNG: re-decoding it for every zoom
         // bucket buys nothing, so only vector pages key on the render width.
         val renderWidthKey = if (isVector) desiredWidthPx else 0
-        LaunchedEffect(page.id, page.updatedAt, renderWidthKey, noteId) {
+
+        // The inking session owns this page while the stylus is writing on it:
+        // it holds the stroke layer (and, for vector pages, a clean pdfium
+        // render to put it on), so the reader's own composite would double the
+        // ink. Once it lets go, the composite is re-rendered from disk.
+        ink.revision // observable: recompose when a stroke or layer changes
+        val inkSession = ink.getSession(pageIndex)
+        val sessionReady = inkSession?.isReady == true
+        val activeSessionReady = ink.isActiveSession(pageIndex)
+
+        LaunchedEffect(page.id, page.updatedAt, renderWidthKey, noteId, activeSessionReady, savedGeneration) {
+            ink.refreshBackground(page, pageIndex, desiredWidthPx)
+            if (activeSessionReady) {
+                loadCompleted = true
+                return@LaunchedEffect
+            }
             // Let a pinch settle on its final bucket before allocating a
             // full-page bitmap; an intermediate key cancels this coroutine
             // while it is still cancellable (a native pdfium render is not).
@@ -3487,45 +4460,225 @@ fun ContinuousPageView(
                     null
                 }
             }
+            loadCompleted = true
         }
 
-        val bmp = pageBitmap
-        if (bmp != null && !bmp.isRecycled) {
+        val shown = when {
+            sessionReady && inkSession?.isVector == true -> inkSession.background
+            sessionReady -> inkSession?.ink
+            else -> pageBitmap
+        }
+
+        // White page bed: an erased raster pixel has to show paper, not the
+        // reader's grey backdrop.
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            color = Color.White,
+            shape = RoundedCornerShape(4.dp),
+            border = if (isCurrentPage) {
+                BorderStroke(1.5.dp, OrangePrimary.copy(alpha = 0.6f))
+            } else {
+                BorderStroke(1.dp, Color(0xFFDCDFE6))
+            }
+        ) {}
+
+        // Draw paper pattern for non-vector pages (or vector pages with no background)
+        if (!isVector) {
+            val effectivePattern = when (PaperPattern.fromCode(page.paperPattern)) {
+                PaperPattern.GRID -> PaperPattern.GRID
+                PaperPattern.LINES -> PaperPattern.LINES
+                PaperPattern.DOTTED -> PaperPattern.DOTTED
+                PaperPattern.BLANK -> when (backgroundMode) {
+                    1 -> PaperPattern.LINES
+                    2 -> PaperPattern.GRID
+                    3 -> PaperPattern.DOTTED
+                    else -> PaperPattern.BLANK
+                }
+            }
+            if (effectivePattern != PaperPattern.BLANK) {
+                androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
+                    val density = backgroundDensity.coerceIn(20, 80).toFloat()
+                    val step = (density * (size.width / 2160f)).coerceAtLeast(8f)
+                    val w = size.width
+                    val h = size.height
+                    val gridColor = Color(0xFFE0E0E0)
+                    when (effectivePattern) {
+                        PaperPattern.LINES -> {
+                            var y = step
+                            while (y < h) {
+                                drawLine(
+                                    color = gridColor,
+                                    start = androidx.compose.ui.geometry.Offset(0f, y),
+                                    end = androidx.compose.ui.geometry.Offset(w, y),
+                                    strokeWidth = 1f
+                                )
+                                y += step
+                            }
+                        }
+                        PaperPattern.GRID -> {
+                            var x = step
+                            while (x < w) {
+                                drawLine(
+                                    color = gridColor,
+                                    start = androidx.compose.ui.geometry.Offset(x, 0f),
+                                    end = androidx.compose.ui.geometry.Offset(x, h),
+                                    strokeWidth = 1f
+                                )
+                                x += step
+                            }
+                            var y = step
+                            while (y < h) {
+                                drawLine(
+                                    color = gridColor,
+                                    start = androidx.compose.ui.geometry.Offset(0f, y),
+                                    end = androidx.compose.ui.geometry.Offset(w, y),
+                                    strokeWidth = 1f
+                                )
+                                y += step
+                            }
+                        }
+                        PaperPattern.DOTTED -> {
+                            var x = step
+                            while (x < w) {
+                                var y = step
+                                while (y < h) {
+                                    drawCircle(
+                                        color = gridColor,
+                                        radius = 1.5f,
+                                        center = androidx.compose.ui.geometry.Offset(x, y)
+                                    )
+                                    y += step
+                                }
+                                x += step
+                            }
+                        }
+                        PaperPattern.BLANK -> {}
+                    }
+                }
+            }
+        }
+
+        if (shown != null && !shown.isRecycled) {
             androidx.compose.foundation.Image(
-                bitmap = bmp.asImageBitmap(),
+                bitmap = shown.asImageBitmap(),
                 contentDescription = "Page ${pageIndex + 1}",
                 modifier = Modifier.fillMaxSize(),
                 filterQuality = androidx.compose.ui.graphics.FilterQuality.High
             )
-        } else {
-            Surface(
-                modifier = Modifier.fillMaxSize(),
-                color = Color.White,
-                shape = RoundedCornerShape(4.dp),
-                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFE0E0E0))
-            ) {
-                Box(contentAlignment = Alignment.Center) {
-                    androidx.compose.material3.CircularProgressIndicator(
-                        modifier = Modifier.size(24.dp),
-                        color = OrangePrimary,
-                        strokeWidth = 2.dp
+        } else if (!loadCompleted && !sessionReady) {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                androidx.compose.material3.CircularProgressIndicator(
+                    modifier = Modifier.size(24.dp),
+                    color = OrangePrimary,
+                    strokeWidth = 2.dp
+                )
+            }
+        }
+
+        // Vector pages: the annotations are a separate transparent layer drawn
+        // over the clean page, exactly like single-page mode composites them.
+        if (sessionReady && inkSession?.isVector == true) {
+            val layer = inkSession.ink
+            if (layer != null && !layer.isRecycled) {
+                androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
+                    val _revision = ink.revision
+                    drawImage(
+                        image = layer.asImageBitmap(),
+                        srcOffset = androidx.compose.ui.unit.IntOffset.Zero,
+                        srcSize = androidx.compose.ui.unit.IntSize(layer.width, layer.height),
+                        dstOffset = androidx.compose.ui.unit.IntOffset.Zero,
+                        dstSize = androidx.compose.ui.unit.IntSize(
+                            size.width.roundToInt().coerceAtLeast(1),
+                            size.height.roundToInt().coerceAtLeast(1)
+                        ),
+                        filterQuality = androidx.compose.ui.graphics.FilterQuality.High
                     )
                 }
             }
         }
+
+        // The in-progress stroke (and the eraser's swath hint) paints above
+        // the committed layer; the commit lands on ACTION_UP.
+        androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
+            val _revision = ink.revision
+            drawIntoCanvas { canvas ->
+                ink.drawPreview(canvas.nativeCanvas, pageIndex, size.width, size.height)
+            }
+        }
+
         Surface(
-            color = Color.Black.copy(alpha = 0.5f),
-            shape = RoundedCornerShape(bottomEnd = 8.dp),
-            modifier = Modifier.align(Alignment.TopStart)
+            color = Color.Black.copy(alpha = 0.38f),
+            shape = RoundedCornerShape(topStart = 6.dp, topEnd = 6.dp),
+            modifier = Modifier.align(Alignment.BottomCenter)
         ) {
             Text(
                 text = "${pageIndex + 1}",
                 color = Color.White,
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Medium,
+                modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
             )
         }
+
+        // Stylus input goes to the ink engine; fingers fall through to the
+        // reader (scroll, pinch, tap-to-open). This is what makes writing in
+        // continuous mode possible without giving up page turning.
+        //
+        // The pen stroke is handled here, in Compose's pointer pipeline, and
+        // every change of it is consumed: this node is the leaf, so it runs
+        // before the enclosing Lazy list and the pinch handler, and a consumed
+        // change makes them give up the gesture. A MotionEvent interop bridge
+        // could not do that (it leaves the initial down unconsumed so parent
+        // scrollables keep working), which on device turned a stroke into a
+        // page scroll one frame later.
+        Box(
+            modifier = Modifier
+                .matchParentSize()
+                .pointerInput(page.id, inkSettings) {
+                    if (inkSettings.readingMode) return@pointerInput
+                    awaitEachGesture {
+                        val down = awaitFirstDown(requireUnconsumed = false)
+                        val isStylus = down.type == PointerType.Stylus || down.type == PointerType.Eraser
+                        val isAllowedPointer = isStylus || (!inkSettings.stylusOnly && down.type == PointerType.Touch)
+                        if (!isAllowedPointer || !inkSettings.isWritingTool) return@awaitEachGesture
+                        if (size.width <= 0 || size.height <= 0) return@awaitEachGesture
+                        
+                        down.consume()
+                        val boxW = size.width.toFloat()
+                        val boxH = size.height.toFloat()
+                        ink.beginStroke(
+                            page = page,
+                            pageIndex = pageIndex,
+                            x = down.position.x / boxW,
+                            y = down.position.y / boxH,
+                            pressure = down.pressure,
+                            boxWidth = boxW,
+                            boxHeight = boxH,
+                            renderWidthPx = desiredWidthPx,
+                            settings = inkSettings
+                        )
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            // If a second finger lands (pinch-to-zoom / multi-touch pan gesture),
+                            // abort the stroke immediately so gestures take over smoothly.
+                            if (event.changes.count { it.pressed } > 1) {
+                                ink.cancelStroke()
+                                break
+                            }
+                            val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                            val x = change.position.x / boxW
+                            val y = change.position.y / boxH
+                            if (change.changedToUpIgnoreConsumed()) {
+                                ink.endStroke(x, y, change.pressure, inkSettings)
+                                change.consume()
+                                break
+                            }
+                            ink.extendStroke(x, y, change.pressure, inkSettings)
+                            change.consume()
+                        }
+                    }
+                }
+        )
     }
 }
 
@@ -3539,13 +4692,14 @@ fun ContinuousPageView(
  * referenced by an ImageBitmap crashes ("trying to use a recycled bitmap").
  * The GC reclaims them once the composable drops its reference.
  */
-private suspend fun renderContinuousPage(
+internal suspend fun renderContinuousPage(
     page: personal.notes.touch.data.db.entity.PageEntity,
     pageIndex: Int,
     noteId: String,
     pdfDocCache: personal.notes.touch.util.PdfDocumentCache,
     repository: personal.notes.touch.data.repo.NoteRepository,
-    desiredWidthPx: Int
+    desiredWidthPx: Int,
+    includeInk: Boolean = true
 ): android.graphics.Bitmap? {
     val document = pdfDocCache.document(page.pdfSourcePath)
         ?: return repository.loadPageBitmap(noteId, pageIndex)
@@ -3569,6 +4723,7 @@ private suspend fun renderContinuousPage(
         composite.recycle()
         return repository.loadPageBitmap(noteId, pageIndex)
     }
+    if (!includeInk) return composite
     val strokes = repository.loadPageStrokes(noteId, pageIndex)
     if (strokes != null && !strokes.isRecycled) {
         val canvas = android.graphics.Canvas(composite)
@@ -3579,4 +4734,166 @@ private suspend fun renderContinuousPage(
         canvas.drawBitmap(strokes, null, android.graphics.Rect(0, 0, width, height), paint)
     }
     return composite
+}
+
+@Composable
+private fun PageThumbnailCard(
+    noteId: String,
+    fileStore: personal.notes.touch.data.files.NoteFileStore,
+    pageItem: personal.notes.touch.data.db.entity.PageEntity,
+    pdfDocCache: personal.notes.touch.util.PdfDocumentCache,
+    isSelected: Boolean,
+    isBookmarked: Boolean,
+    totalPages: Int,
+    savedGeneration: Int = 0,
+    onToggleBookmark: () -> Unit,
+    onDeletePage: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    var showMenu by remember { mutableStateOf(false) }
+
+    val pageFile = remember(noteId, pageItem.index) {
+        fileStore.getPageFile(noteId, pageItem.index)
+    }
+    val strokesFile = remember(noteId, pageItem.index) {
+        fileStore.getStrokesFile(noteId, pageItem.index)
+    }
+
+    val thumbnailBmp by produceState<Bitmap?>(initialValue = null, noteId, pageItem.index, pageItem.updatedAt, savedGeneration) {
+        value = withContext(Dispatchers.IO) {
+            val base = if (pageItem.pdfSourcePath.isNotEmpty() && pageItem.pdfPageIndex >= 0) {
+                try {
+                    val doc = pdfDocCache.document(pageItem.pdfSourcePath)
+                    doc?.renderPage(pageItem.pdfPageIndex, targetWidth = 240, targetHeight = 340)
+                } catch (e: Exception) {
+                    null
+                }
+            } else if (pageFile.exists()) {
+                personal.notes.touch.util.BitmapUtils.loadThumbnail(pageFile, targetWidth = 240, targetHeight = 340)
+            } else null
+
+            val strokes = if (strokesFile.exists()) {
+                personal.notes.touch.util.BitmapUtils.loadAlphaThumbnail(strokesFile, targetWidth = 240, targetHeight = 340)
+            } else null
+
+            when {
+                base != null && strokes != null -> {
+                    val comp = base.copy(Bitmap.Config.ARGB_8888, true)
+                    if (comp != null) {
+                        android.graphics.Canvas(comp).drawBitmap(
+                            strokes,
+                            null,
+                            android.graphics.Rect(0, 0, comp.width, comp.height),
+                            android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG)
+                        )
+                        comp
+                    } else base
+                }
+                base != null -> base
+                strokes != null -> strokes
+                else -> null
+            }
+        }
+    }
+
+    Column(
+        modifier = modifier.padding(6.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        // Page preview box (portrait aspect ratio 0.707f)
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(0.707f)
+                .background(Color.White, RoundedCornerShape(4.dp))
+                .border(0.5.dp, Color(0xFFEAEAEA), RoundedCornerShape(4.dp)),
+            contentAlignment = Alignment.Center
+        ) {
+            val bmp = thumbnailBmp
+            if (bmp != null && !bmp.isRecycled) {
+                androidx.compose.foundation.Image(
+                    bitmap = bmp.asImageBitmap(),
+                    contentDescription = "Thumbnail for page ${pageItem.index + 1}",
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = androidx.compose.ui.layout.ContentScale.Fit
+                )
+            } else {
+                Text(
+                    text = "Page ${pageItem.index + 1}",
+                    fontSize = 12.sp,
+                    color = Color.LightGray
+                )
+            }
+
+            // Bookmark Ribbon overlay (TopStart)
+            IconButton(
+                onClick = onToggleBookmark,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .size(28.dp)
+                    .padding(2.dp)
+            ) {
+                Icon(
+                    imageVector = if (isBookmarked) Icons.Default.Bookmark else Icons.Default.BookmarkBorder,
+                    contentDescription = if (isBookmarked) "Remove Bookmark" else "Bookmark",
+                    tint = if (isBookmarked) OrangePrimary else Color(0xFF888888).copy(alpha = 0.6f),
+                    modifier = Modifier.size(18.dp)
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(4.dp))
+
+        // Footer Row: Centered Page Number + Overflow Menu on right
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Spacer(modifier = Modifier.size(20.dp)) // balance width
+
+            Text(
+                text = "${pageItem.index + 1}",
+                fontSize = 12.sp,
+                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                color = if (isSelected) OrangePrimary else Color(0xFF444444),
+                textAlign = TextAlign.Center,
+                modifier = Modifier.weight(1f)
+            )
+
+            Box(modifier = Modifier.size(20.dp), contentAlignment = Alignment.Center) {
+                IconButton(
+                    onClick = { showMenu = true },
+                    modifier = Modifier.size(20.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.MoreVert,
+                        contentDescription = "More",
+                        tint = Color.Gray,
+                        modifier = Modifier.size(16.dp)
+                    )
+                }
+                DropdownMenu(
+                    expanded = showMenu,
+                    onDismissRequest = { showMenu = false }
+                ) {
+                    DropdownMenuItem(
+                        text = { Text(if (isBookmarked) "Remove Bookmark" else "Add Bookmark") },
+                        onClick = {
+                            showMenu = false
+                            onToggleBookmark()
+                        }
+                    )
+                    if (totalPages > 1) {
+                        DropdownMenuItem(
+                            text = { Text("Delete Page", color = Color.Red) },
+                            onClick = {
+                                showMenu = false
+                                onDeletePage()
+                            }
+                        )
+                    }
+                }
+            }
+        }
+    }
 }

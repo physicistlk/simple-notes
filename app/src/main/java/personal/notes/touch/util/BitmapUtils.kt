@@ -47,11 +47,16 @@ object BitmapUtils {
 
             val opts = BitmapFactory.Options().apply {
                 inSampleSize = sample
-                inPreferredConfig = Bitmap.Config.RGB_565
+                inPreferredConfig = Bitmap.Config.ARGB_8888
             }
-            val decoded = BitmapFactory.decodeFile(file.absolutePath, opts) ?: return@withContext null
-            putCachedThumbnail(cacheKey, decoded)
-            decoded
+            val raw = BitmapFactory.decodeFile(file.absolutePath, opts) ?: return@withContext null
+            val out = Bitmap.createBitmap(raw.width, raw.height, Bitmap.Config.RGB_565)
+            val canvas = android.graphics.Canvas(out)
+            canvas.drawColor(android.graphics.Color.WHITE)
+            canvas.drawBitmap(raw, 0f, 0f, null)
+            raw.recycle()
+            putCachedThumbnail(cacheKey, out)
+            out
         } catch (e: Exception) {
             e.printStackTrace()
             null
@@ -128,11 +133,16 @@ object BitmapUtils {
 
             val opts = BitmapFactory.Options().apply {
                 inSampleSize = sample
-                inPreferredConfig = Bitmap.Config.RGB_565
+                inPreferredConfig = Bitmap.Config.ARGB_8888
             }
-            val decoded = BitmapFactory.decodeFile(file.absolutePath, opts) ?: return@withContext null
-            imageCache[cacheKey] = decoded
-            decoded
+            val raw = BitmapFactory.decodeFile(file.absolutePath, opts) ?: return@withContext null
+            val out = Bitmap.createBitmap(raw.width, raw.height, Bitmap.Config.RGB_565)
+            val canvas = android.graphics.Canvas(out)
+            canvas.drawColor(android.graphics.Color.WHITE)
+            canvas.drawBitmap(raw, 0f, 0f, null)
+            raw.recycle()
+            imageCache[cacheKey] = out
+            out
         } catch (e: Exception) {
             e.printStackTrace()
             null

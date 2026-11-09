@@ -1,9 +1,13 @@
 package personal.notes.touch.ui.export
 
+import personal.notes.touch.ui.theme.OrangePrimary
 import android.content.Context
 import android.graphics.Bitmap
 import android.net.Uri
 import android.widget.Toast
+import androidx.compose.runtime.produceState
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -77,6 +81,7 @@ fun ExportDialog(
     backgroundBitmap: Bitmap? = null,
     imageLayers: List<ImageLayer> = emptyList(),
     currentPageIndex: Int = 0,
+    initialTarget: ExportTarget? = null,
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
@@ -87,6 +92,27 @@ fun ExportDialog(
     var exportStatusText by remember { mutableStateOf("") }
 
     val safeFilename = remember(note.title) { ExportManager.sanitizeFilename(note.title) }
+
+    val resolvedMarkdownContent = remember(note.title, note.content) {
+        note.content?.takeIf { it.isNotBlank() }
+            ?: "# ${note.title.ifBlank { "Untitled Note" }}\n\nExported from TouchNotes.\n"
+    }
+
+    // Produces the composite flattened bitmap (including PDF background, image layers, and white paper bed)
+    // for single-page PNG export across both Single-Page and Continuous Modes.
+    val effectivePageBitmap by produceState<Bitmap?>(
+        initialValue = null,
+        note.id, currentPageIndex, currentBitmap, backgroundBitmap, imageLayers
+    ) {
+        val loaded = withContext(Dispatchers.IO) {
+            if (currentBitmap != null && !currentBitmap.isRecycled) {
+                ExportManager.flattenBitmap(currentBitmap, backgroundBitmap, imageLayers)
+            } else {
+                ExportManager.loadFlattenedPageBitmap(fileStore, note.id, currentPageIndex, includeLayers = true)
+            }
+        }
+        value = loaded
+    }
 
     // Text notes get the markdown-rendering exporters (HTML / paginated PDF);
     // drawing notes keep the rasterised page exporter.
@@ -135,13 +161,14 @@ fun ExportDialog(
     val createPngLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("image/png")
     ) { uri: Uri? ->
-        if (uri != null && currentBitmap != null) {
+        val bmp = effectivePageBitmap
+        if (uri != null && bmp != null) {
             scope.launch {
                 isExporting = true
                 exportStatusText = "Saving PNG image..."
                 try {
                     context.contentResolver.openOutputStream(uri)?.use { out ->
-                        ExportManager.exportPageToOutputStream(currentBitmap, out, backgroundBitmap, imageLayers)
+                        ExportManager.exportPageToOutputStream(bmp, out, backgroundBitmap = null, imageLayers = emptyList())
                     }
                     Toast.makeText(context, "Image saved successfully!", Toast.LENGTH_SHORT).show()
                     onDismiss()
@@ -164,10 +191,7 @@ fun ExportDialog(
                 try {
                     context.contentResolver.openOutputStream(uri)?.use { out ->
                         out.bufferedWriter().use { writer ->
-                            if (note.title.isNotBlank()) {
-                                writer.write("# ${note.title}\n\n")
-                            }
-                            writer.write(note.content ?: "")
+                            writer.write(resolvedMarkdownContent)
                         }
                     }
                     Toast.makeText(context, "Text note saved!", Toast.LENGTH_SHORT).show()
@@ -191,8 +215,8 @@ fun ExportDialog(
                 try {
                     context.contentResolver.openOutputStream(uri)?.use { out ->
                         ExportManager.exportTextNoteToHtmlStream(
-                            title = note.title,
-                            content = note.content.orEmpty(),
+                            title = note.title.ifBlank { "Untitled Note" },
+                            content = resolvedMarkdownContent,
                             out = out
                         )
                     }
@@ -274,6 +298,7 @@ fun ExportDialog(
                         },
                         icon = Icons.Default.PictureAsPdf,
                         iconTint = Color(0xFFD32F2F),
+                        isSelected = initialTarget == ExportTarget.PDF,
                         onShareClick = {
                             scope.launch {
                                 isExporting = true
@@ -312,12 +337,14 @@ fun ExportDialog(
                     )
 
                     // Option 2: PNG Image (When current page bitmap exists)
-                    if (currentBitmap != null) {
+                    val exportBmp = effectivePageBitmap
+                    if (exportBmp != null) {
                         ExportOptionCard(
                             title = "Current Page Image (.png)",
                             subtitle = "Lossless PNG picture of page ${currentPageIndex + 1}",
                             icon = Icons.Default.Image,
                             iconTint = Color(0xFF1976D2),
+                            isSelected = initialTarget == ExportTarget.PNG_CURRENT_PAGE,
                             onShareClick = {
                                 scope.launch {
                                     isExporting = true
@@ -327,8 +354,9 @@ fun ExportDialog(
                                             context = context,
                                             noteTitle = note.title,
                                             pageIndex = currentPageIndex,
-                                            bitmap = currentBitmap,
-                                            backgroundBitmap = backgroundBitmap
+                                            bitmap = exportBmp,
+                                            backgroundBitmap = null,
+                                            imageLayers = emptyList()
                                         )
                                         ExportManager.shareFile(context, file, "image/png", "Share Note Image")
                                         onDismiss()
@@ -345,13 +373,16 @@ fun ExportDialog(
                         )
                     }
 
-                    // Option 3: Markdown / Text (When note has text content)
-                    if (!note.content.isNullOrBlank()) {
+                    // Option 3: Markdown / Text (When note has text content or targeted)
+                    if (!note.content.isNullOrBlank() || initialTarget == ExportTarget.MARKDOWN) {
+                        val markdownContent = note.content?.takeIf { it.isNotBlank() }
+                            ?: "# ${note.title.ifBlank { "Untitled Note" }}\n\nExported from TouchNotes.\n"
                         ExportOptionCard(
                             title = "Markdown Text (.md)",
                             subtitle = "Clean portable markdown file with formatting",
                             icon = Icons.Default.Description,
                             iconTint = Color(0xFF388E3C),
+                            isSelected = initialTarget == ExportTarget.MARKDOWN,
                             onShareClick = {
                                 scope.launch {
                                     isExporting = true
@@ -360,7 +391,7 @@ fun ExportDialog(
                                         val file = ExportManager.exportTextNoteToFile(
                                             context = context,
                                             noteTitle = note.title,
-                                            content = note.content
+                                            content = markdownContent
                                         )
                                         ExportManager.shareFile(context, file, "text/plain", "Share Markdown Note")
                                         onDismiss()
@@ -389,7 +420,7 @@ fun ExportDialog(
                                         val file = ExportManager.exportTextNoteToHtmlFile(
                                             context = context,
                                             noteTitle = note.title,
-                                            content = note.content.orEmpty()
+                                            content = resolvedMarkdownContent
                                         )
                                         ExportManager.shareFile(context, file, "text/html", "Share HTML Note")
                                         onDismiss()
@@ -424,12 +455,16 @@ private fun ExportOptionCard(
     subtitle: String,
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     iconTint: Color,
+    isSelected: Boolean = false,
     onShareClick: () -> Unit,
     onSaveClick: () -> Unit
 ) {
     Card(
         shape = RoundedCornerShape(12.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)),
+        colors = CardDefaults.cardColors(
+            containerColor = if (isSelected) MaterialTheme.colorScheme.surfaceVariant else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+        ),
+        border = if (isSelected) androidx.compose.foundation.BorderStroke(1.5.dp, OrangePrimary) else null,
         modifier = Modifier.fillMaxWidth()
     ) {
         Column(modifier = Modifier.padding(12.dp)) {
@@ -450,12 +485,29 @@ private fun ExportOptionCard(
                 }
                 Spacer(modifier = Modifier.width(10.dp))
                 Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = title,
-                        fontWeight = FontWeight.SemiBold,
-                        fontSize = 14.sp,
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = title,
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 14.sp,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        if (isSelected) {
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Surface(
+                                shape = RoundedCornerShape(4.dp),
+                                color = OrangePrimary.copy(alpha = 0.15f)
+                            ) {
+                                Text(
+                                    text = "Selected",
+                                    color = OrangePrimary,
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp)
+                                )
+                            }
+                        }
+                    }
                     Text(
                         text = subtitle,
                         fontSize = 11.sp,

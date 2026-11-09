@@ -132,19 +132,7 @@ object ExportManager {
             val bitmap = if (pageIdx == currentPageIndex && currentEditingBitmap != null) {
                 flattenBitmap(currentEditingBitmap, currentEditingBackground, currentEditingImageLayers)
             } else {
-                val pageFile = fileStore.getPageFile(note.id, pageIdx)
-                val strokesFile = fileStore.getStrokesFile(note.id, pageIdx)
-                if (strokesFile.exists()) {
-                    val baseBmp = BitmapUtils.loadBitmapFromFile(pageFile)
-                    val strokeBmp = BitmapUtils.loadBitmapFromFile(strokesFile)
-                    if (baseBmp != null && strokeBmp != null) {
-                        flattenBitmap(strokeBmp, baseBmp)
-                    } else {
-                        strokeBmp ?: baseBmp
-                    }
-                } else {
-                    BitmapUtils.loadBitmapFromFile(pageFile)
-                }
+                loadFlattenedPageBitmap(fileStore, note.id, pageIdx)
             }
 
             val pageInfo = PdfDocument.PageInfo.Builder(pdfPageWidth, pdfPageHeight, pdfPageNumber++).create()
@@ -178,6 +166,9 @@ object ExportManager {
             }
 
             document.finishPage(page)
+            if (bitmap !== currentEditingBitmap && bitmap?.isRecycled == false) {
+                bitmap.recycle()
+            }
         }
 
         outputStream.use { out ->
@@ -326,13 +317,91 @@ object ExportManager {
     }
 
 
-    private fun flattenBitmap(bitmap: Bitmap, backgroundBitmap: Bitmap?, imageLayers: List<ImageLayer> = emptyList()): Bitmap {
+    private fun readDiskImageLayers(fileStore: personal.notes.touch.data.files.NoteFileStore, noteId: String): List<ImageLayer> {
+        val infoFile = fileStore.getLayerInfoFile(noteId)
+        if (!infoFile.exists()) return emptyList()
+        val layers = mutableListOf<ImageLayer>()
+        try {
+            val arr = org.json.JSONArray(infoFile.readText())
+            val layersDir = fileStore.getLayersDir(noteId)
+            for (i in 0 until arr.length()) {
+                val obj = arr.getJSONObject(i)
+                val fileName = obj.getString("file")
+                val bitmapFile = java.io.File(layersDir, fileName)
+                val bitmap = android.graphics.BitmapFactory.decodeFile(bitmapFile.absolutePath)
+                if (bitmap != null) {
+                    layers.add(ImageLayer(
+                        bitmap = bitmap,
+                        x = obj.optDouble("x", 0.0).toFloat(),
+                        y = obj.optDouble("y", 0.0).toFloat(),
+                        scale = obj.optDouble("scale", 1.0).toFloat(),
+                        rotation = obj.optDouble("rotation", 0.0).toFloat(),
+                        opacity = obj.optDouble("opacity", 1.0).toFloat(),
+                        visible = obj.optBoolean("visible", true),
+                        cropRect = null,
+                        name = obj.optString("name", "Layer ${i + 1}")
+                    ))
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        return layers
+    }
+
+    suspend fun loadFlattenedPageBitmap(
+        fileStore: personal.notes.touch.data.files.NoteFileStore,
+        noteId: String,
+        pageIndex: Int,
+        includeLayers: Boolean = (pageIndex == 0)
+    ): Bitmap? {
+        val pageFile = fileStore.getPageFile(noteId, pageIndex)
+        val strokesFile = fileStore.getStrokesFile(noteId, pageIndex)
+        val layers = if (includeLayers) readDiskImageLayers(fileStore, noteId) else emptyList()
+        val result = if (strokesFile.exists()) {
+            val baseBmp = BitmapUtils.loadBitmapFromFile(pageFile)
+            val strokeBmp = BitmapUtils.loadBitmapFromFile(strokesFile)
+            if (baseBmp != null && strokeBmp != null) {
+                val flat = flattenBitmap(strokeBmp, baseBmp, layers)
+                if (baseBmp !== flat && !baseBmp.isRecycled) baseBmp.recycle()
+                if (strokeBmp !== flat && !strokeBmp.isRecycled) strokeBmp.recycle()
+                flat
+            } else if (strokeBmp != null) {
+                val flat = flattenBitmap(strokeBmp, null, layers)
+                if (strokeBmp !== flat && !strokeBmp.isRecycled) strokeBmp.recycle()
+                flat
+            } else if (baseBmp != null) {
+                val flat = flattenBitmap(baseBmp, null, layers)
+                if (baseBmp !== flat && !baseBmp.isRecycled) baseBmp.recycle()
+                flat
+            } else null
+        } else {
+            val base = BitmapUtils.loadBitmapFromFile(pageFile)
+            if (base != null) {
+                val flat = flattenBitmap(base, null, layers)
+                if (base !== flat && !base.isRecycled) base.recycle()
+                flat
+            } else if (layers.isNotEmpty()) {
+                val blank = Bitmap.createBitmap(2160, 3056, Bitmap.Config.ARGB_8888)
+                val flat = flattenBitmap(blank, null, layers)
+                if (blank !== flat && !blank.isRecycled) blank.recycle()
+                flat
+            } else null
+        }
+        for (l in layers) {
+            if (!l.bitmap.isRecycled) l.bitmap.recycle()
+        }
+        return result
+    }
+
+    internal fun flattenBitmap(bitmap: Bitmap, backgroundBitmap: Bitmap?, imageLayers: List<ImageLayer> = emptyList()): Bitmap {
         val bgW = backgroundBitmap?.width ?: 0
         val bgH = backgroundBitmap?.height ?: 0
         val w = bitmap.width.coerceAtLeast(bgW).coerceAtLeast(1)
         val h = bitmap.height.coerceAtLeast(bgH).coerceAtLeast(1)
         val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(out)
+        canvas.drawColor(Color.WHITE)
         if (backgroundBitmap != null && !backgroundBitmap.isRecycled) {
             val bgPaint = Paint(Paint.FILTER_BITMAP_FLAG)
             canvas.drawBitmap(backgroundBitmap, null, android.graphics.Rect(0, 0, w, h), bgPaint)
@@ -343,7 +412,7 @@ object ExportManager {
         // output size instead of pinning it to the top-left corner.
         canvas.drawBitmap(bitmap, null, android.graphics.Rect(0, 0, w, h), Paint(Paint.FILTER_BITMAP_FLAG))
         for (layer in imageLayers) {
-            if (layer.bitmap.isRecycled) continue
+            if (!layer.visible || layer.bitmap.isRecycled) continue
             val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG).apply {
                 alpha = (layer.opacity * 255f).toInt().coerceIn(0, 255)
             }

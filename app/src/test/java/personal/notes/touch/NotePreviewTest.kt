@@ -47,7 +47,7 @@ class NotePreviewTest {
         val lines = extractPreviewLines(content, maxLines = 5)
         assertEquals(4, lines.size)
         assertEquals("☐ Task 1: Fix pressure pen", lines[0])
-        assertEquals("☐ Task 2: Block editor", lines[1])
+        assertEquals("☑ Task 2: Block editor", lines[1])
         assertTrue(lines[2].contains("Name") && lines[2].contains("Value"))
         assertTrue(lines[3].contains("Speed") && lines[3].contains("120Hz"))
     }
@@ -72,5 +72,12 @@ class NotePreviewTest {
         val content = "Link to [[Roadmap]] and [[Budget|the budget]] here"
         val lines = extractPreviewLines(content, maxLines = 3)
         assertEquals(listOf("Link to Roadmap and the budget here"), lines)
+    }
+
+    @Test
+    fun testExtractPreviewLinesFlattensBlockReferences() {
+        val content = "Ref to ((20261108120000-abcd|My Section)) and ((20261108120000-xyz))"
+        val lines = extractPreviewLines(content, maxLines = 3)
+        assertEquals(listOf("Ref to My Section and 20261108120000-xyz"), lines)
     }
 }

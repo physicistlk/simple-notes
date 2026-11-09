@@ -12,4 +12,12 @@ local.properties
 # Reference media (keep screenshots as PNG only, no videos)
 reference/screens/*.mp4
 reference/screens/*.webp
+screenshots/
 app/.cxx/
+
+# Secrets & Credentials
+*key*
+*token*
+*.pem
+id_*
+

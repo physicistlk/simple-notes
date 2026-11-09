@@ -154,7 +154,7 @@ fun SettingsScreen(
             confirmButton = {
                 TextButton(
                     onClick = {
-                        val uri = pendingRestoreUri!!
+                        val uri = pendingRestoreUri ?: return@TextButton
                         showRestoreConfirmDialog = false
                         pendingRestoreUri = null
                         scope.launch {
@@ -602,34 +602,39 @@ fun SettingsScreen(
                                 )
                             )
                         }
-                    }
 
-                    // Auto-shape toggle
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "Auto-shape Strokes",
-                                fontWeight = FontWeight.SemiBold,
-                                fontSize = 15.sp
-                            )
-                            Text(
-                                text = "Straighten freehand strokes into lines/shapes",
-                                fontSize = 12.sp,
-                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+                        HorizontalDivider(
+                            modifier = Modifier.padding(vertical = 16.dp),
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f)
+                        )
+
+                        // Auto-shape toggle
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "Auto-shape Strokes",
+                                    fontWeight = FontWeight.SemiBold,
+                                    fontSize = 15.sp
+                                )
+                                Text(
+                                    text = "Straighten freehand strokes into lines/shapes",
+                                    fontSize = 12.sp,
+                                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+                                )
+                            }
+                            Switch(
+                                checked = settings.autoShapeEnabled,
+                                onCheckedChange = { viewModel.setAutoShapeEnabled(it) },
+                                colors = SwitchDefaults.colors(
+                                    checkedThumbColor = Color.White,
+                                    checkedTrackColor = themeColor
+                                )
                             )
                         }
-                        Switch(
-                            checked = settings.autoShapeEnabled,
-                            onCheckedChange = { viewModel.setAutoShapeEnabled(it) },
-                            colors = SwitchDefaults.colors(
-                                checkedThumbColor = Color.White,
-                                checkedTrackColor = themeColor
-                            )
-                        )
                     }
                 }
             }
@@ -672,11 +677,6 @@ fun SettingsScreen(
                                 )
                             )
                         }
-
-                        HorizontalDivider(
-                            modifier = Modifier.padding(vertical = 16.dp),
-                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f)
-                        )
 
                         HorizontalDivider(
                             modifier = Modifier.padding(vertical = 16.dp),
@@ -823,11 +823,6 @@ fun SettingsScreen(
                                 )
                             )
                         }
-
-                        HorizontalDivider(
-                            modifier = Modifier.padding(vertical = 16.dp),
-                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f)
-                        )
 
                         HorizontalDivider(
                             modifier = Modifier.padding(vertical = 16.dp),

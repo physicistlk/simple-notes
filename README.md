@@ -55,8 +55,8 @@ app/src/main/java/personal/notes/touch/
 - `state/FEATURES.md` — feature specs with sources
 - `state/SPEC.md` — architecture, DB schema, key classes
 - `state/STATE.md` — blackboard / progress
-- `state/AUDIT-2026-11-04.md` — full audit
-- `README-HANDOVER.md` — detailed handover
+- `state/AUDIT-2026-11-07.md` — current audit & post-implementation review (#1–#62)
+- `state/archive/` — archived historical audits (`AUDIT-2026-11-03.md`, `AUDIT-2026-11-04.md`, `AUDIT-2026-11-04-v2.md`) and `README-HANDOVER.md`
 
 ## License
 
