@@ -311,7 +311,9 @@ object RichTextParser {
                 // v2: ==highlight==
                 if (text.startsWith("==", cursor)) {
                     val next = text.indexOf("==", cursor + 2)
-                    if (next != -1) {
+                    // An empty pair ("====") is not a highlight: it would
+                    // render as nothing at all.
+                    if (next != -1 && next > cursor + 2) {
                         val inner = text.substring(cursor + 2, next)
                         withStyle(SpanStyle(background = MARK_BG)) {
                             append(parseInline(inner, blockRefLabel))

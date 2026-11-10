@@ -503,6 +503,9 @@ private fun BlockRow(
         value = if (refQuery == null) {
             emptyList()
         } else {
+            // The query hits the block table: wait until the typing settles,
+            // otherwise every keystroke runs a LIKE over all the blocks.
+            kotlinx.coroutines.delay(220)
             viewModel.searchBlocks(refQuery, block.id).first()
         }
     }

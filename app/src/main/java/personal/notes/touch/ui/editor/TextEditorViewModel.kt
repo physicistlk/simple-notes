@@ -675,7 +675,10 @@ class TextEditorViewModel(
 
         val sel = newValue.selection
         val grew = newValue.text.length > cur.field.text.length
+        // An image block is one markdown row (![alt](file)): splitting it
+        // would leave an invalid image and a stray paragraph.
         val enteredNewline = cur.type != BlockType.CODE && cur.type != BlockType.QUERY &&
+            cur.type != BlockType.IMAGE &&
             grew &&
             sel.collapsed &&
             sel.start in 1..newValue.text.length &&

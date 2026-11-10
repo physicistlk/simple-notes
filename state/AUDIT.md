@@ -53,7 +53,7 @@ Rules for a new finding:
 | :--- | :--- | :--- | :--- |
 | **M1** | The editor's markdown and the `note_blocks` rows can drift: the markdown is the source of truth, but the two are written separately and a failure between the writes leaves them out of sync. | A note can show one text in the library and another in the editor. | `TextEditorViewModel.kt` (autosave + `persistBlocks`) |
 | **M2** | `updateNoteContent` is a read-modify-write without a transaction, so an overlapping save can write the older text over the newer one. | An edit silently reverts. | `NoteRepository.kt` |
-| **M3** | A line that starts with ``` is treated as a code fence and swallows the rest of the note, which is then re-written mangled. | The paragraph structure of a note is destroyed on the next save. | `BlockModel.kt` |
+| **M3** | A line that starts with ``` is treated as a code fence and swallows the rest of the note, which is then re-written mangled. | The paragraph structure of a note is destroyed on the next save. | `BlockModel.kt` | **FIXED** — only a line that *is* a fence opens a code block. |
 | **M4** | The "Auto-Save Interval" setting promises to change the note-edit save, but the editor's debounce is hard-coded to 1 s. | The setting silently does nothing for text notes. | `SettingsScreen.kt` vs `TextEditorViewModel.kt` |
 | **M5** | The editor has no undo/redo of its own: a block operation cannot be taken back except through the markdown save. | A mis-typed or mis-moved block is final until the note is reopened. | `ui/editor/**` | **FEATURE** — the user wants undo/redo kept and refined, so it stays on the roadmap rather than being written off. |
 | **M6** | The editor reloads from storage when a block transfer happens, which can overwrite what the user typed in the meantime. | Typed text disappears. | `TextEditorViewModel.kt` (the transfer collector) |
@@ -74,16 +74,16 @@ in any earlier list.
 | **M12** | A block transfer reloads the editor from the database, discarding whatever was typed in the meantime (and resetting the caret). | Keystrokes disappear. | `TextEditorViewModel.kt` | **FIXED** — the reload waits for the next save while there is unsaved text. |
 | **M13** | The cross-note transfer is not transactional: the target's rows and markdown are written, then the source's. A crash in between leaves the source's markdown holding a block whose rows are gone, so the block is re-derived with a new id and exists in both notes. | A duplicated block and dead `((block-id))` references. | `NoteRepository.kt` | **OPEN** |
 | **M14** | The transfer's KDoc said the indented rows are dragged along "for list-like blocks", but the code never looked at the type. | The documentation and the tests disagreed with the implementation. | `BlockTransfer.kt` | **FIXED (doc)** — the wording now matches the tested behaviour. |
-| **M15** | The `[[` and `((` autocompletes fire inside an already-closed link and mangle it when a suggestion is picked. | `[[Beta]]ha]]` — a corrupted link. | `WikiLinks.kt`, `BlockRefs.kt` | **OPEN** |
+| **M15** | The `[[` and `((` autocompletes fire inside an already-closed link and mangle it when a suggestion is picked. | `[[Beta]]ha]]` — a corrupted link. | `WikiLinks.kt`, `BlockRefs.kt` | **FIXED** (the `[[` case) — the token must still be open at the caret. | **OPEN** |
 | **M16** | `WikiLinks.complete` did not escape "\|", so a note titled `A\|B` was written as a target plus an alias. | The link points at a different note. | `WikiLinks.kt` | **FIXED** |
 | **M17** | "⊞ Table" and "# Tag" do nothing in the split workspace (the command needs an active block, which the split pane never sets). | Two dead buttons, with no feedback. | `TextEditorScreen.kt` | **OPEN** |
 | **M18** | The editor folds consecutive plain lines into one block, while the preview and the exporters make one paragraph per line. | The editor and the preview disagree about the structure of the note. | `BlockModel.kt` vs `RichTextParser.kt` | **BY DESIGN** — the user decided to keep the current behaviour. | **OPEN** |
 | **M19** | The library card preview replaced `==(.*?)==.*`, so everything after the first highlight on a line was dropped. | The card preview truncates the line. | `NoteListScreen.kt` | **FIXED** |
-| **M20** | The wiki-link index stores the key with collapsed whitespace, but the SQL join compares the title verbatim. | A note with a double space is reported as "not found". | `NoteRefDao.kt` vs `WikiLinks.kt` | **OPEN** |
-| **M21** | An empty highlight block ("====") renders as nothing. | The block looks empty in the preview and the export. | `RichTextParser.kt` | **OPEN** (polish) |
-| **M22** | The search matches the raw markdown but the snippet is computed from the stripped text. | A query that only matches a marker lists the note without an excerpt. | `NoteSearch.kt` | **OPEN** (polish) |
-| **M23** | The `((` autocomplete queries the block table on every keystroke with no debounce. | Visible lag with a large library. | `BlockEditPane.kt` | **OPEN** (polish) |
-| **M24** | Enter inside an image block's caption splits the image markdown. | An invalid image row plus a stray paragraph. | `TextEditorViewModel.kt` | **OPEN** (polish) |
+| **M20** | The wiki-link index stores the key with collapsed whitespace, but the SQL join compares the title verbatim. | A note with a double space is reported as "not found". | `NoteRefDao.kt` vs `WikiLinks.kt` | **FIXED** — the join collapses the whitespace the same way the key does. | **OPEN** |
+| **M21** | An empty highlight block ("====") renders as nothing. | The block looks empty in the preview and the export. | `RichTextParser.kt` | **FIXED** |
+| **M22** | The search matches the raw markdown but the snippet is computed from the stripped text. | A query that only matches a marker lists the note without an excerpt. | `NoteSearch.kt` | **FIXED** — the excerpt is taken from the line the token was found in. |
+| **M23** | The `((` autocomplete queries the block table on every keystroke with no debounce. | Visible lag with a large library. | `BlockEditPane.kt` | **FIXED** — the query waits for the typing to settle. |
+| **M24** | Enter inside an image block's caption splits the image markdown. | An invalid image row plus a stray paragraph. | `TextEditorViewModel.kt` | **FIXED** — an image block is never split. |
 
 ### Fixed in the recent rounds
 
@@ -131,7 +131,7 @@ in any earlier list.
 | **C7** | The debounced save copies 26 MB on the main thread before handing it to the encoder. | Dropped frames while writing. | `CanvasViewModel.kt`, `ContinuousInkController.kt` |
 | **C8** | `trimTransparentMargins` allocates an `IntArray` for the whole layer (48 MB for a 12 MP photo) on the UI thread. | A freeze of hundreds of ms and an OOM on low-end devices. | `DrawingCanvasView.kt` | **FIXED** — the bitmap is read row by row. |
 | **C9** | The layer PNGs and `layers.json` are written in place, not atomically. | A kill mid-write loses the layer list. | `DrawingCanvasView.kt` | **FIXED** — the layer bitmaps and the manifest are written to a temp file and renamed. |
-| **C10** | Touch targets below 48 dp: the layer panel's icon buttons (24 dp), the zoom lock (24 dp), the text stepper (26 dp), the dock collapse (22 dp) and the live-text drag handle (6 dp tall). | Hard to hit on a tablet. | `CanvasScreen.kt` |
+| **C10** | Touch targets below 48 dp: the layer panel's icon buttons (24 dp), the zoom lock (24 dp), the text stepper (26 dp), the dock collapse (22 dp) and the live-text drag handle (6 dp tall). | Hard to hit on a tablet. | `CanvasScreen.kt` | **PARTLY FIXED** — the buttons are now 32–36 dp; the live-text drag handle is still a small pill. |
 
 ### Fixed in the recent rounds
 
@@ -154,8 +154,8 @@ in any earlier list.
 | **X2** | The drawing engine, the reader, the repository and the export have no unit tests at all — only the extracted pure maths (`ContinuousInkMath`, `InkCropMath`, `PdfRenderPolicy`, the parsers) are covered. | The next round of bugs lands in the untested code. | `app/src/test/**` |
 | **X3** | `ContinuousModeAuditTest` re-implements the logic it claims to test instead of calling production code, so the "unit-test verified" claims for the bookmark/TOC shift and the paper pattern prove nothing. | False confidence. | `ContinuousModeAuditTest.kt` |
 | **X4** | The launcher label is "Simple Notes" while the UI and the backup archive say "TouchNotes". | A naming decision, not a defect — but it should be decided. | `res/values/strings.xml` | **DECIDED** — the product stays "Simple Notes"; the About card, the manual, the splash and the exported/archived footers now say the same. |
-| **X5** | The backup progress dialog cannot be dismissed (no cancel, `onDismissRequest` empty). | A hanging write traps the user behind the dialog. | `SettingsScreen.kt` |
-| **X6** | The colour swatches in Settings and in the library have no content description, so TalkBack announces unlabelled buttons. | The colour row is unusable with a screen reader. | `SettingsScreen.kt`, `NoteListScreen.kt` |
+| **X5** | The backup progress dialog cannot be dismissed (no cancel, `onDismissRequest` empty). | A hanging write traps the user behind the dialog. | `SettingsScreen.kt` | **FIXED** — it can be closed; the work continues in the background. |
+| **X6** | The colour swatches in Settings and in the library have no content description, so TalkBack announces unlabelled buttons. | The colour row is unusable with a screen reader. | `SettingsScreen.kt`, `NoteListScreen.kt` | **FIXED** |
 | **X7** | The library sort order is not persisted. | The sort resets on every start. | `NoteListViewModel.kt` |
 | **X8** | The original's Tools panel has ~16 actions the clone does not have (Split Screen, Merge Note, Insert Row/Column Space, Screenshot, Line Laser Pointer, Mask Mark Pen, Hide Contents, Locking, Password Setting, Pen for Moving, Floating Note, Notes Transfer, Web Search, Audio/Recognition, …) and the rows carry "?" help badges. | A visible feature gap against the reference app. | `CanvasScreen.kt` | **OPEN** — the user checks the Tools panel themselves before it is built. |
 | **X9** | The device pass is still missing: every round so far was verified by source, compiler and unit tests only. | The GUI and the touch behaviour have never been confirmed on the tablet. | — |

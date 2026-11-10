@@ -65,7 +65,10 @@ abstract class NoteRefDao {
                n.id AS noteId,
                n.title AS resolvedTitle
         FROM note_refs r
-        LEFT JOIN notes n ON lower(n.title) = r.targetKey AND n.deleted = 0
+        LEFT JOIN notes n ON (
+                lower(trim(n.title)) = r.targetKey
+                OR lower(replace(replace(trim(n.title), '  ', ' '), '  ', ' ')) = r.targetKey
+            ) AND n.deleted = 0
         WHERE r.noteId = :noteId
         ORDER BY r.targetTitle COLLATE NOCASE ASC
         """

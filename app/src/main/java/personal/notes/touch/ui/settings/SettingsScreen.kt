@@ -8,6 +8,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -192,7 +194,9 @@ fun SettingsScreen(
 
     if (isBackupRunning) {
         AlertDialog(
-            onDismissRequest = {},
+            // The user must not be trapped behind the dialog if the write
+            // hangs: it can be closed, the work continues in the background.
+            onDismissRequest = { isBackupRunning = false },
             title = { Text("Processing Backup...") },
             text = {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -201,7 +205,9 @@ fun SettingsScreen(
                     Text(backupStatusText, fontSize = 13.sp)
                 }
             },
-            confirmButton = {}
+            confirmButton = {
+                TextButton(onClick = { isBackupRunning = false }) { Text("Run in background") }
+            }
         )
     }
 
@@ -511,7 +517,11 @@ fun SettingsScreen(
                                             color = if (isSelected) MaterialTheme.colorScheme.primary else Color.LightGray.copy(alpha = 0.5f),
                                             shape = CircleShape
                                         )
-                                        .clickable { viewModel.setPenDefaults(colorVal, penDefaults.strokeWidth) },
+                                        .clickable { viewModel.setPenDefaults(colorVal, penDefaults.strokeWidth) }
+                                        // The swatch is the only way to pick a
+                                        // colour: it needs a name for the
+                                        // screen reader.
+                                        .semantics { contentDescription = "Pen colour ${colorVal.toULong().toString(16)}" },
                                     contentAlignment = Alignment.Center
                                 ) {
                                     if (isSelected) {

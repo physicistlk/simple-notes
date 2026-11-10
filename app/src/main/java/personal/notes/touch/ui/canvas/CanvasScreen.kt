@@ -2229,7 +2229,7 @@ fun CanvasScreen(
                                         // move the page around.
                                         IconButton(
                                             onClick = { viewModel.setZoomLocked(!uiState.zoomLocked) },
-                                            modifier = Modifier.size(24.dp)
+                                            modifier = Modifier.size(32.dp)
                                         ) {
                                             Icon(
                                                 imageVector = if (uiState.zoomLocked) {
@@ -2339,7 +2339,7 @@ fun CanvasScreen(
                                 )
                                 IconButton(
                                     onClick = { showLayersPanel = false },
-                                    modifier = Modifier.size(24.dp)
+                                    modifier = Modifier.size(36.dp)
                                 ) {
                                     Icon(
                                         imageVector = Icons.Default.Close,
@@ -2374,7 +2374,7 @@ fun CanvasScreen(
                                                     } catch (e: Exception) { e.printStackTrace() }
                                                 }
                                             },
-                                            modifier = Modifier.size(24.dp)
+                                            modifier = Modifier.size(36.dp)
                                         ) {
                                             Icon(
                                                 if (layer.visible) Icons.Default.Visibility else Icons.Default.VisibilityOff,
@@ -2412,7 +2412,7 @@ fun CanvasScreen(
                                                 }
                                             },
                                             enabled = idx > 0,
-                                            modifier = Modifier.size(24.dp)
+                                            modifier = Modifier.size(36.dp)
                                         ) {
                                             Icon(Icons.Default.KeyboardArrowUp, contentDescription = "move up", modifier = Modifier.size(16.dp))
                                         }
@@ -2429,7 +2429,7 @@ fun CanvasScreen(
                                                 }
                                             },
                                             enabled = idx < layers.size - 1,
-                                            modifier = Modifier.size(24.dp)
+                                            modifier = Modifier.size(36.dp)
                                         ) {
                                             Icon(Icons.Default.KeyboardArrowDown, contentDescription = "move down", modifier = Modifier.size(16.dp))
                                         }
@@ -2443,7 +2443,7 @@ fun CanvasScreen(
                                                     } catch (e: Exception) { e.printStackTrace() }
                                                 }
                                             },
-                                            modifier = Modifier.size(24.dp)
+                                            modifier = Modifier.size(36.dp)
                                         ) {
                                             Icon(Icons.Default.Delete, contentDescription = "delete", tint = Color.Red, modifier = Modifier.size(16.dp))
                                         }
@@ -2593,7 +2593,7 @@ fun CanvasScreen(
                                         // Font Size Controls (A- / A+)
                                         IconButton(
                                             onClick = { liveTextSizeSp = (liveTextSizeSp - 4f).coerceAtLeast(12f) },
-                                            modifier = Modifier.size(26.dp)
+                                            modifier = Modifier.size(32.dp)
                                         ) {
                                             Text("A-", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color(0xFF555555))
                                         }
@@ -2605,7 +2605,7 @@ fun CanvasScreen(
                                         )
                                         IconButton(
                                             onClick = { liveTextSizeSp = (liveTextSizeSp + 4f).coerceAtMost(72f) },
-                                            modifier = Modifier.size(26.dp)
+                                            modifier = Modifier.size(32.dp)
                                         ) {
                                             Text("A+", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFF555555))
                                         }
@@ -2923,7 +2923,7 @@ fun CanvasScreen(
                                 // the dock.
                                 IconButton(
                                     onClick = { isPencaseCollapsed = true },
-                                    modifier = Modifier.size(22.dp)
+                                    modifier = Modifier.size(32.dp)
                                 ) {
                                     Icon(
                                         imageVector = Icons.Default.KeyboardArrowUp,
@@ -3238,7 +3238,7 @@ fun CanvasScreen(
                                 // Collapse the dock into its mini pill.
                                 IconButton(
                                     onClick = { isPencaseCollapsed = true },
-                                    modifier = Modifier.size(22.dp)
+                                    modifier = Modifier.size(32.dp)
                                 ) {
                                     Icon(
                                         imageVector = Icons.AutoMirrored.Filled.KeyboardArrowLeft,

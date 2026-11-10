@@ -41,14 +41,24 @@ object NoteSearch {
         for (rawLine in content.split('\n')) {
             val line = MarkdownText.plain(rawLine)
             if (line.isEmpty()) continue
+            // The match is looked for in the raw line (that is what the
+            // search matches), so a token that only appears in a marker (say
+            // "##") still finds its line and can show an excerpt.
             val first = tokens
                 .mapNotNull { token ->
-                    val at = line.indexOf(token, ignoreCase = true)
+                    val at = rawLine.indexOf(token, ignoreCase = true)
                     if (at < 0) null else at to token.length
                 }
                 .minByOrNull { it.first }
                 ?: continue
-            return window(line, first.first, first.second, tokens, radius)
+            // The excerpt is the plain text of that line; the position is
+            // clamped into it.
+            val plainAt = line.indexOf(
+                tokens.firstOrNull { rawLine.contains(it, ignoreCase = true) }
+                    ?: tokens.first(),
+                ignoreCase = true
+            ).coerceAtLeast(0)
+            return window(line, plainAt.coerceAtMost(line.length), 0, tokens, radius)
         }
         return null
     }

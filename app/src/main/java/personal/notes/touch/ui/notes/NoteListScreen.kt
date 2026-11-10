@@ -10,6 +10,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.clickable
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -595,6 +597,12 @@ fun NoteListScreen(
                                         .clickable {
                                             viewModel.setThemeColor(swatch.color.toArgb())
                                             showThemeColorDialog = false
+                                        }
+                                        // The swatches are the only way to pick
+                                        // the theme colour: they need a name for
+                                        // the screen reader.
+                                        .semantics {
+                                            contentDescription = "Theme colour ${swatch.color.toArgb().toUInt().toString(16)}"
                                         }
                                 )
                             }

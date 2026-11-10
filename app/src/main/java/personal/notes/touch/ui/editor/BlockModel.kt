@@ -115,12 +115,17 @@ object BlockModel {
             val raw = lines[i]
             val trimmed = raw.trim()
             when {
-                trimmed.startsWith(CODE_FENCE) -> {
+                // A fence is a line that *is* a fence, not a line that starts
+                // with three backticks: "```inline```" is a paragraph, and
+                // treating it as a fence swallowed the rest of the note.
+                trimmed == CODE_FENCE || trimmed.startsWith("$CODE_FENCE ") ||
+                    trimmed.startsWith("$CODE_FENCE\t") -> {
                     val buf = StringBuilder()
                     var j = i + 1
                     var closed = false
                     while (j < lines.size) {
-                        if (lines[j].trim().startsWith(CODE_FENCE)) {
+                        val closing = lines[j].trim()
+                        if (closing == CODE_FENCE || closing.startsWith("$CODE_FENCE ")) {
                             closed = true
                             break
                         }
