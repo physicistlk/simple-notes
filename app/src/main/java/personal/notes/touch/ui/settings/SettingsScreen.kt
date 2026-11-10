@@ -267,7 +267,7 @@ fun SettingsScreen(
                         Spacer(modifier = Modifier.height(12.dp))
 
                         Text(
-                            text = "Choose from the 10 TouchNotes signature color swatches:",
+                            text = "Choose from the 10 signature color swatches:",
                             fontSize = 13.sp,
                             color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
                         )
@@ -1025,7 +1025,7 @@ fun SettingsScreen(
                             Spacer(modifier = Modifier.width(10.dp))
                             Column {
                                 Text(
-                                    text = "TouchNotes Clone v0.1.0",
+                                    text = "Simple Notes v0.1.0",
                                     fontWeight = FontWeight.SemiBold,
                                     fontSize = 15.sp
                                 )
@@ -1043,7 +1043,7 @@ fun SettingsScreen(
             item {
                 Spacer(modifier = Modifier.height(20.dp))
                 Text(
-                    text = "TouchNotes Clone • Phase 6",
+                    text = "Simple Notes • Phase 6",
                     fontSize = 12.sp,
                     color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.4f),
                     modifier = Modifier

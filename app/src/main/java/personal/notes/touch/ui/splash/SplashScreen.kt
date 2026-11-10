@@ -42,13 +42,13 @@ fun SplashScreen(
         ) {
             Icon(
                 imageVector = Icons.Default.EditNote,
-                contentDescription = "TouchNotes",
+                contentDescription = "Simple Notes",
                 tint = OrangePrimary,
                 modifier = Modifier.size(80.dp)
             )
             Spacer(modifier = Modifier.height(16.dp))
             Text(
-                text = "TouchNotes",
+                text = "Simple Notes",
                 fontSize = 28.sp,
                 fontWeight = FontWeight.Bold,
                 color = MaterialTheme.colorScheme.onBackground

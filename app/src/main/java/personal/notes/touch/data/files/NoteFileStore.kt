@@ -161,7 +161,17 @@ class NoteFileStore(private val context: Context) {
 
     fun getLayersDir(noteId: String): File = File(getNoteDir(noteId), "layers").apply { if (!exists()) mkdirs() }
 
-    fun getLayerInfoFile(noteId: String): File = File(getLayersDir(noteId), "layers.json")
+    /**
+     * The layer list of a page. The layers are page scoped: a note can have
+     * a different set of floating images on every page, so the manifest and
+     * the layer bitmaps carry the page index.
+     */
+    fun getLayerInfoFile(noteId: String, pageIndex: Int): File =
+        File(getLayersDir(noteId), "page_${pageIndex}_layers.json")
+
+    /** The bitmap file of one layer of a page. */
+    fun getLayerFile(noteId: String, pageIndex: Int, layerIndex: Int): File =
+        File(getLayersDir(noteId), "page_${pageIndex}_layer_${layerIndex}.png")
 
     /** Workspace preferences (tab bar state, dock orientation) live beside the notes. */
     fun getUiPrefsFile(): File = File(context.filesDir, "ui_prefs.json")

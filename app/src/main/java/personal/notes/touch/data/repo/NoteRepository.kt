@@ -453,6 +453,9 @@ class NoteRepository(
     }
 
     suspend fun permanentlyDeleteNote(id: String) = withContext(Dispatchers.IO) {
+        // The references into the note go with it, otherwise the table grows
+        // with every permanent delete.
+        blockRefDao.deleteForNote(id)
         noteBlockDao.deleteForNote(id)
         noteTagDao.deleteForNote(id)
         noteRefDao.deleteForNote(id)

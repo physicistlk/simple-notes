@@ -588,7 +588,25 @@ class CanvasViewModel(
     suspend fun loadPageStrokes(index: Int): Bitmap? = repository.loadPageStrokes(noteId, index)
 
     /** F-10: persists the stroke layer the way the page's type dictates. */
+    /**
+     * Writes a page bitmap to disk.
+     *
+     * The bitmap is copied first: the encoder runs on another thread while
+     * the canvas keeps drawing into the same bitmap, and a torn page file
+     * loses the whole page's ink.
+     */
     private suspend fun saveContentLayer(index: Int, bitmap: Bitmap) {
+        val copy = try {
+            bitmap.copy(Bitmap.Config.ARGB_8888, false)
+        } catch (e: OutOfMemoryError) {
+            e.printStackTrace()
+            null
+        } ?: return
+        saveContentLayerDirect(index, copy)
+        copy.recycle()
+    }
+
+    private suspend fun saveContentLayerDirect(index: Int, bitmap: Bitmap) {
         if (pageIsVectorPdf(index)) {
             repository.savePageStrokes(noteId, index, bitmap)
         } else {
@@ -702,7 +720,8 @@ class CanvasViewModel(
             e.printStackTrace()
             null
         } ?: return
-        saveContentLayer(pageIdx, copy)
+        // The copy is already made here; do not copy a second time.
+        saveContentLayerDirect(pageIdx, copy)
         copy.recycle()
         if (pendingSave?.second === bitmap) pendingSave = null
     }

@@ -25,7 +25,7 @@ data class BackupResult(
 object BackupManager {
 
     private const val BACKUP_VERSION = 1
-    private const val COMMENT = "TouchNotes Backup v1.0"
+    private const val COMMENT = "Simple Notes Backup v1.0"
 
     /**
      * Creates a full offline backup ZIP archive written to an OutputStream (e.g. SAF Document Uri).

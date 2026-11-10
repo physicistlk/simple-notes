@@ -95,7 +95,7 @@ fun ExportDialog(
 
     val resolvedMarkdownContent = remember(note.title, note.content) {
         note.content?.takeIf { it.isNotBlank() }
-            ?: "# ${note.title.ifBlank { "Untitled Note" }}\n\nExported from TouchNotes.\n"
+            ?: "# ${note.title.ifBlank { "Untitled Note" }}\n\nExported from Simple Notes.\n"
     }
 
     // Produces the composite flattened bitmap (including PDF background, image layers, and white paper bed)
@@ -376,7 +376,7 @@ fun ExportDialog(
                     // Option 3: Markdown / Text (When note has text content or targeted)
                     if (!note.content.isNullOrBlank() || initialTarget == ExportTarget.MARKDOWN) {
                         val markdownContent = note.content?.takeIf { it.isNotBlank() }
-                            ?: "# ${note.title.ifBlank { "Untitled Note" }}\n\nExported from TouchNotes.\n"
+                            ?: "# ${note.title.ifBlank { "Untitled Note" }}\n\nExported from Simple Notes.\n"
                         ExportOptionCard(
                             title = "Markdown Text (.md)",
                             subtitle = "Clean portable markdown file with formatting",

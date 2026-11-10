@@ -505,7 +505,15 @@ class TextEditorViewModel(
         repository.blockTransfers
             .filter { it.sourceNoteId == noteId || it.targetNoteId == noteId }
             .onEach {
-                if (isInitialized) reloadFromStorage()
+                if (!isInitialized) return@onEach
+                // A reload replaces the text of the note. If the user has
+                // typed something that is not saved yet, the reload waits for
+                // the next save instead of throwing the text away.
+                if (_contentValue.value.text != lastSavedContent) {
+                    reloadPending = true
+                } else {
+                    reloadFromStorage()
+                }
             }
             .launchIn(viewModelScope)
 
@@ -560,10 +568,23 @@ class TextEditorViewModel(
                 content = contentText
             )
             persistBlocks(contentText)
+            lastSavedContent = contentText
+            // A reload that was postponed (because the user was typing) can
+            // happen now.
+            if (reloadPending) {
+                reloadPending = false
+                reloadFromStorage()
+            }
         } finally {
             _isSaving.value = false
         }
     }
+
+    /** The content as it was last written to the database. */
+    private var lastSavedContent: String = ""
+
+    /** A reload was postponed because the user had unsaved text. */
+    private var reloadPending: Boolean = false
 
     private suspend fun reloadFromStorage() {
         val latest = repository.getNoteDirect(noteId) ?: return
@@ -1080,6 +1101,25 @@ class TextEditorViewModel(
     }
 
     fun applyWrapFormatting(prefix: String, suffix: String = prefix, placeholder: String = "text") {
+        // The formatting belongs to the block the caret is in. In EDIT mode the
+        // note's own selection stays at 0, so formatting the whole content
+        // would put the tag at the top of the note and break its first block.
+        val activeId = _activeBlockId.value
+        if (activeId != null) {
+            val list = _blocks.value
+            val idx = list.indexOfFirst { it.id == activeId }
+            if (idx >= 0) {
+                val block = list[idx]
+                val field = block.field
+                val (newText, newSelection) = wrapAt(
+                    field.text, field.selection, prefix, suffix, placeholder
+                )
+                val mutable = list.toMutableList()
+                mutable[idx] = block.copy(field = TextFieldValue(newText, newSelection))
+                publishBlocks(mutable, FocusTarget(block.id))
+                return
+            }
+        }
         val current = _contentValue.value
         val text = current.text
         val selection = current.selection
@@ -1111,6 +1151,34 @@ class TextEditorViewModel(
     fun applyUnderline() = applyWrapFormatting("<u>", "</u>")
     fun applyStrikethrough() = applyWrapFormatting("~~")
     fun applyInlineCode() = applyWrapFormatting("`")
+
+    /** Wraps the selection (or inserts the placeholder) in the given text. */
+    private fun wrapAt(
+        text: String,
+        selection: TextRange,
+        prefix: String,
+        suffix: String,
+        placeholder: String
+    ): Pair<String, TextRange> {
+        return if (selection.collapsed) {
+            val inserted = "$prefix$placeholder$suffix"
+            val before = text.substring(0, selection.start)
+            val after = text.substring(selection.start)
+            (before + inserted + after) to TextRange(
+                selection.start + prefix.length,
+                selection.start + prefix.length + placeholder.length
+            )
+        } else {
+            val selectedText = text.substring(selection.start, selection.end)
+            val wrapped = "$prefix$selectedText$suffix"
+            val before = text.substring(0, selection.start)
+            val after = text.substring(selection.end)
+            (before + wrapped + after) to TextRange(
+                selection.start,
+                selection.start + wrapped.length
+            )
+        }
+    }
 
     fun applyColor(color: Color) {
         val hex = String.format("#%06X", (0xFFFFFF and color.toArgb()))

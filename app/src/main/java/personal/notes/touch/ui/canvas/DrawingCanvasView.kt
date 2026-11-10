@@ -1209,7 +1209,7 @@ class DrawingCanvasView @JvmOverloads constructor(
      * whatever was read); ordinary IO failures produce an empty list.
      */
     fun readLayersFromDisk(fileStore: personal.notes.touch.data.files.NoteFileStore, noteId: String): List<ImageLayer>? {
-        val infoFile = fileStore.getLayerInfoFile(noteId)
+        val infoFile = fileStore.getLayerInfoFile(noteId, pageIndex)
         if (!infoFile.exists()) return null
         val layers = mutableListOf<ImageLayer>()
         try {
@@ -1327,6 +1327,9 @@ class DrawingCanvasView @JvmOverloads constructor(
         }
     }
 
+    /** How many margin crops are held (the load guard compares it). */
+    fun beyondPageInkCount(): Int = beyondPageInk.size
+
     /** True when this page carries ink outside its paper. */
     fun hasBeyondPageInk(): Boolean = beyondPageInk.isNotEmpty()
 
@@ -1377,8 +1380,17 @@ class DrawingCanvasView @JvmOverloads constructor(
      * the page it was loaded for: a load that arrives after the user already
      * drew in the margin must not wipe those strokes.
      */
-    fun applyBeyondPageInk(crops: List<InkCrop>, forPageIndex: Int = pageIndex) {
+    fun applyBeyondPageInk(
+        crops: List<InkCrop>,
+        forPageIndex: Int = pageIndex,
+        expectedCount: Int = -1
+    ) {
         if (forPageIndex != pageIndex) return
+        if (expectedCount >= 0 && expectedCount != beyondPageInk.size) {
+            // The user drew in the margin while the load was running: those
+            // strokes are newer than the file, so they win.
+            return
+        }
         // The old crops are not referenced any more: release them.
         for (old in beyondPageInk) {
             if (!old.bitmap.isRecycled) old.bitmap.recycle()
@@ -1400,7 +1412,7 @@ class DrawingCanvasView @JvmOverloads constructor(
         noteId: String
     ) {
         val layersDir = fileStore.getLayersDir(noteId)
-        val infoFile = fileStore.getLayerInfoFile(noteId)
+        val infoFile = fileStore.getLayerInfoFile(noteId, pageIndex)
         try {
             // The layer list belongs to the UI thread: take the snapshot
             // before the file work moves to another thread, so a concurrent
@@ -1423,7 +1435,7 @@ class DrawingCanvasView @JvmOverloads constructor(
             val writtenFiles = mutableSetOf<String>()
             withContext(Dispatchers.IO) {
             snapshot.forEachIndexed { index, layer ->
-                val fileName = "layer_$index.png"
+                val fileName = "page_${pageIndex}_layer_$index.png"
                 writtenFiles.add(fileName)
                 val file = java.io.File(layersDir, fileName)
                 java.io.FileOutputStream(file).use { fos ->
@@ -1442,7 +1454,7 @@ class DrawingCanvasView @JvmOverloads constructor(
                 val inkArr = org.json.JSONArray()
                 layer.ink.forEachIndexed { inkIdx, crop ->
                     if (crop.bitmap.isRecycled) return@forEachIndexed
-                    val inkName = "layer_${index}_ink_${inkIdx}.png"
+                    val inkName = "page_${pageIndex}_layer_${index}_ink_${inkIdx}.png"
                     writtenFiles.add(inkName)
                     java.io.FileOutputStream(java.io.File(layersDir, inkName)).use { fos ->
                         crop.bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, fos)
@@ -1459,7 +1471,12 @@ class DrawingCanvasView @JvmOverloads constructor(
             }
             infoFile.writeText(arr.toString())
             layersDir.listFiles()?.forEach { file ->
-                if (file.name.startsWith("layer_") && file.name.endsWith(".png") && !writtenFiles.contains(file.name)) {
+                // Only this page's files are cleaned up: the layers of the
+                // other pages must stay.
+                if (file.name.startsWith("page_${pageIndex}_layer_") &&
+                    file.name.endsWith(".png") &&
+                    !writtenFiles.contains(file.name)
+                ) {
                     file.delete()
                 }
             }

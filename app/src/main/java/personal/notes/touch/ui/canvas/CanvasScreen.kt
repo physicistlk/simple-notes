@@ -311,11 +311,14 @@ fun CanvasScreen(
     val loadBeyondPageInk: (Int) -> Unit = { pageIdx ->
         val view = canvasViewRef
         if (view != null) {
+            // The count is the guard: if the user drew in the margin while the
+            // file was read, those strokes are newer and must not be dropped.
+            val countAtStart = view.beyondPageInkCount()
             scope.launch {
                 val crops = withContext(Dispatchers.IO) {
                     view.readBeyondPageInk(viewModel.fileStore, viewModel.noteId, pageIdx)
                 }
-                view.applyBeyondPageInk(crops)
+                view.applyBeyondPageInk(crops, forPageIndex = pageIdx, expectedCount = countAtStart)
             }
         }
     }
@@ -2487,6 +2490,20 @@ fun CanvasScreen(
                                 Spacer(Modifier.height(4.dp))
                                 TextButton(
                                     onClick = {
+                                        if (isContinuous) {
+                                            // The merge flattens the layers into
+                                            // the page bitmap, and the hidden
+                                            // canvas is not written while the
+                                            // reader is on: merging here would
+                                            // delete the layers without
+                                            // flattening them.
+                                            android.widget.Toast.makeText(
+                                                context,
+                                                "Switch to Single-Page to merge the layers",
+                                                android.widget.Toast.LENGTH_SHORT
+                                            ).show()
+                                            return@TextButton
+                                        }
                                         canvasViewRef?.mergeAllLayersToBase()
                                         layersTick++
                                         scope.launch {

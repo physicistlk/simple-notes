@@ -373,8 +373,12 @@ object ExportManager {
         return personal.notes.touch.util.BitmapUtils.loadBitmapFromFile(file)
     }
 
-    private fun readDiskImageLayers(fileStore: personal.notes.touch.data.files.NoteFileStore, noteId: String): List<ImageLayer> {
-        val infoFile = fileStore.getLayerInfoFile(noteId)
+    private fun readDiskImageLayers(
+        fileStore: personal.notes.touch.data.files.NoteFileStore,
+        noteId: String,
+        pageIndex: Int
+    ): List<ImageLayer> {
+        val infoFile = fileStore.getLayerInfoFile(noteId, pageIndex)
         if (!infoFile.exists()) return emptyList()
         val layers = mutableListOf<ImageLayer>()
         try {
@@ -429,11 +433,12 @@ object ExportManager {
         fileStore: personal.notes.touch.data.files.NoteFileStore,
         noteId: String,
         pageIndex: Int,
-        includeLayers: Boolean = (pageIndex == 0)
+        // The layers are page scoped, so every page has its own.
+        includeLayers: Boolean = true
     ): Bitmap? {
         val pageFile = fileStore.getPageFile(noteId, pageIndex)
         val strokesFile = fileStore.getStrokesFile(noteId, pageIndex)
-        val layers = if (includeLayers) readDiskImageLayers(fileStore, noteId) else emptyList()
+        val layers = if (includeLayers) readDiskImageLayers(fileStore, noteId, pageIndex) else emptyList()
         // Ink written outside the paper and a picked page background belong
         // to the page and have to be part of the export as well.
         val beyondInk = readDiskBeyondInk(fileStore, noteId, pageIndex)

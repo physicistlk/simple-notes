@@ -683,7 +683,7 @@ fun NoteListScreen(
     if (showUserManualDialog) {
         AlertDialog(
             onDismissRequest = { showUserManualDialog = false },
-            title = { Text("TouchNotes Manual & Gestures") },
+            title = { Text("Simple Notes Manual & Gestures") },
             text = {
                 Column {
                     Text("• Stylus Inking: Fluid pressure-sensitive fountain pen, fineliner, highlighter, eraser.", fontSize = 13.sp)
@@ -707,10 +707,10 @@ fun NoteListScreen(
     if (showAboutDialog) {
         AlertDialog(
             onDismissRequest = { showAboutDialog = false },
-            title = { Text("About TouchNotes") },
+            title = { Text("About Simple Notes") },
             text = {
                 Column {
-                    Text("TouchNotes Tablet Edition v7.0.4", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                    Text("Simple Notes v0.1.0", fontWeight = FontWeight.Bold, fontSize = 15.sp)
                     Spacer(modifier = Modifier.height(6.dp))
                     Text("100% Private & Offline-first notebook with Room SQLite persistence, native hardware canvas acceleration, and zero network tracking.", fontSize = 13.sp, color = Color.Gray)
                 }
