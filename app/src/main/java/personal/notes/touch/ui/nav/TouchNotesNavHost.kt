@@ -5,7 +5,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.toMutableStateList
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.remember
@@ -37,13 +39,23 @@ fun TouchNotesNavHost(
     app: TouchNotesApp,
     navController: NavHostController = rememberNavController()
 ) {
-    val openNotes = rememberSaveable { mutableStateListOf<String>() }
+    val openNotes = rememberSaveable(
+        saver = listSaver(
+            save = { it.toList() },
+            restore = { it.toMutableStateList() }
+        )
+    ) { mutableStateListOf<String>() }
     /**
      * Notes the user closed in the tab bar. They must not re-open
      * themselves when the canvas recomposes; opening a note again from the
      * library clears the flag.
      */
-    val closedNotes = rememberSaveable { mutableStateListOf<String>() }
+    val closedNotes = rememberSaveable(
+        saver = listSaver(
+            save = { it.toList() },
+            restore = { it.toMutableStateList() }
+        )
+    ) { mutableStateListOf<String>() }
     val context = LocalContext.current
 
     // Edge-to-edge (targetSdk 35+): every screen must clear the status bar, or app

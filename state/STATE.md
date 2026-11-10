@@ -186,3 +186,9 @@
 - Touch Targets & Accessibility: enlarged dock collapse, text stepper, zoom lock, and layer panel icon buttons (32–36 dp); added content descriptions for screen readers; closable backup progress dialog.
 - Audit Synchronization: updated `state/AUDIT.md` with items C11–C17 and X10 documenting live-text insertion, transform bounding box, continuous multi-page scaling, centroid pinch zoom, dock orientation toggle, top-bar page insertion, vector stickers, and tab-close navigation.
 - Verified with 299 passing unit tests (0 failures, 2 skipped), 0 declared runtime permissions, and clean Gradle compilation.
+
+## Decisions appended 64        64. 2026-11-10 (auditor): Physical device hardware pass & SaveableStateRegistry SnapshotStateList fix:
+- Physical Hardware Deployment: device `230b89f8` attached (Xiaomi Pad 5 `21051182G`, Android 16).
+- SaveableStateRegistry Crash Fix: `rememberSaveable { mutableStateListOf<String>() }` on `openNotes` and `closedNotes` in `TouchNotesNavHost.kt` threw `IllegalArgumentException` on device launch because `SnapshotStateList` is not directly Bundle-saveable. Implemented `listSaver(save = { it.toList() }, restore = { it.toMutableStateList() })`.
+- Live Device Verification: installed `app-debug.apk` via ADB stream install; launched successfully (PID active, 0 crash logs); marked audit item `X9` as FIXED in `state/AUDIT.md`.
+- Verified with 299 passing unit tests, clean assembleDebug APK build, and pushed to GitHub repo.
