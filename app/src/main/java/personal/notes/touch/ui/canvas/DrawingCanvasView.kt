@@ -1324,6 +1324,22 @@ class DrawingCanvasView @JvmOverloads constructor(
         }
     }
 
+    /** True when this page carries ink outside its paper. */
+    fun hasBeyondPageInk(): Boolean = beyondPageInk.isNotEmpty()
+
+    /**
+     * Writes the ink outside the paper to disk. The layer save does this as
+     * well, but the margin ink exists without any layer change, so it has to
+     * be saved on its own when a stroke lands outside the paper.
+     */
+    fun saveBeyondPageInkNow(
+        fileStore: personal.notes.touch.data.files.NoteFileStore,
+        noteId: String
+    ) {
+        if (beyondPageInk.isEmpty()) return
+        writeBeyondPageInk(fileStore.getLayersDir(noteId), fileStore, noteId)
+    }
+
     /** Loads the ink written outside the paper of [pageIndex]. */
     fun readBeyondPageInk(
         fileStore: personal.notes.touch.data.files.NoteFileStore,

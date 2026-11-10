@@ -614,10 +614,7 @@ fun CanvasScreen(
                 // only a safety net. Skip it while edits are unsaved: applying
                 // the on-disk copy would silently undo a just-dragged image.
                 if (!view.layersDirty) {
-                    val layers = withContext(Dispatchers.IO) {
-                        view.readLayersFromDisk(viewModel.fileStore, viewModel.noteId)
-                    }
-                    view.applyLoadedLayers(layers)
+                    view.reloadLayersFromDisk(viewModel.fileStore, viewModel.noteId)
                 }
             }
         } catch (e: Exception) {
@@ -647,10 +644,7 @@ fun CanvasScreen(
                 inkController.flushCurrentSuspend()
                 viewModel.setPageTurningMode(1)
                 if (view.imageLayers.isEmpty() && !view.layersDirty) {
-                    val diskLayers = withContext(Dispatchers.IO) {
-                        view.readLayersFromDisk(viewModel.fileStore, viewModel.noteId)
-                    }
-                    view.applyLoadedLayers(diskLayers)
+                    view.reloadLayersFromDisk(viewModel.fileStore, viewModel.noteId)
                 }
             }
             val success = action(view)
@@ -889,6 +883,14 @@ fun CanvasScreen(
         if (canvas != null && canvas.layersDirty) {
             withContext(Dispatchers.IO) {
                 canvas.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+            }
+        }
+        // The margin ink is saved on its own: it exists without any layer
+        // change, so a layer save must not be the only way out.
+        val inkCanvas = canvasViewRef
+        if (inkCanvas != null && inkCanvas.hasBeyondPageInk()) {
+            withContext(Dispatchers.IO) {
+                inkCanvas.saveBeyondPageInkNow(viewModel.fileStore, viewModel.noteId)
             }
         }
     }
@@ -1933,6 +1935,15 @@ fun CanvasScreen(
                                 getBackingBitmap()?.let { bmp ->
                                     viewModel.scheduleDebouncedSave(bmp)
                                 }
+                                // Ink written outside the paper lives in its
+                                // own files and has to be written with the
+                                // stroke, not only when a layer changes.
+                                val canvas = canvasViewRef
+                                if (canvas != null && canvas.hasBeyondPageInk()) {
+                                    scope.launch(Dispatchers.IO) {
+                                        canvas.saveBeyondPageInkNow(viewModel.fileStore, viewModel.noteId)
+                                    }
+                                }
                             }
                             // Initial load, bound to THIS view instance: the
                             // coroutine captures `this`, so it can never miss
@@ -1951,10 +1962,7 @@ fun CanvasScreen(
                                     if (isContinuous) {
                                         viewModel.setCanvasPageIndex(-1)
                                         viewModel.setPageLoadedFromDisk(false)
-                                        val layers = withContext(Dispatchers.IO) {
-                                            readLayersFromDisk(viewModel.fileStore, viewModel.noteId)
-                                        }
-                                        applyLoadedLayers(layers)
+                                        reloadLayersFromDisk(viewModel.fileStore, viewModel.noteId)
                                         return@launch
                                     }
                                     val pageIdx = viewModel.currentPageIndex.value
@@ -1977,10 +1985,7 @@ fun CanvasScreen(
                                         viewModel.setPageLoadedFromDisk(savedBitmap != null)
                                         loadBeyondPageInk(pageIdx)
                                     }
-                                    val layers = withContext(Dispatchers.IO) {
-                                        readLayersFromDisk(viewModel.fileStore, viewModel.noteId)
-                                    }
-                                    applyLoadedLayers(layers)
+                                    reloadLayersFromDisk(viewModel.fileStore, viewModel.noteId)
                                 } catch (e: Exception) {
                                     e.printStackTrace()
                                 }
@@ -5203,6 +5208,24 @@ fun SettingsCheckboxRow(
 }
 
 @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
+/**
+ * Re-reads the layers of a note from disk.
+ *
+ * The layers that are still only in memory (a layer that was just inserted,
+ * or ink written on a layer) are written first, so applying the disk copy
+ * can never drop them.
+ */
+private suspend fun DrawingCanvasView.reloadLayersFromDisk(
+    fileStore: personal.notes.touch.data.files.NoteFileStore,
+    noteId: String
+) {
+    if (layersDirty) {
+        withContext(Dispatchers.IO) { saveImageLayers(fileStore, noteId) }
+    }
+    val disk = withContext(Dispatchers.IO) { readLayersFromDisk(fileStore, noteId) }
+    applyLoadedLayers(disk)
+}
+
 /**
  * Two-finger pinch inside a page of the continuous reader.
  *
