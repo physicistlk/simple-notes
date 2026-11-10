@@ -755,7 +755,38 @@ class TextEditorViewModel(
             }
         }
 
-        val updated = cur.copy(field = newValue)
+        val sanitizedField = when (cur.type) {
+            BlockType.NUMBERED -> {
+                val prefixRegex = Regex("""^(\d{1,9}\.|\*|-|•)\s*""")
+                val m = prefixRegex.find(newValue.text)
+                if (m != null && m.range.first == 0) {
+                    val stripped = newValue.text.substring(m.range.last + 1)
+                    val newOffset = (newValue.selection.start - (m.range.last + 1)).coerceIn(0, stripped.length)
+                    TextFieldValue(stripped, TextRange(newOffset))
+                } else newValue
+            }
+            BlockType.TASK -> {
+                val prefixRegex = Regex("""^(?:-\s*)?\[[ xX]?]\s*""")
+                val m = prefixRegex.find(newValue.text)
+                if (m != null && m.range.first == 0) {
+                    val stripped = newValue.text.substring(m.range.last + 1)
+                    val newOffset = (newValue.selection.start - (m.range.last + 1)).coerceIn(0, stripped.length)
+                    TextFieldValue(stripped, TextRange(newOffset))
+                } else newValue
+            }
+            BlockType.BULLET -> {
+                val prefixRegex = Regex("""^[-*•]\s*""")
+                val m = prefixRegex.find(newValue.text)
+                if (m != null && m.range.first == 0) {
+                    val stripped = newValue.text.substring(m.range.last + 1)
+                    val newOffset = (newValue.selection.start - (m.range.last + 1)).coerceIn(0, stripped.length)
+                    TextFieldValue(stripped, TextRange(newOffset))
+                } else newValue
+            }
+            else -> newValue
+        }
+
+        val updated = cur.copy(field = sanitizedField)
         val mutable = list.toMutableList()
         mutable[idx] = updated
         publishBlocks(mutable)
