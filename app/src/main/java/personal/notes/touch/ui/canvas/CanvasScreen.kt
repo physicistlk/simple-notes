@@ -249,23 +249,27 @@ private const val MIN_CONTINUOUS_SCALE = 0.4f
 private const val MAX_CONTINUOUS_SCALE = 4f
 
 /**
- * "Liquid glass" material for the floating docks: a translucent white body
- * that lets the canvas bleed through, plus a specular hairline edge.
- * The alphas stay high enough for the dark icons (and the yellow highlighter)
- * to stay readable on top of the glass.
+ * Modern Liquid Glass material for floating tool docks:
+ * A high-luminance, translucent frosted acrylic body with multi-stop refraction
+ * that prevents underlying canvas ink or desk boundaries from causing jarring stripes,
+ * paired with a dual-tone specular highlight edge and soft diffused ambient shadows.
  */
-private val GlassBodyBrush = Brush.verticalGradient(
+private val GlassBodyBrush = Brush.linearGradient(
     listOf(
-        Color.White.copy(alpha = 0.94f),
-        Color.White.copy(alpha = 0.70f)
+        Color(0xFAFFFFFF), // 98% pure luminous white highlight (top-left)
+        Color(0xF5F8FAFC), // 96% frosted crystal body
+        Color(0xEEF1F5F9), // 93% subtle optical refraction
+        Color(0xF8FFFFFF)  // 97% bottom-right rim sheen
     )
 )
 
-/** Hairline edge of the glass: bright on the lit side, fading out on the other. */
+/** Specular hairline edge of the liquid glass with ambient occlusion on shadow side. */
 private val GlassEdgeBrush = Brush.linearGradient(
     listOf(
-        Color.White.copy(alpha = 0.95f),
-        Color.White.copy(alpha = 0.30f)
+        Color.White.copy(alpha = 0.95f), // High specular glint on lit edge
+        Color.White.copy(alpha = 0.65f), // Soft diffuse reflection
+        Color(0x1F000000),               // Subtle ambient occlusion rim on shadow side
+        Color.White.copy(alpha = 0.55f)  // Specular rim bounce
     )
 )
 
@@ -2765,12 +2769,17 @@ fun CanvasScreen(
                     Surface(
                         shape = RoundedCornerShape(24.dp),
                         color = Color.Transparent,
-                        shadowElevation = 10.dp,
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
                             .padding(bottom = 96.dp)
+                            .shadow(
+                                elevation = 12.dp,
+                                shape = RoundedCornerShape(24.dp),
+                                ambientColor = Color(0x14000000),
+                                spotColor = Color(0x28000000)
+                            )
                             .background(GlassBodyBrush, RoundedCornerShape(24.dp))
-                            .border(1.dp, GlassEdgeBrush, RoundedCornerShape(24.dp))
+                            .border(1.2.dp, GlassEdgeBrush, RoundedCornerShape(24.dp))
                     ) {
                         Row(
                             modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
@@ -2819,60 +2828,72 @@ fun CanvasScreen(
 
                 if (uiState.showPencase && !uiState.readingMode) {
                     if (isPencaseCollapsed) {
-                        // Collapsed mini restore pill
+                        // Collapsed mini restore pill with luminous liquid glass styling
                         Surface(
                             shape = RoundedCornerShape(20.dp),
                             color = Color.Transparent,
-                            shadowElevation = 8.dp,
                             modifier = Modifier
                                 .align(if (uiState.dockHorizontal) Alignment.TopCenter else Alignment.CenterStart)
                                 .offset { IntOffset(pencaseOffsetX.roundToInt(), pencaseOffsetY.roundToInt()) }
                                 .padding(top = if (uiState.dockHorizontal) 10.dp else 0.dp, start = if (!uiState.dockHorizontal) 12.dp else 0.dp)
+                                .shadow(
+                                    elevation = 12.dp,
+                                    shape = RoundedCornerShape(20.dp),
+                                    ambientColor = Color(0x14000000),
+                                    spotColor = Color(0x28000000)
+                                )
                                 .background(GlassBodyBrush, RoundedCornerShape(20.dp))
-                                .border(1.dp, GlassEdgeBrush, RoundedCornerShape(20.dp))
+                                .border(1.2.dp, GlassEdgeBrush, RoundedCornerShape(20.dp))
                                 .clickable { isPencaseCollapsed = false }
                         ) {
                             Row(
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
                                 verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
                             ) {
                                 Icon(
                                     painter = painterResource(id = R.drawable.ic_tool_fineliner),
                                     contentDescription = "Expand Pens",
                                     tint = OrangePrimary,
-                                    modifier = Modifier.size(16.dp)
+                                    modifier = Modifier.size(17.dp)
                                 )
                                 Icon(
                                     imageVector = if (uiState.dockHorizontal) Icons.Default.KeyboardArrowDown else Icons.AutoMirrored.Filled.KeyboardArrowRight,
                                     contentDescription = "Expand",
-                                    tint = Color.Gray,
-                                    modifier = Modifier.size(14.dp)
+                                    tint = Color(0xFF64748B),
+                                    modifier = Modifier.size(15.dp)
                                 )
                             }
                         }
                     } else if (uiState.dockHorizontal) {
-                        // Horizontal Dock (Top under bar)
+                        // Horizontal Dock (Top under bar) with luminous liquid glass styling
                         Surface(
-                            shape = RoundedCornerShape(24.dp),
+                            shape = RoundedCornerShape(26.dp),
                             color = Color.Transparent,
-                            shadowElevation = 12.dp,
                             modifier = Modifier
                                 .align(Alignment.TopCenter)
                                 .offset { IntOffset(pencaseOffsetX.roundToInt(), pencaseOffsetY.roundToInt()) }
                                 .padding(top = 10.dp)
-                                .background(GlassBodyBrush, RoundedCornerShape(24.dp))
-                                .border(1.dp, GlassEdgeBrush, RoundedCornerShape(24.dp))
+                                .shadow(
+                                    elevation = 14.dp,
+                                    shape = RoundedCornerShape(26.dp),
+                                    ambientColor = Color(0x14000000),
+                                    spotColor = Color(0x28000000)
+                                )
+                                .background(GlassBodyBrush, RoundedCornerShape(26.dp))
+                                .border(1.2.dp, GlassEdgeBrush, RoundedCornerShape(26.dp))
                         ) {
                             Row(
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                                modifier = Modifier
+                                    .height(48.dp)
+                                    .padding(horizontal = 10.dp),
                                 verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
                             ) {
                                 // Drag & Rotate Handle Pill (Tap to switch orientation, Tap & Hold to drag)
                                 Box(
                                     modifier = Modifier
-                                        .size(width = 24.dp, height = 36.dp)
+                                        .size(width = 20.dp, height = 34.dp)
                                         .pointerInput(Unit) {
                                             awaitEachGesture {
                                                 val down = awaitFirstDown(requireUnconsumed = false)
@@ -2912,17 +2933,14 @@ fun CanvasScreen(
                                 ) {
                                     Box(
                                         modifier = Modifier
-                                            .height(18.dp)
+                                            .height(20.dp)
                                             .width(4.dp)
                                             .clip(RoundedCornerShape(2.dp))
-                                            .background(Color.LightGray)
+                                            .background(Color(0x38000000))
                                     )
                                 }
 
-                                // Collapse the dock into its mini pill. It is a
-                                // separate button from the drag handle: the
-                                // handle flips the orientation, this one hides
-                                // the dock.
+                                // Collapse the dock into its mini pill.
                                 IconButton(
                                     onClick = { isPencaseCollapsed = true },
                                     modifier = Modifier.size(32.dp)
@@ -2930,8 +2948,8 @@ fun CanvasScreen(
                                     Icon(
                                         imageVector = Icons.Default.KeyboardArrowUp,
                                         contentDescription = "Collapse pen dock",
-                                        tint = Color(0xFF777777),
-                                        modifier = Modifier.size(15.dp)
+                                        tint = Color(0xFF64748B),
+                                        modifier = Modifier.size(16.dp)
                                     )
                                 }
 
@@ -3041,11 +3059,11 @@ fun CanvasScreen(
                                     onClick = selectLassoTool
                                 )
 
-                                Divider(
+                                Box(
                                     modifier = Modifier
-                                        .height(24.dp)
-                                        .width(1.dp),
-                                    color = Color.LightGray
+                                        .height(22.dp)
+                                        .width(1.dp)
+                                        .background(Color(0x1F000000))
                                 )
 
                                 // 3 Stroke Width Presets (Horizontal bar line thickness)
@@ -3066,11 +3084,11 @@ fun CanvasScreen(
                                         modifier = Modifier
                                             .size(26.dp)
                                             .clip(CircleShape)
-                                            .background(if (isSelected) OrangePrimary.copy(alpha = 0.12f) else Color.Transparent)
+                                            .background(if (isSelected) OrangePrimary.copy(alpha = 0.14f) else Color.Transparent)
                                             .border(
-                                                if (isSelected) 1.5.dp else 0.dp,
-                                                if (isSelected) OrangePrimary else Color.Transparent,
-                                                CircleShape
+                                                width = if (isSelected) 1.5.dp else 0.dp,
+                                                color = if (isSelected) OrangePrimary else Color.Transparent,
+                                                shape = CircleShape
                                             )
                                             .combinedClickable(
                                                 onClick = { viewModel.setStrokeWidth(widthPx) },
@@ -3082,8 +3100,8 @@ fun CanvasScreen(
                                             modifier = Modifier
                                                 .width(14.dp)
                                                 .height(barHeight)
-                                                .clip(RoundedCornerShape(1.dp))
-                                                .background(if (isSelected) OrangePrimary else Color(0xFF444444))
+                                                .clip(RoundedCornerShape(barHeight / 2))
+                                                .background(if (isSelected) OrangePrimary else Color(0xFF374151))
                                         )
                                         WidthPickerPopup(
                                             expanded = showWidthPopupHoriz,
@@ -3097,11 +3115,11 @@ fun CanvasScreen(
                                     }
                                 }
 
-                                Divider(
+                                Box(
                                     modifier = Modifier
-                                        .height(24.dp)
-                                        .width(1.dp),
-                                    color = Color.LightGray
+                                        .height(22.dp)
+                                        .width(1.dp)
+                                        .background(Color(0x1F000000))
                                 )
 
                                 // 3 Rounded-Square Color Swatches with checkmark
@@ -3111,12 +3129,12 @@ fun CanvasScreen(
                                     Box(
                                         modifier = Modifier
                                             .size(24.dp)
-                                            .clip(RoundedCornerShape(6.dp))
+                                            .clip(RoundedCornerShape(7.dp))
                                             .background(c)
                                             .border(
-                                                if (isSelected) 2.dp else 0.5.dp,
-                                                if (isSelected) OrangePrimary else Color.LightGray,
-                                                RoundedCornerShape(6.dp)
+                                                width = if (isSelected) 2.dp else 0.8.dp,
+                                                color = if (isSelected) OrangePrimary else Color(0x28000000),
+                                                shape = RoundedCornerShape(7.dp)
                                             )
                                             .combinedClickable(
                                                 onClick = { viewModel.selectColor(c) },
@@ -3128,7 +3146,7 @@ fun CanvasScreen(
                                             Icon(
                                                 imageVector = Icons.Default.Check,
                                                 contentDescription = "Selected",
-                                                tint = Color.White,
+                                                tint = if (c == Color.White) Color.Black else Color.White,
                                                 modifier = Modifier.size(14.dp)
                                             )
                                         }
@@ -3151,9 +3169,9 @@ fun CanvasScreen(
                                         .clip(CircleShape)
                                         .background(if (isCustomColorActive) uiState.selectedColor else OrangePrimary)
                                         .border(
-                                            if (isCustomColorActive) 2.dp else 0.dp,
-                                            if (isCustomColorActive) OrangePrimary else Color.Transparent,
-                                            CircleShape
+                                            width = if (isCustomColorActive) 2.dp else 0.8.dp,
+                                            color = if (isCustomColorActive) OrangePrimary else Color(0x20000000),
+                                            shape = CircleShape
                                         )
                                         .clickable { showCustomColorDialog = true },
                                     contentAlignment = Alignment.Center
@@ -3161,34 +3179,41 @@ fun CanvasScreen(
                                     Icon(
                                         imageVector = Icons.Default.Add,
                                         contentDescription = "Custom Color",
-                                        tint = Color.White,
-                                        modifier = Modifier.size(14.dp)
+                                        tint = if (isCustomColorActive && uiState.selectedColor == Color.White) Color.Black else Color.White,
+                                        modifier = Modifier.size(15.dp)
                                     )
                                 }
                             }
                         }
                     } else {
-                        // Vertical Dock (Docked on Left)
+                        // Vertical Dock (Docked on Left) with luminous liquid glass styling
                         Surface(
-                            shape = RoundedCornerShape(24.dp),
+                            shape = RoundedCornerShape(26.dp),
                             color = Color.Transparent,
-                            shadowElevation = 12.dp,
                             modifier = Modifier
                                 .align(Alignment.CenterStart)
                                 .offset { IntOffset(pencaseOffsetX.roundToInt(), pencaseOffsetY.roundToInt()) }
                                 .padding(start = 12.dp)
-                                .background(GlassBodyBrush, RoundedCornerShape(24.dp))
-                                .border(1.dp, GlassEdgeBrush, RoundedCornerShape(24.dp))
+                                .shadow(
+                                    elevation = 14.dp,
+                                    shape = RoundedCornerShape(26.dp),
+                                    ambientColor = Color(0x14000000),
+                                    spotColor = Color(0x28000000)
+                                )
+                                .background(GlassBodyBrush, RoundedCornerShape(26.dp))
+                                .border(1.2.dp, GlassEdgeBrush, RoundedCornerShape(26.dp))
                         ) {
                             Column(
-                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 12.dp),
+                                modifier = Modifier
+                                    .width(48.dp)
+                                    .padding(vertical = 10.dp),
                                 horizontalAlignment = Alignment.CenterHorizontally,
-                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
                             ) {
                                 // Drag & Rotate Handle Pill (Tap to toggle orientation, Tap & Hold to drag)
                                 Box(
                                     modifier = Modifier
-                                        .size(width = 36.dp, height = 24.dp)
+                                        .size(width = 34.dp, height = 20.dp)
                                         .pointerInput(Unit) {
                                             awaitEachGesture {
                                                 val down = awaitFirstDown(requireUnconsumed = false)
@@ -3233,7 +3258,7 @@ fun CanvasScreen(
                                             .width(20.dp)
                                             .height(4.dp)
                                             .clip(RoundedCornerShape(2.dp))
-                                            .background(Color.LightGray)
+                                            .background(Color(0x38000000))
                                     )
                                 }
 
@@ -3245,8 +3270,8 @@ fun CanvasScreen(
                                     Icon(
                                         imageVector = Icons.AutoMirrored.Filled.KeyboardArrowLeft,
                                         contentDescription = "Collapse pen dock",
-                                        tint = Color(0xFF777777),
-                                        modifier = Modifier.size(15.dp)
+                                        tint = Color(0xFF64748B),
+                                        modifier = Modifier.size(16.dp)
                                     )
                                 }
 
@@ -3356,11 +3381,11 @@ fun CanvasScreen(
                                     onClick = selectLassoTool
                                 )
 
-                                Divider(
+                                Box(
                                     modifier = Modifier
-                                        .width(24.dp)
-                                        .height(1.dp),
-                                    color = Color.LightGray
+                                        .width(22.dp)
+                                        .height(1.dp)
+                                        .background(Color(0x1F000000))
                                 )
 
                                 // 3 Stroke Width Presets (vertical line thickness bars)
@@ -3379,13 +3404,13 @@ fun CanvasScreen(
                                     }
                                     Box(
                                         modifier = Modifier
-                                            .size(24.dp)
+                                            .size(26.dp)
                                             .clip(CircleShape)
-                                            .background(if (isSelected) OrangePrimary.copy(alpha = 0.12f) else Color.Transparent)
+                                            .background(if (isSelected) OrangePrimary.copy(alpha = 0.14f) else Color.Transparent)
                                             .border(
-                                                if (isSelected) 1.5.dp else 0.dp,
-                                                if (isSelected) OrangePrimary else Color.Transparent,
-                                                CircleShape
+                                                width = if (isSelected) 1.5.dp else 0.dp,
+                                                color = if (isSelected) OrangePrimary else Color.Transparent,
+                                                shape = CircleShape
                                             )
                                             .combinedClickable(
                                                 onClick = { viewModel.setStrokeWidth(widthPx) },
@@ -3395,10 +3420,10 @@ fun CanvasScreen(
                                     ) {
                                         Box(
                                             modifier = Modifier
-                                                .width(13.dp)
+                                                .width(14.dp)
                                                 .height(barH)
-                                                .clip(RoundedCornerShape(1.dp))
-                                                .background(if (isSelected) OrangePrimary else Color(0xFF444444))
+                                                .clip(RoundedCornerShape(barH / 2))
+                                                .background(if (isSelected) OrangePrimary else Color(0xFF374151))
                                         )
                                         WidthPickerPopup(
                                             expanded = showWidthPopupVert,
@@ -3412,11 +3437,11 @@ fun CanvasScreen(
                                     }
                                 }
 
-                                Divider(
+                                Box(
                                     modifier = Modifier
-                                        .width(24.dp)
-                                        .height(1.dp),
-                                    color = Color.LightGray
+                                        .width(22.dp)
+                                        .height(1.dp)
+                                        .background(Color(0x1F000000))
                                 )
 
                                 // 3 Rounded-Square Color Swatches with checkmark
@@ -3425,13 +3450,13 @@ fun CanvasScreen(
                                     val isSelected = uiState.selectedColor == c
                                     Box(
                                         modifier = Modifier
-                                            .size(22.dp)
-                                            .clip(RoundedCornerShape(6.dp))
+                                            .size(24.dp)
+                                            .clip(RoundedCornerShape(7.dp))
                                             .background(c)
                                             .border(
-                                                if (isSelected) 2.dp else 0.5.dp,
-                                                if (isSelected) OrangePrimary else Color.LightGray,
-                                                RoundedCornerShape(6.dp)
+                                                width = if (isSelected) 2.dp else 0.8.dp,
+                                                color = if (isSelected) OrangePrimary else Color(0x28000000),
+                                                shape = RoundedCornerShape(7.dp)
                                             )
                                             .combinedClickable(
                                                 onClick = { viewModel.selectColor(c) },
@@ -3443,8 +3468,8 @@ fun CanvasScreen(
                                             Icon(
                                                 imageVector = Icons.Default.Check,
                                                 contentDescription = "Selected",
-                                                tint = Color.White,
-                                                modifier = Modifier.size(13.dp)
+                                                tint = if (c == Color.White) Color.Black else Color.White,
+                                                modifier = Modifier.size(14.dp)
                                             )
                                         }
                                         ColorPalettePopup(
@@ -3462,13 +3487,13 @@ fun CanvasScreen(
                                 val isCustomColorActiveVert = uiState.selectedColor !in TouchNotesDockColors
                                 Box(
                                     modifier = Modifier
-                                        .size(22.dp)
+                                        .size(24.dp)
                                         .clip(CircleShape)
                                         .background(if (isCustomColorActiveVert) uiState.selectedColor else OrangePrimary)
                                         .border(
-                                            if (isCustomColorActiveVert) 2.dp else 0.dp,
-                                            if (isCustomColorActiveVert) OrangePrimary else Color.Transparent,
-                                            CircleShape
+                                            width = if (isCustomColorActiveVert) 2.dp else 0.8.dp,
+                                            color = if (isCustomColorActiveVert) OrangePrimary else Color(0x20000000),
+                                            shape = CircleShape
                                         )
                                         .clickable { showCustomColorDialog = true },
                                     contentAlignment = Alignment.Center
@@ -3476,8 +3501,8 @@ fun CanvasScreen(
                                     Icon(
                                         imageVector = Icons.Default.Add,
                                         contentDescription = "Custom Color",
-                                        tint = Color.White,
-                                        modifier = Modifier.size(14.dp)
+                                        tint = if (isCustomColorActiveVert && uiState.selectedColor == Color.White) Color.Black else Color.White,
+                                        modifier = Modifier.size(15.dp)
                                     )
                                 }
                             }
@@ -4896,11 +4921,31 @@ fun PencaseToolIcon(
     selectedTint: Color = OrangePrimary,
     onClick: () -> Unit
 ) {
+    val scale by androidx.compose.animation.core.animateFloatAsState(
+        targetValue = if (isSelected) 1.08f else 1.0f,
+        animationSpec = androidx.compose.animation.core.spring(
+            dampingRatio = androidx.compose.animation.core.Spring.DampingRatioMediumBouncy,
+            stiffness = androidx.compose.animation.core.Spring.StiffnessMedium
+        ),
+        label = "toolScale"
+    )
+
     Box(
         modifier = Modifier
-            .size(34.dp)
-            .clip(RoundedCornerShape(8.dp))
-            .background(if (isSelected) selectedTint.copy(alpha = 0.16f) else Color.Transparent)
+            .size(36.dp)
+            .graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+            }
+            .clip(RoundedCornerShape(11.dp))
+            .background(
+                if (isSelected) selectedTint.copy(alpha = 0.16f) else Color.Transparent
+            )
+            .border(
+                width = if (isSelected) 1.dp else 0.dp,
+                color = if (isSelected) selectedTint.copy(alpha = 0.40f) else Color.Transparent,
+                shape = RoundedCornerShape(11.dp)
+            )
             .clickable(onClick = onClick),
         contentAlignment = Alignment.Center
     ) {
@@ -4908,14 +4953,14 @@ fun PencaseToolIcon(
             Icon(
                 painter = painterResource(id = drawableRes),
                 contentDescription = label,
-                tint = if (isSelected) selectedTint else Color(0xFF444444),
+                tint = if (isSelected) selectedTint else Color(0xFF374151),
                 modifier = Modifier.size(20.dp)
             )
         } else if (icon != null) {
             Icon(
                 imageVector = icon,
                 contentDescription = label,
-                tint = if (isSelected) selectedTint else Color(0xFF444444),
+                tint = if (isSelected) selectedTint else Color(0xFF374151),
                 modifier = Modifier.size(20.dp)
             )
         }

@@ -202,3 +202,15 @@
   - Added live typing auto-conversion in `onBlockValueChange` for `1. `, `[ ] `, `- [ ] `, and `- `.
   - Renumbered subsequent `BlockType.NUMBERED` items on `enterSplit` so list sequences remain strictly contiguous.
 - Verified with 299 passing unit tests (0 failures, 2 skipped), deployed cleanly to Xiaomi Pad 5 tablet, and updated GitHub release APKs.
+
+## Decisions appended 66        66. 2026-11-10 (auditor): Pen tool dock liquid glass redesign & optical refinement (`C19`):
+- Root Cause: The pen dock used an artificial low-opacity (70%) vertical gradient and a 1.dp white outline. Because the dock overlays the desk/paper boundary in portrait view, the 70% opacity caused a high-contrast white streak cutting through the middle of the dock, and ink strokes drawn on the canvas underneath bled through and clashed with tool icons.
+- Liquid Glass Material: Implemented a high-luminance, multi-stop frosted acrylic brush (`0xFAFFFFFF` to `0xEEF1F5F9`) with 96-98% opacity, dual-tone specular edge glint (`1.2.dp` border), and soft ambient/spot drop shadow (`elevation = 14.dp`, `ambientColor = Color(0x14000000)`, `spotColor = Color(0x28000000)`). Underlying ink and desk edges remain gently diffused without creating streaks or muddying icons.
+- Micro-interactions & Proportions:
+  - `PencaseToolIcon`: added spring scale animation (`1.08f` on selection), `RoundedCornerShape(11.dp)` liquid droplet background with matching accent border, and high-contrast slate icon glyphs (`Color(0xFF374151)`).
+  - Drag handle: styled as an engraved capsule groove (`Color(0x38000000)`).
+  - Dividers: replaced `Color.LightGray` with subtle optical glass grooves (`Color(0x1F000000)`).
+  - Stroke presets: added rounded bar caps and circular rings.
+  - Color swatches: added `0.8.dp` subtle borders and contrast-aware checkmarks.
+  - Applied consistently across Vertical Dock, Horizontal Dock, Collapsed Mini Pill, and PDF Text Selection overlay.
+- Live Device Verification: Installed on connected Xiaomi Pad 5 tablet (`230b89f8`); captured screenshots in vertical, horizontal, and collapsed states confirming flawless visual presentation.
