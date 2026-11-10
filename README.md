@@ -7,16 +7,16 @@ Open-source Android notes app (clean-room clone of TouchNotes) built with **nati
 - **Notes & folders** — create, rename, move, recycle bin, search, favorites, tags/labels
 - **Rich text editor** — bold/italic/underline, color, size, alignment, autosave
 - **Drawing canvas** — pen, highlighter, eraser, shapes, lasso selection, undo/redo, pan/zoom, pressure-sensitive width, auto-shape
-- **Multi-page notes** — page navigation, double-page spread, background modes (blank/grid/lines/dotted)
-- **Image layers** — import as inset (resizable, rotate, opacity, hide/show, reorder, merge to base, max 3)
-- **PDF import** — page backgrounds via PdfRenderer (aspect-ratio fit, 2048 cap, never-crash guards)
+- **Multi-page notes** — page navigation, continuous mode with centroid pinch zoom & multi-page overview, double-page spread, background modes (blank/grid/lines/dotted)
+- **Image & text layers** — OneNote-style live text preview & inline insertion, procedural vector stickers, interactive transform bounding box (resize, rotate, delete handles), opacity, hide/show, reorder, merge to base
+- **PDF import & annotation** — page backgrounds via PdfRenderer, beyond-paper margin annotation persistence, blank sheet page insertion, TOC & bookmark shifting
 - **Export** — PNG/PDF (flattened) via SAF
-- **Backup/restore** — zip of note directory via SAF
+- **Backup/restore** — atomic temp-file writes, WAL checkpoint TRUNCATE, zip of note directory via SAF
 - **Flashcards** — SM-2 spaced repetition
 - **Table of contents** — hierarchical chapters/pages
 - **Settings** — themes, pen config, full screen, keep-screen-on, volume-key page turn, auto-center, beyond-paper
 - **Drag & drop / paste** — split-screen drag from any app + clipboard paste
-- **Multi-note tabs** — switch between open notes
+- **Multi-note tabs** — switch between open notes with switch-to-previous on close
 - **Offline** — zero network permissions; all data in app-private storage
 
 ## Build
@@ -54,9 +54,9 @@ app/src/main/java/personal/notes/touch/
 - `state/SCOPE.md` — scope & decisions
 - `state/FEATURES.md` — feature specs with sources
 - `state/SPEC.md` — architecture, DB schema, key classes
-- `state/STATE.md` — blackboard / progress
-- `state/AUDIT-2026-11-07.md` — current audit & post-implementation review (#1–#62)
-- `state/archive/` — archived historical audits (`AUDIT-2026-11-03.md`, `AUDIT-2026-11-04.md`, `AUDIT-2026-11-04-v2.md`) and `README-HANDOVER.md`
+- `state/STATE.md` — blackboard / progress decisions (#1–#63)
+- `state/AUDIT.md` — live audit document covering markup text, database, scribble/ink engine, and cross-cutting findings (M1–M24, B1–B4, C1–C17, X1–X10)
+- `state/archive/` — archived historical audits (`AUDIT-2026-11-03.md`, `AUDIT-2026-11-04.md`, `AUDIT-2026-11-04-v2.md`, `AUDIT-2026-11-07-history.md`) and `README-HANDOVER.md`
 
 ## License
 
