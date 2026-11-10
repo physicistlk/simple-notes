@@ -265,21 +265,37 @@ class ContinuousInkController(
     var laserActive by mutableStateOf(false)
         private set
 
+    /** Bumped when the laser moves; read in the draw phase only. */
+    var laserRevision by mutableIntStateOf(0)
+        private set
+
+    /** The page the laser is currently on. */
+    var laserPageIndex by mutableIntStateOf(-1)
+        private set
+
     /** The laser trail in page-normalised coordinates. */
-    private val laserTrail = mutableStateListOf<Pair<Float, Float>>()
+    private val laserTrail = mutableStateListOf<LaserSample>()
 
     /** Moves the laser dot; nothing is written to the page. */
-    fun updateLaser(x: Float, y: Float) {
-        laserTrail.add(x to y)
+    fun updateLaser(pageIndex: Int, x: Float, y: Float) {
+        laserPageIndex = pageIndex
+        laserTrail.add(LaserSample(x, y, System.currentTimeMillis()))
         while (laserTrail.size > 40) laserTrail.removeAt(0)
         laserActive = true
-        revision++
+        // The laser is only read in the draw phase, so it must not bump the
+        // revision that the composition observes (that would recompose the
+        // page on every pointer event).
+        laserRevision++
     }
+
+    /** The laser trail with the time of each sample. */
+    private data class LaserSample(val x: Float, val y: Float, val time: Long)
 
     /** Hides the laser dot. */
     fun clearLaser() {
         if (laserTrail.isEmpty() && !laserActive) return
         laserTrail.clear()
+        laserPageIndex = -1
         laserActive = false
         revision++
     }
@@ -840,6 +856,8 @@ class ContinuousInkController(
     private suspend fun persist(s: ContinuousInkSession) {
         val ink = s.ink
         if (ink == null || ink.isRecycled) return
+        // The page is only "clean" when the write actually succeeded: a
+        // failed write must stay dirty so the next save tries again.
         s.dirty = false
         // Copy on the main thread (drawing also happens there); the PNG
         // encoder then reads the copy off-thread, so a stroke landing during
@@ -848,9 +866,10 @@ class ContinuousInkController(
             ink.copy(Bitmap.Config.ARGB_8888, false)
         } catch (e: OutOfMemoryError) {
             e.printStackTrace()
+            s.dirty = true
             return
-        } ?: return
-        withContext(Dispatchers.IO) {
+        } ?: run { s.dirty = true; return }
+        val ok = withContext(Dispatchers.IO) {
             if (s.isVector) {
                 repository.savePageStrokes(noteId, s.pageIndex, copy)
             } else {
@@ -858,6 +877,13 @@ class ContinuousInkController(
             }
         }
         copy.recycle()
+        if (!ok) {
+            // The write failed: keep the session dirty so the next autosave
+            // or the flush on exit tries again.
+            s.dirty = true
+            android.util.Log.w("TouchNotes", "Could not save page ${s.pageIndex}")
+            return
+        }
         s.savedWhileActive = true
         onSaved(s.pageIndex)
     }
@@ -1053,7 +1079,10 @@ class ContinuousInkController(
      * reader draws it from a Compose Canvas, above the page bitmap.
      */
     fun drawPreview(canvas: Canvas, pageIndex: Int, viewWidth: Float, viewHeight: Float) {
-        drawLaser(canvas, viewWidth, viewHeight)
+        // The laser dot belongs to the page the pointer is on.
+        if (laserPageIndex == pageIndex) {
+            drawLaser(canvas, viewWidth, viewHeight)
+        }
         val s = session ?: return
         if (s.pageIndex != pageIndex) return
         val stroke = s.live ?: return
@@ -1063,6 +1092,12 @@ class ContinuousInkController(
     /** The red laser dot with its short tail. */
     private fun drawLaser(canvas: Canvas, viewWidth: Float, viewHeight: Float) {
         if (!laserActive || laserTrail.isEmpty()) return
+        // The tail fades out, like the single-page laser.
+        val now = System.currentTimeMillis()
+        while (laserTrail.isNotEmpty() && now - laserTrail.first().time > LASER_TRAIL_MS) {
+            laserTrail.removeAt(0)
+        }
+        if (laserTrail.isEmpty()) return
         val glow = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE
             strokeCap = Paint.Cap.ROUND
@@ -1077,16 +1112,17 @@ class ContinuousInkController(
         for (i in 1 until laserTrail.size) {
             val a = laserTrail[i - 1]
             val b = laserTrail[i]
-            glow.alpha = (120f * (i.toFloat() / laserTrail.size)).toInt().coerceIn(20, 120)
+            val age = (now - b.time).toFloat().coerceAtMost(LASER_TRAIL_MS.toFloat())
+            glow.alpha = (120f * (1f - age / LASER_TRAIL_MS)).toInt().coerceIn(20, 120)
             canvas.drawLine(
-                a.first * viewWidth, a.second * viewHeight,
-                b.first * viewWidth, b.second * viewHeight,
+                a.x * viewWidth, a.y * viewHeight,
+                b.x * viewWidth, b.y * viewHeight,
                 glow
             )
         }
         val head = laserTrail.last()
         val radius = 7f * (viewWidth / 1600f).coerceAtLeast(0.6f)
-        canvas.drawCircle(head.first * viewWidth, head.second * viewHeight, radius, dot)
+        canvas.drawCircle(head.x * viewWidth, head.y * viewHeight, radius, dot)
     }
 
     private fun drawStroke(
@@ -1205,6 +1241,8 @@ class ContinuousInkController(
     }
 
     private companion object {
+        /** How long the laser tail stays visible, in milliseconds. */
+        const val LASER_TRAIL_MS = 700L
         /** ~48 MB of patches: a few dozen ordinary strokes, bounded. */
         const val MAX_UNDO_BYTES = 48L * 1024L * 1024L
     }

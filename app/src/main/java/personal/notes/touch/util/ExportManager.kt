@@ -27,8 +27,20 @@ object ExportManager {
     private const val AUTHORITY = "personal.notes.touch.fileprovider"
     private const val MAX_BITMAP_DIMENSION = 2048
 
+    /** How many exported files stay in the cache. */
+    private const val MAX_EXPORT_FILES = 20
+
     private fun getExportCacheDir(context: Context): File {
-        return File(context.cacheDir, "export").apply { if (!exists()) mkdirs() }
+        val dir = File(context.cacheDir, "export").apply { if (!exists()) mkdirs() }
+        // Every export adds a file and the cache is never emptied by the
+        // system in a predictable way: keep only the last few.
+        try {
+            val files = dir.listFiles()?.sortedByDescending { it.lastModified() } ?: return dir
+            files.drop(MAX_EXPORT_FILES).forEach { it.delete() }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        return dir
     }
 
     /**
@@ -318,6 +330,49 @@ object ExportManager {
     }
 
 
+    /**
+     * The ink a page carries outside its paper (the margins of an imported
+     * PDF). It is exported with the page, otherwise the export would lose
+     * everything the user wrote there.
+     */
+    private fun readDiskBeyondInk(
+        fileStore: personal.notes.touch.data.files.NoteFileStore,
+        noteId: String,
+        pageIndex: Int
+    ): List<InkCrop> {
+        val manifest = fileStore.getBeyondInkFile(noteId, pageIndex)
+        if (!manifest.exists()) return emptyList()
+        val crops = mutableListOf<InkCrop>()
+        try {
+            val arr = org.json.JSONArray(manifest.readText())
+            val layersDir = fileStore.getLayersDir(noteId)
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                val name = obj.optString("file", "")
+                if (name.isEmpty()) continue
+                val bmp = android.graphics.BitmapFactory
+                    .decodeFile(java.io.File(layersDir, name).absolutePath) ?: continue
+                crops.add(
+                    InkCrop(bmp, obj.optDouble("x", 0.0).toFloat(), obj.optDouble("y", 0.0).toFloat())
+                )
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        return crops
+    }
+
+    /** The raster background a page picked out of a PDF (if there is one). */
+    private suspend fun loadPageBackgroundOverride(
+        fileStore: personal.notes.touch.data.files.NoteFileStore,
+        noteId: String,
+        pageIndex: Int
+    ): Bitmap? {
+        val file = fileStore.getPageBackgroundFile(noteId, pageIndex)
+        if (!file.exists()) return null
+        return personal.notes.touch.util.BitmapUtils.loadBitmapFromFile(file)
+    }
+
     private fun readDiskImageLayers(fileStore: personal.notes.touch.data.files.NoteFileStore, noteId: String): List<ImageLayer> {
         val infoFile = fileStore.getLayerInfoFile(noteId)
         if (!infoFile.exists()) return emptyList()
@@ -379,39 +434,51 @@ object ExportManager {
         val pageFile = fileStore.getPageFile(noteId, pageIndex)
         val strokesFile = fileStore.getStrokesFile(noteId, pageIndex)
         val layers = if (includeLayers) readDiskImageLayers(fileStore, noteId) else emptyList()
+        // Ink written outside the paper and a picked page background belong
+        // to the page and have to be part of the export as well.
+        val beyondInk = readDiskBeyondInk(fileStore, noteId, pageIndex)
+        val backgroundOverride = loadPageBackgroundOverride(fileStore, noteId, pageIndex)
         val result = if (strokesFile.exists()) {
             val baseBmp = BitmapUtils.loadBitmapFromFile(pageFile)
             val strokeBmp = BitmapUtils.loadBitmapFromFile(strokesFile)
             if (baseBmp != null && strokeBmp != null) {
-                val flat = flattenBitmap(strokeBmp, baseBmp, layers)
+                val flat = flattenBitmap(strokeBmp, backgroundOverride ?: baseBmp, layers, beyondInk)
                 if (baseBmp !== flat && !baseBmp.isRecycled) baseBmp.recycle()
                 if (strokeBmp !== flat && !strokeBmp.isRecycled) strokeBmp.recycle()
                 flat
             } else if (strokeBmp != null) {
-                val flat = flattenBitmap(strokeBmp, null, layers)
+                val flat = flattenBitmap(strokeBmp, backgroundOverride, layers, beyondInk)
                 if (strokeBmp !== flat && !strokeBmp.isRecycled) strokeBmp.recycle()
                 flat
             } else if (baseBmp != null) {
-                val flat = flattenBitmap(baseBmp, null, layers)
+                val flat = flattenBitmap(baseBmp, backgroundOverride, layers, beyondInk)
                 if (baseBmp !== flat && !baseBmp.isRecycled) baseBmp.recycle()
                 flat
             } else null
         } else {
             val base = BitmapUtils.loadBitmapFromFile(pageFile)
             if (base != null) {
-                val flat = flattenBitmap(base, null, layers)
+                val flat = flattenBitmap(base, backgroundOverride, layers, beyondInk)
                 if (base !== flat && !base.isRecycled) base.recycle()
                 flat
             } else if (layers.isNotEmpty()) {
                 val blank = Bitmap.createBitmap(2160, 3056, Bitmap.Config.ARGB_8888)
-                val flat = flattenBitmap(blank, null, layers)
+                val flat = flattenBitmap(blank, backgroundOverride, layers, beyondInk)
                 if (blank !== flat && !blank.isRecycled) blank.recycle()
                 flat
             } else null
         }
         for (l in layers) {
             if (!l.bitmap.isRecycled) l.bitmap.recycle()
+            // The ink crops of a layer are decoded bitmaps as well.
+            for (crop in l.ink) {
+                if (!crop.bitmap.isRecycled) crop.bitmap.recycle()
+            }
         }
+        for (crop in beyondInk) {
+            if (!crop.bitmap.isRecycled) crop.bitmap.recycle()
+        }
+        if (backgroundOverride != null && !backgroundOverride.isRecycled) backgroundOverride.recycle()
         return result
     }
 

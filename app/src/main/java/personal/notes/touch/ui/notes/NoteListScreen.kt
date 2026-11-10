@@ -244,9 +244,23 @@ fun NoteListScreen(
                 val decoded = withContext(Dispatchers.IO) {
                     try {
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                            android.graphics.ImageDecoder.decodeBitmap(
-                                android.graphics.ImageDecoder.createSource(context.contentResolver, it)
+                            // A phone photo is 12 MP: decoding it at full size
+                            // costs ~48 MB, so the decoder is asked for a
+                            // sample that fits the page.
+                            val source = android.graphics.ImageDecoder.createSource(
+                                context.contentResolver, it
                             )
+                            android.graphics.ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+                                val size = info.size
+                                val maxSide = 2160
+                                if (size.width > maxSide || size.height > maxSide) {
+                                    val sample = maxOf(
+                                        size.width / maxSide,
+                                        size.height / maxSide
+                                    )
+                                    decoder.setTargetSampleSize(sample)
+                                }
+                            }
                         } else {
                             @Suppress("DEPRECATION")
                             MediaStore.Images.Media.getBitmap(context.contentResolver, it)

@@ -509,17 +509,6 @@ class TextEditorViewModel(
             }
             .launchIn(viewModelScope)
 
-        // Cross-document transfer: a repository event means either this note
-        // received blocks or one of its blocks was moved away. Reload from the
-        // database rather than saving first, so an editor cannot resurrect the
-        // rows the transfer just removed. Autosave then persists that state.
-        repository.blockTransfers
-            .filter { it.sourceNoteId == noteId || it.targetNoteId == noteId }
-            .onEach {
-                if (isInitialized) reloadFromStorage()
-            }
-            .launchIn(viewModelScope)
-
         // Setup debounced autosave (M2 spec: debounce 1s) — unchanged persistence
         // path. Block edits funnel into _contentValue, so this still covers them;
         // TextEditorScreen additionally calls saveNow() on ON_PAUSE / back /

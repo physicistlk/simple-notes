@@ -642,7 +642,8 @@ fun CanvasScreen(
         if (view != null) {
             if (isContinuous) {
                 inkController.flushCurrentSuspend()
-                viewModel.setPageTurningMode(1)
+                // Internal step: the user's page turning preference stays.
+                viewModel.setPageTurningModeTransient(1)
                 if (view.imageLayers.isEmpty() && !view.layersDirty) {
                     view.reloadLayersFromDisk(viewModel.fileStore, viewModel.noteId)
                 }
@@ -650,9 +651,7 @@ fun CanvasScreen(
             val success = action(view)
             if (success) {
                 try {
-                    withContext(Dispatchers.IO) {
-                        view.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                    }
+                    view.saveImageLayers(viewModel.fileStore, viewModel.noteId)
                 } catch (e: Exception) {
                     e.printStackTrace()
                 }
@@ -881,9 +880,7 @@ fun CanvasScreen(
         }
         val canvas = canvasViewRef
         if (canvas != null && canvas.layersDirty) {
-            withContext(Dispatchers.IO) {
-                canvas.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-            }
+            canvas.saveImageLayers(viewModel.fileStore, viewModel.noteId)
         }
         // The margin ink is saved on its own: it exists without any layer
         // change, so a layer save must not be the only way out.
@@ -1241,9 +1238,7 @@ fun CanvasScreen(
                                 viewModel.saveCurrentPageBitmap(bmp)
                             }
                             if (canvasViewRef?.layersDirty == true) {
-                                withContext(Dispatchers.IO) {
-                                    canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                                }
+                                canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
                             }
                             viewModel.goToPage(clamped, canvasViewRef?.getBackingBitmap()) { newBmp ->
                                 applyLoadedPage(clamped, newBmp)
@@ -1732,9 +1727,7 @@ fun CanvasScreen(
                                         canvasViewRef?.getBackingBitmap()?.let { bmp ->
                                             viewModel.saveCurrentPageBitmap(bmp)
                                         }
-                                        withContext(Dispatchers.IO) {
-                                            canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                                        }
+                                        canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
                                     } catch (e: Exception) { e.printStackTrace() }
                                     viewModel.previousPage(canvasViewRef?.getBackingBitmap()) { newBmp ->
                                         applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
@@ -1759,9 +1752,7 @@ fun CanvasScreen(
                                         canvasViewRef?.getBackingBitmap()?.let { bmp ->
                                             viewModel.saveCurrentPageBitmap(bmp)
                                         }
-                                        withContext(Dispatchers.IO) {
-                                            canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                                        }
+                                        canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
                                     } catch (e: Exception) { e.printStackTrace() }
                                     viewModel.nextPage(canvasViewRef?.getBackingBitmap()) { newBmp ->
                                         applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
@@ -1907,7 +1898,11 @@ fun CanvasScreen(
                             onThreeFingerTap = { handleClipboardPaste() }
                             // Any touch on the page closes the open menus.
                             onCanvasTouchStart = { dismissCanvasOverlays() }
-                            onImageSelectionChanged = { selectedImageIndex = it }
+                            onImageSelectionChanged = {
+                                selectedImageIndex = it
+                                // A new layer has to show up in the panel.
+                                layersTick++
+                            }
                             onPdfSelectionChanged = { selection -> pdfSelection = selection }
                             onStylusDetected = {
                                 viewModel.onStylusDetected()
@@ -2027,8 +2022,15 @@ fun CanvasScreen(
                                 .fillMaxSize()
                                 .background(Color(0xFFEEEEEE))
                                 .pointerInput(Unit) {
+                                    // Compose reports the zoom accumulated
+                                    // since the gesture started; the handler
+                                    // wants a delta, like the in-page pinch.
+                                    var previousZoom = 1f
                                     detectTransformGestures { centroid, pan, zoom, _ ->
-                                        handleReaderTransform(centroid, pan, zoom)
+                                        if (zoom == 1f) previousZoom = 1f
+                                        val delta = if (previousZoom > 0f) zoom / previousZoom else 1f
+                                        previousZoom = zoom
+                                        handleReaderTransform(centroid, pan, delta)
                                     }
                                 }
                         ) {
@@ -2041,8 +2043,8 @@ fun CanvasScreen(
                                     horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(16.dp),
                                     contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp)
                                 ) {
-                                    items(pages.size) { idx ->
-                                        val page = pages[idx]
+                                    items(items = pages, key = { it.id }) { page ->
+                                        val idx = pages.indexOf(page)
                                         Box(
                                             modifier = Modifier
                                                 .height(pageHeightDp)
@@ -2128,8 +2130,8 @@ fun CanvasScreen(
                                     contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 16.dp, horizontal = 16.dp),
                                     horizontalAlignment = Alignment.CenterHorizontally
                                 ) {
-                                    items(pages.size) { idx ->
-                                        val page = pages[idx]
+                                    items(items = pages, key = { it.id }) { page ->
+                                        val idx = pages.indexOf(page)
                                         Box(
                                             modifier = Modifier
                                                 .width(pageWidthDp)
@@ -2291,9 +2293,7 @@ fun CanvasScreen(
                                 selectedImageIndex = -1
                                 scope.launch {
                                     try {
-                                        withContext(Dispatchers.IO) {
-                                            canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                                        }
+                                        canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
                                     } catch (e: Exception) { e.printStackTrace() }
                                 }
                             }) {
@@ -2367,9 +2367,7 @@ fun CanvasScreen(
                                                 layersTick++
                                                 scope.launch {
                                                     try {
-                                                        withContext(Dispatchers.IO) {
-                                                            canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                                                        }
+                                                        canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
                                                     } catch (e: Exception) { e.printStackTrace() }
                                                 }
                                             },
@@ -2405,9 +2403,7 @@ fun CanvasScreen(
                                                     layersTick++
                                                     scope.launch {
                                                         try {
-                                                            withContext(Dispatchers.IO) {
-                                                                canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                                                            }
+                                                            canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
                                                         } catch (e: Exception) { e.printStackTrace() }
                                                     }
                                                 }
@@ -2424,9 +2420,7 @@ fun CanvasScreen(
                                                     layersTick++
                                                     scope.launch {
                                                         try {
-                                                            withContext(Dispatchers.IO) {
-                                                                canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                                                            }
+                                                            canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
                                                         } catch (e: Exception) { e.printStackTrace() }
                                                     }
                                                 }
@@ -2442,9 +2436,7 @@ fun CanvasScreen(
                                                 layersTick++
                                                 scope.launch {
                                                     try {
-                                                        withContext(Dispatchers.IO) {
-                                                            canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                                                        }
+                                                        canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
                                                     } catch (e: Exception) { e.printStackTrace() }
                                                 }
                                             },
@@ -2502,9 +2494,7 @@ fun CanvasScreen(
                                                 canvasViewRef?.getBackingBitmap()?.let { bmp ->
                                                     viewModel.saveCurrentPageBitmapDirect(bmp)
                                                 }
-                                                withContext(Dispatchers.IO) {
-                                                    canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                                                }
+                                                canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
                                             } catch (e: Exception) { e.printStackTrace() }
                                         }
                                     },
@@ -3519,9 +3509,7 @@ fun CanvasScreen(
                                             // Await the layer save (IO) so nothing
                                             // writes layers while the page switch
                                             // below reloads them.
-                                            withContext(Dispatchers.IO) {
-                                                canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                                            }
+                                            canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
                                         } catch (e: Exception) { e.printStackTrace() }
                                         val currentBmp = canvasViewRef?.getBackingBitmap()
                                         viewModel.previousPage(currentBmp) { newBmp ->
@@ -3585,9 +3573,7 @@ fun CanvasScreen(
                                             // Await the layer save (IO) so nothing
                                             // writes layers while the page switch
                                             // below reloads them.
-                                            withContext(Dispatchers.IO) {
-                                                canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                                            }
+                                            canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
                                         } catch (e: Exception) { e.printStackTrace() }
                                         val currentBmp = canvasViewRef?.getBackingBitmap()
                                         viewModel.nextPage(currentBmp) { newBmp ->
@@ -3659,9 +3645,7 @@ fun CanvasScreen(
                                             viewModel.saveCurrentPageBitmap(bmp)
                                         }
                                         if (canvasViewRef?.layersDirty == true) {
-                                            withContext(Dispatchers.IO) {
-                                                canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                                            }
+                                            canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
                                         }
                                         viewModel.previousPage(canvasViewRef?.getBackingBitmap()) { newBmp ->
                                             applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
@@ -3695,9 +3679,7 @@ fun CanvasScreen(
                                             viewModel.saveCurrentPageBitmap(bmp)
                                         }
                                         if (canvasViewRef?.layersDirty == true) {
-                                            withContext(Dispatchers.IO) {
-                                                canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                                            }
+                                            canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
                                         }
                                         viewModel.nextPage(canvasViewRef?.getBackingBitmap()) { newBmp ->
                                             applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
@@ -3844,9 +3826,7 @@ fun CanvasScreen(
                                                                 } else {
                                                                     scope.launch {
                                                                         if (canvasViewRef?.layersDirty == true) {
-                                                                            withContext(Dispatchers.IO) {
-                                                                                canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                                                                            }
+                                                                            canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
                                                                         }
                                                                         val currentBmp = canvasViewRef?.getBackingBitmap()
                                                                         viewModel.goToPage(pageItem.index, currentBmp) { newBmp ->
@@ -3948,9 +3928,7 @@ fun CanvasScreen(
                                                                     } else {
                                                                         scope.launch {
                                                                             if (canvasViewRef?.layersDirty == true) {
-                                                                                withContext(Dispatchers.IO) {
-                                                                                    canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                                                                                }
+                                                                                canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
                                                                             }
                                                                             val currentBmp = canvasViewRef?.getBackingBitmap()
                                                                             viewModel.goToPage(pageItem.index, currentBmp) { newBmp ->
@@ -4071,9 +4049,7 @@ fun CanvasScreen(
                                                                     } else {
                                                                         scope.launch {
                                                                             if (canvasViewRef?.layersDirty == true) {
-                                                                                withContext(Dispatchers.IO) {
-                                                                                    canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                                                                                }
+                                                                                canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
                                                                             }
                                                                             val currentBmp = canvasViewRef?.getBackingBitmap()
                                                                             viewModel.goToPage(tocEntry.pageIndex, currentBmp) { newBmp ->
@@ -4735,9 +4711,7 @@ fun CanvasScreen(
                                                                                 viewModel.saveCurrentPageBitmapDirect(bmp, force = true)
                                                                             }
                                                                             if (canvasViewRef?.layersDirty == true) {
-                                                                                withContext(Dispatchers.IO) {
-                                                                                    canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                                                                                }
+                                                                                canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
                                                                             }
                                                                             viewModel.setPageTurningMode(0)
                                                                             val cur = viewModel.currentPageIndex.value
@@ -5534,6 +5508,7 @@ fun ContinuousPageView(
         // the committed layer; the commit lands on ACTION_UP.
         androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
             val _revision = ink.revision
+            val _laserRevision = ink.laserRevision
             drawIntoCanvas { canvas ->
                 ink.drawPreview(canvas.nativeCanvas, pageIndex, size.width, size.height)
             }
@@ -5573,6 +5548,7 @@ fun ContinuousPageView(
                 }
                 .pointerInput(page.id, inkSettings) {
                     if (inkSettings.readingMode) return@pointerInput
+                    try {
                     awaitEachGesture {
                         val down = awaitFirstDown(requireUnconsumed = false)
                         val isStylus = down.type == PointerType.Stylus || down.type == PointerType.Eraser
@@ -5586,12 +5562,12 @@ fun ContinuousPageView(
                         if (inkSettings.isLaserPointer) {
                             val lBoxW = size.width.toFloat()
                             val lBoxH = size.height.toFloat()
-                            ink.updateLaser(down.position.x / lBoxW, down.position.y / lBoxH)
+                            ink.updateLaser(pageIndex, down.position.x / lBoxW, down.position.y / lBoxH)
                             down.consume()
                             while (true) {
                                 val event = awaitPointerEvent()
                                 val change = event.changes.firstOrNull { it.id == down.id } ?: break
-                                ink.updateLaser(change.position.x / lBoxW, change.position.y / lBoxH)
+                                ink.updateLaser(pageIndex, change.position.x / lBoxW, change.position.y / lBoxH)
                                 change.consume()
                                 if (change.changedToUpIgnoreConsumed()) break
                             }
@@ -5625,7 +5601,14 @@ fun ContinuousPageView(
                                 ink.cancelStroke()
                                 break
                             }
-                            val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                            val change = event.changes.firstOrNull { it.id == down.id }
+                            if (change == null) {
+                                // The pointer is gone: end the stroke, or the
+                                // reader would stay "drawing" and refuse to
+                                // scroll.
+                                ink.cancelStroke()
+                                break
+                            }
                             val x = change.position.x / boxW
                             val y = change.position.y / boxH
                             if (change.changedToUpIgnoreConsumed()) {
@@ -5636,6 +5619,13 @@ fun ContinuousPageView(
                             ink.extendStroke(x, y, change.pressure, inkSettings)
                             change.consume()
                         }
+                    }
+                    } finally {
+                        // The gesture handler can be cancelled (the tool
+                        // changed, the item left the list): the reader must
+                        // not stay in the "drawing" state, or it would refuse
+                        // to scroll.
+                        ink.cancelStroke()
                     }
                 }
         )

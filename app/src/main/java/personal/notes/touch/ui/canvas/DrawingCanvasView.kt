@@ -16,6 +16,8 @@ import android.os.Looper
 import android.util.AttributeSet
 import android.view.MotionEvent
 import android.view.View
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import personal.notes.touch.util.BitmapUtils
 import personal.notes.touch.util.DebugGestureInjector
 import personal.notes.touch.util.PdfRenderPolicy
@@ -1090,7 +1092,8 @@ class DrawingCanvasView @JvmOverloads constructor(
     fun addImageLayer(image: Bitmap): Boolean = addImageLayerDirect(image, null, null)
 
     fun addImageLayerDirect(image: Bitmap, posX: Float? = null, posY: Float? = null): Boolean {
-        if (imageLayers.size >= 8) return false
+        // The panel shows "Layers (n/3)": the engine has to agree.
+        if (imageLayers.size >= 3) return false
         saveUndoState()
         val w = if (pdfPageWidthPts > 0f && pdfBasePxPerPt > 0f) {
             pdfPageWidthPts * pdfBasePxPerPt
@@ -1369,8 +1372,17 @@ class DrawingCanvasView @JvmOverloads constructor(
         return crops
     }
 
-    /** Replaces the ink outside the paper with the given crops. */
-    fun applyBeyondPageInk(crops: List<InkCrop>) {
+    /**
+     * Installs the ink outside the paper, but only when it still belongs to
+     * the page it was loaded for: a load that arrives after the user already
+     * drew in the margin must not wipe those strokes.
+     */
+    fun applyBeyondPageInk(crops: List<InkCrop>, forPageIndex: Int = pageIndex) {
+        if (forPageIndex != pageIndex) return
+        // The old crops are not referenced any more: release them.
+        for (old in beyondPageInk) {
+            if (!old.bitmap.isRecycled) old.bitmap.recycle()
+        }
         beyondPageInk.clear()
         beyondPageInk.addAll(crops)
         invalidate()
@@ -1383,10 +1395,17 @@ class DrawingCanvasView @JvmOverloads constructor(
      * The layer geometry is snapshotted before the (slow) compressions so
      * concurrent main-thread edits during the save cannot skew the output.
      */
-    fun saveImageLayers(fileStore: personal.notes.touch.data.files.NoteFileStore, noteId: String) {
+    suspend fun saveImageLayers(
+        fileStore: personal.notes.touch.data.files.NoteFileStore,
+        noteId: String
+    ) {
         val layersDir = fileStore.getLayersDir(noteId)
         val infoFile = fileStore.getLayerInfoFile(noteId)
         try {
+            // The layer list belongs to the UI thread: take the snapshot
+            // before the file work moves to another thread, so a concurrent
+            // edit cannot make the iteration fail and the "saved" flag cannot
+            // be cleared for a change that never reached the disk.
             val snapshot = imageLayers.map { layer ->
                 LayerSnapshot(
                     bitmap = layer.bitmap,
@@ -1402,6 +1421,7 @@ class DrawingCanvasView @JvmOverloads constructor(
             }
             val arr = org.json.JSONArray()
             val writtenFiles = mutableSetOf<String>()
+            withContext(Dispatchers.IO) {
             snapshot.forEachIndexed { index, layer ->
                 val fileName = "layer_$index.png"
                 writtenFiles.add(fileName)
@@ -1435,6 +1455,7 @@ class DrawingCanvasView @JvmOverloads constructor(
                 }
                 obj.put("ink", inkArr)
                 arr.put(obj)
+            }
             }
             infoFile.writeText(arr.toString())
             layersDir.listFiles()?.forEach { file ->
@@ -1509,19 +1530,39 @@ class DrawingCanvasView @JvmOverloads constructor(
             c.scale(layer.scale, layer.scale)
             c.drawBitmap(layer.bitmap, -w / 2f, -h / 2f, layerPaint)
             c.restore()
-            // Flatten the ink written on the layer: marks that sit on the
-            // paper become part of the page ink, marks beyond the paper stay
-            // page-level crops so they survive the merge.
+            // Flatten the ink written on the layer. The marks carry the
+            // layer's transform, so they are drawn through the same
+            // translate/rotate/scale as the layer bitmap - otherwise a moved
+            // or rotated layer would snap its marks back to the old place.
             for (crop in layer.ink) {
                 if (crop.bitmap.isRecycled) continue
+                val iw = crop.bitmap.width
+                val ih = crop.bitmap.height
+                val dx = (crop.x + iw / 2f) - cx
+                val dy = (crop.y + ih / 2f) - cy
+                val rad = Math.toRadians((-layer.rotation).toDouble())
+                val cos = Math.cos(rad).toFloat()
+                val sin = Math.sin(rad).toFloat()
+                val lx = (dx * cos - dy * sin) / layer.scale - iw / 2f
+                val ly = (dx * sin + dy * cos) / layer.scale - ih / 2f
+                val pageX = cx + lx * layer.scale
+                val pageY = cy + ly * layer.scale
                 val cropRect = Rect(
-                    crop.x.toInt(), crop.y.toInt(),
-                    (crop.x + crop.bitmap.width).toInt(), (crop.y + crop.bitmap.height).toInt()
+                    pageX.toInt(), pageY.toInt(),
+                    (pageX + iw * layer.scale).toInt(), (pageY + ih * layer.scale).toInt()
                 )
                 if (paper.contains(cropRect)) {
-                    c.drawBitmap(crop.bitmap, crop.x, crop.y, layerPaint)
+                    // Inside the paper: the mark becomes part of the page ink.
+                    c.save()
+                    c.translate(cx, cy)
+                    c.rotate(layer.rotation)
+                    c.scale(layer.scale, layer.scale)
+                    c.drawBitmap(crop.bitmap, lx, ly, layerPaint)
+                    c.restore()
                 } else {
-                    beyondPageInk.add(crop)
+                    // Beyond the paper: keep it as a page-level crop, at the
+                    // place the layer transform puts it.
+                    beyondPageInk.add(InkCrop(crop.bitmap, pageX, pageY))
                 }
             }
         }
@@ -1558,14 +1599,89 @@ class DrawingCanvasView @JvmOverloads constructor(
         invalidate()
     }
 
+    /**
+     * Crops the selected layer to the pixels that are actually painted: the
+     * transparent margins around it are dropped and the content keeps its
+     * place on the page. The ink written on the layer travels with it.
+     */
     fun cropSelectedImageLayer() {
-        // Cropping changes the layer: keep it undoable.
-        saveUndoState()
         val idx = selectedImageIndex
         if (idx !in imageLayers.indices) return
         val layer = imageLayers[idx]
-        // No-op if full bounds
-        if (layer.cropRect == null) return
+        if (layer.bitmap.isRecycled) return
+        val trimmed = trimTransparentMargins(layer.bitmap) ?: return
+        if (trimmed.rect.width() == layer.bitmap.width && trimmed.rect.height() == layer.bitmap.height) {
+            // Nothing to trim.
+            return
+        }
+        // Cropping changes the layer: keep it undoable.
+        saveUndoState()
+        val oldW = layer.bitmap.width
+        val oldH = layer.bitmap.height
+        // The content must stay exactly where it is: the scale grows with the
+        // crop and the origin moves by the trimmed part.
+        val newScaleX = if (trimmed.rect.width() > 0) layer.scale * oldW / trimmed.rect.width() else layer.scale
+        val newScaleY = if (trimmed.rect.height() > 0) layer.scale * oldH / trimmed.rect.height() else layer.scale
+        val scale = min(newScaleX, newScaleY)
+        val newX = layer.x + trimmed.rect.left * layer.scale
+        val newY = layer.y + trimmed.rect.top * layer.scale
+        imageLayers[idx] = ImageLayer(
+            bitmap = trimmed.bitmap,
+            x = newX,
+            y = newY,
+            scale = scale,
+            rotation = layer.rotation,
+            opacity = layer.opacity,
+            cropRect = null,
+            visible = layer.visible,
+            name = layer.name,
+            ink = layer.ink.toMutableList()
+        )
+        // The old bitmap is still referenced by the undo snapshot, so it must
+        // not be recycled here - the garbage collector takes it.
+        layersDirty = true
+        invalidate()
+        onStrokeFinishedListener?.invoke()
+    }
+
+    /** A trimmed bitmap and the rectangle it was taken from. */
+    private class TrimmedBitmap(val bitmap: Bitmap, val rect: Rect)
+
+    /** The bounding box of the painted pixels of a bitmap, or null. */
+    private fun trimTransparentMargins(bitmap: Bitmap): TrimmedBitmap? {
+        val w = bitmap.width
+        val h = bitmap.height
+        if (w <= 0 || h <= 0) return null
+        val pixels = IntArray(w * h)
+        try {
+            bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
+        } catch (e: Exception) {
+            return null
+        }
+        var minX = w
+        var minY = h
+        var maxX = -1
+        var maxY = -1
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                if ((pixels[y * w + x] ushr 24) != 0) {
+                    if (x < minX) minX = x
+                    if (x > maxX) maxX = x
+                    if (y < minY) minY = y
+                    if (y > maxY) maxY = y
+                }
+            }
+        }
+        if (maxX < 0) return null
+        val trimmedW = maxX - minX + 1
+        val trimmedH = maxY - minY + 1
+        val out = try {
+            android.graphics.Bitmap.createBitmap(trimmedW, trimmedH, android.graphics.Bitmap.Config.ARGB_8888)
+        } catch (e: OutOfMemoryError) {
+            return null
+        }
+        out.setPixels(pixels, minY * w + minX, w, 0, 0, trimmedW, trimmedH)
+        return TrimmedBitmap(out, Rect(minX, minY, minX + trimmedW, minY + trimmedH))
     }
 
     fun layerBounds(layer: ImageLayer): RectF {
@@ -1780,6 +1896,11 @@ class DrawingCanvasView @JvmOverloads constructor(
                 canvas.drawRoundRect(deleteRect, 16f, 16f, lassoDeletePillPaint)
                 canvas.drawText("✕ Cut", deleteRect.centerX(), deleteRect.centerY() + 10f, lassoPillTextPaint)
             }
+        }
+
+        // The laser pointer sits on top of everything else.
+        if (currentTool == CanvasTool.LASER_POINTER) {
+            drawLaserPointer(canvas)
         }
 
         canvas.restore()
@@ -2671,26 +2792,19 @@ class DrawingCanvasView @JvmOverloads constructor(
         val pts: List<Pair<Float, Float>> =
             if (fountain) currentStrokePoints.map { it.x to it.y } else sampledPoints
         if (pts.isEmpty()) return null
-        var minX = Float.MAX_VALUE
-        var minY = Float.MAX_VALUE
-        var maxX = -Float.MAX_VALUE
-        var maxY = -Float.MAX_VALUE
         var widest = strokeWidthPx
-        for ((px, py) in pts) {
-            minX = min(minX, px); maxX = max(maxX, px)
-            minY = min(minY, py); maxY = max(maxY, py)
-        }
         if (fountain) for (p in currentStrokePoints) widest = max(widest, p.width)
-        val pad = when (currentTool) {
-            CanvasTool.HIGHLIGHTER -> widest * 1.7f + 6f
-            CanvasTool.ERASER -> eraserWidthPx / 2f + 6f
-            else -> widest / 2f + 6f
+        // The same geometry the unit tests cover.
+        val xs = FloatArray(pts.size) { pts[it].first }
+        val ys = FloatArray(pts.size) { pts[it].second }
+        val padFactor = when (currentTool) {
+            CanvasTool.HIGHLIGHTER -> 1.7f
+            CanvasTool.ERASER -> 0f
+            else -> 0.5f
         }
-        val left = floor(minX - pad).toInt()
-        val top = floor(minY - pad).toInt()
-        val right = ceil(maxX + pad).toInt()
-        val bottom = ceil(maxY + pad).toInt()
-        return Rect(left, top, max(right, left + 1), max(bottom, top + 1))
+        val widestForPad = if (currentTool == CanvasTool.ERASER) eraserWidthPx else widest
+        val box = InkCropMath.strokeBounds(xs, ys, widestForPad, padFactor, 6f) ?: return null
+        return Rect(box.left, box.top, box.right, box.bottom)
     }
 
     /** A transparent bitmap holding just the given rectangle of the page. */

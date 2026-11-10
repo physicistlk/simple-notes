@@ -149,7 +149,11 @@ class SettingsViewModel(private val repository: SettingsRepository) : ViewModel(
 
     fun setPressureSensitivity(pressure: Float) {
         viewModelScope.launch {
-            val current = parsePenDefaults(settings.value.penDefaultsJson)
+            // Read the saved defaults from the database, not from the flow:
+            // the flow can still hold the initial (empty) defaults, and
+            // rewriting them would reset the pen colour and width.
+            val saved = repository.getSettingsDirect()
+            val current = parsePenDefaults(saved.penDefaultsJson)
             repository.updatePenDefaults(current.color, current.strokeWidth, pressure)
         }
     }

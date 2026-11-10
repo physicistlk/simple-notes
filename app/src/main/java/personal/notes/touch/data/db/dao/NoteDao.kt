@@ -69,6 +69,10 @@ interface NoteDao {
     @Query("DELETE FROM notes WHERE deleted = 1")
     suspend fun clearRecycled()
 
+    /** The ids of the notes in the recycle bin (their files are deleted with them). */
+    @Query("SELECT id FROM notes WHERE deleted = 1")
+    suspend fun getRecycledIds(): List<String>
+
     /** Notes the knowledge index derives from (tags, wiki links). */
     @Query("SELECT * FROM notes WHERE deleted = 0 AND content IS NOT NULL")
     suspend fun getNotesWithContent(): List<NoteEntity>

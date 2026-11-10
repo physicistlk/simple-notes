@@ -135,7 +135,12 @@ object BackupManager {
                     if (!entry.isDirectory) {
                         // Prevent Zip Slip vulnerability
                         val destFile = File(stagingDir, entryName)
-                        if (!destFile.canonicalPath.startsWith(stagingDir.canonicalPath)) {
+                        // The separator matters: a sibling whose name merely
+                        // starts with the staging directory's name is not
+                        // inside it.
+                        val root = stagingDir.canonicalPath
+                        val target = destFile.canonicalPath
+                        if (target != root && !target.startsWith(root + File.separator)) {
                             throw SecurityException("Invalid zip entry: $entryName")
                         }
                         destFile.parentFile?.mkdirs()

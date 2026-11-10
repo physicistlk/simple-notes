@@ -1,6 +1,7 @@
 package personal.notes.touch.ui.editor
 
 import android.widget.Toast
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -218,6 +219,12 @@ fun TextEditorScreen(
             currentPageIndex = 0,
             onDismiss = { showExportDialog = false }
         )
+    }
+
+    // The system back gesture must not skip the save: the ViewModel scope is
+    // cancelled with the navigation entry, so the flush has to happen here.
+    androidx.activity.compose.BackHandler {
+        viewModel.saveNow { onBackClick() }
     }
 
     Scaffold(

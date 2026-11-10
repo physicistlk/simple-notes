@@ -267,8 +267,19 @@ object MarkdownExport {
         when {
             run.wiki -> html =
                 "<span class=\"wiki\" title=\"${escapeAttr(run.link.orEmpty())}\">$html</span>"
-            !run.link.isNullOrBlank() -> html =
-                "<a href=\"${escapeAttr(run.link)}\">$html</a>"
+            !run.link.isNullOrBlank() -> {
+                // Only safe schemes become a link: a note that contains
+                // [x](javascript:...) must not turn into a script in a file
+                // the user shares with other people.
+                val link = run.link
+                val safe = link.startsWith("http://") || link.startsWith("https://") ||
+                    link.startsWith("mailto:") || link.startsWith("#")
+                html = if (safe) {
+                    "<a href=\"${escapeAttr(link)}\">$html</a>"
+                } else {
+                    "<span>$html</span>"
+                }
+            }
         }
         html
     }

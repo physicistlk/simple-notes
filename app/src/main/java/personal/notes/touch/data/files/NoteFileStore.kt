@@ -112,6 +112,12 @@ class NoteFileStore(private val context: Context) {
         val file = getPageFile(noteId, pageIndex)
         val strokes = getStrokesFile(noteId, pageIndex)
         if (strokes.exists()) strokes.delete()
+        // The page background and the margin ink belong to this page too.
+        getPageBackgroundFile(noteId, pageIndex).delete()
+        getBeyondInkFile(noteId, pageIndex).delete()
+        getLayersDir(noteId).listFiles()?.forEach { f ->
+            if (f.name.startsWith("beyond_${pageIndex}_") && f.name.endsWith(".png")) f.delete()
+        }
         return if (file.exists()) file.delete() else true
     }
 
@@ -121,6 +127,28 @@ class NoteFileStore(private val context: Context) {
         if (oldStrokes.exists()) {
             if (newStrokes.exists()) newStrokes.delete()
             oldStrokes.renameTo(newStrokes)
+        }
+        // The background and the margin ink are page scoped: they have to
+        // move with the page, or they end up on the wrong one.
+        val oldBackground = getPageBackgroundFile(noteId, oldIndex)
+        val newBackground = getPageBackgroundFile(noteId, newIndex)
+        if (oldBackground.exists()) {
+            if (newBackground.exists()) newBackground.delete()
+            oldBackground.renameTo(newBackground)
+        }
+        val layersDir = getLayersDir(noteId)
+        val oldBeyond = getBeyondInkFile(noteId, oldIndex)
+        val newBeyond = getBeyondInkFile(noteId, newIndex)
+        layersDir.listFiles()?.forEach { f ->
+            if (f.name.startsWith("beyond_${oldIndex}_") && f.name.endsWith(".png")) {
+                val target = java.io.File(layersDir, f.name.replace("beyond_${oldIndex}_", "beyond_${newIndex}_"))
+                if (target.exists()) target.delete()
+                f.renameTo(target)
+            }
+        }
+        if (oldBeyond.exists()) {
+            if (newBeyond.exists()) newBeyond.delete()
+            oldBeyond.renameTo(newBeyond)
         }
         val oldFile = getPageFile(noteId, oldIndex)
         val newFile = getPageFile(noteId, newIndex)

@@ -155,13 +155,28 @@ object BitmapUtils {
             if (parent != null && !parent.exists()) {
                 parent.mkdirs()
             }
-            val tempFile = File(file.parentFile, "${file.name}.tmp")
-            FileOutputStream(tempFile).use { fos ->
+            // A unique temp name: two writers (the debounced save and a page
+            // flip) must never write into the same temp file, or the second
+            // one truncates the first one's stream and the published page
+            // file ends up half-written.
+            val tempFile = File(file.parentFile, "${file.name}.${System.nanoTime()}.tmp")
+            val compressed = FileOutputStream(tempFile).use { fos ->
                 bitmap.compress(Bitmap.CompressFormat.PNG, 100, fos)
             }
-            if (tempFile.exists()) {
-                if (file.exists()) file.delete()
-                tempFile.renameTo(file)
+            if (!compressed || !tempFile.exists()) {
+                // Nothing was written: keep the file that is already there.
+                tempFile.delete()
+                return@withContext false
+            }
+            // Rename over the old file: the old content stays readable until
+            // the new one is in place (deleting it first would leave the
+            // page empty if the process dies here).
+            if (!tempFile.renameTo(file)) {
+                // Some filesystems refuse to rename onto an existing file.
+                if (!file.delete() || !tempFile.renameTo(file)) {
+                    tempFile.delete()
+                    return@withContext false
+                }
             }
             true
         } catch (e: Exception) {

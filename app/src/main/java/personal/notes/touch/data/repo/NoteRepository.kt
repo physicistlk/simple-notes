@@ -136,6 +136,9 @@ class NoteRepository(
         noteTagDao.deleteForRecycledNotes()
         noteRefDao.deleteForRecycledNotes()
         blockRefDao.deleteForRecycledNotes()
+        // The page images of the deleted notes are files: without this they
+        // stay on disk forever and are packed into every later backup.
+        noteDao.getRecycledIds().forEach { id -> fileStore.deleteNoteFiles(id) }
         noteDao.clearRecycled()
     }
 

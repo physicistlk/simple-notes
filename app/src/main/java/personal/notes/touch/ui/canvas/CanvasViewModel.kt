@@ -50,7 +50,9 @@ data class CanvasUiState(
     val penSlot1Width: Float = 6f,
     val penSlot2Color: Int = 0xFFFB6443.toInt(),
     val penSlot2Width: Float = 3f,
-    val stylusOnly: Boolean = false,
+    // Pen mode by default: the pen writes, the hand scrolls and uses the
+    // tools. It switches off when the user wants to write with a finger.
+    val stylusOnly: Boolean = true,
     /** True once a stylus has been seen in this session. */
     val stylusDetected: Boolean = false,
     val readingMode: Boolean = false,
@@ -108,9 +110,16 @@ class CanvasViewModel(
         // Workspace preferences that survive the screen: the open-notes tab
         // bar state and the pen dock orientation.
         viewModelScope.launch(Dispatchers.IO) {
-            val showTabs = uiPrefs.getBoolean(KEY_SHOW_TABS, true)
-            val dockHorizontal = uiPrefs.getBoolean(KEY_DOCK_HORIZONTAL, false)
-            _uiState.value = _uiState.value.copy(showTabs = showTabs, dockHorizontal = dockHorizontal)
+            _uiState.value = _uiState.value.copy(
+                showTabs = uiPrefs.getBoolean(KEY_SHOW_TABS, true),
+                dockHorizontal = uiPrefs.getBoolean(KEY_DOCK_HORIZONTAL, false),
+                showPencase = uiPrefs.getBoolean(KEY_SHOW_PENCASE, true),
+                readingMode = uiPrefs.getBoolean(KEY_READING_MODE, false),
+                zoomLocked = uiPrefs.getBoolean(KEY_ZOOM_LOCKED, false),
+                fixPreviewPage = uiPrefs.getBoolean(KEY_FIX_PREVIEW_PAGE, false),
+                horizontalResistance = uiPrefs.getFloat(KEY_HORIZONTAL_RESISTANCE, 0.4f),
+                minimalInfiniteZoom = uiPrefs.getFloat(KEY_MINIMAL_INFINITE_ZOOM, 0.20f)
+            )
         }
         if (settingsRepository != null) {
             viewModelScope.launch {
@@ -335,6 +344,23 @@ class CanvasViewModel(
         }
     }
 
+    /**
+     * Switches the page turning mode for this session only.
+     *
+     * Inserting a layer or picking a lasso moves the note into single-page
+     * mode; that is an internal step and must not overwrite the user's
+     * preference for the next time they open the note.
+     */
+    fun setPageTurningModeTransient(mode: Int) {
+        if (mode == 0) {
+            debouncedSaveJob?.cancel()
+            debouncedSaveJob = null
+            pendingSave = null
+            canvasPageIndex = -1
+        }
+        _uiState.value = _uiState.value.copy(pageTurningMode = mode)
+    }
+
     fun setPageTurningMode(mode: Int) {
         if (mode == 0) {
             debouncedSaveJob?.cancel()
@@ -407,7 +433,9 @@ class CanvasViewModel(
     }
 
     fun toggleShowPencase(show: Boolean? = null) {
-        _uiState.value = _uiState.value.copy(showPencase = show ?: !_uiState.value.showPencase)
+        val next = show ?: !_uiState.value.showPencase
+        _uiState.value = _uiState.value.copy(showPencase = next)
+        viewModelScope.launch(Dispatchers.IO) { uiPrefs.putBoolean(KEY_SHOW_PENCASE, next) }
     }
 
     fun togglePenBox(enabled: Boolean? = null) {
@@ -449,7 +477,9 @@ class CanvasViewModel(
     }
 
     fun toggleReadingMode(enabled: Boolean? = null) {
-        _uiState.value = _uiState.value.copy(readingMode = enabled ?: !_uiState.value.readingMode)
+        val next = enabled ?: !_uiState.value.readingMode
+        _uiState.value = _uiState.value.copy(readingMode = next)
+        viewModelScope.launch(Dispatchers.IO) { uiPrefs.putBoolean(KEY_READING_MODE, next) }
     }
 
     fun toggleDoublePageMode(enabled: Boolean? = null) {
@@ -462,6 +492,7 @@ class CanvasViewModel(
 
     fun setZoomLocked(locked: Boolean) {
         _uiState.value = _uiState.value.copy(zoomLocked = locked)
+        viewModelScope.launch(Dispatchers.IO) { uiPrefs.putBoolean(KEY_ZOOM_LOCKED, locked) }
     }
 
     fun setShowTabs(show: Boolean) {
@@ -471,14 +502,17 @@ class CanvasViewModel(
 
     fun setFixPreviewPage(fix: Boolean) {
         _uiState.value = _uiState.value.copy(fixPreviewPage = fix)
+        viewModelScope.launch(Dispatchers.IO) { uiPrefs.putBoolean(KEY_FIX_PREVIEW_PAGE, fix) }
     }
 
     fun setHorizontalResistance(resistance: Float) {
         _uiState.value = _uiState.value.copy(horizontalResistance = resistance)
+        viewModelScope.launch(Dispatchers.IO) { uiPrefs.putFloat(KEY_HORIZONTAL_RESISTANCE, resistance) }
     }
 
     fun setMinimalInfiniteZoom(zoom: Float) {
         _uiState.value = _uiState.value.copy(minimalInfiniteZoom = zoom)
+        viewModelScope.launch(Dispatchers.IO) { uiPrefs.putFloat(KEY_MINIMAL_INFINITE_ZOOM, zoom) }
     }
 
     var isNoteDeleted: Boolean = false
@@ -660,7 +694,16 @@ class CanvasViewModel(
             fileStore.getPageFile(noteId, pageIdx)
         }
         if (!pageLoadedFromDisk && guardFile.exists()) return
-        saveContentLayer(pageIdx, bitmap)
+        // The encoder runs off the main thread while the canvas keeps drawing
+        // into the same bitmap: encode a copy so the file can never be torn.
+        val copy = try {
+            bitmap.copy(Bitmap.Config.ARGB_8888, false)
+        } catch (e: OutOfMemoryError) {
+            e.printStackTrace()
+            null
+        } ?: return
+        saveContentLayer(pageIdx, copy)
+        copy.recycle()
         if (pendingSave?.second === bitmap) pendingSave = null
     }
 
@@ -863,6 +906,12 @@ class CanvasViewModel(
     private companion object {
         const val KEY_SHOW_TABS = "show_tabs"
         const val KEY_DOCK_HORIZONTAL = "dock_horizontal"
+        const val KEY_SHOW_PENCASE = "show_pencase"
+        const val KEY_READING_MODE = "reading_mode"
+        const val KEY_ZOOM_LOCKED = "zoom_locked"
+        const val KEY_FIX_PREVIEW_PAGE = "fix_preview_page"
+        const val KEY_HORIZONTAL_RESISTANCE = "horizontal_resistance"
+        const val KEY_MINIMAL_INFINITE_ZOOM = "minimal_infinite_zoom"
     }
 
     class Factory(

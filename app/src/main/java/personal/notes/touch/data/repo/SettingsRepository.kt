@@ -1,6 +1,7 @@
 package personal.notes.touch.data.repo
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
 import personal.notes.touch.data.db.dao.SettingsDao
@@ -15,88 +16,88 @@ class SettingsRepository(private val settingsDao: SettingsDao) {
         }
     }
 
+    /**
+     * The settings live in one row. Two updates that run at the same time
+     * would both read the old row, and the second write would undo the
+     * first one - so the read-modify-write is serialised here.
+     */
+    private val updateLock = kotlinx.coroutines.sync.Mutex()
+
+    private suspend fun updateSettingsField(
+        block: (SettingsEntity) -> SettingsEntity
+    ) = withContext(Dispatchers.IO) {
+        updateLock.withLock {
+            val current = getSettingsDirect()
+            settingsDao.insertOrUpdate(block(current))
+        }
+    }
+
     suspend fun updateSettings(settings: SettingsEntity) = withContext(Dispatchers.IO) {
         settingsDao.insertOrUpdate(settings)
     }
 
-    suspend fun updateThemeColor(color: Int) = withContext(Dispatchers.IO) {
-        val current = getSettingsDirect()
-        settingsDao.insertOrUpdate(current.copy(themeColor = color))
+    suspend fun updateThemeColor(color: Int) = updateSettingsField { current ->
+        current.copy(themeColor = color)
     }
 
-    suspend fun updateDarkMode(mode: Int) = withContext(Dispatchers.IO) {
-        val current = getSettingsDirect()
-        settingsDao.insertOrUpdate(current.copy(darkMode = mode))
+    suspend fun updateDarkMode(mode: Int) = updateSettingsField { current ->
+        current.copy(darkMode = mode)
     }
 
-    suspend fun updateKeepScreenOn(keep: Boolean) = withContext(Dispatchers.IO) {
-        val current = getSettingsDirect()
-        settingsDao.insertOrUpdate(current.copy(keepScreenOn = keep))
+    suspend fun updateKeepScreenOn(keep: Boolean) = updateSettingsField { current ->
+        current.copy(keepScreenOn = keep)
     }
 
-    suspend fun updateAutoSaveInterval(intervalMs: Int) = withContext(Dispatchers.IO) {
-        val current = getSettingsDirect()
-        settingsDao.insertOrUpdate(current.copy(autoSaveIntervalMs = intervalMs))
+    suspend fun updateAutoSaveInterval(intervalMs: Int) = updateSettingsField { current ->
+        current.copy(autoSaveIntervalMs = intervalMs)
     }
 
-    suspend fun updateDefaultBackground(bgOrdinal: Int) = withContext(Dispatchers.IO) {
-        val current = getSettingsDirect()
-        settingsDao.insertOrUpdate(current.copy(defaultBackground = bgOrdinal))
+    suspend fun updateDefaultBackground(bgOrdinal: Int) = updateSettingsField { current ->
+        current.copy(defaultBackground = bgOrdinal)
     }
 
-    suspend fun updatePressureSizeEnabled(enabled: Boolean) = withContext(Dispatchers.IO) {
-        val current = getSettingsDirect()
-        settingsDao.insertOrUpdate(current.copy(pressureSizeEnabled = enabled))
+    suspend fun updatePressureSizeEnabled(enabled: Boolean) = updateSettingsField { current ->
+        current.copy(pressureSizeEnabled = enabled)
     }
 
-    suspend fun updateAutoShapeEnabled(enabled: Boolean) = withContext(Dispatchers.IO) {
-        val current = getSettingsDirect()
-        settingsDao.insertOrUpdate(current.copy(autoShapeEnabled = enabled))
+    suspend fun updateAutoShapeEnabled(enabled: Boolean) = updateSettingsField { current ->
+        current.copy(autoShapeEnabled = enabled)
     }
 
-    suspend fun updateVolumeForPage(enabled: Boolean) = withContext(Dispatchers.IO) {
-        val current = getSettingsDirect()
-        settingsDao.insertOrUpdate(current.copy(volumeForPage = enabled))
+    suspend fun updateVolumeForPage(enabled: Boolean) = updateSettingsField { current ->
+        current.copy(volumeForPage = enabled)
     }
 
-    suspend fun updateBackgroundMode(mode: Int) = withContext(Dispatchers.IO) {
-        val current = getSettingsDirect()
-        settingsDao.insertOrUpdate(current.copy(backgroundMode = mode))
+    suspend fun updateBackgroundMode(mode: Int) = updateSettingsField { current ->
+        current.copy(backgroundMode = mode)
     }
 
-    suspend fun updateBackgroundDensity(density: Int) = withContext(Dispatchers.IO) {
-        val current = getSettingsDirect()
-        settingsDao.insertOrUpdate(current.copy(backgroundDensity = density))
+    suspend fun updateBackgroundDensity(density: Int) = updateSettingsField { current ->
+        current.copy(backgroundDensity = density)
     }
 
-    suspend fun updateDoublePage(enabled: Boolean) = withContext(Dispatchers.IO) {
-        val current = getSettingsDirect()
-        settingsDao.insertOrUpdate(current.copy(doublePage = enabled))
+    suspend fun updateDoublePage(enabled: Boolean) = updateSettingsField { current ->
+        current.copy(doublePage = enabled)
     }
 
-    suspend fun updateShowPenBox(enabled: Boolean) = withContext(Dispatchers.IO) {
-        val current = getSettingsDirect()
-        settingsDao.insertOrUpdate(current.copy(showPenBox = enabled))
+    suspend fun updateShowPenBox(enabled: Boolean) = updateSettingsField { current ->
+        current.copy(showPenBox = enabled)
     }
 
-    suspend fun updateFullScreen(enabled: Boolean) = withContext(Dispatchers.IO) {
-        val current = getSettingsDirect()
-        settingsDao.insertOrUpdate(current.copy(fullScreen = enabled))
+    suspend fun updateFullScreen(enabled: Boolean) = updateSettingsField { current ->
+        current.copy(fullScreen = enabled)
     }
 
-    suspend fun updateAutoCenter(enabled: Boolean) = withContext(Dispatchers.IO) {
-        val current = getSettingsDirect()
-        settingsDao.insertOrUpdate(current.copy(autoCenter = enabled))
+    suspend fun updateAutoCenter(enabled: Boolean) = updateSettingsField { current ->
+        current.copy(autoCenter = enabled)
     }
 
-    suspend fun updatePageTurningDirection(direction: Int) = withContext(Dispatchers.IO) {
-        val current = getSettingsDirect()
-        settingsDao.insertOrUpdate(current.copy(pageTurningDirection = direction))
+    suspend fun updatePageTurningDirection(direction: Int) = updateSettingsField { current ->
+        current.copy(pageTurningDirection = direction)
     }
 
-    suspend fun updatePageTurningMode(mode: Int) = withContext(Dispatchers.IO) {
-        val current = getSettingsDirect()
-        settingsDao.insertOrUpdate(current.copy(pageTurningMode = mode))
+    suspend fun updatePageTurningMode(mode: Int) = updateSettingsField { current ->
+        current.copy(pageTurningMode = mode)
     }
 
     suspend fun updatePenSlot(slot: Int, color: Int, width: Float) = withContext(Dispatchers.IO) {

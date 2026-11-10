@@ -37,13 +37,13 @@ fun TouchNotesNavHost(
     app: TouchNotesApp,
     navController: NavHostController = rememberNavController()
 ) {
-    val openNotes = remember { mutableStateListOf<String>() }
+    val openNotes = rememberSaveable { mutableStateListOf<String>() }
     /**
      * Notes the user closed in the tab bar. They must not re-open
      * themselves when the canvas recomposes; opening a note again from the
      * library clears the flag.
      */
-    val closedNotes = remember { mutableStateListOf<String>() }
+    val closedNotes = rememberSaveable { mutableStateListOf<String>() }
     val context = LocalContext.current
 
     // Edge-to-edge (targetSdk 35+): every screen must clear the status bar, or app
