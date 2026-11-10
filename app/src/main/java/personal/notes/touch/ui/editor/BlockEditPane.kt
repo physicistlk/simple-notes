@@ -1008,6 +1008,11 @@ private fun BlockTextField(
             }
             .onPreviewKeyEvent { event ->
                 when {
+                    event.type == KeyEventType.KeyDown && (event.key == Key.Enter || event.key == Key.NumPadEnter) &&
+                        !event.isShiftPressed -> {
+                        viewModel.onEnterPressed(block.id)
+                        true
+                    }
                     event.type == KeyEventType.KeyDown && event.key == Key.Tab &&
                         BlockStructureOps.isListBlock(block.type) -> {
                         if (event.isShiftPressed) viewModel.outdentBlock(block.id)

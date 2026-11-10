@@ -84,6 +84,7 @@ in any earlier list.
 | **M22** | The search matches the raw markdown but the snippet is computed from the stripped text. | A query that only matches a marker lists the note without an excerpt. | `NoteSearch.kt` | **FIXED** — the excerpt is taken from the line the token was found in. |
 | **M23** | The `((` autocomplete queries the block table on every keystroke with no debounce. | Visible lag with a large library. | `BlockEditPane.kt` | **FIXED** — the query waits for the typing to settle. |
 | **M24** | Enter inside an image block's caption splits the image markdown. | An invalid image row plus a stray paragraph. | `TextEditorViewModel.kt` | **FIXED** — an image block is never split. |
+| **M25** | Pressing Enter in numbered lists or checklists spawned double items or duplicated prefix markers due to unconsumed Key.Enter and IME key bounce, plus unstripped prefixes in block conversions. | Double items/digits or double checkboxes spawned on a single Enter key press. | `BlockEditPane.kt`, `TextEditorViewModel.kt`, `BlockOps.kt` | **FIXED** — Consumed `Key.Enter` in `onPreviewKeyEvent`, added 250ms enter-split cooldown, stripped prefixes in block transformations, auto-renumbered subsequent items, and added live typing auto-conversion for `1. `, `- [ ] `, and `- `. |
 
 ### Fixed in the recent rounds
 
@@ -139,6 +140,7 @@ in any earlier list.
 | **C15** | Floating pen dock required a dedicated rotate button taking up toolbar real estate. | Wasted toolbar space and cluttered the dock. | `CanvasScreen.kt` | **FIXED** — Single tap on the dock toggles orientation (horizontal / vertical); tap-and-hold drags dock; redundant rotate button removed. |
 | **C16** | Top bar lacked a direct "Insert New Page" button (TOC button was redundant with Outline drawer). | Inserting a page required diving into drawer menus or scrolling to the end. | `CanvasScreen.kt`, `CanvasViewModel.kt` | **FIXED** — Top bar button inserts a blank page next to current page across Infinite, A4, and PDF notes, and shifts bookmarks/TOC chapter indices. |
 | **C17** | Tools menu "Sticker" dropped a static text "★" and "Add Mind Map" injected a dummy text outline. | Stickers lacked graphic styling and transformability; mind map placeholder was misleading. | `StickerArt.kt`, `CanvasScreen.kt` | **FIXED** — Procedural vector stickers (`StickerArt.kt`: Star, Heart, Smiley with cutout features) cycled and dropped as transformable `ImageLayer`s; Mind Map displays honest "not implemented yet" toast; Web Excerpt gives actionable copy/paste instructions. |
+| **C18** | `CanvasViewModel` declared `_uiState` below its `init` block, but `init` launched background coroutines accessing `_uiState.value` immediately upon instantiation. | Immediate crash (`NullPointerException` on `_uiState`) when opening ANY drawing canvas note (Infinite, A4, PDF). | `CanvasViewModel.kt` | **FIXED** — Hoisted `_uiState`, `_currentPageIndex`, and StateFlow declarations above `init`. |
 
 ### Fixed in the recent rounds
 

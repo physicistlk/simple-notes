@@ -106,6 +106,37 @@ class CanvasViewModel(
     /** True once the user picked stylus mode by hand (auto-switch stops). */
     private var stylusOnlyChosen = false
 
+    private var pagePatternHydrated = false
+    private val _uiState = MutableStateFlow(CanvasUiState())
+    val uiState: StateFlow<CanvasUiState> = _uiState.asStateFlow()
+
+    private val _currentPageIndex = MutableStateFlow(0)
+    val currentPageIndex: StateFlow<Int> = _currentPageIndex.asStateFlow()
+
+    val note: StateFlow<NoteEntity?> = repository.getNoteById(noteId)
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = null
+        )
+
+    val allNotesMap: StateFlow<Map<String, String>> = repository.getAllNotes()
+        .map { list ->
+            list.associate { it.id to (it.title.ifBlank { "Untitled Note" }) }
+        }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyMap()
+        )
+
+    val pages: StateFlow<List<PageEntity>> = repository.getPagesForNote(noteId)
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
+
     init {
         // Workspace preferences that survive the screen: the open-notes tab
         // bar state and the pen dock orientation.
@@ -172,37 +203,6 @@ class CanvasViewModel(
             loadDrawerData()
         }
     }
-
-    val note: StateFlow<NoteEntity?> = repository.getNoteById(noteId)
-        .stateIn(
-            scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(5000),
-            initialValue = null
-        )
-
-    val allNotesMap: StateFlow<Map<String, String>> = repository.getAllNotes()
-        .map { list ->
-            list.associate { it.id to (it.title.ifBlank { "Untitled Note" }) }
-        }
-        .stateIn(
-            scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(5000),
-            initialValue = emptyMap()
-        )
-
-    val pages: StateFlow<List<PageEntity>> = repository.getPagesForNote(noteId)
-        .stateIn(
-            scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(5000),
-            initialValue = emptyList()
-        )
-
-    private val _currentPageIndex = MutableStateFlow(0)
-    val currentPageIndex: StateFlow<Int> = _currentPageIndex.asStateFlow()
-
-    private var pagePatternHydrated = false
-    private val _uiState = MutableStateFlow(CanvasUiState())
-    val uiState: StateFlow<CanvasUiState> = _uiState.asStateFlow()
 
     fun selectTool(tool: CanvasTool) {
         _uiState.value = _uiState.value.copy(selectedTool = tool)

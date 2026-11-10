@@ -666,6 +666,9 @@ class TextEditorViewModel(
         }
     }
 
+    /** Cooldown for enter-split to reject key-bounce or leaked IME Enter events. */
+    private var lastEnterSplitTime = 0L
+
     /** Plain per-keystroke change of one block's text field; also detects Enter. */
     fun onBlockValueChange(id: String, newValue: TextFieldValue) {
         val list = _blocks.value
@@ -685,6 +688,17 @@ class TextEditorViewModel(
             newValue.text[sel.start - 1] == '\n'
 
         if (enteredNewline) {
+            val now = System.currentTimeMillis()
+            if (now - lastEnterSplitTime < 250) {
+                // Drop duplicate / leaked newline event
+                val pre = newValue.text.replace("\n", "")
+                val updated = cur.copy(field = TextFieldValue(pre, TextRange(pre.length)))
+                val mutable = list.toMutableList()
+                mutable[idx] = updated
+                publishBlocks(mutable)
+                return
+            }
+            lastEnterSplitTime = now
             val caret = sel.start
             val pre = newValue.text.substring(0, caret - 1)
             val post = newValue.text.substring(caret)
@@ -695,6 +709,52 @@ class TextEditorViewModel(
             return
         }
 
+        // Live markdown typing shortcuts: typing "1. ", "- [ ] ", "- " at the start
+        // of a plain paragraph transforms it into that list item type seamlessly.
+        if (cur.type == BlockType.PARAGRAPH && grew) {
+            val text = newValue.text
+            val numMatch = Regex("""^(\d{1,9})\.\s+(.*)$""").find(text)
+            if (numMatch != null) {
+                val order = numMatch.groupValues[1].toIntOrNull() ?: 1
+                val remainder = numMatch.groupValues[2]
+                val converted = cur.copy(
+                    type = BlockType.NUMBERED,
+                    order = order,
+                    field = TextFieldValue(remainder, TextRange(remainder.length))
+                )
+                val mutable = list.toMutableList()
+                mutable[idx] = converted
+                publishBlocks(mutable, FocusTarget(cur.id))
+                return
+            }
+            val taskMatch = Regex("""^(?:-\s*)?\[([ xX])]\s*(.*)$""").find(text)
+            if (taskMatch != null) {
+                val checked = taskMatch.groupValues[1].equals("x", ignoreCase = true)
+                val remainder = taskMatch.groupValues[2]
+                val converted = cur.copy(
+                    type = BlockType.TASK,
+                    checked = checked,
+                    field = TextFieldValue(remainder, TextRange(remainder.length))
+                )
+                val mutable = list.toMutableList()
+                mutable[idx] = converted
+                publishBlocks(mutable, FocusTarget(cur.id))
+                return
+            }
+            val bulletMatch = Regex("""^[-*•]\s+(.*)$""").find(text)
+            if (bulletMatch != null) {
+                val remainder = bulletMatch.groupValues[1]
+                val converted = cur.copy(
+                    type = BlockType.BULLET,
+                    field = TextFieldValue(remainder, TextRange(remainder.length))
+                )
+                val mutable = list.toMutableList()
+                mutable[idx] = converted
+                publishBlocks(mutable, FocusTarget(cur.id))
+                return
+            }
+        }
+
         val updated = cur.copy(field = newValue)
         val mutable = list.toMutableList()
         mutable[idx] = updated
@@ -703,6 +763,9 @@ class TextEditorViewModel(
 
     /** Enter key handled through the key-event path (hardware / some IMEs). */
     fun onEnterPressed(id: String) {
+        val now = System.currentTimeMillis()
+        if (now - lastEnterSplitTime < 250) return
+        lastEnterSplitTime = now
         val list = _blocks.value
         val idx = list.indexOfFirst { it.id == id }
         if (idx < 0) return
@@ -982,28 +1045,42 @@ class TextEditorViewModel(
                 finish(mutable, FocusTarget(clean.id))
             }
             BlockCommand.BULLET -> {
+                val match = Regex("""^[-*•]\s*(.*)$""").find(body)
+                val cleanText = match?.groupValues?.get(1) ?: body
                 mutable[idx] = clean.copy(
                     type = BlockType.BULLET,
                     indent = cur.indent,
-                    field = bodyField
+                    field = TextFieldValue(cleanText, TextRange(cleanText.length))
                 )
                 finish(mutable, FocusTarget(clean.id))
             }
             BlockCommand.NUMBERED -> {
+                val match = Regex("""^(\d{1,9})\.\s*(.*)$""").find(body)
+                val (orderNo, cleanText) = if (match != null) {
+                    (match.groupValues[1].toIntOrNull() ?: 1) to match.groupValues[2]
+                } else {
+                    1 to body
+                }
                 mutable[idx] = clean.copy(
                     type = BlockType.NUMBERED,
-                    order = 1,
+                    order = orderNo,
                     indent = cur.indent,
-                    field = bodyField
+                    field = TextFieldValue(cleanText, TextRange(cleanText.length))
                 )
                 finish(mutable, FocusTarget(clean.id))
             }
             BlockCommand.TASK -> {
+                val match = Regex("""^(?:-\s*)?\[([ xX])]\s*(.*)$""").find(body)
+                val (checked, cleanText) = if (match != null) {
+                    match.groupValues[1].equals("x", ignoreCase = true) to match.groupValues[2]
+                } else {
+                    false to body
+                }
                 mutable[idx] = clean.copy(
                     type = BlockType.TASK,
-                    checked = false,
+                    checked = checked,
                     indent = cur.indent,
-                    field = bodyField
+                    field = TextFieldValue(cleanText, TextRange(cleanText.length))
                 )
                 finish(mutable, FocusTarget(clean.id))
             }

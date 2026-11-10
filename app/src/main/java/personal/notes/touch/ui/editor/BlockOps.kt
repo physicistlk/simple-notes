@@ -89,6 +89,17 @@ object BlockOps {
         val mutable = blocks.toMutableList()
         mutable[idx] = updatedCurrent
         mutable.add(idx + 1, newBlock)
+        if (newBlock.type == BlockType.NUMBERED) {
+            var nextExpected = newBlock.order + 1
+            for (i in (idx + 2) until mutable.size) {
+                val b = mutable[i]
+                if (b.type == BlockType.NUMBERED && b.indent == newBlock.indent) {
+                    mutable[i] = b.copy(order = nextExpected++)
+                } else if (b.type != BlockType.NUMBERED || b.indent < newBlock.indent) {
+                    break
+                }
+            }
+        }
         return mutable
     }
 

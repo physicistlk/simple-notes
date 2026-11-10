@@ -192,3 +192,13 @@
 - SaveableStateRegistry Crash Fix: `rememberSaveable { mutableStateListOf<String>() }` on `openNotes` and `closedNotes` in `TouchNotesNavHost.kt` threw `IllegalArgumentException` on device launch because `SnapshotStateList` is not directly Bundle-saveable. Implemented `listSaver(save = { it.toList() }, restore = { it.toMutableStateList() })`.
 - Live Device Verification: installed `app-debug.apk` via ADB stream install; launched successfully (PID active, 0 crash logs); marked audit item `X9` as FIXED in `state/AUDIT.md`.
 - Verified with 299 passing unit tests, clean assembleDebug APK build, and pushed to GitHub repo.
+
+## Decisions appended 65        65. 2026-11-10 (auditor): Canvas note opening crash fix & editor list Enter handling:
+- CanvasViewModel Initialization Ordering (`C18`): `_uiState` was declared below the `init` block; background coroutines launched in `init` on `Dispatchers.IO` immediately read `_uiState.value` while the field was still null, throwing `NullPointerException: Attempt to invoke interface method MutableStateFlow.getValue() on a null object reference` upon opening any drawing canvas note (Infinite, A4, PDF). Hoisted `_uiState`, `_currentPageIndex`, and StateFlow declarations above `init`.
+- Editor Enter & List Handling (`M25`):
+  - Consumed `Key.Enter` and `Key.NumPadEnter` in `BlockEditPane.kt` `onPreviewKeyEvent` so keyboard events do not leak or repeat to newly focused items.
+  - Added a 250ms enter-split cooldown in `TextEditorViewModel.kt` to reject IME key bounce.
+  - Stripped redundant prefix markers (`1. `, `[ ]`, `- `) in `applyBlockCommand` so converting an existing line does not create duplicate numbers (`1. 1.`) or duplicate checkboxes.
+  - Added live typing auto-conversion in `onBlockValueChange` for `1. `, `[ ] `, `- [ ] `, and `- `.
+  - Renumbered subsequent `BlockType.NUMBERED` items on `enterSplit` so list sequences remain strictly contiguous.
+- Verified with 299 passing unit tests (0 failures, 2 skipped), deployed cleanly to Xiaomi Pad 5 tablet, and updated GitHub release APKs.
