@@ -101,8 +101,8 @@ in any earlier list.
 
 | # | Finding | Impact | Where |
 | :--- | :--- | :--- | :--- |
-| **B1** | The restore copies the database in place, so an interrupted restore leaves an unopenable database, and it never removes files that are absent from the backup. | A failed restore can make the app unreadable; orphan files accumulate and are packed into every later backup. | `BackupManager.kt` |
-| **B2** | The backup copies the database and its WAL at different moments without a lock, so the archive can hold a mismatched pair. | The most recent transactions are lost on restore. | `BackupManager.kt` |
+| **B1** | The restore copies the database in place, so an interrupted restore leaves an unopenable database, and it never removes files that are absent from the backup. | A failed restore can make the app unreadable; orphan files accumulate and are packed into every later backup. | `BackupManager.kt` | **FIXED** — the database is renamed into place and the old note directories are removed before the copy. |
+| **B2** | The backup copies the database and its WAL at different moments without a lock, so the archive can hold a mismatched pair. | The most recent transactions are lost on restore. | `BackupManager.kt` | **FIXED** — the checkpoint truncates the WAL, so the copied database is self-contained. |
 | **B3** | A permanent delete leaves `block_refs` rows behind (no orphan cleanup for that table). | The table grows with every permanent delete. | `NoteRepository.kt`, `BlockRefDao.kt` | **FIXED** |
 | **B4** | The *layer* files were note-scoped, so a page change could not carry a page's layers with it. | Floating layers stayed on the wrong page. | `NoteFileStore.kt`, `DrawingCanvasView.kt` | **FIXED** — the layers are page scoped now (`page_<i>_layers.json` + `page_<i>_layer_<n>.png`), and the export takes the layers of the page it exports. |
 
@@ -127,10 +127,10 @@ in any earlier list.
 | **C3** | The reader's flush of a page is written asynchronously while the next session for the same page loads the pre-flush file. | Strokes are lost on a quick page round trip. | `ContinuousInkController.kt` |
 | **C4** | The margin ink is loaded asynchronously; a load that arrives after the user drew in the margin can wipe those strokes. | Margin strokes disappear. | `CanvasScreen.kt` | **FIXED** — the load carries the crop count it started with and is dropped when the user drew in the meantime. |
 | **C5** | The eraser cannot remove ink written on a layer or in the margin, because that ink no longer lives in the page bitmap the eraser clears. | The user cannot erase their own mistakes there. | `DrawingCanvasView.kt` |
-| **C6** | Every stroke copies the whole page (26 MB) on the UI thread for the undo snapshot, and the undo budget is forced to at least three snapshots (≈78 MB) plus the same again for redo. | A visible hitch per stroke and an OOM risk on a 108 MB tablet. | `DrawingCanvasView.kt` |
+| **C6** | Every stroke copies the whole page (26 MB) on the UI thread for the undo snapshot, and the undo budget is forced to at least three snapshots (≈78 MB) plus the same again for redo. | A visible hitch per stroke and an OOM risk on a 108 MB tablet. | `DrawingCanvasView.kt` | **PARTLY FIXED** — the budget follows the heap again (the floor is 1, not 3); the copy per stroke remains. |
 | **C7** | The debounced save copies 26 MB on the main thread before handing it to the encoder. | Dropped frames while writing. | `CanvasViewModel.kt`, `ContinuousInkController.kt` |
-| **C8** | `trimTransparentMargins` allocates an `IntArray` for the whole layer (48 MB for a 12 MP photo) on the UI thread. | A freeze of hundreds of ms and an OOM on low-end devices. | `DrawingCanvasView.kt` |
-| **C9** | The layer PNGs and `layers.json` are written in place, not atomically. | A kill mid-write loses the layer list. | `DrawingCanvasView.kt` |
+| **C8** | `trimTransparentMargins` allocates an `IntArray` for the whole layer (48 MB for a 12 MP photo) on the UI thread. | A freeze of hundreds of ms and an OOM on low-end devices. | `DrawingCanvasView.kt` | **FIXED** — the bitmap is read row by row. |
+| **C9** | The layer PNGs and `layers.json` are written in place, not atomically. | A kill mid-write loses the layer list. | `DrawingCanvasView.kt` | **FIXED** — the layer bitmaps and the manifest are written to a temp file and renamed. |
 | **C10** | Touch targets below 48 dp: the layer panel's icon buttons (24 dp), the zoom lock (24 dp), the text stepper (26 dp), the dock collapse (22 dp) and the live-text drag handle (6 dp tall). | Hard to hit on a tablet. | `CanvasScreen.kt` |
 
 ### Fixed in the recent rounds

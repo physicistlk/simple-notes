@@ -38,9 +38,12 @@ object BackupManager {
         try {
             val app = context.applicationContext as TouchNotesApp
 
-            // 1. Force a WAL checkpoint to flush all pending SQLite transactions to touchnotes.db
+            // 1. Force a WAL checkpoint to flush all pending SQLite transactions
+            // into touchnotes.db. TRUNCATE also empties the WAL, so the copied
+            // database file is self-contained and cannot be paired with a WAL
+            // whose salt belongs to a different database state.
             try {
-                app.database.openHelper.writableDatabase.query("PRAGMA wal_checkpoint(FULL)").close()
+                app.database.openHelper.writableDatabase.query("PRAGMA wal_checkpoint(TRUNCATE)").close()
             } catch (_: Exception) {
                 // Ignore if in-memory or not supported
             }
@@ -170,7 +173,10 @@ object BackupManager {
             // 3. Close active database connections
             app.reloadDatabase()
 
-            // 4. Overwrite SQLite database with staged database
+            // 4. Overwrite the SQLite database with the staged one.
+            // The copy goes to a temp file first and is renamed over the
+            // target: an interrupted restore can then never leave a
+            // half-written database behind.
             val stagedDb = File(stagingDir, "database/touchnotes.db")
             if (stagedDb.exists()) {
                 val targetDb = context.getDatabasePath("touchnotes.db")
@@ -178,18 +184,32 @@ object BackupManager {
                 // Clear old WAL and shared memory sidecars
                 File(targetDb.parentFile, "touchnotes.db-wal").delete()
                 File(targetDb.parentFile, "touchnotes.db-shm").delete()
-                stagedDb.copyTo(targetDb, overwrite = true)
+                val dbTmp = File(targetDb.parentFile, "touchnotes.db.restore")
+                stagedDb.copyTo(dbTmp, overwrite = true)
+                if (!dbTmp.renameTo(targetDb)) {
+                    targetDb.delete()
+                    if (!dbTmp.renameTo(targetDb)) {
+                        dbTmp.delete()
+                        throw IllegalStateException("Could not install the restored database")
+                    }
+                }
                 val stagedWal = File(stagingDir, "database/touchnotes.db-wal")
                 if (stagedWal.exists()) {
                     stagedWal.copyTo(File(targetDb.parentFile, "touchnotes.db-wal"), overwrite = true)
                 }
             }
 
-            // 5. Overwrite files/note/ directory with staged files
+            // 5. Replace files/note/ with the staged files. The old
+            // directories are removed first, so a note that is not in the
+            // backup does not survive as an orphan (it would be packed into
+            // every later backup).
             val stagedNotesDir = File(stagingDir, "files/note")
+            val targetNotesDir = File(context.filesDir, "note")
             if (stagedNotesDir.exists()) {
-                val targetNotesDir = File(context.filesDir, "note")
                 targetNotesDir.mkdirs()
+                targetNotesDir.listFiles()?.forEach { old ->
+                    if (old.isDirectory) old.deleteRecursively() else old.delete()
+                }
                 stagedNotesDir.copyRecursively(targetNotesDir, overwrite = true)
             }
 

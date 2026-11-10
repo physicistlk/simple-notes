@@ -784,16 +784,19 @@ class DrawingCanvasView @JvmOverloads constructor(
     /**
      * Undo/redo depth derived from the heap and the page size. A 2160×3056
      * page snapshot is ~26 MB, so a fixed depth of 6 could hold ~158 MB on
-     * its own; keep history inside roughly a sixth of the heap while still
-     * allowing 3–6 steps for typical pages.
+     * its own; keep history inside roughly a sixth of the heap.
+     *
+     * The floor is 1, not 3: on a 108 MB tablet three snapshots are 78 MB
+     * and the redo stack holds the same again - the floor was what turned a
+     * small budget into an out-of-memory crash.
      */
     private val maxUndoSnapshots: Int
         get() {
             val bmp = backingBitmap ?: return 4
             if (bmp.width <= 0 || bmp.height <= 0) return 4
             val snapshotBytes = bmp.width.toLong() * bmp.height.toLong() * 4L
-            val budget = Runtime.getRuntime().maxMemory() / 6
-            return (budget / snapshotBytes).toInt().coerceIn(3, 6)
+            val budget = Runtime.getRuntime().maxMemory() / 8
+            return (budget / snapshotBytes).toInt().coerceIn(1, 6)
         }
     private val undoStack = ArrayDeque<UndoSnapshot>()
     private val redoStack = ArrayDeque<UndoSnapshot>()
@@ -1438,8 +1441,14 @@ class DrawingCanvasView @JvmOverloads constructor(
                 val fileName = "page_${pageIndex}_layer_$index.png"
                 writtenFiles.add(fileName)
                 val file = java.io.File(layersDir, fileName)
-                java.io.FileOutputStream(file).use { fos ->
+                // Atomic: a kill during the write must not leave a truncated
+                // PNG that the manifest would point at.
+                val tmp = java.io.File(layersDir, "$fileName.tmp")
+                java.io.FileOutputStream(tmp).use { fos ->
                     layer.bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, fos)
+                }
+                if (!tmp.renameTo(file)) {
+                    if (!file.delete() || !tmp.renameTo(file)) tmp.delete()
                 }
                 val obj = org.json.JSONObject()
                 obj.put("file", fileName)
@@ -1456,8 +1465,13 @@ class DrawingCanvasView @JvmOverloads constructor(
                     if (crop.bitmap.isRecycled) return@forEachIndexed
                     val inkName = "page_${pageIndex}_layer_${index}_ink_${inkIdx}.png"
                     writtenFiles.add(inkName)
-                    java.io.FileOutputStream(java.io.File(layersDir, inkName)).use { fos ->
+                    val inkFile = java.io.File(layersDir, inkName)
+                    val inkTmp = java.io.File(layersDir, "$inkName.tmp")
+                    java.io.FileOutputStream(inkTmp).use { fos ->
                         crop.bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, fos)
+                    }
+                    if (!inkTmp.renameTo(inkFile)) {
+                        if (!inkFile.delete() || !inkTmp.renameTo(inkFile)) inkTmp.delete()
                     }
                     val inkObj = org.json.JSONObject()
                     inkObj.put("file", inkName)
@@ -1469,7 +1483,13 @@ class DrawingCanvasView @JvmOverloads constructor(
                 arr.put(obj)
             }
             }
-            infoFile.writeText(arr.toString())
+            // The manifest is written atomically as well: a truncated one
+            // makes the whole layer list unreadable.
+            val manifestTmp = java.io.File(layersDir, "${infoFile.name}.tmp")
+            manifestTmp.writeText(arr.toString())
+            if (!manifestTmp.renameTo(infoFile)) {
+                if (!infoFile.delete() || !manifestTmp.renameTo(infoFile)) manifestTmp.delete()
+            }
             layersDir.listFiles()?.forEach { file ->
                 // Only this page's files are cleaned up: the layers of the
                 // other pages must stay.
@@ -1664,29 +1684,40 @@ class DrawingCanvasView @JvmOverloads constructor(
     /** A trimmed bitmap and the rectangle it was taken from. */
     private class TrimmedBitmap(val bitmap: Bitmap, val rect: Rect)
 
-    /** The bounding box of the painted pixels of a bitmap, or null. */
+    /**
+     * The bounding box of the painted pixels of a bitmap, or null.
+     *
+     * The bitmap is read row by row: a whole-image `IntArray` would be 48 MB
+     * for a 12 MP photo, on the UI thread.
+     */
     private fun trimTransparentMargins(bitmap: Bitmap): TrimmedBitmap? {
         val w = bitmap.width
         val h = bitmap.height
         if (w <= 0 || h <= 0) return null
-        val pixels = IntArray(w * h)
-        try {
-            bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
-        } catch (e: Exception) {
-            return null
-        }
         var minX = w
         var minY = h
         var maxX = -1
         var maxY = -1
+        val row = IntArray(w)
         for (y in 0 until h) {
+            try {
+                bitmap.getPixels(row, 0, w, 0, y, w, 1)
+            } catch (e: Exception) {
+                return null
+            }
+            var rowMin = w
+            var rowMax = -1
             for (x in 0 until w) {
-                if ((pixels[y * w + x] ushr 24) != 0) {
-                    if (x < minX) minX = x
-                    if (x > maxX) maxX = x
-                    if (y < minY) minY = y
-                    if (y > maxY) maxY = y
+                if ((row[x] ushr 24) != 0) {
+                    if (x < rowMin) rowMin = x
+                    if (x > rowMax) rowMax = x
                 }
+            }
+            if (rowMax >= 0) {
+                if (rowMin < minX) minX = rowMin
+                if (rowMax > maxX) maxX = rowMax
+                if (y < minY) minY = y
+                if (y > maxY) maxY = y
             }
         }
         if (maxX < 0) return null
@@ -1697,7 +1728,16 @@ class DrawingCanvasView @JvmOverloads constructor(
         } catch (e: OutOfMemoryError) {
             return null
         }
-        out.setPixels(pixels, minY * w + minX, w, 0, 0, trimmedW, trimmedH)
+        // Copy the trimmed region row by row.
+        val copyRow = IntArray(trimmedW)
+        for (y in 0 until trimmedH) {
+            try {
+                bitmap.getPixels(copyRow, 0, trimmedW, minX, minY + y, trimmedW, 1)
+            } catch (e: Exception) {
+                return null
+            }
+            out.setPixels(copyRow, 0, trimmedW, 0, y, trimmedW, 1)
+        }
         return TrimmedBitmap(out, Rect(minX, minY, minX + trimmedW, minY + trimmedH))
     }
 
