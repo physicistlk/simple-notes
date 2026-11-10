@@ -63,7 +63,9 @@ object WikiLinks {
 
     /** Replaces the pending `[[query` with a complete `[[title]]`. */
     fun complete(text: String, pending: Pending, title: String): Pair<String, Int> {
-        val safe = title.replace("[", "").replace("]", "").trim()
+        // "|" separates the target from the alias, so it has to go too -
+        // otherwise the link points at a different note.
+        val safe = title.replace("[", "").replace("]", "").replace("|", "").trim()
         val insertion = "[[$safe]]"
         val newText = text.substring(0, pending.start) + insertion + text.substring(pending.end)
         return newText to (pending.start + insertion.length)

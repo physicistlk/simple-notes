@@ -17,10 +17,12 @@ import personal.notes.touch.data.db.entity.NoteBlockEntity
 object BlockTransfer {
 
     /**
-     * Rows to transfer: the selected rows plus, for list-like blocks, the
-     * descendants that follow them with a larger indent. A selection of
-     * `- parent` therefore drags `- child` along, which is what the outline
-     * implies; selecting a paragraph only takes the paragraph.
+     * Rows to transfer: the selected rows plus the rows that follow them
+     * with a larger indent. A selection of `- parent` therefore drags
+     * `- child` along, which is what the outline implies. (The rule is
+     * indent-based, not type-based: the unit tests pin that behaviour, and
+     * the previous wording said "list-like blocks" while the code never
+     * checked the type.)
      */
     fun selection(
         rows: List<NoteBlockEntity>,

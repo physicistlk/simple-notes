@@ -1,0 +1,178 @@
+# Audit — one document for the whole app
+
+This is **the** audit of the TouchNotes clone (`personal.notes.touch`). From now
+on there is a single audit for the whole app instead of one per area: the
+markup text side, the database layer and the scribble/ink engine are audited
+together, because they share the same notes, the same files and the same
+failure modes (a stroke and a paragraph are both "content of a page").
+
+The historical audit chain (`state/AUDIT-2026-11-07.md`, 1 455 lines, items
+`#1`–`#171`) is kept as the archive: `state/archive/AUDIT-2026-11-07-history.md`.
+It holds the reasoning, the resolutions and the evidence of every round; this
+document holds the **live** state.
+
+## How to work with this document
+
+| Area | Prefix | Covers |
+| :--- | :--- | :--- |
+| **A — Markup text** | `M…` | The block editor, the markdown parser/renderer, the preview, the search over markdown, the links and references, the text persistence |
+| **B — Database** | `B…` | The Room schema and migrations, the DAOs, the repositories, the settings store, the backup/restore |
+| **C — Scribble / ink** | `C…` | The drawing engine, the continuous reader, the layers, the tools, the input handling |
+| **D — Cross-cutting** | `X…` | The GUI, the export, the privacy, the lifecycle, the build, the tests, the performance |
+
+Rules for a new finding:
+
+1. One number per finding, in its area, never reused.
+2. A finding carries: the file and line, the mechanism, the user-visible
+   impact, a repro, and its state (`OPEN` / `FIXED` / `WONTFIX`).
+3. A finding is only `FIXED` when the code says so — a claim of "fixed" without
+   the code change is not a fix.
+4. The blind rounds (auditors forbidden to read this document and the archive)
+   are the ones that find the loopholes; they are listed here with their
+   numbers so they are never re-discovered.
+
+## Invariants (every round checks these)
+
+| Invariant | Value | Checked |
+| :--- | :--- | :--- |
+| `uses-permission` in the built APK | **0** (only the AndroidX self-permission) | `aapt2 dump permissions` |
+| `!!` in the sources | **0** | `grep -ro '!!'` |
+| Room schema | v12, exported schema in `app/schemas/…/12.json` | `DatabaseSchemaPolicyTest` |
+| Unit tests | **299 passing / 2 skipped / 0 failures** | `./gradlew testDebugUnitTest` |
+| Lint | 0 errors | `./gradlew lintDebug` |
+| Network | impossible (no permission, no cleartext) | manifest + `aapt2` |
+| Platform backup | **off** (`allowBackup=false` + `data_extraction_rules`) | manifest |
+
+---
+
+## A — Markup text
+
+### Open
+
+| # | Finding | Impact | Where |
+| :--- | :--- | :--- | :--- |
+| **M1** | The editor's markdown and the `note_blocks` rows can drift: the markdown is the source of truth, but the two are written separately and a failure between the writes leaves them out of sync. | A note can show one text in the library and another in the editor. | `TextEditorViewModel.kt` (autosave + `persistBlocks`) |
+| **M2** | `updateNoteContent` is a read-modify-write without a transaction, so an overlapping save can write the older text over the newer one. | An edit silently reverts. | `NoteRepository.kt` |
+| **M3** | A line that starts with ``` is treated as a code fence and swallows the rest of the note, which is then re-written mangled. | The paragraph structure of a note is destroyed on the next save. | `BlockModel.kt` |
+| **M4** | The "Auto-Save Interval" setting promises to change the note-edit save, but the editor's debounce is hard-coded to 1 s. | The setting silently does nothing for text notes. | `SettingsScreen.kt` vs `TextEditorViewModel.kt` |
+| **M5** | The editor has no undo/redo of its own: a block operation cannot be taken back except through the markdown save. | A mis-typed or mis-moved block is final until the note is reopened. | `ui/editor/**` |
+| **M6** | The editor reloads from storage when a block transfer happens, which can overwrite what the user typed in the meantime. | Typed text disappears. | `TextEditorViewModel.kt` (the transfer collector) |
+| **M7** | The exported HTML keeps remote `<img>` sources, so the exported file fetches from the internet when it is opened. | Breaks the offline promise of the export and leaks the reader's IP. | `MarkdownExport.kt` |
+
+### Blind findings (a third blind round, markup/text side only)
+
+The editor, the markdown layer, the preview, the search and the block
+persistence were audited blind as well; these are the loopholes that were not
+in any earlier list.
+
+| # | Finding | Impact | Where | State |
+| :--- | :--- | :--- | :--- | :--- |
+| **M8** | Every block-type button stripped a leading "/" from the block: `stripSlashQuery` was applied to *any* block whose text began with a slash, so the toolbar deleted the text before the caret. | Text vanishes from the block and the markdown is rewritten without it. | `BlockOps.kt`, `TextEditorViewModel.kt` | **FIXED** — only the slash menu strips the prefix now. |
+| **M9** | `saveNow()` had no `isInitialized` guard, so a back press (or the app going to the background) while the note was still loading wrote an empty body and the title "Untitled Note" over the note. | The whole note is erased. | `TextEditorViewModel.kt` | **FIXED** — the save is skipped until the note has loaded. |
+| **M10** | The colour swatches and the wrap formatting edited the raw markdown at offset 0 instead of at the caret, so the `<font color>` tag landed at the top of the note and broke the first block (a heading lost its "#", a table lost its header, a code fence leaked). | The tag lands in the wrong place *and* the first block is destroyed. | `TextEditorViewModel.kt` (`applyColor`, `applyWrapFormatting`) | **OPEN** |
+| **M11** | `reconcileIds` allocated an (n+1)×(m+1) int matrix and rebuilt it on every keystroke in the split pane. | 100 MB for a 5 000-block note, 400 MB for 10 000 — an OOM on a phone. | `BlockPersistence.kt` | **FIXED** — above a cell limit the blocks are matched by position. |
+| **M12** | A block transfer reloads the editor from the database, discarding whatever was typed in the meantime (and resetting the caret). | Keystrokes disappear. | `TextEditorViewModel.kt` | **OPEN** |
+| **M13** | The cross-note transfer is not transactional: the target's rows and markdown are written, then the source's. A crash in between leaves the source's markdown holding a block whose rows are gone, so the block is re-derived with a new id and exists in both notes. | A duplicated block and dead `((block-id))` references. | `NoteRepository.kt` | **OPEN** |
+| **M14** | The transfer's KDoc said the indented rows are dragged along "for list-like blocks", but the code never looked at the type. | The documentation and the tests disagreed with the implementation. | `BlockTransfer.kt` | **FIXED (doc)** — the wording now matches the tested behaviour. |
+| **M15** | The `[[` and `((` autocompletes fire inside an already-closed link and mangle it when a suggestion is picked. | `[[Beta]]ha]]` — a corrupted link. | `WikiLinks.kt`, `BlockRefs.kt` | **OPEN** |
+| **M16** | `WikiLinks.complete` did not escape "\|", so a note titled `A\|B` was written as a target plus an alias. | The link points at a different note. | `WikiLinks.kt` | **FIXED** |
+| **M17** | "⊞ Table" and "# Tag" do nothing in the split workspace (the command needs an active block, which the split pane never sets). | Two dead buttons, with no feedback. | `TextEditorScreen.kt` | **OPEN** |
+| **M18** | The editor folds consecutive plain lines into one block, while the preview and the exporters make one paragraph per line. | The editor and the preview disagree about the structure of the note. | `BlockModel.kt` vs `RichTextParser.kt` | **OPEN** |
+| **M19** | The library card preview replaced `==(.*?)==.*`, so everything after the first highlight on a line was dropped. | The card preview truncates the line. | `NoteListScreen.kt` | **FIXED** |
+| **M20** | The wiki-link index stores the key with collapsed whitespace, but the SQL join compares the title verbatim. | A note with a double space is reported as "not found". | `NoteRefDao.kt` vs `WikiLinks.kt` | **OPEN** |
+| **M21** | An empty highlight block ("====") renders as nothing. | The block looks empty in the preview and the export. | `RichTextParser.kt` | **OPEN** (polish) |
+| **M22** | The search matches the raw markdown but the snippet is computed from the stripped text. | A query that only matches a marker lists the note without an excerpt. | `NoteSearch.kt` | **OPEN** (polish) |
+| **M23** | The `((` autocomplete queries the block table on every keystroke with no debounce. | Visible lag with a large library. | `BlockEditPane.kt` | **OPEN** (polish) |
+| **M24** | Enter inside an image block's caption splits the image markdown. | An invalid image row plus a stray paragraph. | `TextEditorViewModel.kt` | **OPEN** (polish) |
+
+### Fixed in the recent rounds
+
+- The editor flushed only on pause, so the **system back gesture** cancelled the pending save (up to a second of typing lost) → a `BackHandler` now flushes before it pops.
+- The **block-transfer listener was registered twice** → every transfer reloaded the note twice.
+- The **pressure slider** in Settings rewrote the pen defaults from a stale in-memory value → the pen colour and width jumped back to black/6 px.
+- The **HTML export** wrote `javascript:`/`data:` links into a file the app offers to share → only `http(s)`, `mailto:` and `#` become links now.
+- The markdown preview renders `☑`/`☐` for task items and strips `((block-id))` syntax.
+
+---
+
+## B — Database
+
+### Open
+
+| # | Finding | Impact | Where |
+| :--- | :--- | :--- | :--- |
+| **B1** | The restore copies the database in place, so an interrupted restore leaves an unopenable database, and it never removes files that are absent from the backup. | A failed restore can make the app unreadable; orphan files accumulate and are packed into every later backup. | `BackupManager.kt` |
+| **B2** | The backup copies the database and its WAL at different moments without a lock, so the archive can hold a mismatched pair. | The most recent transactions are lost on restore. | `BackupManager.kt` |
+| **B3** | A permanent delete leaves `block_refs` rows behind (no orphan cleanup for that table). | The table grows with every permanent delete. | `NoteRepository.kt`, `BlockRefDao.kt` |
+| **B4** | `page_<i>.png`, `strokes_<i>.png`, `background_<i>.png` and `beyond_<i>.*` are moved by the file store, but the *layer* files (`layers.json`, `layer_*.png`) are note-scoped, so a page change cannot carry a page's layers with it. | Floating layers belong to the note, not to the page: moving or deleting a page keeps the layers on the wrong page. | `NoteFileStore.kt`, `NoteRepository.kt` |
+
+### Fixed in the recent rounds
+
+- **Emptying the recycle bin** deleted the rows but not the page images → the files stayed on disk and were packed into every later backup.
+- The **settings store** was a read-modify-write on one row → two quick toggles could revert one of them; the updates are serialised with a mutex now.
+- The **page files** were written through one shared temp file → two writers truncated each other and a half-written page lost the whole page's ink; every write uses a unique temp name now, and the rename result is checked.
+- The **layer files** were written in place → a kill mid-write made `readLayersFromDisk` fail and lost the whole layer list. (Still open: they are not written atomically — see the scribble area.)
+- The **zip-slip guard** compared paths with a prefix test without a separator → a sibling directory with the same prefix escaped the staging directory.
+
+---
+
+## C — Scribble / ink
+
+### Open
+
+| # | Finding | Impact | Where |
+| :--- | :--- | :--- | :--- |
+| **C1** | "Merge to base" in continuous mode flattens the layers into the hidden canvas, whose save is refused while the reader is on; the layer files are then written as `[]`. | The user's images are deleted and the merged pixels are never written. | `CanvasScreen.kt`, `CanvasViewModel.kt` |
+| **C2** | The page navigation (`goToPage`, insert, delete) writes the live backing bitmap while the debounced save writes a copy. | The last stroke before a page flip can be torn into the file. | `CanvasViewModel.kt` |
+| **C3** | The reader's flush of a page is written asynchronously while the next session for the same page loads the pre-flush file. | Strokes are lost on a quick page round trip. | `ContinuousInkController.kt` |
+| **C4** | The margin ink is loaded asynchronously; a load that arrives after the user drew in the margin can wipe those strokes. | Margin strokes disappear. | `CanvasScreen.kt` |
+| **C5** | The eraser cannot remove ink written on a layer or in the margin, because that ink no longer lives in the page bitmap the eraser clears. | The user cannot erase their own mistakes there. | `DrawingCanvasView.kt` |
+| **C6** | Every stroke copies the whole page (26 MB) on the UI thread for the undo snapshot, and the undo budget is forced to at least three snapshots (≈78 MB) plus the same again for redo. | A visible hitch per stroke and an OOM risk on a 108 MB tablet. | `DrawingCanvasView.kt` |
+| **C7** | The debounced save copies 26 MB on the main thread before handing it to the encoder. | Dropped frames while writing. | `CanvasViewModel.kt`, `ContinuousInkController.kt` |
+| **C8** | `trimTransparentMargins` allocates an `IntArray` for the whole layer (48 MB for a 12 MP photo) on the UI thread. | A freeze of hundreds of ms and an OOM on low-end devices. | `DrawingCanvasView.kt` |
+| **C9** | The layer PNGs and `layers.json` are written in place, not atomically. | A kill mid-write loses the layer list. | `DrawingCanvasView.kt` |
+| **C10** | Touch targets below 48 dp: the layer panel's icon buttons (24 dp), the zoom lock (24 dp), the text stepper (26 dp), the dock collapse (22 dp) and the live-text drag handle (6 dp tall). | Hard to hit on a tablet. | `CanvasScreen.kt` |
+
+### Fixed in the recent rounds
+
+- The **laser pointer** never rendered in single-page mode (a lost patch) and rendered on *every* page of the reader; it now belongs to the page the pointer is on and fades.
+- The **pen mode** now means what it says: the pen writes, the hand scrolls, pinches and uses the tools. Before, a finger drew ink in the reader and the reader could not be scrolled.
+- The **reader could get stuck un-scrollable** when a gesture was cancelled mid-stroke (`isDrawing` stayed `true`) → the gesture handler now always ends the stroke.
+- The **ink written on a layer** now belongs to that layer, so the eye button hides the strokes and the text with it; the marks follow the layer's transform and are flattened by "merge to base".
+- **Ink outside the paper** is kept as a page-level crop, exported with the page, and the picked PDF background is stored in its own file instead of overwriting the annotations.
+- The **page border** is drawn after the page image (it was invisible on PDF pages), the **tools panel** is a grey panel with white cards and right-aligned labels, the **pen dock** has a liquid-glass material and long-press menus for the width slider and the colour palette, and the **zoom pill** has a lock that freezes the pinch.
+
+---
+
+## D — Cross-cutting
+
+### Open
+
+| # | Finding | Impact | Where |
+| :--- | :--- | :--- | :--- |
+| **X1** | `CanvasScreen.kt` is 5 859 lines and carries the top bar, the tab bar, the pen dock, the four panels, the layers popover, the live-text box, the export dialog and the whole reader. | Every change risks breaking something else; the file is hard to review. | `ui/canvas/CanvasScreen.kt` |
+| **X2** | The drawing engine, the reader, the repository and the export have no unit tests at all — only the extracted pure maths (`ContinuousInkMath`, `InkCropMath`, `PdfRenderPolicy`, the parsers) are covered. | The next round of bugs lands in the untested code. | `app/src/test/**` |
+| **X3** | `ContinuousModeAuditTest` re-implements the logic it claims to test instead of calling production code, so the "unit-test verified" claims for the bookmark/TOC shift and the paper pattern prove nothing. | False confidence. | `ContinuousModeAuditTest.kt` |
+| **X4** | The launcher label is "Simple Notes" while the UI and the backup archive say "TouchNotes". | A naming decision, not a defect — but it should be decided. | `res/values/strings.xml` |
+| **X5** | The backup progress dialog cannot be dismissed (no cancel, `onDismissRequest` empty). | A hanging write traps the user behind the dialog. | `SettingsScreen.kt` |
+| **X6** | The colour swatches in Settings and in the library have no content description, so TalkBack announces unlabelled buttons. | The colour row is unusable with a screen reader. | `SettingsScreen.kt`, `NoteListScreen.kt` |
+| **X7** | The library sort order is not persisted. | The sort resets on every start. | `NoteListViewModel.kt` |
+| **X8** | The original's Tools panel has ~16 actions the clone does not have (Split Screen, Merge Note, Insert Row/Column Space, Screenshot, Line Laser Pointer, Mask Mark Pen, Hide Contents, Locking, Password Setting, Pen for Moving, Floating Note, Notes Transfer, Web Search, Audio/Recognition, …) and the rows carry "?" help badges. | A visible feature gap against the reference app. | `CanvasScreen.kt` |
+| **X9** | The device pass is still missing: every round so far was verified by source, compiler and unit tests only. | The GUI and the touch behaviour have never been confirmed on the tablet. | — |
+
+### Fixed in the recent rounds
+
+- **Privacy**: `android:allowBackup` was `true`, so the platform backed the notes up to the cloud while the app advertises "100% Offline & Private"; the backup is off now with `data_extraction_rules` for the cloud *and* device transfer. The FileProvider no longer exposes the whole `files/` directory (only the export cache).
+- The **export cache** was never pruned; it keeps the last 20 files now. The **image import** decoded a 12 MP photo at full size; it takes a sample now. The **tab bar** was lost on a rotation; it is `rememberSaveable` now.
+- The **page files** are written with a unique temp file and a checked rename, the **layer save** snapshots the list on the UI thread, and **cropping a layer** no longer recycles the bitmap the undo snapshot points at.
+
+---
+
+## Roadmap
+
+1. **Close the data-loss findings** — `C1`–`C4` and `B1`–`B3` are the ones that can cost a user their work; they are all small, local changes.
+2. **Break up `CanvasScreen.kt`** (`X1`) into `PenDock.kt`, `CanvasPanels.kt`, `ContinuousReader.kt` and `CanvasTopBar.kt`; the file is the reason the last rounds were risky.
+3. **Test the engine** (`X2`): pull the decisions out of the view — which page a save goes to, which layer owns an ink crop, the crop geometry, the debounce — into small pure objects, the way `ContinuousInkMath` and `InkCropMath` already are.
+4. **Make the test suite call the production code** (`X3`).
+5. **The mind map** — open design question, not an implementation yet. It has to live in the *markup* database (a mind map is a tree of nodes that belong to a note and can be referenced like any other block) while its drawing surface is a *scribble* page (a mind map is a picture that the user arranges by hand). The open questions: is a mind map a special block (a tree of `note_blocks` with a `parentId`) plus a scribble page that renders it, or is it a scribble page whose nodes are mirrored into the block database? The second option fits the app best: the blocks carry the structure and the text (so they are searchable, linkable and exportable), and the page carries the layout (so the user can drag the nodes around). Until that is decided, the "Add Mind Map" action stays a text placeholder.
+6. **Device pass** (`X9`) — the one thing that is still missing from every round.

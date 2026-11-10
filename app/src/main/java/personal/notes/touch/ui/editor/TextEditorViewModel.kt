@@ -541,7 +541,12 @@ class TextEditorViewModel(
 
     fun saveNow(onSaved: (() -> Unit)? = null) {
         viewModelScope.launch {
-            performSave(_title.value, _contentValue.value.text)
+            // Before the note has loaded, the title and the body are still
+            // empty: saving now would write "Untitled Note" with an empty
+            // body over the note that is opening.
+            if (isInitialized) {
+                performSave(_title.value, _contentValue.value.text)
+            }
             onSaved?.invoke()
         }
     }
@@ -902,13 +907,25 @@ class TextEditorViewModel(
      * inserts are simple markdown placeholders — the follow-up worker swaps in
      * real pickers (image assets, tag chips) at this same seam.
      */
-    fun applyBlockCommand(command: BlockCommand) {
+    /**
+     * Applies a block-type command to the active block.
+     *
+     * [fromSlashMenu] tells the command that it comes from the slash menu:
+     * only then is the "/query" prefix removed. A block that merely starts
+     * with a slash (a path, a date) must keep its text when the toolbar
+     * changes its type.
+     */
+    fun applyBlockCommand(command: BlockCommand, fromSlashMenu: Boolean = false) {
         val list = _blocks.value
         val id = _activeBlockId.value ?: return
         val idx = list.indexOfFirst { it.id == id }
         if (idx < 0) return
         val cur = list[idx]
-        val (clean, body) = BlockOps.stripSlashQuery(cur)
+        val (clean, body) = if (fromSlashMenu) {
+            BlockOps.stripSlashQuery(cur)
+        } else {
+            cur to cur.field.text
+        }
         val bodyField = TextFieldValue(body, TextRange(body.length))
         val mutable = list.toMutableList()
         mutable[idx] = clean

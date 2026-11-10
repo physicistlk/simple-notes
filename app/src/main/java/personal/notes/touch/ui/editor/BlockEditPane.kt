@@ -914,7 +914,8 @@ private fun BlockRow(
 
         if (slashOpen) {
             SlashMenuPopup {
-                viewModel.applyBlockCommand(it)
+                // The slash menu: the "/query" prefix belongs to the menu.
+                viewModel.applyBlockCommand(it, fromSlashMenu = true)
             }
         }
 

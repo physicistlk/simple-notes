@@ -2157,7 +2157,9 @@ fun extractPreviewLines(rawContent: String, maxLines: Int = 8): List<String> {
             .replace(Regex("^[-*+]\\s+"), "• ")
             .replace(Regex("^\\d+\\.\\s+"), "")
             .replace(Regex("^>\\s*"), "")
-            .replace(Regex("==(.*?)==.*"), "$1")
+            // Only the highlighted part is replaced - the rest of the line
+            // has to survive.
+            .replace(Regex("==(.*?)=="), "$1")
             .replace(Regex("\\*\\*(.*?)\\*\\*"), "$1")
             .replace(Regex("\\*(.*?)\\*"), "$1")
             .replace(Regex("`{1,3}(.*?)`{1,3}"), "$1")

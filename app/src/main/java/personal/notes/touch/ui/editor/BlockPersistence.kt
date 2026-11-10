@@ -4,6 +4,9 @@ import androidx.compose.ui.text.input.TextFieldValue
 import personal.notes.touch.data.db.entity.NoteBlockEntity
 import java.util.UUID
 
+/** Above this many cells the quadratic id matcher is skipped (≈2 500 blocks). */
+private const val MAX_RECONCILE_CELLS = 6_000_000L
+
 /**
  * Mapping between editor blocks ([EditableBlock]) and the persisted
  * `note_blocks` rows, plus stable-id reconciliation for markdown-first edits.
@@ -106,6 +109,15 @@ object BlockPersistence {
 
         // suf[i][j] = number of exact content matches available when aligning
         // parsed[i..] with previous[j..].
+        //
+        // The table is (n+1) x (m+1) ints: for a note with thousands of
+        // blocks that is hundreds of megabytes, and it is rebuilt on every
+        // keystroke in the split pane. Above the limit the blocks are
+        // matched by position instead, which is slower to get right but
+        // cannot exhaust the heap.
+        if (n.toLong() * m.toLong() > MAX_RECONCILE_CELLS) {
+            return alignByPosition(parsed, previous)
+        }
         val suf = Array(n + 1) { IntArray(m + 1) }
         for (i in n - 1 downTo 0) {
             for (j in m - 1 downTo 0) {
@@ -161,4 +173,22 @@ object BlockPersistence {
             a.headingLevel == b.headingLevel &&
             a.indent == b.indent &&
             a.order == b.order
+
+    /**
+     * Fallback for very large notes: the blocks are matched by position, so
+     * an edited block keeps the id of the block it replaced.
+     */
+    private fun alignByPosition(
+        parsed: List<EditableBlock>,
+        previous: List<EditableBlock>
+    ): List<EditableBlock> {
+        val result = ArrayList<EditableBlock>(parsed.size)
+        for ((index, block) in parsed.withIndex()) {
+            val old = previous.getOrNull(index)
+            result.add(
+                if (old != null && sameContent(block, old)) block.copy(id = old.id) else block
+            )
+        }
+        return result
+    }
 }
