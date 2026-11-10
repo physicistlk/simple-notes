@@ -51,6 +51,8 @@ data class CanvasUiState(
     val penSlot2Color: Int = 0xFFFB6443.toInt(),
     val penSlot2Width: Float = 3f,
     val stylusOnly: Boolean = false,
+    /** True once a stylus has been seen in this session. */
+    val stylusDetected: Boolean = false,
     val readingMode: Boolean = false,
     val doublePageMode: Boolean = false,
     val pressureSensitivity: Float = 1.0f,
@@ -61,6 +63,8 @@ data class CanvasUiState(
     val bookmarkedPages: Set<Int> = emptySet(),
     val tocEntries: List<TocItem> = emptyList(),
     val showTabs: Boolean = true,
+    /** True while the pinch-to-zoom is locked: two fingers only move the page. */
+    val zoomLocked: Boolean = false,
     val fixPreviewPage: Boolean = false,
     val horizontalResistance: Float = 0.4f,
     val minimalInfiniteZoom: Float = 0.20f,
@@ -90,7 +94,24 @@ class CanvasViewModel(
     private var defaultPaperPattern: PaperPattern = PaperPattern.BLANK
     private var lastPenDefaultsJson: String? = null
 
+    /**
+     * Workspace preferences that outlive the screen (tab bar state, dock
+     * orientation). They are UI choices, not note data, so they live in a
+     * small file instead of the settings table.
+     */
+    private val uiPrefs = fileStore.uiPrefs()
+
+    /** True once the user picked stylus mode by hand (auto-switch stops). */
+    private var stylusOnlyChosen = false
+
     init {
+        // Workspace preferences that survive the screen: the open-notes tab
+        // bar state and the pen dock orientation.
+        viewModelScope.launch(Dispatchers.IO) {
+            val showTabs = uiPrefs.getBoolean(KEY_SHOW_TABS, true)
+            val dockHorizontal = uiPrefs.getBoolean(KEY_DOCK_HORIZONTAL, false)
+            _uiState.value = _uiState.value.copy(showTabs = showTabs, dockHorizontal = dockHorizontal)
+        }
         if (settingsRepository != null) {
             viewModelScope.launch {
                 settingsRepository.getSettings().collect { nullableSettings ->
@@ -250,7 +271,9 @@ class CanvasViewModel(
     }
 
     fun toggleDockOrientation() {
-        _uiState.value = _uiState.value.copy(dockHorizontal = !_uiState.value.dockHorizontal)
+        val next = !_uiState.value.dockHorizontal
+        _uiState.value = _uiState.value.copy(dockHorizontal = next)
+        viewModelScope.launch(Dispatchers.IO) { uiPrefs.putBoolean(KEY_DOCK_HORIZONTAL, next) }
     }
 
     private fun getBookmarksFile(): File = File(fileStore.getNoteDir(noteId), "bookmarks.json")
@@ -395,8 +418,26 @@ class CanvasViewModel(
         }
     }
 
+    /**
+     * Stylus mode: only the pen writes, the hand is for buttons and tools.
+     *
+     * It switches itself on as soon as a stylus is actually used, so a
+     * tablet with a pen never draws a stray palm stroke. Once the user has
+     * chosen the mode by hand, that choice wins and the auto switch stops.
+     */
     fun toggleStylusOnly(enabled: Boolean? = null) {
+        stylusOnlyChosen = true
         _uiState.value = _uiState.value.copy(stylusOnly = enabled ?: !_uiState.value.stylusOnly)
+    }
+
+    /** Called when a stylus event arrives: arm stylus mode for this session. */
+    fun onStylusDetected() {
+        val state = _uiState.value
+        if (state.stylusDetected && state.stylusOnly) return
+        _uiState.value = state.copy(
+            stylusDetected = true,
+            stylusOnly = if (stylusOnlyChosen) state.stylusOnly else true
+        )
     }
 
     fun toggleAutoShape(enabled: Boolean? = null) {
@@ -419,8 +460,13 @@ class CanvasViewModel(
         }
     }
 
+    fun setZoomLocked(locked: Boolean) {
+        _uiState.value = _uiState.value.copy(zoomLocked = locked)
+    }
+
     fun setShowTabs(show: Boolean) {
         _uiState.value = _uiState.value.copy(showTabs = show)
+        viewModelScope.launch(Dispatchers.IO) { uiPrefs.putBoolean(KEY_SHOW_TABS, show) }
     }
 
     fun setFixPreviewPage(fix: Boolean) {
@@ -601,8 +647,9 @@ class CanvasViewModel(
 
         // In Continuous Mode, the hidden single-page DrawingCanvasView must never overwrite
         // disk files; ContinuousMode ink is persisted exclusively by ContinuousInkController.
-        val isInfinite = (note.value?.pageType ?: "infinite") == "infinite"
-        val isContinuous = !isInfinite && _uiState.value.pageTurningMode == 0
+        // Continuous reading is available for every note type, so the hidden
+        // canvas must step aside whenever the reader is on.
+        val isContinuous = _uiState.value.pageTurningMode == 0
         if (!force && isContinuous) return
 
         val totalPages = note.value?.pageCount ?: 1
@@ -615,6 +662,34 @@ class CanvasViewModel(
         if (!pageLoadedFromDisk && guardFile.exists()) return
         saveContentLayer(pageIdx, bitmap)
         if (pendingSave?.second === bitmap) pendingSave = null
+    }
+
+    /**
+     * Stores a raster page background (a page picked out of a PDF) without
+     * touching the page's ink: the picture lives in its own file and is
+     * drawn under the annotations.
+     */
+    suspend fun savePageBackgroundOverride(pageIndex: Int, bitmap: Bitmap) {
+        val file = fileStore.getPageBackgroundFile(noteId, pageIndex)
+        withContext(Dispatchers.IO) {
+            try {
+                val tmp = File(file.parentFile, file.name + ".tmp")
+                java.io.FileOutputStream(tmp).use { fos ->
+                    bitmap.compress(Bitmap.CompressFormat.PNG, 100, fos)
+                }
+                if (file.exists()) file.delete()
+                tmp.renameTo(file)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
+    /** Loads the raster background override of a page, if there is one. */
+    suspend fun loadPageBackgroundOverride(pageIndex: Int): Bitmap? = withContext(Dispatchers.IO) {
+        val file = fileStore.getPageBackgroundFile(noteId, pageIndex)
+        if (!file.exists()) return@withContext null
+        personal.notes.touch.util.BitmapUtils.loadBitmapFromFile(file)
     }
 
     fun setCurrentPageIndex(index: Int) {
@@ -783,6 +858,11 @@ class CanvasViewModel(
                 }
             }
         }
+    }
+
+    private companion object {
+        const val KEY_SHOW_TABS = "show_tabs"
+        const val KEY_DOCK_HORIZONTAL = "dock_horizontal"
     }
 
     class Factory(

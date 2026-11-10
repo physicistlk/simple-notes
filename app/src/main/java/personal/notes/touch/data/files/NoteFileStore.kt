@@ -135,6 +135,31 @@ class NoteFileStore(private val context: Context) {
 
     fun getLayerInfoFile(noteId: String): File = File(getLayersDir(noteId), "layers.json")
 
+    /** Workspace preferences (tab bar state, dock orientation) live beside the notes. */
+    fun getUiPrefsFile(): File = File(context.filesDir, "ui_prefs.json")
+
+    /** Convenience accessor for the workspace preferences. */
+    fun uiPrefs(): UiPrefs = UiPrefs(getUiPrefsFile())
+
+    /**
+     * Optional raster background of a page (a page picked out of a PDF).
+     *
+     * A vector page draws its PDF live and a raster page draws its ink on
+     * white paper, so neither has a place for "this is the picture of the
+     * page". The override keeps the picked page without touching the
+     * annotations.
+     */
+    fun getPageBackgroundFile(noteId: String, pageIndex: Int): File =
+        File(getNoteDir(noteId), "background_${pageIndex}.png")
+
+    /**
+     * Manifest of the ink a page carries outside its paper (the margins of an
+     * imported PDF). The crops themselves are PNGs next to it, named
+     * `beyond_<pageIndex>_<n>.png`.
+     */
+    fun getBeyondInkFile(noteId: String, pageIndex: Int): File =
+        File(getLayersDir(noteId), "beyond_$pageIndex.json")
+
     fun deleteNoteFiles(noteId: String): Boolean {
         val dir = File(notesDir, noteId)
         return if (dir.exists()) dir.deleteRecursively() else true

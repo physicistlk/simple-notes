@@ -17,6 +17,7 @@ import personal.notes.touch.data.files.NoteFileStore
 import personal.notes.touch.data.repo.NoteRepository
 import personal.notes.touch.text.MarkdownExport
 import personal.notes.touch.ui.canvas.ImageLayer
+import personal.notes.touch.ui.canvas.InkCrop
 import java.io.File
 import java.io.FileOutputStream
 import java.io.OutputStream
@@ -330,6 +331,25 @@ object ExportManager {
                 val bitmapFile = java.io.File(layersDir, fileName)
                 val bitmap = android.graphics.BitmapFactory.decodeFile(bitmapFile.absolutePath)
                 if (bitmap != null) {
+                    // Ink written on the layer travels with it.
+                    val ink = mutableListOf<InkCrop>()
+                    val inkArr = obj.optJSONArray("ink")
+                    if (inkArr != null) {
+                        for (k in 0 until inkArr.length()) {
+                            val inkObj = inkArr.optJSONObject(k) ?: continue
+                            val inkName = inkObj.optString("file", "")
+                            if (inkName.isEmpty()) continue
+                            val inkBmp = android.graphics.BitmapFactory
+                                .decodeFile(java.io.File(layersDir, inkName).absolutePath) ?: continue
+                            ink.add(
+                                InkCrop(
+                                    inkBmp,
+                                    inkObj.optDouble("x", 0.0).toFloat(),
+                                    inkObj.optDouble("y", 0.0).toFloat()
+                                )
+                            )
+                        }
+                    }
                     layers.add(ImageLayer(
                         bitmap = bitmap,
                         x = obj.optDouble("x", 0.0).toFloat(),
@@ -339,7 +359,8 @@ object ExportManager {
                         opacity = obj.optDouble("opacity", 1.0).toFloat(),
                         visible = obj.optBoolean("visible", true),
                         cropRect = null,
-                        name = obj.optString("name", "Layer ${i + 1}")
+                        name = obj.optString("name", "Layer ${i + 1}"),
+                        ink = ink
                     ))
                 }
             }
@@ -394,23 +415,49 @@ object ExportManager {
         return result
     }
 
-    internal fun flattenBitmap(bitmap: Bitmap, backgroundBitmap: Bitmap?, imageLayers: List<ImageLayer> = emptyList()): Bitmap {
+    internal fun flattenBitmap(
+        bitmap: Bitmap,
+        backgroundBitmap: Bitmap?,
+        imageLayers: List<ImageLayer> = emptyList(),
+        beyondInk: List<InkCrop> = emptyList()
+    ): Bitmap {
         val bgW = backgroundBitmap?.width ?: 0
         val bgH = backgroundBitmap?.height ?: 0
         val w = bitmap.width.coerceAtLeast(bgW).coerceAtLeast(1)
         val h = bitmap.height.coerceAtLeast(bgH).coerceAtLeast(1)
-        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        // Ink written outside the paper enlarges the sheet, so the export
+        // keeps the margins the user wrote in.
+        var minX = 0f
+        var minY = 0f
+        var maxX = w.toFloat()
+        var maxY = h.toFloat()
+        for (crop in beyondInk) {
+            if (crop.bitmap.isRecycled) continue
+            minX = minOf(minX, crop.x)
+            minY = minOf(minY, crop.y)
+            maxX = maxOf(maxX, crop.x + crop.bitmap.width)
+            maxY = maxOf(maxY, crop.y + crop.bitmap.height)
+        }
+        val outW = (maxX - minX).toInt().coerceAtLeast(1)
+        val outH = (maxY - minY).toInt().coerceAtLeast(1)
+        val out = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(out)
         canvas.drawColor(Color.WHITE)
+        val offX = -minX
+        val offY = -minY
         if (backgroundBitmap != null && !backgroundBitmap.isRecycled) {
             val bgPaint = Paint(Paint.FILTER_BITMAP_FLAG)
-            canvas.drawBitmap(backgroundBitmap, null, android.graphics.Rect(0, 0, w, h), bgPaint)
+            canvas.drawBitmap(backgroundBitmap, null, android.graphics.Rect(offX.toInt(), offY.toInt(), (offX + w).toInt(), (offY + h).toInt()), bgPaint)
         }
         // The page raster and the stroke layer can differ in size (vector PDF
         // pages: pdfium render at zoom resolution vs. view-sized stroke layer).
         // Both describe the same page rect, so stretch the stroke layer to the
         // output size instead of pinning it to the top-left corner.
-        canvas.drawBitmap(bitmap, null, android.graphics.Rect(0, 0, w, h), Paint(Paint.FILTER_BITMAP_FLAG))
+        canvas.drawBitmap(bitmap, null, android.graphics.Rect(offX.toInt(), offY.toInt(), (offX + w).toInt(), (offY + h).toInt()), Paint(Paint.FILTER_BITMAP_FLAG))
+        for (crop in beyondInk) {
+            if (crop.bitmap.isRecycled) continue
+            canvas.drawBitmap(crop.bitmap, offX + crop.x, offY + crop.y, Paint(Paint.FILTER_BITMAP_FLAG))
+        }
         for (layer in imageLayers) {
             if (!layer.visible || layer.bitmap.isRecycled) continue
             val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG).apply {
@@ -421,10 +468,24 @@ object ExportManager {
             val cx = layer.x + bw * layer.scale / 2f
             val cy = layer.y + bh * layer.scale / 2f
             canvas.save()
-            canvas.translate(cx, cy)
+            canvas.translate(cx + offX, cy + offY)
             canvas.rotate(layer.rotation)
             canvas.scale(layer.scale, layer.scale)
             canvas.drawBitmap(layer.bitmap, -bw / 2f, -bh / 2f, paint)
+            // The ink written on the layer follows the same transform.
+            for (crop in layer.ink) {
+                if (crop.bitmap.isRecycled) continue
+                val iw = crop.bitmap.width
+                val ih = crop.bitmap.height
+                val dx = (crop.x + iw / 2f) - cx
+                val dy = (crop.y + ih / 2f) - cy
+                val rad = Math.toRadians((-layer.rotation).toDouble())
+                val cos = Math.cos(rad).toFloat()
+                val sin = Math.sin(rad).toFloat()
+                val lx = (dx * cos - dy * sin) / layer.scale - iw / 2f
+                val ly = (dx * sin + dy * cos) / layer.scale - ih / 2f
+                canvas.drawBitmap(crop.bitmap, lx, ly, paint)
+            }
             canvas.restore()
         }
         return out

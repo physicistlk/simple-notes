@@ -38,6 +38,12 @@ fun TouchNotesNavHost(
     navController: NavHostController = rememberNavController()
 ) {
     val openNotes = remember { mutableStateListOf<String>() }
+    /**
+     * Notes the user closed in the tab bar. They must not re-open
+     * themselves when the canvas recomposes; opening a note again from the
+     * library clears the flag.
+     */
+    val closedNotes = remember { mutableStateListOf<String>() }
     val context = LocalContext.current
 
     // Edge-to-edge (targetSdk 35+): every screen must clear the status bar, or app
@@ -65,6 +71,8 @@ fun TouchNotesNavHost(
             NoteListScreen(
                 viewModel = viewModel,
                 onNoteClick = { noteId ->
+                    // Opening a note again takes it out of the closed list.
+                    closedNotes.remove(noteId)
                     navController.navigate(Screen.Canvas.createRoute(noteId))
                 },
                 onOpenEditorClick = { noteId ->
@@ -93,7 +101,12 @@ fun TouchNotesNavHost(
                 ),
                 key = "canvas_$noteId"
             )
-            if (noteId.isNotBlank() && noteId !in openNotes) openNotes.add(noteId)
+            // A note the user closed must not re-open itself on the next
+            // recomposition: the seed only runs the first time the canvas for
+            // this note appears.
+            if (noteId.isNotBlank() && noteId !in openNotes && noteId !in closedNotes) {
+                openNotes.add(noteId)
+            }
             CanvasScreen(
                 viewModel = viewModel,
                 onBackClick = { navController.popBackStack() },
@@ -112,10 +125,12 @@ fun TouchNotesNavHost(
                 onCloseTab = { id ->
                     val idx = openNotes.indexOf(id)
                     openNotes.remove(id)
+                    closedNotes.add(id)
                     if (id == noteId) {
                         if (openNotes.isNotEmpty()) {
                             val targetIdx = (idx - 1).coerceAtLeast(0).coerceAtMost(openNotes.size - 1)
                             val nextNoteId = openNotes[targetIdx]
+                        closedNotes.remove(nextNoteId)
                             navController.navigate(Screen.Canvas.createRoute(nextNoteId)) {
                                 popUpTo(Screen.Canvas.route) { inclusive = true }
                                 launchSingleTop = true

@@ -18,8 +18,10 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -55,7 +57,6 @@ import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.BookmarkBorder
 import androidx.compose.material.icons.filled.BorderClear
 import androidx.compose.material.icons.filled.Brush
-import androidx.compose.material.icons.filled.Category
 import androidx.compose.material.icons.filled.ChangeCircle
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
@@ -69,12 +70,14 @@ import androidx.compose.material.icons.filled.GridOn
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.NoteAdd
+import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.outlined.LockOpen
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
@@ -130,15 +133,18 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
@@ -151,6 +157,8 @@ import androidx.compose.ui.input.pointer.PointerType
 import androidx.compose.ui.input.pointer.changedToUp
 import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChanged
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.defaultMinSize
@@ -167,9 +175,15 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntRect
+import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupPositionProvider
+import androidx.compose.ui.window.PopupProperties
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -195,6 +209,16 @@ val TouchNotesColors = listOf(
     Color(0xFF388E3C), // Forest Green
     Color(0xFFFFB300), // Warm Amber
     Color(0xFF8E24AA)  // Purple
+)
+
+/**
+ * The three colour presets the original dock shows: black, red and navy.
+ * The orange of the app is the accent colour, not a preset.
+ */
+val TouchNotesDockColors = listOf(
+    TouchNotesColors[0], // Black
+    TouchNotesColors[2], // Crimson Red
+    TouchNotesColors[3]  // Royal Blue
 )
 
 val PaletteColors = TouchNotesColors
@@ -224,7 +248,34 @@ val TouchNotesEraserPresets = listOf(
 private const val MIN_CONTINUOUS_SCALE = 0.4f
 private const val MAX_CONTINUOUS_SCALE = 4f
 
-@OptIn(ExperimentalMaterial3Api::class)
+/**
+ * "Liquid glass" material for the floating docks: a translucent white body
+ * that lets the canvas bleed through, plus a specular hairline edge.
+ * The alphas stay high enough for the dark icons (and the yellow highlighter)
+ * to stay readable on top of the glass.
+ */
+private val GlassBodyBrush = Brush.verticalGradient(
+    listOf(
+        Color.White.copy(alpha = 0.94f),
+        Color.White.copy(alpha = 0.70f)
+    )
+)
+
+/** Hairline edge of the glass: bright on the lit side, fading out on the other. */
+private val GlassEdgeBrush = Brush.linearGradient(
+    listOf(
+        Color.White.copy(alpha = 0.95f),
+        Color.White.copy(alpha = 0.30f)
+    )
+)
+
+/** Stroke width slider ranges (canvas px); the eraser works on a bigger scale. */
+private const val PEN_WIDTH_MIN = 1f
+private const val PEN_WIDTH_MAX = 40f
+private const val ERASER_WIDTH_MIN = 8f
+private const val ERASER_WIDTH_MAX = 80f
+
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun CanvasScreen(
     viewModel: CanvasViewModel,
@@ -251,6 +302,23 @@ fun CanvasScreen(
     val scope = rememberCoroutineScope()
 
     var canvasViewRef by remember { mutableStateOf<DrawingCanvasView?>(null) }
+
+    /**
+     * Loads the ink a page carries outside its paper (the margins of an
+     * imported PDF). Reading the crops is file I/O, so it runs off the main
+     * thread; the view is updated back on it.
+     */
+    val loadBeyondPageInk: (Int) -> Unit = { pageIdx ->
+        val view = canvasViewRef
+        if (view != null) {
+            scope.launch {
+                val crops = withContext(Dispatchers.IO) {
+                    view.readBeyondPageInk(viewModel.fileStore, viewModel.noteId, pageIdx)
+                }
+                view.applyBeyondPageInk(crops)
+            }
+        }
+    }
     var selectedImageIndex by remember { mutableStateOf(-1) }
     var showRenameDialog by remember { mutableStateOf(false) }
     var showClearDialog by remember { mutableStateOf(false) }
@@ -259,6 +327,8 @@ fun CanvasScreen(
     var showDeleteNoteDialog by remember { mutableStateOf(false) }
     var showPdfPagePicker by remember { mutableStateOf(false) }
     var pendingPdfUri by remember { mutableStateOf<Uri?>(null) }
+    /** True while the next PDF is picked as a page background, not imported. */
+    var pdfImportAsBackground by remember { mutableStateOf(false) }
     var pendingPdfPageCount by remember { mutableStateOf(0) }
     var pendingPdfPageIndex by remember { mutableStateOf("1") }
     var showCustomColorDialog by remember { mutableStateOf(false) }
@@ -273,6 +343,10 @@ fun CanvasScreen(
     var liveTextOffsetX by remember { mutableFloatStateOf(0f) }
     var liveTextOffsetY by remember { mutableFloatStateOf(0f) }
     var liveTextSizeSp by remember { mutableFloatStateOf(20f) }
+    // Measured size of the live text card, so the committed text lands where
+    // the card is instead of at a hard-coded guess.
+    var liveTextCardWidth by remember { mutableIntStateOf(0) }
+    var liveTextCardHeight by remember { mutableIntStateOf(0) }
     var liveTextColor by remember { mutableStateOf(Color.Black) }
     val liveTextFocusRequester = remember { FocusRequester() }
     var showGoToPageDialog by remember { mutableStateOf(false) }
@@ -280,6 +354,11 @@ fun CanvasScreen(
     var isPencaseCollapsed by remember { mutableStateOf(false) }
     var pencaseOffsetX by remember { mutableFloatStateOf(0f) }
     var pencaseOffsetY by remember { mutableFloatStateOf(0f) }
+    // Long-press popups of the dock (width slider / full colour palette).
+    var showWidthPopupHoriz by remember { mutableStateOf(false) }
+    var showColorPopupHoriz by remember { mutableStateOf(false) }
+    var showWidthPopupVert by remember { mutableStateOf(false) }
+    var showColorPopupVert by remember { mutableStateOf(false) }
 
     val isInfinite = (note?.pageType ?: "infinite") == "infinite"
     val isContinuous = uiState.pageTurningMode == 0
@@ -468,6 +547,12 @@ fun CanvasScreen(
         }
     }
 
+    /**
+     * Continuous reading is on for every note type now (the infinite canvas
+     * included), so this is the single definition the screen uses.
+     */
+    val continuousMode = uiState.pageTurningMode == 0
+
     val continuousColState = androidx.compose.foundation.lazy.rememberLazyListState()
     val continuousRowState = androidx.compose.foundation.lazy.rememberLazyListState()
 
@@ -489,8 +574,7 @@ fun CanvasScreen(
         // page into the hidden canvas as well would decode each scrolled page
         // twice, so leave the canvas alone until the reader returns to single
         // page mode (P1 audit).
-        val continuousReading = (note?.pageType ?: "infinite") != "infinite" &&
-            uiState.pageTurningMode == 0
+        val continuousReading = continuousMode
         if (continuousReading) return@LaunchedEffect
 
         // When leaving continuous mode to single-page mode, flush and release
@@ -519,6 +603,8 @@ fun CanvasScreen(
             canvasViewRef?.setPageContent(savedBitmap)
             canvasViewRef?.backgroundBitmap = null
             viewModel.setPageLoadedFromDisk(savedBitmap != null)
+            // The margins of the page carry their own ink.
+            loadBeyondPageInk(currentPageIndex)
         }
         try {
             // Layer PNG decode is file I/O: read on Dispatchers.IO, apply
@@ -622,6 +708,32 @@ fun CanvasScreen(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
         uri?.let {
+            if (pdfImportAsBackground) {
+                // "Set page background": the picked PDF is not imported, the
+                // user chooses one of its pages for the current page.
+                pdfImportAsBackground = false
+                scope.launch {
+                    val imported = try {
+                        withContext(Dispatchers.IO) { PdfVectorImporter.readDocument(context, it) }
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                        null
+                    }
+                    if (imported == null) {
+                        android.widget.Toast.makeText(context, "Could not open PDF", android.widget.Toast.LENGTH_SHORT).show()
+                        return@launch
+                    }
+                    try {
+                        pendingPdfUri = it
+                        pendingPdfPageCount = imported.pageCount
+                        pendingPdfPageIndex = "1"
+                        showPdfPagePicker = true
+                    } finally {
+                        imported.document.close()
+                    }
+                }
+                return@let
+            }
             scope.launch {
                 val imported = try {
                     withContext(Dispatchers.IO) { PdfVectorImporter.readDocument(context, it) }
@@ -765,8 +877,7 @@ fun CanvasScreen(
     }
 
     val flushCurrentNote: suspend () -> Unit = {
-        val continuousReading = (note?.pageType ?: "infinite") != "infinite" &&
-            uiState.pageTurningMode == 0
+        val continuousReading = continuousMode
         if (continuousReading) {
             inkController.flushCurrentSuspend()
         } else {
@@ -1026,18 +1137,26 @@ fun CanvasScreen(
                                 null
                             }
                             if (bmp != null) {
-                                // Non-destructive: set background only, leave strokes alone.
+                                // Non-destructive: the picked page becomes the
+                                // page's background. It is stored in its own
+                                // file, so the annotations of the page stay
+                                // untouched (writing it into the page or the
+                                // stroke file would have destroyed them).
+                                val cur = viewModel.currentPageIndex.value
                                 if (isContinuous) {
                                     inkController.flushCurrentSuspend()
-                                    viewModel.saveCurrentPageBitmapDirect(bmp, force = true)
-                                    val cur = viewModel.currentPageIndex.value
-                                    savedPageGenerations[cur] = (savedPageGenerations[cur] ?: 0) + 1
-                                } else {
-                                    canvasViewRef?.let { it.backgroundBitmap = bmp }
-                                    viewModel.saveCurrentPageBitmapDirect(bmp, force = true)
-                                    val cur = viewModel.currentPageIndex.value
-                                    savedPageGenerations[cur] = (savedPageGenerations[cur] ?: 0) + 1
                                 }
+                                viewModel.savePageBackgroundOverride(cur, bmp)
+                                canvasViewRef?.let {
+                                    it.backgroundBitmap = bmp
+                                    it.invalidate()
+                                }
+                                savedPageGenerations[cur] = (savedPageGenerations[cur] ?: 0) + 1
+                                android.widget.Toast.makeText(
+                                    context,
+                                    "Page background set",
+                                    android.widget.Toast.LENGTH_SHORT
+                                ).show()
                             } else {
                                 android.widget.Toast.makeText(context, "Failed to render PDF page", android.widget.Toast.LENGTH_SHORT).show()
                             }
@@ -1283,8 +1402,7 @@ fun CanvasScreen(
                             // Undo
                             IconButton(
                                 onClick = {
-                                    val continuous = (note?.pageType ?: "infinite") != "infinite" &&
-                                        uiState.pageTurningMode == 0
+                                    val continuous = continuousMode
                                     if (!continuous || !inkController.undo()) {
                                         if (!continuous) canvasViewRef?.undo()
                                     }
@@ -1301,8 +1419,7 @@ fun CanvasScreen(
                             // Redo
                             IconButton(
                                 onClick = {
-                                    val continuous = (note?.pageType ?: "infinite") != "infinite" &&
-                                        uiState.pageTurningMode == 0
+                                    val continuous = continuousMode
                                     if (!continuous || !inkController.redo()) {
                                         if (!continuous) canvasViewRef?.redo()
                                     }
@@ -1586,8 +1703,7 @@ fun CanvasScreen(
                 .fillMaxSize()
                 .padding(innerPadding)
                 .onKeyEvent { event: androidx.compose.ui.input.key.KeyEvent ->
-                    val continuousReading = (note?.pageType ?: "infinite") != "infinite" &&
-                        uiState.pageTurningMode == 0
+                    val continuousReading = continuousMode
                     val isHorizontalReading = uiState.pageTurningDirection == 1
                     if (uiState.volumeForPageEnabled && event.nativeKeyEvent.action == android.view.KeyEvent.ACTION_DOWN) {
                         when (event.nativeKeyEvent.keyCode) {
@@ -1656,6 +1772,44 @@ fun CanvasScreen(
                     } else false
                 }
         ) {
+                /**
+                 * Zoom / pan of the reader. Shared by the gesture detector on
+                 * the backdrop and by the two-finger pinch inside a page, so
+                 * both do the same thing.
+                 */
+                val handleReaderTransform: (androidx.compose.ui.geometry.Offset, androidx.compose.ui.geometry.Offset, Float) -> Unit =
+                    { centroid, pan, zoom ->
+                        val oldScale = continuousScale
+                        // With the zoom locked the pinch only moves the page.
+                        val newScale = if (uiState.zoomLocked) {
+                            oldScale
+                        } else {
+                            (continuousScale * zoom)
+                                .coerceIn(MIN_CONTINUOUS_SCALE, MAX_CONTINUOUS_SCALE)
+                        }
+                        val factor = newScale / oldScale
+                        if (isHorizontal) {
+                            val scrollDelta = (centroid.x * (factor - 1f)) - pan.x
+                            continuousRowState.dispatchRawDelta(scrollDelta)
+                            if (newScale > 1f) {
+                                val maxPanY = (screenHeightPx * (newScale - 1f)) / 2f
+                                continuousPanY = (centroid.y - (centroid.y - continuousPanY) * factor + pan.y).coerceIn(-maxPanY, maxPanY)
+                            } else {
+                                continuousPanY = 0f
+                            }
+                        } else {
+                            val scrollDelta = (centroid.y * (factor - 1f)) - pan.y
+                            continuousColState.dispatchRawDelta(scrollDelta)
+                            if (newScale > 1f) {
+                                val maxPanX = (screenWidthPx * (newScale - 1f)) / 2f
+                                continuousPanX = (centroid.x - (centroid.x - continuousPanX) * factor + pan.x).coerceIn(-maxPanX, maxPanX)
+                            } else {
+                                continuousPanX = 0f
+                            }
+                        }
+                        continuousScale = newScale
+                    }
+
                 // Rendering key for the page bitmaps. Quantising the zoom keeps
                 // a pinch gesture from launching a PDF render per frame while
                 // still upgrading resolution as the user zooms in (P1 audit).
@@ -1704,19 +1858,30 @@ fun CanvasScreen(
                     }
                 }
 
+                // The visible item index comes from a snapshotFlow: reading the
+                // list state straight in composition would recompose the whole
+                // screen on every scroll frame.
+                var continuousVisibleIndex by remember { mutableIntStateOf(0) }
+                LaunchedEffect(isContinuous, isHorizontal) {
+                    if (!isContinuous) return@LaunchedEffect
+                    snapshotFlow {
+                        if (isHorizontal) continuousRowState.firstVisibleItemIndex
+                        else continuousColState.firstVisibleItemIndex
+                    }.collect { continuousVisibleIndex = it }
+                }
+
                 // Sync current visible item index in continuous mode to viewModel
                 val currentContinuousVisible = if (isHorizontal) {
-                    continuousRowState.firstVisibleItemIndex
+                    continuousVisibleIndex
                 } else if (uiState.doublePageMode) {
-                    val pairIdx = continuousColState.firstVisibleItemIndex
-                    val firstPageInPair = pairIdx * 2
+                    val firstPageInPair = continuousVisibleIndex * 2
                     if (currentPageIndex == firstPageInPair || currentPageIndex == firstPageInPair + 1) {
                         currentPageIndex
                     } else {
                         firstPageInPair
                     }
                 } else {
-                    continuousColState.firstVisibleItemIndex
+                    continuousVisibleIndex
                 }
                 LaunchedEffect(isContinuous, currentContinuousVisible) {
                     if (isContinuous && pages.isNotEmpty()) {
@@ -1742,9 +1907,23 @@ fun CanvasScreen(
                             onCanvasTouchStart = { dismissCanvasOverlays() }
                             onImageSelectionChanged = { selectedImageIndex = it }
                             onPdfSelectionChanged = { selection -> pdfSelection = selection }
+                            onStylusDetected = {
+                                viewModel.onStylusDetected()
+                            }
                             onZoomOutToContinuous = {
                                 if (pages.size > 1) {
-                                    viewModel.setPageTurningMode(0)
+                                    scope.launch {
+                                        // The canvas is about to be hidden and
+                                        // its page index dropped (-1), so its
+                                        // strokes have to be written first —
+                                        // otherwise the last stroke is lost.
+                                        try {
+                                            flushCurrentNote()
+                                        } catch (e: Exception) {
+                                            e.printStackTrace()
+                                        }
+                                        viewModel.setPageTurningMode(0)
+                                    }
                                 }
                             }
                             onUndoRedoListener = { canUndo, canRedo ->
@@ -1790,11 +1969,13 @@ fun CanvasScreen(
                                             viewModel.loadPageStrokes(pageIdx)
                                         }
                                         setPageContent(strokes)
+                                        loadBeyondPageInk(pageIdx)
                                     } else {
                                         val savedBitmap = viewModel.loadCurrentPageBitmap()
                                         setPageContent(savedBitmap)
                                         backgroundBitmap = null
                                         viewModel.setPageLoadedFromDisk(savedBitmap != null)
+                                        loadBeyondPageInk(pageIdx)
                                     }
                                     val layers = withContext(Dispatchers.IO) {
                                         readLayersFromDisk(viewModel.fileStore, viewModel.noteId)
@@ -1817,6 +1998,7 @@ fun CanvasScreen(
                         view.backgroundMode = uiState.backgroundMode
                         view.backgroundDensity = uiState.backgroundDensity
                         view.stylusOnly = uiState.stylusOnly
+                        view.pageIndex = currentPageIndex
                         view.readingMode = uiState.readingMode
                         view.pressureSensitivity = uiState.pressureSensitivity
                         view.pressureSizeEnabled = uiState.pressureSizeEnabled
@@ -1839,32 +2021,12 @@ fun CanvasScreen(
                             modifier = Modifier
                                 .fillMaxSize()
                                 .background(Color(0xFFEEEEEE))
-                                .pointerInput(Unit) {
+                                .pointerInput(uiState.stylusOnly) {
+                                    // Stylus mode: the hand is for buttons
+                                    // only, so it may not pinch or pan either.
+                                    if (uiState.stylusOnly) return@pointerInput
                                     detectTransformGestures { centroid, pan, zoom, _ ->
-                                        val oldScale = continuousScale
-                                        val newScale = (continuousScale * zoom)
-                                            .coerceIn(MIN_CONTINUOUS_SCALE, MAX_CONTINUOUS_SCALE)
-                                        val factor = newScale / oldScale
-                                        if (isHorizontal) {
-                                            val scrollDelta = (centroid.x * (factor - 1f)) - pan.x
-                                            continuousRowState.dispatchRawDelta(scrollDelta)
-                                            if (newScale > 1f) {
-                                                val maxPanY = (screenHeightPx * (newScale - 1f)) / 2f
-                                                continuousPanY = (centroid.y - (centroid.y - continuousPanY) * factor + pan.y).coerceIn(-maxPanY, maxPanY)
-                                            } else {
-                                                continuousPanY = 0f
-                                            }
-                                        } else {
-                                            val scrollDelta = (centroid.y * (factor - 1f)) - pan.y
-                                            continuousColState.dispatchRawDelta(scrollDelta)
-                                            if (newScale > 1f) {
-                                                val maxPanX = (screenWidthPx * (newScale - 1f)) / 2f
-                                                continuousPanX = (centroid.x - (centroid.x - continuousPanX) * factor + pan.x).coerceIn(-maxPanX, maxPanX)
-                                            } else {
-                                                continuousPanX = 0f
-                                            }
-                                        }
-                                        continuousScale = newScale
+                                        handleReaderTransform(centroid, pan, zoom)
                                     }
                                 }
                         ) {
@@ -1872,7 +2034,7 @@ fun CanvasScreen(
                                 androidx.compose.foundation.lazy.LazyRow(
                                     state = continuousRowState,
                                     modifier = Modifier.fillMaxSize(),
-                                    userScrollEnabled = !inkController.isDrawing,
+                                    userScrollEnabled = !inkController.isDrawing && !uiState.stylusOnly,
                                     verticalAlignment = Alignment.CenterVertically,
                                     horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(16.dp),
                                     contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp)
@@ -1911,7 +2073,7 @@ fun CanvasScreen(
                                 androidx.compose.foundation.lazy.LazyColumn(
                                     state = continuousColState,
                                     modifier = Modifier.fillMaxSize(),
-                                    userScrollEnabled = !inkController.isDrawing,
+                                    userScrollEnabled = !inkController.isDrawing && !uiState.stylusOnly,
                                     verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(16.dp),
                                     contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 16.dp, horizontal = 16.dp),
                                     horizontalAlignment = Alignment.CenterHorizontally
@@ -1959,7 +2121,7 @@ fun CanvasScreen(
                                 androidx.compose.foundation.lazy.LazyColumn(
                                     state = continuousColState,
                                     modifier = Modifier.fillMaxSize(),
-                                    userScrollEnabled = !inkController.isDrawing,
+                                    userScrollEnabled = !inkController.isDrawing && !uiState.stylusOnly,
                                     verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(16.dp),
                                     contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 16.dp, horizontal = 16.dp),
                                     horizontalAlignment = Alignment.CenterHorizontally
@@ -1986,6 +2148,8 @@ fun CanvasScreen(
                                                 savedGeneration = savedPageGenerations[idx] ?: 0,
                                                 isCurrentPage = idx == currentPageIndex,
                                                 modifier = androidx.compose.ui.Modifier.fillMaxWidth(),
+                                                onStylusDetected = { viewModel.onStylusDetected() },
+                                        onPinch = { centroid, pan, zoom -> handleReaderTransform(centroid, pan, zoom) },
                                                 onClick = {
                                                     viewModel.setCurrentPageIndex(idx)
                                                     dismissCanvasOverlays()
@@ -2042,25 +2206,51 @@ fun CanvasScreen(
                                 }
                             }
 
-                            if (kotlin.math.abs(continuousScale - 1f) > 0.05f) {
+                            if (uiState.zoomLocked || kotlin.math.abs(continuousScale - 1f) > 0.05f) {
                                 Surface(
                                     shape = RoundedCornerShape(16.dp),
                                     color = Color.Black.copy(alpha = 0.72f),
                                     modifier = Modifier
                                         .clip(RoundedCornerShape(16.dp))
-                                        .clickable {
-                                            continuousScale = 1f
-                                            continuousPanX = 0f
-                                            continuousPanY = 0f
-                                        }
                                 ) {
-                                    Text(
-                                        text = "${(continuousScale * 100).roundToInt()}% · Reset",
-                                        color = Color.White,
-                                        fontSize = 12.sp,
-                                        fontWeight = FontWeight.Medium,
-                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
-                                    )
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(2.dp),
+                                        modifier = Modifier.padding(start = 2.dp, end = 12.dp, top = 2.dp, bottom = 2.dp)
+                                    ) {
+                                        // Lock the pinch: two fingers then only
+                                        // move the page around.
+                                        IconButton(
+                                            onClick = { viewModel.setZoomLocked(!uiState.zoomLocked) },
+                                            modifier = Modifier.size(24.dp)
+                                        ) {
+                                            Icon(
+                                                imageVector = if (uiState.zoomLocked) {
+                                                    Icons.Default.Lock
+                                                } else {
+                                                    Icons.Outlined.LockOpen
+                                                },
+                                                contentDescription = if (uiState.zoomLocked) {
+                                                    "Unlock pinch zoom"
+                                                } else {
+                                                    "Lock pinch zoom"
+                                                },
+                                                tint = if (uiState.zoomLocked) OrangePrimary else Color.White,
+                                                modifier = Modifier.size(13.dp)
+                                            )
+                                        }
+                                        Text(
+                                            text = "${(continuousScale * 100).roundToInt()}% · Reset",
+                                            color = Color.White,
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.Medium,
+                                            modifier = Modifier.clickable {
+                                                continuousScale = 1f
+                                                continuousPanX = 0f
+                                                continuousPanY = 0f
+                                            }
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -2191,7 +2381,21 @@ fun CanvasScreen(
                                             )
                                         }
                                         Spacer(Modifier.width(4.dp))
-                                        Text("Layer ${idx + 1}", fontSize = 12.sp, modifier = Modifier.weight(1f))
+                                        Text(
+                                            text = buildString {
+                                                append("Layer ${idx + 1}")
+                                                // The layer that owns the ink: strokes
+                                                // written while it was current hide
+                                                // with it.
+                                                if (idx == selectedImageIndex) append(" · current")
+                                                if (layer.ink.isNotEmpty()) {
+                                                    append(" · ${layer.ink.size} mark")
+                                                    if (layer.ink.size > 1) append("s")
+                                                }
+                                            },
+                                            fontSize = 12.sp,
+                                            modifier = Modifier.weight(1f)
+                                        )
                                         IconButton(
                                             onClick = {
                                                 if (idx > 0) {
@@ -2330,6 +2534,10 @@ fun CanvasScreen(
                             modifier = Modifier
                                 .offset { IntOffset(liveTextOffsetX.roundToInt(), liveTextOffsetY.roundToInt()) }
                                 .widthIn(min = 320.dp, max = 560.dp)
+                                .onSizeChanged { size ->
+                                    liveTextCardWidth = size.width
+                                    liveTextCardHeight = size.height
+                                }
                                 .padding(8.dp)
                         ) {
                             Column(modifier = Modifier.padding(10.dp)) {
@@ -2387,7 +2595,7 @@ fun CanvasScreen(
                                             modifier = Modifier.padding(horizontal = 1.dp)
                                         )
                                         IconButton(
-                                            onClick = { liveTextSizeSp = (liveTextSizeSp + 4f).coerceAtMost(48f) },
+                                            onClick = { liveTextSizeSp = (liveTextSizeSp + 4f).coerceAtMost(72f) },
                                             modifier = Modifier.size(26.dp)
                                         ) {
                                             Text("A+", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFF555555))
@@ -2420,9 +2628,20 @@ fun CanvasScreen(
                                             onClick = {
                                                 val text = liveTextContent.trim()
                                                 if (text.isNotEmpty()) {
-                                                    val boxViewX = (screenWidthPx - with(density) { 360.dp.toPx() }) / 2f + liveTextOffsetX
-                                                    val boxViewY = (screenHeightPx - with(density) { 240.dp.toPx() }) / 2f + liveTextOffsetY
-                                                    val pts = floatArrayOf(boxViewX, boxViewY)
+                                                    // The card is centred in the canvas
+                                                    // area; its top-left in canvas
+                                                    // coordinates is the point the text
+                                                    // is anchored to.
+                                                    val viewW = canvasViewRef?.width ?: 0
+                                                    val viewH = canvasViewRef?.height ?: 0
+                                                    val cardW = if (liveTextCardWidth > 0) liveTextCardWidth.toFloat() else 360f * density.density
+                                                    val cardH = if (liveTextCardHeight > 0) liveTextCardHeight.toFloat() else 240f * density.density
+                                                    val centreX = viewW / 2f + liveTextOffsetX
+                                                    val centreY = (viewH - 50f * density.density) / 2f + liveTextOffsetY
+                                                    val pts = floatArrayOf(
+                                                        centreX - cardW / 2f,
+                                                        centreY - cardH / 2f
+                                                    )
                                                     canvasViewRef?.pageInverseMatrix?.mapPoints(pts)
                                                     val targetX = pts[0]
                                                     val targetY = pts[1]
@@ -2533,13 +2752,14 @@ fun CanvasScreen(
                 // is painted by DrawingCanvasView.
                 if (pdfTextMode) {
                     Surface(
-                        shape = RoundedCornerShape(20.dp),
-                        color = Color.White.copy(alpha = 0.97f),
-                        shadowElevation = 8.dp,
+                        shape = RoundedCornerShape(24.dp),
+                        color = Color.Transparent,
+                        shadowElevation = 10.dp,
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
                             .padding(bottom = 96.dp)
-                            .border(1.dp, Color(0xFFEEEEEE), RoundedCornerShape(20.dp))
+                            .background(GlassBodyBrush, RoundedCornerShape(24.dp))
+                            .border(1.dp, GlassEdgeBrush, RoundedCornerShape(24.dp))
                     ) {
                         Row(
                             modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
@@ -2590,14 +2810,15 @@ fun CanvasScreen(
                     if (isPencaseCollapsed) {
                         // Collapsed mini restore pill
                         Surface(
-                            shape = RoundedCornerShape(16.dp),
-                            color = Color.White.copy(alpha = 0.95f),
-                            shadowElevation = 4.dp,
+                            shape = RoundedCornerShape(20.dp),
+                            color = Color.Transparent,
+                            shadowElevation = 8.dp,
                             modifier = Modifier
                                 .align(if (uiState.dockHorizontal) Alignment.TopCenter else Alignment.CenterStart)
                                 .offset { IntOffset(pencaseOffsetX.roundToInt(), pencaseOffsetY.roundToInt()) }
                                 .padding(top = if (uiState.dockHorizontal) 10.dp else 0.dp, start = if (!uiState.dockHorizontal) 12.dp else 0.dp)
-                                .border(1.dp, Color(0xFFEEEEEE), RoundedCornerShape(16.dp))
+                                .background(GlassBodyBrush, RoundedCornerShape(20.dp))
+                                .border(1.dp, GlassEdgeBrush, RoundedCornerShape(20.dp))
                                 .clickable { isPencaseCollapsed = false }
                         ) {
                             Row(
@@ -2622,14 +2843,15 @@ fun CanvasScreen(
                     } else if (uiState.dockHorizontal) {
                         // Horizontal Dock (Top under bar)
                         Surface(
-                            shape = RoundedCornerShape(20.dp),
-                            color = Color.White.copy(alpha = 0.96f),
-                            shadowElevation = 6.dp,
+                            shape = RoundedCornerShape(24.dp),
+                            color = Color.Transparent,
+                            shadowElevation = 12.dp,
                             modifier = Modifier
                                 .align(Alignment.TopCenter)
                                 .offset { IntOffset(pencaseOffsetX.roundToInt(), pencaseOffsetY.roundToInt()) }
                                 .padding(top = 10.dp)
-                                .border(1.dp, Color(0xFFEEEEEE), RoundedCornerShape(20.dp))
+                                .background(GlassBodyBrush, RoundedCornerShape(24.dp))
+                                .border(1.dp, GlassEdgeBrush, RoundedCornerShape(24.dp))
                         ) {
                             Row(
                                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
@@ -2683,6 +2905,22 @@ fun CanvasScreen(
                                             .width(4.dp)
                                             .clip(RoundedCornerShape(2.dp))
                                             .background(Color.LightGray)
+                                    )
+                                }
+
+                                // Collapse the dock into its mini pill. It is a
+                                // separate button from the drag handle: the
+                                // handle flips the orientation, this one hides
+                                // the dock.
+                                IconButton(
+                                    onClick = { isPencaseCollapsed = true },
+                                    modifier = Modifier.size(22.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.KeyboardArrowUp,
+                                        contentDescription = "Collapse pen dock",
+                                        tint = Color(0xFF777777),
+                                        modifier = Modifier.size(15.dp)
                                     )
                                 }
 
@@ -2800,11 +3038,13 @@ fun CanvasScreen(
                                 )
 
                                 // 3 Stroke Width Presets (Horizontal bar line thickness)
+                                // Short tap picks the preset, long press opens the slider popup.
                                 val widthPresets =
                                     if (uiState.selectedTool == CanvasTool.ERASER) TouchNotesEraserPresets
                                     else TouchNotesWidthPresets
                                 val activeWidth = uiState.activeStrokeWidth()
-                                widthPresets.take(3).forEachIndexed { wIdx, (widthPx, _) ->
+                                val isEraserTool = uiState.selectedTool == CanvasTool.ERASER
+                                widthPresets.forEachIndexed { wIdx, (widthPx, _) ->
                                     val isSelected = activeWidth == widthPx
                                     val barHeight = when (wIdx) {
                                         0 -> 2.dp
@@ -2821,7 +3061,10 @@ fun CanvasScreen(
                                                 if (isSelected) OrangePrimary else Color.Transparent,
                                                 CircleShape
                                             )
-                                            .clickable { viewModel.setStrokeWidth(widthPx) },
+                                            .combinedClickable(
+                                                onClick = { viewModel.setStrokeWidth(widthPx) },
+                                                onLongClick = { showWidthPopupHoriz = true }
+                                            ),
                                         contentAlignment = Alignment.Center
                                     ) {
                                         Box(
@@ -2830,6 +3073,15 @@ fun CanvasScreen(
                                                 .height(barHeight)
                                                 .clip(RoundedCornerShape(1.dp))
                                                 .background(if (isSelected) OrangePrimary else Color(0xFF444444))
+                                        )
+                                        WidthPickerPopup(
+                                            expanded = showWidthPopupHoriz,
+                                            onDismiss = { showWidthPopupHoriz = false },
+                                            presets = widthPresets,
+                                            activeWidth = activeWidth,
+                                            isEraser = isEraserTool,
+                                            preferRight = false,
+                                            onWidthChange = { viewModel.setStrokeWidth(it) }
                                         )
                                     }
                                 }
@@ -2842,7 +3094,8 @@ fun CanvasScreen(
                                 )
 
                                 // 3 Rounded-Square Color Swatches with checkmark
-                                TouchNotesColors.take(3).forEach { c ->
+                                // Short tap picks the colour, long press opens the full palette.
+                                TouchNotesDockColors.forEach { c ->
                                     val isSelected = uiState.selectedColor == c
                                     Box(
                                         modifier = Modifier
@@ -2854,7 +3107,10 @@ fun CanvasScreen(
                                                 if (isSelected) OrangePrimary else Color.LightGray,
                                                 RoundedCornerShape(6.dp)
                                             )
-                                            .clickable { viewModel.selectColor(c) },
+                                            .combinedClickable(
+                                                onClick = { viewModel.selectColor(c) },
+                                                onLongClick = { showColorPopupHoriz = true }
+                                            ),
                                         contentAlignment = Alignment.Center
                                     ) {
                                         if (isSelected) {
@@ -2865,11 +3121,19 @@ fun CanvasScreen(
                                                 modifier = Modifier.size(14.dp)
                                             )
                                         }
+                                        ColorPalettePopup(
+                                            expanded = showColorPopupHoriz,
+                                            onDismiss = { showColorPopupHoriz = false },
+                                            selectedColor = uiState.selectedColor,
+                                            preferRight = false,
+                                            onColorSelected = { viewModel.selectColor(it) },
+                                            onCustomColor = { showCustomColorDialog = true }
+                                        )
                                     }
                                 }
 
                                 // Color Picker (+) Button
-                                val isCustomColorActive = uiState.selectedColor !in TouchNotesColors.take(3)
+                                val isCustomColorActive = uiState.selectedColor !in TouchNotesDockColors
                                 Box(
                                     modifier = Modifier
                                         .size(24.dp)
@@ -2895,14 +3159,15 @@ fun CanvasScreen(
                     } else {
                         // Vertical Dock (Docked on Left)
                         Surface(
-                            shape = RoundedCornerShape(22.dp),
-                            color = Color.White.copy(alpha = 0.96f),
-                            shadowElevation = 6.dp,
+                            shape = RoundedCornerShape(24.dp),
+                            color = Color.Transparent,
+                            shadowElevation = 12.dp,
                             modifier = Modifier
                                 .align(Alignment.CenterStart)
                                 .offset { IntOffset(pencaseOffsetX.roundToInt(), pencaseOffsetY.roundToInt()) }
                                 .padding(start = 12.dp)
-                                .border(1.dp, Color(0xFFEEEEEE), RoundedCornerShape(22.dp))
+                                .background(GlassBodyBrush, RoundedCornerShape(24.dp))
+                                .border(1.dp, GlassEdgeBrush, RoundedCornerShape(24.dp))
                         ) {
                             Column(
                                 modifier = Modifier.padding(horizontal = 8.dp, vertical = 12.dp),
@@ -2939,7 +3204,9 @@ fun CanvasScreen(
                                                         val dragDelta = change.position - change.previousPosition
                                                         change.consume()
                                                         val minX = 0f
-                                                        val maxX = screenWidthPx - 100f
+                                                        // Keep the whole dock on screen, so it
+                                                        // can never be dragged out of reach.
+                                                        val maxX = (screenWidthPx - 220f).coerceAtLeast(0f)
                                                         val minY = -screenHeightPx / 2f + 80f
                                                         val maxY = screenHeightPx / 2f - 80f
                                                         pencaseOffsetX = (pencaseOffsetX + dragDelta.x).coerceIn(minX, maxX)
@@ -2956,6 +3223,19 @@ fun CanvasScreen(
                                             .height(4.dp)
                                             .clip(RoundedCornerShape(2.dp))
                                             .background(Color.LightGray)
+                                    )
+                                }
+
+                                // Collapse the dock into its mini pill.
+                                IconButton(
+                                    onClick = { isPencaseCollapsed = true },
+                                    modifier = Modifier.size(22.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.AutoMirrored.Filled.KeyboardArrowLeft,
+                                        contentDescription = "Collapse pen dock",
+                                        tint = Color(0xFF777777),
+                                        modifier = Modifier.size(15.dp)
                                     )
                                 }
 
@@ -3073,10 +3353,12 @@ fun CanvasScreen(
                                 )
 
                                 // 3 Stroke Width Presets (vertical line thickness bars)
+                                // Short tap picks the preset, long press opens the slider popup.
                                 val verticalPresets =
                                     if (uiState.selectedTool == CanvasTool.ERASER) TouchNotesEraserPresets
                                     else TouchNotesWidthPresets
                                 val verticalActive = uiState.activeStrokeWidth()
+                                val isEraserToolVert = uiState.selectedTool == CanvasTool.ERASER
                                 verticalPresets.take(3).forEachIndexed { vIdx, (widthPx, _) ->
                                     val isSelected = verticalActive == widthPx
                                     val barH = when (vIdx) {
@@ -3094,7 +3376,10 @@ fun CanvasScreen(
                                                 if (isSelected) OrangePrimary else Color.Transparent,
                                                 CircleShape
                                             )
-                                            .clickable { viewModel.setStrokeWidth(widthPx) },
+                                            .combinedClickable(
+                                                onClick = { viewModel.setStrokeWidth(widthPx) },
+                                                onLongClick = { showWidthPopupVert = true }
+                                            ),
                                         contentAlignment = Alignment.Center
                                     ) {
                                         Box(
@@ -3103,6 +3388,15 @@ fun CanvasScreen(
                                                 .height(barH)
                                                 .clip(RoundedCornerShape(1.dp))
                                                 .background(if (isSelected) OrangePrimary else Color(0xFF444444))
+                                        )
+                                        WidthPickerPopup(
+                                            expanded = showWidthPopupVert,
+                                            onDismiss = { showWidthPopupVert = false },
+                                            presets = verticalPresets,
+                                            activeWidth = verticalActive,
+                                            isEraser = isEraserToolVert,
+                                            preferRight = true,
+                                            onWidthChange = { viewModel.setStrokeWidth(it) }
                                         )
                                     }
                                 }
@@ -3115,7 +3409,8 @@ fun CanvasScreen(
                                 )
 
                                 // 3 Rounded-Square Color Swatches with checkmark
-                                TouchNotesColors.take(3).forEach { c ->
+                                // Short tap picks the colour, long press opens the full palette.
+                                TouchNotesDockColors.forEach { c ->
                                     val isSelected = uiState.selectedColor == c
                                     Box(
                                         modifier = Modifier
@@ -3127,7 +3422,10 @@ fun CanvasScreen(
                                                 if (isSelected) OrangePrimary else Color.LightGray,
                                                 RoundedCornerShape(6.dp)
                                             )
-                                            .clickable { viewModel.selectColor(c) },
+                                            .combinedClickable(
+                                                onClick = { viewModel.selectColor(c) },
+                                                onLongClick = { showColorPopupVert = true }
+                                            ),
                                         contentAlignment = Alignment.Center
                                     ) {
                                         if (isSelected) {
@@ -3138,11 +3436,19 @@ fun CanvasScreen(
                                                 modifier = Modifier.size(13.dp)
                                             )
                                         }
+                                        ColorPalettePopup(
+                                            expanded = showColorPopupVert,
+                                            onDismiss = { showColorPopupVert = false },
+                                            selectedColor = uiState.selectedColor,
+                                            preferRight = true,
+                                            onColorSelected = { viewModel.selectColor(it) },
+                                            onCustomColor = { showCustomColorDialog = true }
+                                        )
                                     }
                                 }
 
                                 // Color Picker (+) Button
-                                val isCustomColorActiveVert = uiState.selectedColor !in TouchNotesColors.take(3)
+                                val isCustomColorActiveVert = uiState.selectedColor !in TouchNotesDockColors
                                 Box(
                                     modifier = Modifier
                                         .size(22.dp)
@@ -4014,7 +4320,10 @@ fun CanvasScreen(
                             // 3. Tab Content Card
                             Surface(
                                 shape = RoundedCornerShape(20.dp),
-                                color = Color.White,
+                                // Light grey panel, like the original: the white
+                                // group cards inside it are what makes the
+                                // grouping readable.
+                                color = Color(0xFFF5F6F8),
                                 shadowElevation = 4.dp,
                                 modifier = Modifier
                                     .fillMaxWidth()
@@ -4034,7 +4343,7 @@ fun CanvasScreen(
                                                 Text("Productivity Integration", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = Color.Gray)
                                                 Surface(
                                                     shape = RoundedCornerShape(12.dp),
-                                                    color = Color(0xFFFBFBFB),
+                                                    color = Color.White,
                                                     border = BorderStroke(1.dp, Color(0xFFEBEBEB)),
                                                     modifier = Modifier.fillMaxWidth()
                                                 ) {
@@ -4055,7 +4364,7 @@ fun CanvasScreen(
                                                 Text("Add", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = Color.Gray)
                                                 Surface(
                                                     shape = RoundedCornerShape(12.dp),
-                                                    color = Color(0xFFFBFBFB),
+                                                    color = Color.White,
                                                     border = BorderStroke(1.dp, Color(0xFFEBEBEB)),
                                                     modifier = Modifier.fillMaxWidth()
                                                 ) {
@@ -4074,6 +4383,23 @@ fun CanvasScreen(
                                                                 } else {
                                                                     inkController.flushCurrentSuspend()
                                                                 }
+                                                                pdfPickerLauncher.launch(arrayOf("application/pdf"))
+                                                                viewModel.toggleToolsPanel(false)
+                                                            }
+                                                        }
+                                                        Divider(color = Color(0xFFEEEEEE), thickness = 0.5.dp)
+                                                        ToolsPanelItem(Icons.Default.PictureAsPdf, "Page Background from PDF") {
+                                                            scope.launch {
+                                                                if (!isContinuous) {
+                                                                    canvasViewRef?.getBackingBitmap()?.let { bmp ->
+                                                                        viewModel.saveCurrentPageBitmap(bmp)
+                                                                    }
+                                                                } else {
+                                                                    inkController.flushCurrentSuspend()
+                                                                }
+                                                                // The picked page becomes the background of
+                                                                // the current page; the annotations stay.
+                                                                pdfImportAsBackground = true
                                                                 pdfPickerLauncher.launch(arrayOf("application/pdf"))
                                                                 viewModel.toggleToolsPanel(false)
                                                             }
@@ -4104,7 +4430,7 @@ fun CanvasScreen(
                                                 Text("Page", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = Color.Gray)
                                                 Surface(
                                                     shape = RoundedCornerShape(12.dp),
-                                                    color = Color(0xFFFBFBFB),
+                                                    color = Color.White,
                                                     border = BorderStroke(1.dp, Color(0xFFEBEBEB)),
                                                     modifier = Modifier.fillMaxWidth()
                                                 ) {
@@ -4154,7 +4480,7 @@ fun CanvasScreen(
                                                 Text("Write", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = Color.Gray)
                                                 Surface(
                                                     shape = RoundedCornerShape(12.dp),
-                                                    color = Color(0xFFFBFBFB),
+                                                    color = Color.White,
                                                     border = BorderStroke(1.dp, Color(0xFFEBEBEB)),
                                                     modifier = Modifier.fillMaxWidth()
                                                 ) {
@@ -4179,9 +4505,11 @@ fun CanvasScreen(
                                                         }
                                                         Divider(color = Color(0xFFEEEEEE), thickness = 0.5.dp)
                                                         ToolsPanelItem(Icons.Default.Highlight, "Laser Pointer") {
-                                                            viewModel.selectTool(CanvasTool.HIGHLIGHTER)
+                                                            // The laser pointer shows a red dot
+                                                            // where the pen is; it writes nothing.
+                                                            viewModel.selectTool(CanvasTool.LASER_POINTER)
                                                             viewModel.toggleToolsPanel(false)
-                                                            android.widget.Toast.makeText(context, "Highlighter pointer active", android.widget.Toast.LENGTH_SHORT).show()
+                                                            android.widget.Toast.makeText(context, "Laser pointer: move the pen to point", android.widget.Toast.LENGTH_SHORT).show()
                                                         }
                                                     }
                                                 }
@@ -4190,7 +4518,7 @@ fun CanvasScreen(
                                                 Text("Other", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = Color.Gray)
                                                 Surface(
                                                     shape = RoundedCornerShape(12.dp),
-                                                    color = Color(0xFFFBFBFB),
+                                                    color = Color.White,
                                                     border = BorderStroke(1.dp, Color(0xFFEBEBEB)),
                                                     modifier = Modifier.fillMaxWidth()
                                                 ) {
@@ -4220,7 +4548,7 @@ fun CanvasScreen(
                                             // EXPORT TAB
                                             Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
                                                 Text("Document Export", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color.Gray)
-                                                ToolsPanelItem(Icons.Default.Description, "Export as Multi-Page PDF") {
+                                                ToolsPanelItem(Icons.Default.PictureAsPdf, "Export as Multi-Page PDF") {
                                                     scope.launch {
                                                         flushCurrentNote()
                                                         selectedExportTarget = personal.notes.touch.ui.export.ExportTarget.PDF
@@ -4257,11 +4585,17 @@ fun CanvasScreen(
                                         2 -> {
                                             // SETTINGS TAB (1-to-1 match with TouchNotes Screenshot_20261107-133240)
                                             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                                // 1. Stylus Mode
+                                                // 1. Stylus Mode — only offered once a
+                                                // stylus has actually been used.
                                                 SettingsCheckboxRow(
                                                     title = "Stylus Mode",
-                                                    subtitle = "Only allow stylus writing permitted",
+                                                    subtitle = if (uiState.stylusDetected) {
+                                                        "Only the pen writes; the hand presses buttons"
+                                                    } else {
+                                                        "Turns on by itself when a stylus is used"
+                                                    },
                                                     checked = uiState.stylusOnly,
+                                                    enabled = uiState.stylusDetected,
                                                     onCheckedChange = { viewModel.toggleStylusOnly(it) }
                                                 )
                                                 // 2. Show Pencase
@@ -4456,7 +4790,7 @@ fun CanvasScreen(
 
                                                 // 10. Horizontal Move Resistance
                                                 Text(
-                                                    text = "Horizontal Move Resistance(Double click for centering)",
+                                                    text = "Horizontal move resistance (double click for centring)",
                                                     fontSize = 12.sp,
                                                     fontWeight = FontWeight.Normal,
                                                     color = Color(0xFF222222)
@@ -4500,7 +4834,7 @@ fun CanvasScreen(
                                                 Text("Note Manager", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = Color.Gray)
                                                 Surface(
                                                     shape = RoundedCornerShape(12.dp),
-                                                    color = Color(0xFFFBFBFB),
+                                                    color = Color.White,
                                                     border = BorderStroke(1.dp, Color(0xFFEBEBEB)),
                                                     modifier = Modifier.fillMaxWidth()
                                                 ) {
@@ -4569,6 +4903,225 @@ fun PencaseToolIcon(
     }
 }
 
+/**
+ * Places a long-press popup next to the chip that opened it: below the chip
+ * when there is room, otherwise above it. The vertical dock opens its popups
+ * to the right of the chip so they do not sit on top of the dock itself.
+ */
+private class ChipPopupPositionProvider(
+    private val preferRight: Boolean = false
+) : PopupPositionProvider {
+    override fun calculatePosition(
+        anchorBounds: IntRect,
+        windowSize: IntSize,
+        layoutDirection: LayoutDirection,
+        popupContentSize: IntSize
+    ): IntOffset {
+        val gap = 8
+        val rawX = if (preferRight) {
+            anchorBounds.right + gap
+        } else {
+            anchorBounds.left + (anchorBounds.width - popupContentSize.width) / 2
+        }
+        val x = rawX.coerceIn(0, (windowSize.width - popupContentSize.width).coerceAtLeast(0))
+        val below = anchorBounds.bottom + gap
+        val above = anchorBounds.top - popupContentSize.height - gap
+        val y = if (below + popupContentSize.height <= windowSize.height) below else above.coerceAtLeast(0)
+        return IntOffset(x, y)
+    }
+}
+
+/** "6" for whole widths, "6.5" for fractional ones. */
+private fun formatPx(value: Float): String =
+    if (value % 1f == 0f) value.roundToInt().toString() else String.format(java.util.Locale.US, "%.1f", value)
+
+/**
+ * Long-press popup of the stroke-width chips: a slider that updates the width
+ * live while dragging, the current size in px and the presets of the active
+ * tool. The range follows the tool - the eraser is much larger than the pen.
+ */
+@Composable
+private fun WidthPickerPopup(
+    expanded: Boolean,
+    onDismiss: () -> Unit,
+    presets: List<Pair<Float, String>>,
+    activeWidth: Float,
+    isEraser: Boolean,
+    preferRight: Boolean,
+    onWidthChange: (Float) -> Unit
+) {
+    if (!expanded) return
+    val minWidth = if (isEraser) ERASER_WIDTH_MIN else PEN_WIDTH_MIN
+    val maxWidth = if (isEraser) ERASER_WIDTH_MAX else PEN_WIDTH_MAX
+    Popup(
+        onDismissRequest = onDismiss,
+        popupPositionProvider = ChipPopupPositionProvider(preferRight),
+        properties = PopupProperties(
+            focusable = true,
+            dismissOnClickOutside = true,
+            dismissOnBackPress = true
+        )
+    ) {
+        // Local thumb state keeps the drag smooth; the view model is updated
+        // on every change so the canvas preview follows the slider.
+        var sliderValue by remember { mutableFloatStateOf(activeWidth.coerceIn(minWidth, maxWidth)) }
+        Surface(
+            shape = RoundedCornerShape(18.dp),
+            color = Color.White.copy(alpha = 0.97f),
+            shadowElevation = 10.dp,
+            modifier = Modifier.width(240.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text("Width", fontSize = 12.sp, color = Color(0xFF444444))
+                    Text(
+                        text = "${formatPx(sliderValue)} px",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = OrangePrimary
+                    )
+                }
+                Slider(
+                    value = sliderValue,
+                    onValueChange = {
+                        sliderValue = it
+                        onWidthChange(it)
+                    },
+                    valueRange = minWidth..maxWidth,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    presets.forEach { (widthPx, label) ->
+                        val isSelected = activeWidth == widthPx
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(if (isSelected) OrangePrimary.copy(alpha = 0.12f) else Color(0xFFF3F3F3))
+                                .clickable {
+                                    sliderValue = widthPx.coerceIn(minWidth, maxWidth)
+                                    onWidthChange(widthPx)
+                                    onDismiss()
+                                }
+                                .padding(vertical = 6.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = label,
+                                fontSize = 11.sp,
+                                maxLines = 1,
+                                color = if (isSelected) OrangePrimary else Color(0xFF444444)
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Long-press popup of the colour swatches: the full preset palette in a 4x2
+ * grid (the active colour is ticked) plus a custom colour entry that opens
+ * the existing colour picker dialog.
+ */
+@Composable
+private fun ColorPalettePopup(
+    expanded: Boolean,
+    onDismiss: () -> Unit,
+    selectedColor: Color,
+    preferRight: Boolean,
+    onColorSelected: (Color) -> Unit,
+    onCustomColor: () -> Unit
+) {
+    if (!expanded) return
+    Popup(
+        onDismissRequest = onDismiss,
+        popupPositionProvider = ChipPopupPositionProvider(preferRight),
+        properties = PopupProperties(
+            focusable = true,
+            dismissOnClickOutside = true,
+            dismissOnBackPress = true
+        )
+    ) {
+        Surface(
+            shape = RoundedCornerShape(18.dp),
+            color = Color.White.copy(alpha = 0.97f),
+            shadowElevation = 10.dp,
+            modifier = Modifier.width(180.dp)
+        ) {
+            Column(
+                modifier = Modifier.padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                TouchNotesColors.chunked(4).forEach { paletteRow ->
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        paletteRow.forEach { c ->
+                            val isSelected = selectedColor == c
+                            Box(
+                                modifier = Modifier
+                                    .size(32.dp)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(c)
+                                    .border(
+                                        if (isSelected) 2.dp else 0.5.dp,
+                                        if (isSelected) OrangePrimary else Color.LightGray,
+                                        RoundedCornerShape(8.dp)
+                                    )
+                                    .clickable {
+                                        onColorSelected(c)
+                                        onDismiss()
+                                    },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                if (isSelected) {
+                                    Icon(
+                                        imageVector = Icons.Default.Check,
+                                        contentDescription = "Selected",
+                                        tint = Color.White,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(Color(0xFFF3F3F3))
+                        .clickable {
+                            onDismiss()
+                            onCustomColor()
+                        }
+                        .padding(horizontal = 10.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Add,
+                        contentDescription = null,
+                        tint = OrangePrimary,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Text("Custom colour", fontSize = 12.sp, color = Color(0xFF444444))
+                }
+            }
+        }
+    }
+}
+
 @Composable
 fun ToolsPanelItem(
     icon: androidx.compose.ui.graphics.vector.ImageVector,
@@ -4593,7 +5146,10 @@ fun ToolsPanelItem(
         Text(
             text = title,
             fontSize = 14.sp,
-            color = Color(0xFF212529)
+            color = Color(0xFF212529),
+            // The original puts the label at the right edge of the row.
+            modifier = Modifier.weight(1f),
+            textAlign = androidx.compose.ui.text.style.TextAlign.End
         )
     }
 }
@@ -4603,18 +5159,20 @@ fun SettingsCheckboxRow(
     title: String,
     subtitle: String = "",
     checked: Boolean,
+    enabled: Boolean = true,
     onCheckedChange: (Boolean) -> Unit
 ) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable { onCheckedChange(!checked) }
+            .clickable(enabled = enabled) { onCheckedChange(!checked) }
             .padding(vertical = 1.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Checkbox(
             checked = checked,
             onCheckedChange = onCheckedChange,
+            enabled = enabled,
             modifier = Modifier.size(24.dp),
             colors = CheckboxDefaults.colors(
                 checkedColor = OrangePrimary,
@@ -4648,6 +5206,57 @@ fun SettingsCheckboxRow(
 }
 
 @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
+/**
+ * Two-finger pinch inside a page of the continuous reader.
+ *
+ * The list's own scroll takes the gesture away from a detector that sits
+ * behind it, so the pinch is handled here — inside the page, where this
+ * node runs before the list. It only reacts once a second pointer is down:
+ * one finger keeps scrolling the reader and drawing.
+ */
+private suspend fun androidx.compose.ui.input.pointer.PointerInputScope.detectPagePinch(
+    onPinch: (androidx.compose.ui.geometry.Offset, androidx.compose.ui.geometry.Offset, Float) -> Unit
+) {
+    val touchSlop = viewConfiguration.touchSlop
+    awaitPointerEventScope {
+        var pastSlop = false
+        var zoom = 1f
+        var pan = androidx.compose.ui.geometry.Offset.Zero
+        var prevCentroid = androidx.compose.ui.geometry.Offset.Zero
+        var prevDistance = 0f
+        while (true) {
+            val event = awaitPointerEvent()
+            val pressed = event.changes.filter { it.pressed }
+            if (pressed.size < 2) {
+                // The pinch is over: give the list back the gesture.
+                if (pressed.isEmpty() || pastSlop) return@awaitPointerEventScope
+                continue
+            }
+            val sumX = pressed.sumOf { it.position.x.toDouble() }.toFloat()
+            val sumY = pressed.sumOf { it.position.y.toDouble() }.toFloat()
+            val centroid = androidx.compose.ui.geometry.Offset(sumX / pressed.size, sumY / pressed.size)
+            val distance = (pressed[0].position - pressed[1].position).getDistance()
+            val zoomChange = if (prevDistance > 0f) distance / prevDistance else 1f
+            val panChange = centroid - prevCentroid
+            if (!pastSlop) {
+                zoom *= zoomChange
+                pan += panChange
+                val zoomMotion = kotlin.math.abs(1f - zoom) * centroid.getDistance()
+                if (zoomMotion > touchSlop || pan.getDistance() > touchSlop) pastSlop = true
+            }
+            if (pastSlop) {
+                // Take the gesture from the list.
+                event.changes.forEach { if (it.positionChanged()) it.consume() }
+                if (zoomChange != 1f || panChange != androidx.compose.ui.geometry.Offset.Zero) {
+                    onPinch(centroid, panChange, zoomChange)
+                }
+            }
+            prevCentroid = centroid
+            prevDistance = distance
+        }
+    }
+}
+
 @Composable
 fun ContinuousPageView(
     pageIndex: Int,
@@ -4663,6 +5272,8 @@ fun ContinuousPageView(
     savedGeneration: Int = 0,
     isCurrentPage: Boolean = false,
     modifier: Modifier = Modifier,
+    onStylusDetected: () -> Unit = {},
+    onPinch: (androidx.compose.ui.geometry.Offset, androidx.compose.ui.geometry.Offset, Float) -> Unit = { _, _, _ -> },
     onClick: () -> Unit
 ) {
     val isVector = page.pdfSourcePath.isNotEmpty() && page.pdfPageIndex >= 0
@@ -4759,12 +5370,7 @@ fun ContinuousPageView(
         Surface(
             modifier = Modifier.fillMaxSize(),
             color = Color.White,
-            shape = RoundedCornerShape(4.dp),
-            border = if (isCurrentPage) {
-                BorderStroke(1.5.dp, OrangePrimary.copy(alpha = 0.6f))
-            } else {
-                BorderStroke(1.dp, Color(0xFFDCDFE6))
-            }
+            shape = RoundedCornerShape(4.dp)
         ) {}
 
         // Draw paper pattern for non-vector pages (or vector pages with no background)
@@ -4850,7 +5456,29 @@ fun ContinuousPageView(
                 modifier = Modifier.fillMaxSize(),
                 filterQuality = androidx.compose.ui.graphics.FilterQuality.High
             )
-        } else if (!loadCompleted && !sessionReady) {
+        }
+
+        // Page border: drawn after the page so it stays visible on top of an
+        // opaque PDF page (the image would otherwise cover it).
+        androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
+            val stroke = if (isCurrentPage) 1.5.dp.toPx() else 1.dp.toPx()
+            val borderColor = if (isCurrentPage) {
+                OrangePrimary.copy(alpha = 0.6f)
+            } else {
+                Color(0xFFDCDFE6)
+            }
+            drawRect(
+                color = borderColor,
+                style = androidx.compose.ui.graphics.drawscope.Stroke(width = stroke),
+                topLeft = androidx.compose.ui.geometry.Offset(stroke / 2f, stroke / 2f),
+                size = androidx.compose.ui.geometry.Size(
+                    (size.width - stroke).coerceAtLeast(1f),
+                    (size.height - stroke).coerceAtLeast(1f)
+                )
+            )
+        }
+
+        if (shown == null && !loadCompleted && !sessionReady) {
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 androidx.compose.material3.CircularProgressIndicator(
                     modifier = Modifier.size(24.dp),
@@ -4919,14 +5547,38 @@ fun ContinuousPageView(
         Box(
             modifier = Modifier
                 .matchParentSize()
+                .pointerInput(Unit) {
+                    // Two fingers zoom the reader; one finger still scrolls.
+                    detectPagePinch { centroid, pan, zoom -> onPinch(centroid, pan, zoom) }
+                }
                 .pointerInput(page.id, inkSettings) {
                     if (inkSettings.readingMode) return@pointerInput
                     awaitEachGesture {
                         val down = awaitFirstDown(requireUnconsumed = false)
                         val isStylus = down.type == PointerType.Stylus || down.type == PointerType.Eraser
+                        if (isStylus) onStylusDetected()
                         val isAllowedPointer = isStylus || (!inkSettings.stylusOnly && down.type == PointerType.Touch)
-                        if (!isAllowedPointer || !inkSettings.isWritingTool) return@awaitEachGesture
+                        if (!isAllowedPointer) return@awaitEachGesture
                         if (size.width <= 0 || size.height <= 0) return@awaitEachGesture
+
+                        // The laser pointer: a dot follows the pen, nothing is
+                        // written to the page.
+                        if (inkSettings.isLaserPointer) {
+                            val lBoxW = size.width.toFloat()
+                            val lBoxH = size.height.toFloat()
+                            ink.updateLaser(down.position.x / lBoxW, down.position.y / lBoxH)
+                            down.consume()
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                ink.updateLaser(change.position.x / lBoxW, change.position.y / lBoxH)
+                                change.consume()
+                                if (change.changedToUpIgnoreConsumed()) break
+                            }
+                            ink.clearLaser()
+                            return@awaitEachGesture
+                        }
+                        if (!inkSettings.isWritingTool) return@awaitEachGesture
                         
                         down.consume()
                         val boxW = size.width.toFloat()

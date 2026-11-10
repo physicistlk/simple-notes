@@ -10,6 +10,7 @@ import android.graphics.Rect
 import android.graphics.RectF
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import kotlinx.coroutines.CoroutineScope
@@ -50,6 +51,10 @@ data class InkToolSettings(
             CanvasTool.SHAPE_CIRCLE, CanvasTool.SHAPE_LINE -> true
             else -> false
         }
+
+    /** The laser pointer shows a dot instead of writing. */
+    val isLaserPointer: Boolean
+        get() = tool == CanvasTool.LASER_POINTER
 }
 
 /** One sampled point of a stroke, in normalised page coordinates. */
@@ -210,9 +215,21 @@ class ContinuousInkController(
     private val onSaved: (pageIndex: Int) -> Unit,
     private val onUndoRedoChanged: (canUndo: Boolean, canRedo: Boolean) -> Unit
 ) {
-    /** Bumped whenever a layer or the live stroke changes; the page canvas
-     *  reads it so Compose redraws the bitmap/path. */
+    /**
+     * Bumped whenever the committed layer changes (a stroke was committed,
+     * undone or the session swapped). The page composable reads this, so it
+     * must stay rare: reading it per pointer sample would recompose the page
+     * on every movement of the pen.
+     */
     var revision by mutableIntStateOf(0)
+        private set
+
+    /**
+     * Bumped on every sample of the stroke in progress. It is read only in
+     * the draw phase (the live-stroke canvas), never in composition, so the
+     * pen can move without a recomposition per event.
+     */
+    var previewRevision by mutableIntStateOf(0)
         private set
 
     var session: ContinuousInkSession? by mutableStateOf(null)
@@ -241,6 +258,31 @@ class ContinuousInkController(
     var isDrawing by mutableStateOf(false)
         private set
 
+
+    // ---- laser pointer ---------------------------------------------------
+
+    /** True while the laser pointer is on screen. */
+    var laserActive by mutableStateOf(false)
+        private set
+
+    /** The laser trail in page-normalised coordinates. */
+    private val laserTrail = mutableStateListOf<Pair<Float, Float>>()
+
+    /** Moves the laser dot; nothing is written to the page. */
+    fun updateLaser(x: Float, y: Float) {
+        laserTrail.add(x to y)
+        while (laserTrail.size > 40) laserTrail.removeAt(0)
+        laserActive = true
+        revision++
+    }
+
+    /** Hides the laser dot. */
+    fun clearLaser() {
+        if (laserTrail.isEmpty() && !laserActive) return
+        laserTrail.clear()
+        laserActive = false
+        revision++
+    }
 
     // ---- touch ----------------------------------------------------------
 
@@ -284,7 +326,7 @@ class ContinuousInkController(
     fun extendStroke(x: Float, y: Float, pressure: Float, settings: InkToolSettings) {
         val stroke = session?.live ?: return
         addPoint(stroke, x, y, pressure, settings)
-        revision++
+        previewRevision++
     }
 
     /** Lifts the pen: the stroke joins the page's ink layer and is saved. */
@@ -1011,10 +1053,40 @@ class ContinuousInkController(
      * reader draws it from a Compose Canvas, above the page bitmap.
      */
     fun drawPreview(canvas: Canvas, pageIndex: Int, viewWidth: Float, viewHeight: Float) {
+        drawLaser(canvas, viewWidth, viewHeight)
         val s = session ?: return
         if (s.pageIndex != pageIndex) return
         val stroke = s.live ?: return
         drawStroke(canvas, stroke, viewWidth, viewHeight, preview = true)
+    }
+
+    /** The red laser dot with its short tail. */
+    private fun drawLaser(canvas: Canvas, viewWidth: Float, viewHeight: Float) {
+        if (!laserActive || laserTrail.isEmpty()) return
+        val glow = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeCap = Paint.Cap.ROUND
+            color = 0xFFFF3B30.toInt()
+            alpha = 120
+            strokeWidth = 6f * (viewWidth / 1600f).coerceAtLeast(0.6f)
+        }
+        val dot = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+            color = 0xFFFF3B30.toInt()
+        }
+        for (i in 1 until laserTrail.size) {
+            val a = laserTrail[i - 1]
+            val b = laserTrail[i]
+            glow.alpha = (120f * (i.toFloat() / laserTrail.size)).toInt().coerceIn(20, 120)
+            canvas.drawLine(
+                a.first * viewWidth, a.second * viewHeight,
+                b.first * viewWidth, b.second * viewHeight,
+                glow
+            )
+        }
+        val head = laserTrail.last()
+        val radius = 7f * (viewWidth / 1600f).coerceAtLeast(0.6f)
+        canvas.drawCircle(head.first * viewWidth, head.second * viewHeight, radius, dot)
     }
 
     private fun drawStroke(

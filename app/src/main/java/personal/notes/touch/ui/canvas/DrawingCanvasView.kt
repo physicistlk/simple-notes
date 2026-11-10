@@ -24,6 +24,10 @@ import personal.notes.touch.util.PdfTextSelectionMath
 import java.util.ArrayDeque
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import kotlin.math.ceil
+import kotlin.math.floor
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 
 enum class CanvasTool {
@@ -34,7 +38,9 @@ enum class CanvasTool {
     SHAPE_RECT,
     SHAPE_CIRCLE,
     SHAPE_LINE,
-    LASSO
+    LASSO,
+    /** Shows a red dot with a short tail where the pen is; writes nothing. */
+    LASER_POINTER
 }
 
 enum class PaperPattern {
@@ -52,6 +58,18 @@ enum class PaperPattern {
     }
 }
 
+/**
+ * A transparent crop of page ink.
+ *
+ * The page's own ink bitmap only covers the paper, so two kinds of marks
+ * cannot live in it: the ink written on a layer (the eye button has to hide
+ * it together with the layer) and the ink written outside the paper. Both are
+ * kept as small crops with their position in page coordinates — a crop is
+ * what the layer panel hides and what "merge to base" flattens back into the
+ * page ink.
+ */
+class InkCrop(val bitmap: Bitmap, val x: Float, val y: Float)
+
 data class ImageLayer(
     val bitmap: Bitmap,
     var x: Float,
@@ -61,7 +79,9 @@ data class ImageLayer(
     var opacity: Float = 1f,
     var cropRect: Rect? = null,
     var visible: Boolean = true,
-    var name: String = "Layer"
+    var name: String = "Layer",
+    /** Ink written while this layer was the current one. */
+    val ink: MutableList<InkCrop> = mutableListOf()
 )
 
 data class LayerStateSnapshot(
@@ -73,12 +93,16 @@ data class LayerStateSnapshot(
     val opacity: Float = 1f,
     val cropRect: Rect? = null,
     val visible: Boolean = true,
-    val name: String = "Layer"
+    val name: String = "Layer",
+    /** Ink written on the layer while it was the current one. */
+    val ink: List<InkCrop> = emptyList()
 )
 
 data class UndoSnapshot(
     val bitmap: Bitmap,
-    val layers: List<LayerStateSnapshot>
+    val layers: List<LayerStateSnapshot>,
+    /** Ink written outside the paper (page-level crops). */
+    val beyondInk: List<InkCrop> = emptyList()
 )
 
 class DrawingCanvasView @JvmOverloads constructor(
@@ -444,6 +468,17 @@ class DrawingCanvasView @JvmOverloads constructor(
     val imageLayers: MutableList<ImageLayer> = mutableListOf()
 
     /**
+     * Ink written outside the paper. The page's ink bitmap covers the paper
+     * only, so marks beyond its edge are kept as transparent crops that are
+     * painted over the canvas surround — that is what gives an imported PDF
+     * room to write in the margins.
+     */
+    private val beyondPageInk = mutableListOf<InkCrop>()
+
+    /** Index of the page this view shows; the beyond-paper ink is stored per page. */
+    var pageIndex: Int = 0
+
+    /**
      * True when a layer's geometry or content changed since the last
      * [saveImageLayers]. Layer edits are not part of the backing bitmap, so
      * this is what tells the screen a layer write is still owed when it is
@@ -478,12 +513,32 @@ class DrawingCanvasView @JvmOverloads constructor(
 
     // Stylus Mode & Pressure Sensitivity
     var stylusOnly: Boolean = false
+
+    /** Called the first time a stylus is used on this canvas. */
+    var onStylusDetected: (() -> Unit)? = null
     var readingMode: Boolean = false
     var pressureSensitivity: Float = 1.0f
     var pressureSizeEnabled: Boolean = true
     var autoShapeEnabled: Boolean = false
 
     private val sampledPoints = mutableListOf<Pair<Float, Float>>()
+
+    /** One sample of the laser pointer trail (page coordinates). */
+    private data class LaserPoint(val x: Float, val y: Float, val time: Long)
+
+    /** The laser pointer trail; it fades out on its own. */
+    private val laserTrail = mutableListOf<LaserPoint>()
+
+    private val laserDotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = LASER_COLOR
+    }
+
+    private val laserGlowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = LASER_COLOR
+        alpha = 60
+    }
 
     data class StrokePoint(val x: Float, val y: Float, val width: Float)
     private val currentStrokePoints = mutableListOf<StrokePoint>()
@@ -543,6 +598,10 @@ class DrawingCanvasView @JvmOverloads constructor(
     var onZoomOutToContinuous: (() -> Unit)? = null
     private val lassoPath = Path()
     private val lassoBounds = RectF()
+    /** Pre-allocated so the draw pass does not allocate on every frame. */
+    private val lassoDoneRect = RectF()
+    private val lassoDeleteRect = RectF()
+    private val layerBboxPath = Path()
     private var selectedBitmap: Bitmap? = null
     private var dragStartX = 0f
     private var dragStartY = 0f
@@ -794,6 +853,13 @@ class DrawingCanvasView @JvmOverloads constructor(
                 strokePaint.strokeWidth = 3f
                 strokePaint.strokeCap = Paint.Cap.ROUND
                 strokePaint.alpha = 200
+            }
+            CanvasTool.LASER_POINTER -> {
+                strokePaint.xfermode = null
+                strokePaint.color = LASER_COLOR
+                strokePaint.strokeWidth = 6f
+                strokePaint.strokeCap = Paint.Cap.ROUND
+                strokePaint.alpha = 255
             }
         }
     }
@@ -1152,6 +1218,25 @@ class DrawingCanvasView @JvmOverloads constructor(
                 val bitmapFile = java.io.File(layersDir, fileName)
                 val bitmap = android.graphics.BitmapFactory.decodeFile(bitmapFile.absolutePath)?.copy(android.graphics.Bitmap.Config.ARGB_8888, true)
                 if (bitmap != null) {
+                    val ink = mutableListOf<InkCrop>()
+                    val inkArr = obj.optJSONArray("ink")
+                    if (inkArr != null) {
+                        for (k in 0 until inkArr.length()) {
+                            val inkObj = inkArr.optJSONObject(k) ?: continue
+                            val inkFile = inkObj.optString("file", "")
+                            if (inkFile.isEmpty()) continue
+                            val inkBitmap = android.graphics.BitmapFactory
+                                .decodeFile(java.io.File(layersDir, inkFile).absolutePath)
+                                ?.copy(android.graphics.Bitmap.Config.ARGB_8888, true) ?: continue
+                            ink.add(
+                                InkCrop(
+                                    inkBitmap,
+                                    inkObj.optDouble("x", 0.0).toFloat(),
+                                    inkObj.optDouble("y", 0.0).toFloat()
+                                )
+                            )
+                        }
+                    }
                     layers.add(ImageLayer(
                         bitmap = bitmap,
                         x = obj.optDouble("x", 0.0).toFloat(),
@@ -1161,7 +1246,8 @@ class DrawingCanvasView @JvmOverloads constructor(
                         opacity = obj.optDouble("opacity", 1.0).toFloat(),
                         visible = obj.optBoolean("visible", true),
                         cropRect = null,
-                        name = obj.optString("name", "Layer ${i + 1}")
+                        name = obj.optString("name", "Layer ${i + 1}"),
+                        ink = ink
                     ))
                 }
             }
@@ -1194,8 +1280,85 @@ class DrawingCanvasView @JvmOverloads constructor(
         val rotation: Float,
         val opacity: Float,
         val visible: Boolean,
-        val name: String
+        val name: String,
+        /** Ink written on the layer while it was the current one. */
+        val ink: List<InkCrop> = emptyList()
     )
+
+    /**
+     * Writes the ink that sits outside the paper of this page: one
+     * transparent PNG per crop plus a small manifest that keeps their
+     * positions. Stale crops of the same page are removed.
+     */
+    private fun writeBeyondPageInk(
+        layersDir: java.io.File,
+        fileStore: personal.notes.touch.data.files.NoteFileStore,
+        noteId: String
+    ) {
+        try {
+            val prefix = "beyond_${pageIndex}_"
+            val manifest = fileStore.getBeyondInkFile(noteId, pageIndex)
+            val arr = org.json.JSONArray()
+            val written = mutableSetOf<String>()
+            beyondPageInk.forEachIndexed { index, crop ->
+                if (crop.bitmap.isRecycled) return@forEachIndexed
+                val name = "${prefix}${index}.png"
+                written.add(name)
+                java.io.FileOutputStream(java.io.File(layersDir, name)).use { fos ->
+                    crop.bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, fos)
+                }
+                val obj = org.json.JSONObject()
+                obj.put("file", name)
+                obj.put("x", crop.x.toDouble())
+                obj.put("y", crop.y.toDouble())
+                arr.put(obj)
+            }
+            manifest?.writeText(arr.toString())
+            layersDir.listFiles()?.forEach { file ->
+                if (file.name.startsWith(prefix) && file.name.endsWith(".png") && !written.contains(file.name)) {
+                    file.delete()
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    /** Loads the ink written outside the paper of [pageIndex]. */
+    fun readBeyondPageInk(
+        fileStore: personal.notes.touch.data.files.NoteFileStore,
+        noteId: String,
+        pageIndex: Int
+    ): List<InkCrop> {
+        val manifest = fileStore.getBeyondInkFile(noteId, pageIndex)
+        if (!manifest.exists()) return emptyList()
+        val crops = mutableListOf<InkCrop>()
+        try {
+            val arr = org.json.JSONArray(manifest.readText())
+            val layersDir = fileStore.getLayersDir(noteId)
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                val name = obj.optString("file", "")
+                if (name.isEmpty()) continue
+                val bmp = android.graphics.BitmapFactory
+                    .decodeFile(java.io.File(layersDir, name).absolutePath)
+                    ?.copy(android.graphics.Bitmap.Config.ARGB_8888, true) ?: continue
+                crops.add(
+                    InkCrop(bmp, obj.optDouble("x", 0.0).toFloat(), obj.optDouble("y", 0.0).toFloat())
+                )
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        return crops
+    }
+
+    /** Replaces the ink outside the paper with the given crops. */
+    fun applyBeyondPageInk(crops: List<InkCrop>) {
+        beyondPageInk.clear()
+        beyondPageInk.addAll(crops)
+        invalidate()
+    }
 
     /**
      * Disk part of the layer save (PNG compression + JSON write). Contains
@@ -1217,7 +1380,8 @@ class DrawingCanvasView @JvmOverloads constructor(
                     rotation = layer.rotation,
                     opacity = layer.opacity,
                     visible = layer.visible,
-                    name = layer.name
+                    name = layer.name,
+                    ink = layer.ink.toList()
                 )
             }
             val arr = org.json.JSONArray()
@@ -1238,6 +1402,22 @@ class DrawingCanvasView @JvmOverloads constructor(
                 obj.put("opacity", layer.opacity.toDouble())
                 obj.put("visible", layer.visible)
                 obj.put("name", layer.name)
+                // Ink written on this layer: one transparent PNG per crop.
+                val inkArr = org.json.JSONArray()
+                layer.ink.forEachIndexed { inkIdx, crop ->
+                    if (crop.bitmap.isRecycled) return@forEachIndexed
+                    val inkName = "layer_${index}_ink_${inkIdx}.png"
+                    writtenFiles.add(inkName)
+                    java.io.FileOutputStream(java.io.File(layersDir, inkName)).use { fos ->
+                        crop.bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, fos)
+                    }
+                    val inkObj = org.json.JSONObject()
+                    inkObj.put("file", inkName)
+                    inkObj.put("x", crop.x.toDouble())
+                    inkObj.put("y", crop.y.toDouble())
+                    inkArr.put(inkObj)
+                }
+                obj.put("ink", inkArr)
                 arr.put(obj)
             }
             infoFile.writeText(arr.toString())
@@ -1246,6 +1426,7 @@ class DrawingCanvasView @JvmOverloads constructor(
                     file.delete()
                 }
             }
+            writeBeyondPageInk(layersDir, fileStore, noteId)
             layersDirty = false
         } catch (e: Exception) {
             e.printStackTrace()
@@ -1295,6 +1476,9 @@ class DrawingCanvasView @JvmOverloads constructor(
 
     fun mergeAllLayersToBase() {
         val c = bitmapCanvas ?: return
+        // Merging flattens the layers into the page: it has to be undoable.
+        saveUndoState()
+        val paper = paperRect()
         for (layer in imageLayers) {
             if (!layer.visible) continue
             if (layer.bitmap.isRecycled) continue
@@ -1309,6 +1493,21 @@ class DrawingCanvasView @JvmOverloads constructor(
             c.scale(layer.scale, layer.scale)
             c.drawBitmap(layer.bitmap, -w / 2f, -h / 2f, layerPaint)
             c.restore()
+            // Flatten the ink written on the layer: marks that sit on the
+            // paper become part of the page ink, marks beyond the paper stay
+            // page-level crops so they survive the merge.
+            for (crop in layer.ink) {
+                if (crop.bitmap.isRecycled) continue
+                val cropRect = Rect(
+                    crop.x.toInt(), crop.y.toInt(),
+                    (crop.x + crop.bitmap.width).toInt(), (crop.y + crop.bitmap.height).toInt()
+                )
+                if (paper.contains(cropRect)) {
+                    c.drawBitmap(crop.bitmap, crop.x, crop.y, layerPaint)
+                } else {
+                    beyondPageInk.add(crop)
+                }
+            }
         }
         imageLayers.clear()
         layersDirty = true
@@ -1344,6 +1543,8 @@ class DrawingCanvasView @JvmOverloads constructor(
     }
 
     fun cropSelectedImageLayer() {
+        // Cropping changes the layer: keep it undoable.
+        saveUndoState()
         val idx = selectedImageIndex
         if (idx !in imageLayers.indices) return
         val layer = imageLayers[idx]
@@ -1478,7 +1679,29 @@ class DrawingCanvasView @JvmOverloads constructor(
             canvas.rotate(layer.rotation)
             canvas.scale(layer.scale, layer.scale)
             canvas.drawBitmap(layer.bitmap, -w / 2f, -h / 2f, layerPaint)
+            // Ink written on this layer follows the layer's own transform, so
+            // moving or rotating the layer carries its marks along.
+            for (crop in layer.ink) {
+                if (crop.bitmap.isRecycled) continue
+                val iw = crop.bitmap.width
+                val ih = crop.bitmap.height
+                val dx = (crop.x + iw / 2f) - cx
+                val dy = (crop.y + ih / 2f) - cy
+                val rad = Math.toRadians((-layer.rotation).toDouble())
+                val cos = Math.cos(rad).toFloat()
+                val sin = Math.sin(rad).toFloat()
+                val lx = (dx * cos - dy * sin) / layer.scale - iw / 2f
+                val ly = (dx * sin + dy * cos) / layer.scale - ih / 2f
+                canvas.drawBitmap(crop.bitmap, lx, ly, layerPaint)
+            }
             canvas.restore()
+        }
+
+        // 3c. Ink written outside the paper: page-level crops painted over the
+        // canvas surround, so a PDF page can be annotated in its margins.
+        for (crop in beyondPageInk) {
+            if (crop.bitmap.isRecycled) continue
+            canvas.drawBitmap(crop.bitmap, crop.x, crop.y, bitmapPaint)
         }
 
         // 4. Draw current in-progress stroke or shape preview
@@ -1528,8 +1751,12 @@ class DrawingCanvasView @JvmOverloads constructor(
             if (lassoState == LassoState.SELECTED) {
                 val pillTop = if (lassoBounds.top < 70f) lassoBounds.bottom + 15f else lassoBounds.top - 65f
                 val pillBottom = if (lassoBounds.top < 70f) lassoBounds.bottom + 65f else lassoBounds.top - 15f
-                val doneRect = RectF(lassoBounds.centerX() - 120f, pillTop, lassoBounds.centerX() - 10f, pillBottom)
-                val deleteRect = RectF(lassoBounds.centerX() + 10f, pillTop, lassoBounds.centerX() + 120f, pillBottom)
+                val doneRect = lassoDoneRect.apply {
+                    set(lassoBounds.centerX() - 120f, pillTop, lassoBounds.centerX() - 10f, pillBottom)
+                }
+                val deleteRect = lassoDeleteRect.apply {
+                    set(lassoBounds.centerX() + 10f, pillTop, lassoBounds.centerX() + 120f, pillBottom)
+                }
 
                 canvas.drawRoundRect(doneRect, 16f, 16f, lassoDonePillPaint)
                 canvas.drawText("✓ Done", doneRect.centerX(), doneRect.centerY() + 10f, lassoPillTextPaint)
@@ -1590,7 +1817,8 @@ class DrawingCanvasView @JvmOverloads constructor(
                 val vRotX = pts[10]; val vRotY = pts[11]
 
                 // Bounding box border
-                val bboxPath = Path().apply {
+                val bboxPath = layerBboxPath.apply {
+                    reset()
                     moveTo(vTLx, vTLy)
                     lineTo(vTRx, vTRy)
                     lineTo(vBRx, vBRy)
@@ -1948,6 +2176,20 @@ class DrawingCanvasView @JvmOverloads constructor(
 
         // Multi-touch gestures (2-finger pinch zoom and pan):
         // Always allowed in drawing mode, stylus-only mode, and reading mode!
+        // Stylus mode: the pen writes, the hand only presses buttons. A
+        // finger must therefore not draw, pinch or pan the canvas.
+        val pointerToolType = event.getToolType(0)
+        if (stylusOnly && pointerToolType != MotionEvent.TOOL_TYPE_STYLUS &&
+            pointerToolType != MotionEvent.TOOL_TYPE_ERASER
+        ) {
+            return false
+        }
+        if (pointerToolType == MotionEvent.TOOL_TYPE_STYLUS ||
+            pointerToolType == MotionEvent.TOOL_TYPE_ERASER
+        ) {
+            onStylusDetected?.invoke()
+        }
+
         if (event.pointerCount >= 2) {
             if (event.actionMasked == MotionEvent.ACTION_POINTER_DOWN) {
                 // Pinch-zoom / two-finger pan: cancel any drawing
@@ -2092,6 +2334,12 @@ class DrawingCanvasView @JvmOverloads constructor(
                 }
             }
             return super.onTouchEvent(event)
+        }
+
+        // Laser pointer: the pen shows a dot instead of writing.
+        if (currentTool == CanvasTool.LASER_POINTER) {
+            handleLaserTouch(event)
+            return true
         }
 
         // Lasso selection & transform tool
@@ -2308,7 +2556,8 @@ class DrawingCanvasView @JvmOverloads constructor(
                     invalidate()
                     return true
                 }
-                if (currentTool == CanvasTool.FOUNTAIN_PEN && currentStrokePoints.isNotEmpty()) {
+                val fountain = currentTool == CanvasTool.FOUNTAIN_PEN && currentStrokePoints.isNotEmpty()
+                if (fountain) {
                     val last = currentStrokePoints.last()
                     val distSq = (x - last.x) * (x - last.x) + (y - last.y) * (y - last.y)
                     if (distSq > 1f) {
@@ -2316,8 +2565,22 @@ class DrawingCanvasView @JvmOverloads constructor(
                         currentStrokePoints.add(StrokePoint(x, y, finalWidth))
                         sampledPoints.add(x to y)
                     }
-                    val c = bitmapCanvas
-                    if (c != null) {
+                } else {
+                    currentPath.lineTo(x, y)
+                    sampledPoints.add(x to y)
+                }
+
+                // Where the marks of this stroke belong:
+                //  - on a layer  -> they must hide with that layer, so they are
+                //    rasterised into their own transparent crop;
+                //  - off the paper -> the page ink bitmap does not reach there,
+                //    so they become a page-level crop as well;
+                //  - otherwise   -> straight into the page ink, as before.
+                val marks = strokeInkBounds()
+                val onLayer = currentLayerOwnsInk()
+                val offPaper = marks != null && !paperRect().contains(marks)
+                val drawStroke: (android.graphics.Canvas) -> Unit = { c ->
+                    if (fountain) {
                         if (autoShapeEnabled) {
                             val shape = autoShape(sampledPoints)
                             if (shape != null) {
@@ -2329,39 +2592,159 @@ class DrawingCanvasView @JvmOverloads constructor(
                         } else {
                             drawFountainPenStroke(c, currentStrokePoints, strokePaint)
                         }
-                    }
-                    currentStrokePoints.clear()
-                    currentPath.reset()
-                    sampledPoints.clear()
-                    lastSmoothedWidth = -1f
-                    invalidate()
-                    onStrokeFinishedListener?.invoke()
-                    return true
-                }
-                currentPath.lineTo(x, y)
-                sampledPoints.add(x to y)
-                // Commit current path to backing bitmap
-                val c = bitmapCanvas
-                if (c != null) {
-                    if (autoShapeEnabled) {
-                        val shape = autoShape(sampledPoints)
-                        if (shape != null) {
-                            c.drawPath(shape, strokePaint)
+                    } else {
+                        if (autoShapeEnabled) {
+                            val shape = autoShape(sampledPoints)
+                            if (shape != null) {
+                                c.drawPath(shape, strokePaint)
+                            } else {
+                                c.drawPath(currentPath, strokePaint)
+                            }
                         } else {
                             c.drawPath(currentPath, strokePaint)
                         }
-                    } else {
-                        c.drawPath(currentPath, strokePaint)
                     }
                 }
+                if ((onLayer || offPaper) && marks != null) {
+                    val crop = newInkCropCanvas(marks)
+                    if (crop != null) {
+                        val (bmp, c) = crop
+                        c.save()
+                        c.translate(-marks.left.toFloat(), -marks.top.toFloat())
+                        drawStroke(c)
+                        c.restore()
+                        val ink = InkCrop(bmp, marks.left.toFloat(), marks.top.toFloat())
+                        if (onLayer) {
+                            imageLayers[selectedImageIndex].ink.add(ink)
+                            layersDirty = true
+                        } else {
+                            beyondPageInk.add(ink)
+                        }
+                    } else {
+                        // No room for a crop: fall back to the page ink.
+                        bitmapCanvas?.let { drawStroke(it) }
+                    }
+                } else {
+                    bitmapCanvas?.let { drawStroke(it) }
+                }
+                currentStrokePoints.clear()
                 currentPath.reset()
                 sampledPoints.clear()
+                lastSmoothedWidth = -1f
                 invalidate()
                 onStrokeFinishedListener?.invoke()
                 return true
             }
         }
         return super.onTouchEvent(event)
+    }
+
+    /** The paper rectangle in page coordinates (the ink bitmap covers exactly it). */
+    private fun paperRect(): Rect {
+        val bmp = backingBitmap
+        val w = bmp?.width?.takeIf { it > 0 } ?: 2160
+        val h = bmp?.height?.takeIf { it > 0 } ?: 3056
+        return Rect(0, 0, w, h)
+    }
+
+    /**
+     * Bounding box of the stroke in progress, in page coordinates, padded by
+     * the nib so round caps and the wide highlighter stay inside the box.
+     */
+    private fun strokeInkBounds(): Rect? {
+        val fountain = currentTool == CanvasTool.FOUNTAIN_PEN && currentStrokePoints.isNotEmpty()
+        val pts: List<Pair<Float, Float>> =
+            if (fountain) currentStrokePoints.map { it.x to it.y } else sampledPoints
+        if (pts.isEmpty()) return null
+        var minX = Float.MAX_VALUE
+        var minY = Float.MAX_VALUE
+        var maxX = -Float.MAX_VALUE
+        var maxY = -Float.MAX_VALUE
+        var widest = strokeWidthPx
+        for ((px, py) in pts) {
+            minX = min(minX, px); maxX = max(maxX, px)
+            minY = min(minY, py); maxY = max(maxY, py)
+        }
+        if (fountain) for (p in currentStrokePoints) widest = max(widest, p.width)
+        val pad = when (currentTool) {
+            CanvasTool.HIGHLIGHTER -> widest * 1.7f + 6f
+            CanvasTool.ERASER -> eraserWidthPx / 2f + 6f
+            else -> widest / 2f + 6f
+        }
+        val left = floor(minX - pad).toInt()
+        val top = floor(minY - pad).toInt()
+        val right = ceil(maxX + pad).toInt()
+        val bottom = ceil(maxY + pad).toInt()
+        return Rect(left, top, max(right, left + 1), max(bottom, top + 1))
+    }
+
+    /** A transparent bitmap holding just the given rectangle of the page. */
+    private fun newInkCropCanvas(rect: Rect): Pair<android.graphics.Bitmap, android.graphics.Canvas>? {
+        val w = rect.width()
+        val h = rect.height()
+        if (w <= 0 || h <= 0 || w > 4096 || h > 4096) return null
+        val bmp = try {
+            android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
+        } catch (e: OutOfMemoryError) {
+            e.printStackTrace()
+            return null
+        }
+        return bmp to android.graphics.Canvas(bmp)
+    }
+
+    /** True when the layer panel's current layer owns the ink of a new stroke. */
+    private fun currentLayerOwnsInk(): Boolean =
+        selectedImageIndex in imageLayers.indices && currentTool != CanvasTool.ERASER
+
+    /**
+     * Moves the laser pointer: a red dot with a short fading tail. Nothing is
+     * written to the page.
+     */
+    private fun handleLaserTouch(event: MotionEvent) {
+        val pts = floatArrayOf(event.x, event.y)
+        pageInverseMatrix.mapPoints(pts)
+        val now = System.currentTimeMillis()
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                laserTrail.clear()
+                laserTrail.add(LaserPoint(pts[0], pts[1], now))
+                onCanvasTouchStart?.invoke()
+            }
+            MotionEvent.ACTION_MOVE -> {
+                laserTrail.add(LaserPoint(pts[0], pts[1], now))
+                // Keep the tail short.
+                while (laserTrail.size > 48) laserTrail.removeAt(0)
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                // The dot stays for a moment and fades out on its own.
+            }
+        }
+        invalidate()
+    }
+
+    /** Draws the laser dot and its tail (page coordinates). */
+    private fun drawLaserPointer(canvas: Canvas) {
+        if (laserTrail.isEmpty()) return
+        val now = System.currentTimeMillis()
+        val points = laserTrail.filter { now - it.time < LASER_TRAIL_MS }
+        if (points.isEmpty()) {
+            laserTrail.clear()
+            return
+        }
+        for (i in 1 until points.size) {
+            val a = points[i - 1]
+            val b = points[i]
+            val age = (now - b.time).toFloat().coerceAtMost(LASER_TRAIL_MS.toFloat())
+            laserGlowPaint.alpha = (90f * (1f - age / LASER_TRAIL_MS)).toInt().coerceIn(0, 255)
+            canvas.drawLine(a.x, a.y, b.x, b.y, laserGlowPaint)
+        }
+        val head = points.last()
+        laserGlowPaint.alpha = 70
+        canvas.drawCircle(head.x, head.y, LASER_DOT_RADIUS * 2.4f, laserGlowPaint)
+        laserDotPaint.alpha = 255
+        canvas.drawCircle(head.x, head.y, LASER_DOT_RADIUS, laserDotPaint)
+        // Keep the fade running.
+        postInvalidateOnAnimation()
     }
 
     private fun autoShape(points: List<Pair<Float, Float>>): Path? {
@@ -2416,9 +2799,15 @@ class DrawingCanvasView @JvmOverloads constructor(
                 if (!oldest.bitmap.isRecycled) oldest.bitmap.recycle()
             }
             val layerSnapshots = imageLayers.map {
-                LayerStateSnapshot(it.bitmap, it.x, it.y, it.scale, it.rotation, it.opacity, it.cropRect, it.visible, it.name)
+                LayerStateSnapshot(it.bitmap, it.x, it.y, it.scale, it.rotation, it.opacity, it.cropRect, it.visible, it.name, it.ink.toList())
             }
-            undoStack.addLast(UndoSnapshot(bmp.copy(Bitmap.Config.ARGB_8888, true), layerSnapshots))
+            undoStack.addLast(
+                UndoSnapshot(
+                    bmp.copy(Bitmap.Config.ARGB_8888, true),
+                    layerSnapshots,
+                    beyondPageInk.toList()
+                )
+            )
             clearRedoStack()
             notifyUndoRedo()
         }
@@ -2433,17 +2822,21 @@ class DrawingCanvasView @JvmOverloads constructor(
                     if (!oldest.bitmap.isRecycled) oldest.bitmap.recycle()
                 }
                 val currentLayers = imageLayers.map {
-                    LayerStateSnapshot(it.bitmap, it.x, it.y, it.scale, it.rotation, it.opacity, it.cropRect, it.visible, it.name)
+                    LayerStateSnapshot(it.bitmap, it.x, it.y, it.scale, it.rotation, it.opacity, it.cropRect, it.visible, it.name, it.ink.toList())
                 }
-                redoStack.addLast(UndoSnapshot(current.copy(Bitmap.Config.ARGB_8888, true), currentLayers))
+                redoStack.addLast(
+                    UndoSnapshot(current.copy(Bitmap.Config.ARGB_8888, true), currentLayers, beyondPageInk.toList())
+                )
             }
             val previous = undoStack.removeLast()
             backingBitmap = previous.bitmap
             bitmapCanvas = if (previous.bitmap != null && !previous.bitmap.isRecycled) Canvas(previous.bitmap) else null
             imageLayers.clear()
             imageLayers.addAll(previous.layers.map {
-                ImageLayer(it.bitmap, it.x, it.y, it.scale, it.rotation, it.opacity, it.cropRect, it.visible, it.name)
+                ImageLayer(it.bitmap, it.x, it.y, it.scale, it.rotation, it.opacity, it.cropRect, it.visible, it.name, it.ink.toMutableList())
             })
+            beyondPageInk.clear()
+            beyondPageInk.addAll(previous.beyondInk)
             selectedImageIndex = -1
             layersDirty = true
             notifyUndoRedo()
@@ -2461,17 +2854,21 @@ class DrawingCanvasView @JvmOverloads constructor(
                     if (!oldest.bitmap.isRecycled) oldest.bitmap.recycle()
                 }
                 val currentLayers = imageLayers.map {
-                    LayerStateSnapshot(it.bitmap, it.x, it.y, it.scale, it.rotation, it.opacity, it.cropRect, it.visible, it.name)
+                    LayerStateSnapshot(it.bitmap, it.x, it.y, it.scale, it.rotation, it.opacity, it.cropRect, it.visible, it.name, it.ink.toList())
                 }
-                undoStack.addLast(UndoSnapshot(current.copy(Bitmap.Config.ARGB_8888, true), currentLayers))
+                undoStack.addLast(
+                    UndoSnapshot(current.copy(Bitmap.Config.ARGB_8888, true), currentLayers, beyondPageInk.toList())
+                )
             }
             val next = redoStack.removeLast()
             backingBitmap = next.bitmap
             bitmapCanvas = if (next.bitmap != null && !next.bitmap.isRecycled) Canvas(next.bitmap) else null
             imageLayers.clear()
             imageLayers.addAll(next.layers.map {
-                ImageLayer(it.bitmap, it.x, it.y, it.scale, it.rotation, it.opacity, it.cropRect, it.visible, it.name)
+                ImageLayer(it.bitmap, it.x, it.y, it.scale, it.rotation, it.opacity, it.cropRect, it.visible, it.name, it.ink.toMutableList())
             })
+            beyondPageInk.clear()
+            beyondPageInk.addAll(next.beyondInk)
             selectedImageIndex = -1
             layersDirty = true
             notifyUndoRedo()
@@ -2753,6 +3150,15 @@ class DrawingCanvasView @JvmOverloads constructor(
     }
 
     companion object {
+        /** Red dot of the laser pointer. */
+        private const val LASER_COLOR = 0xFFFF3B30.toInt()
+
+        /** How long the laser tail stays visible, in milliseconds. */
+        private const val LASER_TRAIL_MS = 700L
+
+        /** Radius of the laser dot, in canvas units. */
+        private const val LASER_DOT_RADIUS = 7f
+
         /** Quiet period after a zoom change before the vector re-render fires. */
         private const val PDF_RENDER_DEBOUNCE_MS = 180L
 

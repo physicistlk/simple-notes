@@ -583,7 +583,11 @@ class NoteRepository(
             noteId = noteId,
             index = targetIndex,
             bitmapPath = pageFile.absolutePath,
-            paperPattern = 0,
+            // The new sheet looks like its neighbours: it inherits the paper
+            // pattern of the page it is inserted in front of.
+            paperPattern = existing.getOrNull(targetIndex)?.paperPattern
+                ?: existing.lastOrNull()?.paperPattern
+                ?: 0,
             pdfSourcePath = "",
             pdfPageIndex = -1,
             updatedAt = System.currentTimeMillis()
