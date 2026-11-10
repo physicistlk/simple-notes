@@ -214,3 +214,8 @@
   - Color swatches: added `0.8.dp` subtle borders and contrast-aware checkmarks.
   - Applied consistently across Vertical Dock, Horizontal Dock, Collapsed Mini Pill, and PDF Text Selection overlay.
 - Live Device Verification: Installed on connected Xiaomi Pad 5 tablet (`230b89f8`); captured screenshots in vertical, horizontal, and collapsed states confirming flawless visual presentation.
+
+## Decisions appended 67        67. 2026-11-10 (auditor): Pen tool dock collapse chevron & restore pill removal:
+- Removed unnecessary collapse chevron (`KeyboardArrowUp` / `KeyboardArrowLeft`) and floating collapsed mini restore pill from the floating pen dock.
+- Simplified dock presentation to keep tools and drag handle directly accessible without accidental collapsing.
+- Verified with 299 passing unit tests and clean `assembleDebug` APK build.

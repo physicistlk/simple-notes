@@ -91,8 +91,6 @@ import androidx.compose.material.icons.filled.Timeline
 import androidx.compose.material.icons.filled.ViewSidebar
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
-import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.AccountTree
 import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.EmojiEmotions
@@ -358,7 +356,6 @@ fun CanvasScreen(
     val liveTextFocusRequester = remember { FocusRequester() }
     var showGoToPageDialog by remember { mutableStateOf(false) }
     var pageToDeleteIndex by remember { mutableStateOf<Int?>(null) }
-    var isPencaseCollapsed by remember { mutableStateOf(false) }
     /** Which sticker the Tools menu drops next. */
     var stickerIndex by remember { mutableIntStateOf(0) }
     var pencaseOffsetX by remember { mutableFloatStateOf(0f) }
@@ -2827,45 +2824,7 @@ fun CanvasScreen(
                 }
 
                 if (uiState.showPencase && !uiState.readingMode) {
-                    if (isPencaseCollapsed) {
-                        // Collapsed mini restore pill with luminous liquid glass styling
-                        Surface(
-                            shape = RoundedCornerShape(20.dp),
-                            color = Color.Transparent,
-                            modifier = Modifier
-                                .align(if (uiState.dockHorizontal) Alignment.TopCenter else Alignment.CenterStart)
-                                .offset { IntOffset(pencaseOffsetX.roundToInt(), pencaseOffsetY.roundToInt()) }
-                                .padding(top = if (uiState.dockHorizontal) 10.dp else 0.dp, start = if (!uiState.dockHorizontal) 12.dp else 0.dp)
-                                .shadow(
-                                    elevation = 12.dp,
-                                    shape = RoundedCornerShape(20.dp),
-                                    ambientColor = Color(0x14000000),
-                                    spotColor = Color(0x28000000)
-                                )
-                                .background(GlassBodyBrush, RoundedCornerShape(20.dp))
-                                .border(1.2.dp, GlassEdgeBrush, RoundedCornerShape(20.dp))
-                                .clickable { isPencaseCollapsed = false }
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(6.dp)
-                            ) {
-                                Icon(
-                                    painter = painterResource(id = R.drawable.ic_tool_fineliner),
-                                    contentDescription = "Expand Pens",
-                                    tint = OrangePrimary,
-                                    modifier = Modifier.size(17.dp)
-                                )
-                                Icon(
-                                    imageVector = if (uiState.dockHorizontal) Icons.Default.KeyboardArrowDown else Icons.AutoMirrored.Filled.KeyboardArrowRight,
-                                    contentDescription = "Expand",
-                                    tint = Color(0xFF64748B),
-                                    modifier = Modifier.size(15.dp)
-                                )
-                            }
-                        }
-                    } else if (uiState.dockHorizontal) {
+                    if (uiState.dockHorizontal) {
                         // Horizontal Dock (Top under bar) with luminous liquid glass styling
                         Surface(
                             shape = RoundedCornerShape(26.dp),
@@ -2940,18 +2899,6 @@ fun CanvasScreen(
                                     )
                                 }
 
-                                // Collapse the dock into its mini pill.
-                                IconButton(
-                                    onClick = { isPencaseCollapsed = true },
-                                    modifier = Modifier.size(32.dp)
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.KeyboardArrowUp,
-                                        contentDescription = "Collapse pen dock",
-                                        tint = Color(0xFF64748B),
-                                        modifier = Modifier.size(16.dp)
-                                    )
-                                }
 
                                 // Fountain Pen
                                 PencaseToolIcon(
@@ -3262,18 +3209,6 @@ fun CanvasScreen(
                                     )
                                 }
 
-                                // Collapse the dock into its mini pill.
-                                IconButton(
-                                    onClick = { isPencaseCollapsed = true },
-                                    modifier = Modifier.size(32.dp)
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.AutoMirrored.Filled.KeyboardArrowLeft,
-                                        contentDescription = "Collapse pen dock",
-                                        tint = Color(0xFF64748B),
-                                        modifier = Modifier.size(16.dp)
-                                    )
-                                }
 
                                 // Fountain Pen
                                 PencaseToolIcon(
