@@ -176,3 +176,13 @@
 - Native Page Sizing in Continuous Mode: replaced the outer `graphicsLayer` post-scale hack over `LazyColumn` / `LazyRow` with native item layout sizing (`pageWidthDp = screenWidth * continuousScale`). As center pages shrink on zoom out, Compose's layout pipeline naturally lays out and renders surrounding pages (previous pages above and next pages below) seamlessly.
 - Single-page Mode Smoothing: removed the mid-gesture interrupt in `DrawingCanvasView` so pinch zooming in single-page mode operates smoothly at the touch focal point.
 - Verified with 291 passing unit tests, built clean APK, and synced to GitHub repo.
+
+## Decisions appended 63        63. 2026-11-10 (auditor): Data-loss & privacy audit closures, page-scoped layers, vector stickers, and live audit sync:
+- Page-Scoped Layers & Safe Flattening: layers migrated to `page_<i>_layers.json` and `page_<i>_layer_<n>.png` so layers belong to individual pages and survive page switches/exports; "Merge to base" blocked in continuous reader to prevent flattening into uncommitted bitmaps.
+- Atomic Persistence & Clean Backup: atomic temp-file write-and-rename for layer bitmaps and manifests; SQLite WAL checkpoint TRUNCATE on backup for self-contained archives; restore cleanly prunes absent note directories; heap-aware undo budget prevents OOMs; row-by-row layer trim replaces monolithic 48 MB IntArray allocations.
+- Procedural Vector Stickers (`StickerArt.kt`): vector-drawn Star, Heart, and Smiley (`Kind.STAR`, `Kind.HEART`, `Kind.SMILEY`) generated procedurally via `Canvas`/`Paint` with `PorterDuff.Mode.CLEAR` cutouts, cycled and inserted as interactive transformable ImageLayers.
+- Tools Menu Refinement: Web Excerpt provides actionable copy/paste instructions; Mind Map shows honest "not implemented yet" toast rather than mock outline text.
+- Markup Parser & Editor Hardening: code fences require pure backtick lines; wiki-link SQL join collapses whitespace matching key generation; debounced `((` autocomplete; search snippets extracted from source token line; color swatches and text formatting target active block instead of note start.
+- Touch Targets & Accessibility: enlarged dock collapse, text stepper, zoom lock, and layer panel icon buttons (32–36 dp); added content descriptions for screen readers; closable backup progress dialog.
+- Audit Synchronization: updated `state/AUDIT.md` with items C11–C17 and X10 documenting live-text insertion, transform bounding box, continuous multi-page scaling, centroid pinch zoom, dock orientation toggle, top-bar page insertion, vector stickers, and tab-close navigation.
+- Verified with 299 passing unit tests (0 failures, 2 skipped), 0 declared runtime permissions, and clean Gradle compilation.

@@ -355,6 +355,8 @@ fun CanvasScreen(
     var showGoToPageDialog by remember { mutableStateOf(false) }
     var pageToDeleteIndex by remember { mutableStateOf<Int?>(null) }
     var isPencaseCollapsed by remember { mutableStateOf(false) }
+    /** Which sticker the Tools menu drops next. */
+    var stickerIndex by remember { mutableIntStateOf(0) }
     var pencaseOffsetX by remember { mutableFloatStateOf(0f) }
     var pencaseOffsetY by remember { mutableFloatStateOf(0f) }
     // Long-press popups of the dock (width slider / full colour palette).
@@ -4344,7 +4346,16 @@ fun CanvasScreen(
                                                 ) {
                                                     Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 2.dp)) {
                                                         ToolsPanelItem(Icons.Default.Language, "Web Excerpt") {
-                                                            android.widget.Toast.makeText(context, "Web Excerpt: Share text or images directly to this note from browser or any app", android.widget.Toast.LENGTH_SHORT).show()
+                                                            // The app has no share target yet, so the
+                                                            // hint has to name the way that works:
+                                                            // copy the text or the image and paste it
+                                                            // into the note (three-finger tap on the
+                                                            // canvas, or the clipboard button).
+                                                            android.widget.Toast.makeText(
+                                                                context,
+                                                                "Copy the text or the image, then paste it into the note",
+                                                                android.widget.Toast.LENGTH_LONG
+                                                            ).show()
                                                         }
                                                         Divider(color = Color(0xFFEEEEEE), thickness = 0.5.dp)
                                                         ToolsPanelItem(Icons.Default.AccountTree, "Open in CardsMind") {
@@ -4402,16 +4413,31 @@ fun CanvasScreen(
                                                         Divider(color = Color(0xFFEEEEEE), thickness = 0.5.dp)
                                                         ToolsPanelItem(Icons.Default.EmojiEmotions, "Sticker") {
                                                             scope.launch {
-                                                                insertLayerInCurrentNote { it.addTextBlock("★") }
+                                                                // A sticker is a small drawing, not a
+                                                                // text symbol: it is inserted as a layer
+                                                                // so it can be moved, scaled and deleted
+                                                                // like any other layer.
+                                                                val kind = StickerArt.Kind.entries[
+                                            stickerIndex % StickerArt.Kind.entries.size
+                                        ]
+                                        stickerIndex++
+                                                                val sticker = StickerArt.draw(kind, 120)
+                                                                insertLayerInCurrentNote { it.addImageLayer(sticker) }
                                                                 viewModel.toggleToolsPanel(false)
                                                             }
                                                         }
                                                         Divider(color = Color(0xFFEEEEEE), thickness = 0.5.dp)
                                                         ToolsPanelItem(Icons.Default.Timeline, "Add Mind Map") {
-                                                            scope.launch {
-                                                                insertLayerInCurrentNote { it.addTextBlock("○ Central Topic\n  ├ Idea 1\n  └ Idea 2") }
-                                                                viewModel.toggleToolsPanel(false)
-                                                            }
+                                                            // Not implemented yet: the mind map has to
+                                                            // live in the markup database (the nodes are
+                                                            // blocks of a note) while the drawing stays a
+                                                            // scribble page - that is still an open design
+                                                            // question, so nothing is faked here.
+                                                            android.widget.Toast.makeText(
+                                                                context,
+                                                                "Mind map: not implemented yet",
+                                                                android.widget.Toast.LENGTH_SHORT
+                                                            ).show()
                                                         }
                                                         Divider(color = Color(0xFFEEEEEE), thickness = 0.5.dp)
                                                         ToolsPanelItem(Icons.Default.Style, "Flashcard") {
