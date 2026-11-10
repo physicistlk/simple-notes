@@ -2021,10 +2021,7 @@ fun CanvasScreen(
                             modifier = Modifier
                                 .fillMaxSize()
                                 .background(Color(0xFFEEEEEE))
-                                .pointerInput(uiState.stylusOnly) {
-                                    // Stylus mode: the hand is for buttons
-                                    // only, so it may not pinch or pan either.
-                                    if (uiState.stylusOnly) return@pointerInput
+                                .pointerInput(Unit) {
                                     detectTransformGestures { centroid, pan, zoom, _ ->
                                         handleReaderTransform(centroid, pan, zoom)
                                     }
@@ -2034,7 +2031,7 @@ fun CanvasScreen(
                                 androidx.compose.foundation.lazy.LazyRow(
                                     state = continuousRowState,
                                     modifier = Modifier.fillMaxSize(),
-                                    userScrollEnabled = !inkController.isDrawing && !uiState.stylusOnly,
+                                    userScrollEnabled = !inkController.isDrawing,
                                     verticalAlignment = Alignment.CenterVertically,
                                     horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(16.dp),
                                     contentPadding = androidx.compose.foundation.layout.PaddingValues(16.dp)
@@ -2073,7 +2070,7 @@ fun CanvasScreen(
                                 androidx.compose.foundation.lazy.LazyColumn(
                                     state = continuousColState,
                                     modifier = Modifier.fillMaxSize(),
-                                    userScrollEnabled = !inkController.isDrawing && !uiState.stylusOnly,
+                                    userScrollEnabled = !inkController.isDrawing,
                                     verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(16.dp),
                                     contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 16.dp, horizontal = 16.dp),
                                     horizontalAlignment = Alignment.CenterHorizontally
@@ -2121,7 +2118,7 @@ fun CanvasScreen(
                                 androidx.compose.foundation.lazy.LazyColumn(
                                     state = continuousColState,
                                     modifier = Modifier.fillMaxSize(),
-                                    userScrollEnabled = !inkController.isDrawing && !uiState.stylusOnly,
+                                    userScrollEnabled = !inkController.isDrawing,
                                     verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(16.dp),
                                     contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 16.dp, horizontal = 16.dp),
                                     horizontalAlignment = Alignment.CenterHorizontally
@@ -5558,11 +5555,11 @@ fun ContinuousPageView(
                         val isStylus = down.type == PointerType.Stylus || down.type == PointerType.Eraser
                         if (isStylus) onStylusDetected()
                         val isAllowedPointer = isStylus || (!inkSettings.stylusOnly && down.type == PointerType.Touch)
-                        if (!isAllowedPointer) return@awaitEachGesture
                         if (size.width <= 0 || size.height <= 0) return@awaitEachGesture
 
-                        // The laser pointer: a dot follows the pen, nothing is
-                        // written to the page.
+                        // The laser pointer: a dot follows the pointer, nothing
+                        // is written to the page. It works with a finger as
+                        // well, in every mode.
                         if (inkSettings.isLaserPointer) {
                             val lBoxW = size.width.toFloat()
                             val lBoxH = size.height.toFloat()
@@ -5578,6 +5575,9 @@ fun ContinuousPageView(
                             ink.clearLaser()
                             return@awaitEachGesture
                         }
+                        // Stylus mode: the hand may scroll, pinch and use the
+                        // tools, but it does not write.
+                        if (!isAllowedPointer) return@awaitEachGesture
                         if (!inkSettings.isWritingTool) return@awaitEachGesture
                         
                         down.consume()

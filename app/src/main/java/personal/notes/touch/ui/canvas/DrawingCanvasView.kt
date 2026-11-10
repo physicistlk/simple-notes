@@ -2176,18 +2176,18 @@ class DrawingCanvasView @JvmOverloads constructor(
 
         // Multi-touch gestures (2-finger pinch zoom and pan):
         // Always allowed in drawing mode, stylus-only mode, and reading mode!
-        // Stylus mode: the pen writes, the hand only presses buttons. A
-        // finger must therefore not draw, pinch or pan the canvas.
         val pointerToolType = event.getToolType(0)
-        if (stylusOnly && pointerToolType != MotionEvent.TOOL_TYPE_STYLUS &&
-            pointerToolType != MotionEvent.TOOL_TYPE_ERASER
-        ) {
-            return false
-        }
         if (pointerToolType == MotionEvent.TOOL_TYPE_STYLUS ||
             pointerToolType == MotionEvent.TOOL_TYPE_ERASER
         ) {
             onStylusDetected?.invoke()
+        }
+
+        // The laser pointer: it points with any pointer (finger or stylus),
+        // in every mode, and never writes.
+        if (currentTool == CanvasTool.LASER_POINTER && event.pointerCount < 2) {
+            handleLaserTouch(event)
+            return true
         }
 
         if (event.pointerCount >= 2) {
@@ -2202,7 +2202,12 @@ class DrawingCanvasView @JvmOverloads constructor(
         }
 
         // Check if drawing / single-pointer editing is blocked (reading mode or non-stylus finger)
-        val isDrawingBlocked = readingMode || (stylusOnly && event.getToolType(0) != MotionEvent.TOOL_TYPE_STYLUS)
+        // Stylus mode: only the pen writes. The hand may still pinch, pan and
+        // use the tools - it just cannot draw.
+        val pointerType = event.getToolType(0)
+        val isDrawingBlocked = readingMode ||
+            (stylusOnly && pointerType != MotionEvent.TOOL_TYPE_STYLUS &&
+                pointerType != MotionEvent.TOOL_TYPE_ERASER)
         if (isDrawingBlocked) {
             // Return true on ACTION_DOWN and moves so multi-touch pinch/pan or tap up is delivered
             return true
@@ -2334,12 +2339,6 @@ class DrawingCanvasView @JvmOverloads constructor(
                 }
             }
             return super.onTouchEvent(event)
-        }
-
-        // Laser pointer: the pen shows a dot instead of writing.
-        if (currentTool == CanvasTool.LASER_POINTER) {
-            handleLaserTouch(event)
-            return true
         }
 
         // Lasso selection & transform tool

@@ -182,8 +182,8 @@ Status legend: Planned (not implemented), Implemented. Source cites analysis fil
 - **Continuous reader zoom out** — the reader zooms out to 0.4× (previously it stopped at fit-to-width), centring the pages below 1× instead of clamping the pan. The two-finger pinch is detected inside the page (the list used to swallow it), and the zoom pill has a lock button: with it locked two fingers only move the page around.
 - **Ink that belongs to a layer** — strokes and text written while a layer is the *current* one are kept with that layer, so the eye button hides them together with it; the marks follow the layer when it is moved or rotated and are flattened by "merge to base".
 - **Writing outside the paper** — an imported PDF can be annotated in its margins: ink that reaches past the page is kept as a page-level crop, the export sheet grows with it, and double tap re-centres the page (the *Horizontal move resistance* slider decides how far the page may be pushed aside).
-- **Stylus mode** — switches itself on as soon as a stylus is used; while it is on only the pen writes and the hand is for buttons, tools and panels.
-- **Laser pointer** — a red dot with a short fading tail follows the pen without writing anything (right-side Tools menu).
+- **Stylus mode** — switches itself on as soon as a stylus is used; while it is on only the pen writes, and the hand keeps pinch, pan, scrolling and the tool dock.
+- **Laser pointer** — a red dot with a short fading tail follows the pointer without writing anything; it works in every mode and with a finger or a stylus (right-side Tools menu).
 - **Liquid-glass pen dock** — the floating dock uses a translucent gradient body, a specular hairline and a deeper shadow; a long press on a width chip opens a slider (1–40 px, 8–80 px for the eraser) and a long press on a swatch opens the full colour palette.
 - 
 # Gaps & Next Features for Your TouchNotes-Inspired App
