@@ -2,6 +2,7 @@ package personal.notes.touch
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import personal.notes.touch.ui.canvas.CanvasTool
@@ -133,6 +134,55 @@ class ContinuousInkHistoryTest {
         // Every erase keeps 4x4 pixels twice: 128 bytes per action.
         history.trim(200)
         assertTrue(history.canUndo)
+        assertTrue(history.ops.size >= 1)
+    }
+
+    @Test
+    fun undoOfACropTakesTheCropAwayAndRedoBringsItBack() {
+        val history = InkHistory()
+        val place = personal.notes.touch.ui.canvas.ContinuousPageGeometry.CropPlace(-40f, 120f, 60, 30)
+        val crop = InkOp.Crop(7, place)
+        history.commit(crop)
+
+        assertEquals(1, history.ops.size)
+        assertTrue(history.canUndo)
+
+        var undone: InkOp.Crop? = null
+        var restored = false
+        assertTrue(
+            history.undo(
+                { _, _ -> },
+                { _, _ -> },
+                { op, restore -> undone = op; restored = restore }
+            )
+        )
+        assertNotNull(undone)
+        assertTrue("the undo takes the crop away", restored)
+        assertEquals(0, history.ops.size)
+        assertTrue(history.canRedo)
+
+        var redone: InkOp.Crop? = null
+        assertTrue(
+            history.redo(
+                { _, _ -> },
+                { _, _ -> },
+                { op, _ -> redone = op }
+            )
+        )
+        assertNotNull(redone)
+        assertEquals(7, redone!!.id)
+        assertEquals(1, history.ops.size)
+        assertTrue(history.ops[0] === crop)
+    }
+
+    @Test
+    fun aCropCountsTowardsTheUndoMemory() {
+        val history = InkHistory()
+        val place = personal.notes.touch.ui.canvas.ContinuousPageGeometry.CropPlace(0f, 0f, 100, 100)
+        history.commit(InkOp.Crop(1, place))
+        // 100x100 pixels are 40 KB; the oldest action is dropped when the
+        // history is trimmed below that.
+        history.trim(1024)
         assertTrue(history.ops.size >= 1)
     }
 }

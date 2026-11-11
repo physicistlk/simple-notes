@@ -180,6 +180,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.zIndex
 import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.IntSize
@@ -648,7 +650,10 @@ fun CanvasScreen(
 
     // In-place stylus inking for the continuous reader: one page layer at a
     // time, saved through the same repository calls single-page mode uses.
-    val inkController = remember(viewModel.noteId) {
+    // The note (and with it the type of its pages) is loaded asynchronously:
+    // the controller has to be rebuilt when it arrives, or every note would
+    // be treated as an infinite canvas (no margin, no page edge).
+    val inkController = remember(viewModel.noteId, note?.pageType) {
         val app = context.applicationContext as? TouchNotesApp
         ContinuousInkController(
             noteId = viewModel.noteId,
@@ -656,6 +661,9 @@ fun CanvasScreen(
             pdfDocCache = pdfDocCache,
             scope = scope,
             appScope = app?.appScope ?: scope,
+            // The type of the note decides the shape of the page box: an
+            // infinite page has no edge, a fixed page has a margin.
+            pageType = note?.pageType ?: "infinite",
             onSaved = { savedPage ->
                 savedPageGenerations[savedPage] = (savedPageGenerations[savedPage] ?: 0) + 1
             },
@@ -2462,6 +2470,12 @@ fun CanvasScreen(
                                         Box(
                                             modifier = Modifier
                                                 .height(pageHeightDp)
+                                                // An infinite page has no edge:
+                                                // its box is the visible canvas,
+                                                // not a rectangle with the
+                                                // aspect ratio of the saved
+                                                // bitmap.
+                                                .then(if (isInfiniteNote) Modifier.width(pageWidthDp) else Modifier)
                                                 .offset { IntOffset(0, continuousPanY.roundToInt()) },
                                             contentAlignment = Alignment.Center
                                         ) {
@@ -2482,7 +2496,13 @@ fun CanvasScreen(
                                                 savedGeneration = savedPageGenerations[idx] ?: 0,
                                                 isCurrentPage = idx == currentPageIndex,
                                                 isInfinite = isInfiniteNote,
-                                                modifier = androidx.compose.ui.Modifier.fillMaxHeight(),
+                                                modifier = androidx.compose.ui.Modifier.then(
+                                                    if (isInfiniteNote) {
+                                                        Modifier.fillMaxSize()
+                                                    } else {
+                                                        Modifier.fillMaxHeight()
+                                                    }
+                                                ),
                                                 onPageBitmap = { idx, bmp ->
                                                     if (idx == currentPageIndex) {
                                                         glassReaderBitmap = bmp
@@ -2512,12 +2532,19 @@ fun CanvasScreen(
                                         Row(
                                             modifier = Modifier
                                                 .width(pageWidthDp)
+                                                // An infinite page has no edge:
+                                                // its box is the visible canvas.
+                                                .then(if (isInfiniteNote) Modifier.height(pageHeightDp) else Modifier)
                                                 .offset { IntOffset(continuousPanX.roundToInt(), 0) },
                                             horizontalArrangement = Arrangement.spacedBy(16.dp)
                                         ) {
                                             for (idx in pair) {
                                                 val page = pages[idx]
-                                                Box(modifier = Modifier.weight(1f)) {
+                                                Box(
+                                                    modifier = Modifier
+                                                        .weight(1f)
+                                                        .then(if (isInfiniteNote) Modifier.fillMaxHeight() else Modifier)
+                                                ) {
                                                     ContinuousPageView(
                                                         pageIndex = idx,
                                                         page = page,
@@ -2535,7 +2562,13 @@ fun CanvasScreen(
                                                         savedGeneration = savedPageGenerations[idx] ?: 0,
                                                         isCurrentPage = idx == currentPageIndex,
                                                         isInfinite = isInfiniteNote,
-                                                        modifier = androidx.compose.ui.Modifier.fillMaxWidth(),
+                                                        modifier = androidx.compose.ui.Modifier.then(
+                                                            if (isInfiniteNote) {
+                                                                Modifier.fillMaxSize()
+                                                            } else {
+                                                                Modifier.fillMaxWidth()
+                                                            }
+                                                        ),
                                                         onPageBitmap = { idx, bmp ->
                                                             if (idx == currentPageIndex) {
                                                                 glassReaderBitmap = bmp
@@ -2569,6 +2602,12 @@ fun CanvasScreen(
                                         Box(
                                             modifier = Modifier
                                                 .width(pageWidthDp)
+                                                // An infinite page has no edge:
+                                                // its box is the visible canvas,
+                                                // not a rectangle with the
+                                                // aspect ratio of the saved
+                                                // bitmap.
+                                                .then(if (isInfiniteNote) Modifier.height(pageHeightDp) else Modifier)
                                                 .offset { IntOffset(continuousPanX.roundToInt(), 0) },
                                             contentAlignment = Alignment.Center
                                         ) {
@@ -2589,7 +2628,13 @@ fun CanvasScreen(
                                                 savedGeneration = savedPageGenerations[idx] ?: 0,
                                                 isCurrentPage = idx == currentPageIndex,
                                                 isInfinite = isInfiniteNote,
-                                                modifier = androidx.compose.ui.Modifier.fillMaxWidth(),
+                                                modifier = androidx.compose.ui.Modifier.then(
+                                                    if (isInfiniteNote) {
+                                                        Modifier.fillMaxSize()
+                                                    } else {
+                                                        Modifier.fillMaxWidth()
+                                                    }
+                                                ),
                                                 onStylusDetected = { viewModel.onStylusDetected() },
                                         onPinch = { centroid, pan, zoom -> handleReaderTransform(centroid, pan, zoom) },
                                                 onPageBitmap = { idx, bmp ->
@@ -5991,25 +6036,29 @@ class ReaderPageBox {
 /**
  * Publishes the map of the page *image* (the bitmap the reader draws and the
  * glass samples).
+ *
+ * The image sits inside the page box (a fixed page has a margin around it),
+ * so the map describes the rect the image is drawn in - not the whole box.
  */
 private fun publishImageMap(
     pageBox: ReaderPageBox,
     pageIndex: Int,
+    pageRect: ContinuousPageGeometry.BoxRect,
     imageWidth: Int,
     imageHeight: Int,
     onImageMapping: (ContinuousImageMap) -> Unit
 ) {
     if (!pageBox.valid || imageWidth <= 0 || imageHeight <= 0) return
-    val fit = minOf(
-        pageBox.width / imageWidth.toFloat(),
-        pageBox.height / imageHeight.toFloat()
-    )
+    if (pageRect.empty) return
+    // The image is drawn into the page rect: one pixel of the image is
+    // pageRect.width * pageBox.width / imageWidth screen pixels.
+    val scale = pageRect.width * pageBox.width / imageWidth
     onImageMapping(
         ContinuousImageMap(
             pageIndex = pageIndex,
-            scale = fit,
-            offsetX = pageBox.originX + (pageBox.width - imageWidth * fit) / 2f,
-            offsetY = pageBox.originY + (pageBox.height - imageHeight * fit) / 2f
+            scale = scale,
+            offsetX = pageBox.originX + pageRect.left * pageBox.width,
+            offsetY = pageBox.originY + pageRect.top * pageBox.height
         )
     )
 }
@@ -6017,21 +6066,20 @@ private fun publishImageMap(
 private fun publishPageMap(
     pageBox: ReaderPageBox,
     pageIndex: Int,
+    pageRect: ContinuousPageGeometry.BoxRect,
     pageWidth: Int,
     pageHeight: Int,
     onPageMapping: (ContinuousPageMap) -> Unit
 ) {
     if (!pageBox.valid || pageWidth <= 0 || pageHeight <= 0) return
-    val fit = minOf(
-        pageBox.width / pageWidth.toFloat(),
-        pageBox.height / pageHeight.toFloat()
-    )
+    if (pageRect.empty) return
+    val scale = pageRect.width * pageBox.width / pageWidth
     onPageMapping(
         ContinuousPageMap(
             pageIndex = pageIndex,
-            scale = fit,
-            offsetX = pageBox.originX + (pageBox.width - pageWidth * fit) / 2f,
-            offsetY = pageBox.originY + (pageBox.height - pageHeight * fit) / 2f
+            scale = scale,
+            offsetX = pageBox.originX + pageRect.left * pageBox.width,
+            offsetY = pageBox.originY + pageRect.top * pageBox.height
         )
     )
 }
@@ -6095,18 +6143,51 @@ fun ContinuousPageView(
         }
     }
 
+    /**
+     * Where the page image sits inside the page box.
+     *
+     * A fixed page is centred in its box and keeps a margin around it (the
+     * room to write in the margin of an imported PDF); an infinite page is
+     * fitted into the box, so the endless canvas is not bounded by the
+     * saved bitmap. The ink session knows the same rect - the strokes are
+     * normalised to the box.
+     */
+    fun pageRectOf(
+        pageIndex: Int,
+        boxWidth: Float,
+        boxHeight: Float
+    ): ContinuousPageGeometry.BoxRect {
+        val ratio = if (pageImageWidth > 0 && pageImageHeight > 0) {
+            pageImageWidth.toFloat() / pageImageHeight
+        } else if (isInfinite) {
+            // An infinite page that was never drawn on has no image yet: the
+            // page keeps the shape of the saved canvas.
+            ContinuousPageGeometry.INFINITE_PAGE_RATIO
+        } else {
+            pageRatio
+        }
+        return ink.pageRectFor(pageIndex, boxWidth, boxHeight, ratio)
+    }
+
     BoxWithConstraints(
         modifier = modifier
-            .aspectRatio(pageRatio)
+            // An infinite page has no edge: its box is the visible canvas,
+            // not a rectangle with the aspect ratio of the saved bitmap.
+            .then(if (isInfinite) Modifier else Modifier.aspectRatio(pageRatio))
             .onGloballyPositioned { coords ->
                 pageBox.originX = coords.positionInRoot().x
                 pageBox.originY = coords.positionInRoot().y
                 pageBox.width = coords.size.width
                 pageBox.height = coords.size.height
                 if (isCurrentPage) {
+                    // The page image sits inside the box (a fixed page has a
+                    // margin, an infinite page is fitted into it), so the
+                    // maps have to describe that rect and not the whole box.
+                    val rect = pageRectOf(pageIndex, pageBox.width.toFloat(), pageBox.height.toFloat())
                     publishPageMap(
                         pageBox = pageBox,
                         pageIndex = pageIndex,
+                        pageRect = rect,
                         pageWidth = readerLayers.entry(pageIndex)?.pageWidth ?: 0,
                         pageHeight = readerLayers.entry(pageIndex)?.pageHeight ?: 0,
                         onPageMapping = onPageMapping
@@ -6116,6 +6197,7 @@ fun ContinuousPageView(
                     publishImageMap(
                         pageBox = pageBox,
                         pageIndex = pageIndex,
+                        pageRect = rect,
                         imageWidth = pageImageWidth,
                         imageHeight = pageImageHeight,
                         onImageMapping = onImageMapping
@@ -6178,6 +6260,7 @@ fun ContinuousPageView(
                 publishPageMap(
                     pageBox = pageBox,
                     pageIndex = pageIndex,
+                    pageRect = pageRectOf(pageIndex, pageBox.width.toFloat(), pageBox.height.toFloat()),
                     pageWidth = layerEntry?.pageWidth ?: 0,
                     pageHeight = layerEntry?.pageHeight ?: 0,
                     onPageMapping = onPageMapping
@@ -6189,6 +6272,13 @@ fun ContinuousPageView(
                 android.graphics.Paint.FILTER_BITMAP_FLAG or
                     android.graphics.Paint.ANTI_ALIAS_FLAG
             )
+        }
+
+        // The margin notes of the page: the strokes that left the page image.
+        // They live in their own files (the ones the single-page engine
+        // writes), so they are loaded with the page.
+        LaunchedEffect(page.id, noteId) {
+            ink.loadCrops(page, pageIndex)
         }
 
         LaunchedEffect(page.id, page.updatedAt, renderWidthKey, noteId, activeSessionReady, savedGeneration) {
@@ -6313,33 +6403,47 @@ fun ContinuousPageView(
         }
 
         if (shown != null && !shown.isRecycled) {
-            androidx.compose.foundation.Image(
-                bitmap = shown.asImageBitmap(),
-                contentDescription = "Page ${pageIndex + 1}",
-                modifier = Modifier.fillMaxSize(),
-                filterQuality = androidx.compose.ui.graphics.FilterQuality.High
-            )
+            // The page image is drawn into the page rect (the box minus the
+            // margin), not into the whole box: the margin is the room the
+            // user writes in.
+            androidx.compose.foundation.Canvas(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .semantics { contentDescription = "Page ${pageIndex + 1}" }
+            ) {
+                val rect = pageRectOf(pageIndex, size.width, size.height)
+                if (rect.empty) return@Canvas
+                val dest = android.graphics.RectF(
+                    rect.left * size.width,
+                    rect.top * size.height,
+                    rect.right * size.width,
+                    rect.bottom * size.height
+                )
+                drawIntoCanvas { canvas ->
+                    canvas.nativeCanvas.drawBitmap(shown, null, dest, layerPaint)
+                }
+            }
         }
 
         // Floating layers, composited in the page's own pixel space so they
         // land exactly where the single-page engine placed them. The page is
-        // drawn with ContentScale.Fit, so the same fit rect is used here.
+        // drawn into the page rect, so the same rect is used here.
         val pageLayers = layerEntry?.layers.orEmpty()
         val layerPageWidth = layerEntry?.pageWidth ?: 0
         val layerPageHeight = layerEntry?.pageHeight ?: 0
         if (pageLayers.isNotEmpty() && layerPageWidth > 0 && layerPageHeight > 0) {
             androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
-                val fit = minOf(
-                    size.width / layerPageWidth.toFloat(),
-                    size.height / layerPageHeight.toFloat()
-                )
-                val offsetX = (size.width - layerPageWidth * fit) / 2f
-                val offsetY = (size.height - layerPageHeight * fit) / 2f
+                val rect = pageRectOf(pageIndex, size.width, size.height)
+                if (rect.empty) return@Canvas
+                val scaleX = rect.width * size.width / layerPageWidth
+                val scaleY = rect.height * size.height / layerPageHeight
+                val offsetX = rect.left * size.width
+                val offsetY = rect.top * size.height
                 drawIntoCanvas { canvas ->
                     val native = canvas.nativeCanvas
                     val saveCount = native.save()
                     native.translate(offsetX, offsetY)
-                    native.scale(fit, fit)
+                    native.scale(scaleX, scaleY)
                     drawImageLayers(native, pageLayers, layerPaint)
                     native.restoreToCount(saveCount)
                 }
@@ -6350,6 +6454,8 @@ fun ContinuousPageView(
         // opaque PDF page (the image would otherwise cover it).
         // An infinite canvas has no edge at all - a frame there would turn
         // the endless canvas into a sheet of paper.
+        // The frame surrounds the page image, not the whole box: the margin
+        // around it belongs to the desk.
         if (!isInfinite) {
         androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
             val stroke = if (isCurrentPage) 1.5.dp.toPx() else 1.dp.toPx()
@@ -6358,13 +6464,16 @@ fun ContinuousPageView(
             } else {
                 Color(0xFFDCDFE6)
             }
+            val rect = pageRectOf(pageIndex, size.width, size.height)
+            val left = rect.left * size.width + stroke / 2f
+            val top = rect.top * size.height + stroke / 2f
             drawRect(
                 color = borderColor,
                 style = androidx.compose.ui.graphics.drawscope.Stroke(width = stroke),
-                topLeft = androidx.compose.ui.geometry.Offset(stroke / 2f, stroke / 2f),
+                topLeft = androidx.compose.ui.geometry.Offset(left, top),
                 size = androidx.compose.ui.geometry.Size(
-                    (size.width - stroke).coerceAtLeast(1f),
-                    (size.height - stroke).coerceAtLeast(1f)
+                    (rect.width * size.width - stroke).coerceAtLeast(1f),
+                    (rect.height * size.height - stroke).coerceAtLeast(1f)
                 )
             )
         }
@@ -6382,23 +6491,47 @@ fun ContinuousPageView(
 
         // Vector pages: the annotations are a separate transparent layer drawn
         // over the clean page, exactly like single-page mode composites them.
+        // The layer lives in the page's pixel space, so it is drawn into the
+        // page rect - the same rect the page image is drawn in.
         if (sessionReady && inkSession?.isVector == true) {
             val layer = inkSession.ink
             if (layer != null && !layer.isRecycled) {
                 androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
                     val _revision = ink.revision
+                    val rect = pageRectOf(pageIndex, size.width, size.height)
+                    if (rect.empty) return@Canvas
                     drawImage(
                         image = layer.asImageBitmap(),
                         srcOffset = androidx.compose.ui.unit.IntOffset.Zero,
                         srcSize = androidx.compose.ui.unit.IntSize(layer.width, layer.height),
-                        dstOffset = androidx.compose.ui.unit.IntOffset.Zero,
+                        dstOffset = androidx.compose.ui.unit.IntOffset(
+                            (rect.left * size.width).roundToInt(),
+                            (rect.top * size.height).roundToInt()
+                        ),
                         dstSize = androidx.compose.ui.unit.IntSize(
-                            size.width.roundToInt().coerceAtLeast(1),
-                            size.height.roundToInt().coerceAtLeast(1)
+                            (rect.width * size.width).roundToInt().coerceAtLeast(1),
+                            (rect.height * size.height).roundToInt().coerceAtLeast(1)
                         ),
                         filterQuality = androidx.compose.ui.graphics.FilterQuality.High
                     )
                 }
+            }
+        }
+
+        // The margin notes: the strokes that left the page image. They are
+        // painted on the page (at the place they have in the page's pixel
+        // space), under the vector operations of the session.
+        androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
+            val _revision = ink.revision
+            val ratio = if (pageImageWidth > 0 && pageImageHeight > 0) {
+                pageImageWidth.toFloat() / pageImageHeight
+            } else if (isInfinite) {
+                ContinuousPageGeometry.INFINITE_PAGE_RATIO
+            } else {
+                pageRatio
+            }
+            drawIntoCanvas { canvas ->
+                ink.drawCrops(canvas.nativeCanvas, pageIndex, size.width, size.height, ratio)
             }
         }
 
@@ -6441,6 +6574,9 @@ fun ContinuousPageView(
             val _revision = ink.revision
             val _previewRevision = if (ink.livePageIndex == pageIndex) ink.previewRevision else 0
             val _laserRevision = ink.laserRevision
+            // The strokes are normalised to the box: the session has to know
+            // the size of the box (the zoom changed it).
+            ink.updateGeometry(pageIndex, size.width, size.height)
             drawIntoCanvas { canvas ->
                 ink.drawPreview(canvas.nativeCanvas, pageIndex, size.width, size.height)
             }

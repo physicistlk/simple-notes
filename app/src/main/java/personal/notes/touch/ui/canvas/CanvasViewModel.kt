@@ -76,7 +76,14 @@ data class CanvasUiState(
     val penSlot2Width: Float = 3f,
     // Pen mode by default: the pen writes, the hand scrolls and uses the
     // tools. It switches off when the user wants to write with a finger.
-    val stylusOnly: Boolean = true,
+    /**
+     * Only the pen writes.
+     *
+     * It arms itself the first time a stylus is used (and stays off until
+     * then, so a device without a stylus can still be written on with the
+     * hand); an explicit choice of the user wins over that.
+     */
+    val stylusOnly: Boolean = false,
     /** True once a stylus has been seen in this session. */
     val stylusDetected: Boolean = false,
     val readingMode: Boolean = false,
@@ -156,6 +163,9 @@ class CanvasViewModel(
 
     /** True once the user picked stylus mode by hand (auto-switch stops). */
     private var stylusOnlyChosen = false
+
+    /** The user's own choice about the stylus mode (remembered). */
+    private val KEY_STYLUS_ONLY = "stylus_only"
 
     private var pagePatternHydrated = false
     private val _uiState = MutableStateFlow(CanvasUiState())
@@ -299,6 +309,10 @@ class CanvasViewModel(
                 showPencase = uiPrefs.getBoolean(KEY_SHOW_PENCASE, true),
                 readingMode = uiPrefs.getBoolean(KEY_READING_MODE, false),
                 zoomLocked = uiPrefs.getBoolean(KEY_ZOOM_LOCKED, false),
+                // The stylus mode is only forced on when a stylus is actually
+                // used; without one the hand has to be able to write, and the
+                // switch has to be usable.
+                stylusOnly = uiPrefs.getBoolean(KEY_STYLUS_ONLY, false),
                 fixPreviewPage = uiPrefs.getBoolean(KEY_FIX_PREVIEW_PAGE, false),
                 horizontalResistance = uiPrefs.getFloat(KEY_HORIZONTAL_RESISTANCE, 0.4f),
                 minimalInfiniteZoom = uiPrefs.getFloat(KEY_MINIMAL_INFINITE_ZOOM, 0.20f)
@@ -611,7 +625,11 @@ class CanvasViewModel(
      */
     fun toggleStylusOnly(enabled: Boolean? = null) {
         stylusOnlyChosen = true
-        _uiState.value = _uiState.value.copy(stylusOnly = enabled ?: !_uiState.value.stylusOnly)
+        val next = enabled ?: !_uiState.value.stylusOnly
+        _uiState.value = _uiState.value.copy(stylusOnly = next)
+        // The choice is remembered: otherwise every restart would force the
+        // stylus mode back on and the hand could never write again.
+        viewModelScope.launch(Dispatchers.IO) { uiPrefs.putBoolean(KEY_STYLUS_ONLY, next) }
     }
 
     /** Called when a stylus event arrives: arm stylus mode for this session. */
