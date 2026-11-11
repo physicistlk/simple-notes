@@ -744,14 +744,27 @@ class ContinuousInkController(
         val bounds = strokeBounds(stroke, s.inkWidth, s.inkHeight) ?: return
         val patch = snapshot(ink, bounds) ?: return
         synchronized(s.inkLock) {
-            val canvas = Canvas(ink)
-            drawStroke(canvas, stroke, s.inkWidth.toFloat(), s.inkHeight.toFloat(), preview = false)
-            patch.after = capture(ink, bounds)
+            // A Canvas needs a mutable bitmap. The ink layer is mutable, but
+            // if it ever is not, the erase must not take the app down.
+            if (!ink.isMutable) {
+                val mutable = ink.copy(Bitmap.Config.ARGB_8888, true) ?: return@synchronized
+                s.ink = mutable
+                drawStroke(Canvas(mutable), stroke, s.inkWidth.toFloat(), s.inkHeight.toFloat(), preview = false)
+                patch.after = capture(mutable, bounds)
+            } else {
+                val canvas = Canvas(ink)
+                drawStroke(canvas, stroke, s.inkWidth.toFloat(), s.inkHeight.toFloat(), preview = false)
+                patch.after = capture(ink, bounds)
+            }
         }
         val op = InkOp.Erase(stroke, patch)
         s.history.commit(op)
         trimUndo(s)
         s.dirty = true
+        // The erase changed the ink bitmap, so the reader has to redraw it:
+        // without this the wiped stroke stayed on the screen until something
+        // else invalidated the page.
+        revision++
     }
 
     private fun autoShape(points: List<Pair<Float, Float>>): Path? {
@@ -1119,7 +1132,11 @@ class ContinuousInkController(
      */
     private fun copyWithOps(s: ContinuousInkSession, ink: Bitmap, ops: List<InkOp>? = null): Bitmap? {
         val prepared = synchronized(s.inkLock) {
-            val copied = ink.copy(Bitmap.Config.ARGB_8888, false)
+            // The copy has to be MUTABLE: the strokes of this session are
+            // drawn into it, and a Canvas over an immutable bitmap throws
+            // ("Immutable bitmap passed to Canvas constructor") - that was
+            // the crash on the first stroke.
+            val copied = ink.copy(Bitmap.Config.ARGB_8888, true)
             if (copied == null) null else copied to (ops ?: s.history.ops.toList())
         } ?: return null
         drawOps(Canvas(prepared.first), prepared.second, s.inkWidth, s.inkHeight)

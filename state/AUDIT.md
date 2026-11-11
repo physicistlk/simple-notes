@@ -248,7 +248,7 @@ The user ticks a line here; only then does the row in the tables above become
 - [ ] **C33** The infinite canvas takes a stroke outside the saved rectangle (still open).
 - [ ] **C34** A PDF can be annotated in the margin with the page moved aside (still open).
 - [ ] **C35** The stroke follows the finger in the reader (the live preview repaints, the page bitmap is no longer uploaded per stroke).
-      *Verified on the tablet: the ink is drawn while the stroke is still going (two frames taken during one stroke differ by 2 900 pixels - `39_live_stroke_preview.png`). The number of slow bitmap uploads per stroke is the other half of the check.*
+      *Verified on the tablet: the ink is drawn while the stroke is still going (two frames taken during one stroke differ by 2 900 pixels - `39_live_stroke_preview.png`), the user confirms "live stroke with instant feedback", and the stroke survives a restart. Two defects the tablet found are fixed: the save copied the page into an **immutable** bitmap and then drew into it (`IllegalStateException: Immutable bitmap passed to Canvas constructor` - the crash on the first stroke), and the eraser changed the ink bitmap without invalidating the page, so the wiped stroke stayed on the screen. The eraser still needs one more check (that it cuts the ink but not the PDF text).*
 - [ ] **C38** The pinch zoom is continuous, without steps (still open).
 - [ ] **C39** Two fingers move the page reliably, and the second finger cancels the stroke (still open).
 - [ ] **C40** The layers panel can add a layer to the current page (not implemented yet).
