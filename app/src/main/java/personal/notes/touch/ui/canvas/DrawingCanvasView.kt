@@ -102,10 +102,22 @@ data class LayerStateSnapshot(
 )
 
 data class UndoSnapshot(
-    val bitmap: Bitmap,
+    /**
+     * The whole page, for the operations that change more than one spot
+     * (clear page, delete a layer, ...). Null for a stroke snapshot.
+     */
+    val bitmap: Bitmap?,
     val layers: List<LayerStateSnapshot>,
     /** Ink written outside the paper (page-level crops). */
-    val beyondInk: List<InkCrop> = emptyList()
+    val beyondInk: List<InkCrop> = emptyList(),
+    /**
+     * The part of the page a stroke touched, with the pixels it had before
+     * the stroke. A stroke only changes a small rectangle, and copying the
+     * whole page (26 MB for an A4 sheet) for every stroke is what made the
+     * pen lag behind the finger.
+     */
+    val dirty: Rect? = null,
+    val dirtyBitmap: Bitmap? = null
 )
 
 /**
@@ -1028,11 +1040,12 @@ class DrawingCanvasView @JvmOverloads constructor(
      */
     private val maxUndoSnapshots: Int
         get() {
-            val bmp = backingBitmap ?: return 4
-            if (bmp.width <= 0 || bmp.height <= 0) return 4
-            val snapshotBytes = bmp.width.toLong() * bmp.height.toLong() * 4L
-            val budget = Runtime.getRuntime().maxMemory() / 8
-            return (budget / snapshotBytes).toInt().coerceIn(1, 6)
+            // A stroke snapshot is only the rectangle the stroke touched (a
+            // few hundred KB), not the whole page, so the depth no longer has
+            // to be measured against the size of the page.
+            val bmp = backingBitmap ?: return 20
+            if (bmp.width <= 0 || bmp.height <= 0) return 20
+            return 20
         }
     private val undoStack = ArrayDeque<UndoSnapshot>()
     private val redoStack = ArrayDeque<UndoSnapshot>()
@@ -2856,7 +2869,9 @@ class DrawingCanvasView @JvmOverloads constructor(
         // Standard stroke drawing
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
-                saveUndoState()
+                // No snapshot here: the stroke is rasterised into the page
+                // when the finger lifts, and only the rectangle it touches
+                // has to be remembered (see saveUndoStateForRect).
                 currentPath.reset()
                 currentPath.moveTo(x, y)
                 lastTouchX = x
@@ -2979,6 +2994,10 @@ class DrawingCanvasView @JvmOverloads constructor(
                         }
                     }
                 }
+                // The page is still untouched here (the stroke is only
+                // rasterised below), so the undo entry can be the small
+                // rectangle the stroke covers.
+                saveUndoStateForRect(marks)
                 if ((onLayer || offPaper) && marks != null) {
                     val crop = newInkCropCanvas(marks)
                     if (crop != null) {
@@ -3163,7 +3182,8 @@ class DrawingCanvasView @JvmOverloads constructor(
         backingBitmap?.let { bmp ->
             if (undoStack.size >= maxUndoSnapshots) {
                 val oldest = undoStack.removeFirst()
-                if (!oldest.bitmap.isRecycled) oldest.bitmap.recycle()
+                oldest.bitmap?.let { if (!it.isRecycled) it.recycle() }
+                oldest.dirtyBitmap?.let { if (!it.isRecycled) it.recycle() }
             }
             val layerSnapshots = imageLayers.map {
                 LayerStateSnapshot(it.bitmap, it.x, it.y, it.scale, it.rotation, it.opacity, it.cropRect, it.visible, it.name, it.ink.toList())
@@ -3180,24 +3200,112 @@ class DrawingCanvasView @JvmOverloads constructor(
         }
     }
 
+    /**
+     * The undo state of a stroke: only the rectangle the stroke touches.
+     *
+     * The stroke is rasterised into the page bitmap when the finger lifts,
+     * so the page is still untouched here and the copy is exact.
+     */
+    private fun saveUndoStateForRect(rect: Rect?) {
+        val bmp = backingBitmap ?: return
+        val area = rect?.let { Rect(it).apply { intersect(0, 0, bmp.width, bmp.height) } }
+        if (area == null || area.isEmpty) {
+            saveUndoState()
+            return
+        }
+        if (undoStack.size >= maxUndoSnapshots) {
+            val oldest = undoStack.removeFirst()
+            oldest.bitmap?.let { if (!it.isRecycled) it.recycle() }
+            oldest.dirtyBitmap?.let { if (!it.isRecycled) it.recycle() }
+        }
+        val patch = copyRegion(area)
+        if (patch == null) {
+            saveUndoState()
+            return
+        }
+        val layerSnapshots = imageLayers.map {
+            LayerStateSnapshot(it.bitmap, it.x, it.y, it.scale, it.rotation, it.opacity, it.cropRect, it.visible, it.name, it.ink.toList())
+        }
+        undoStack.addLast(
+            UndoSnapshot(null, layerSnapshots, beyondPageInk.toList(), area, patch)
+        )
+        clearRedoStack()
+        notifyUndoRedo()
+    }
+
+    /** Puts a patch back into the page, replacing the pixels (not blending). */
+    private fun applyPatch(patch: Bitmap, area: Rect) {
+        val bmp = backingBitmap ?: return
+        val canvas = bitmapCanvas ?: return
+        val paint = Paint().apply {
+            xfermode = android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.SRC)
+        }
+        try {
+            canvas.drawBitmap(patch, area.left.toFloat(), area.top.toFloat(), paint)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    /** The current content of a rectangle, for the redo stack. */
+    private fun copyRegion(area: Rect): Bitmap? {
+        val bmp = backingBitmap ?: return null
+        val clipped = Rect(area).apply { intersect(0, 0, bmp.width, bmp.height) }
+        if (clipped.isEmpty) return null
+        return try {
+            // Bitmap.copy(x, y, w, h) only exists from API 34, so the region
+            // is copied by hand.
+            val out = Bitmap.createBitmap(
+                clipped.width(), clipped.height(), Bitmap.Config.ARGB_8888
+            )
+            Canvas(out).drawBitmap(
+                bmp,
+                clipped,
+                Rect(0, 0, clipped.width(), clipped.height()),
+                null
+            )
+            out
+        } catch (e: Exception) {
+            e.printStackTrace()
+            null
+        }
+    }
+
     fun undo() {
         commitLassoSelection()
         if (undoStack.isNotEmpty()) {
-            backingBitmap?.let { current ->
-                if (redoStack.size >= maxUndoSnapshots) {
-                    val oldest = redoStack.removeFirst()
-                    if (!oldest.bitmap.isRecycled) oldest.bitmap.recycle()
-                }
-                val currentLayers = imageLayers.map {
-                    LayerStateSnapshot(it.bitmap, it.x, it.y, it.scale, it.rotation, it.opacity, it.cropRect, it.visible, it.name, it.ink.toList())
-                }
-                redoStack.addLast(
-                    UndoSnapshot(current.copy(Bitmap.Config.ARGB_8888, true), currentLayers, beyondPageInk.toList())
-                )
+            val currentLayers = imageLayers.map {
+                LayerStateSnapshot(it.bitmap, it.x, it.y, it.scale, it.rotation, it.opacity, it.cropRect, it.visible, it.name, it.ink.toList())
             }
             val previous = undoStack.removeLast()
-            backingBitmap = previous.bitmap
-            bitmapCanvas = if (previous.bitmap != null && !previous.bitmap.isRecycled) Canvas(previous.bitmap) else null
+            if (previous.dirty != null && previous.dirtyBitmap != null) {
+                // A stroke: only the rectangle it touched comes back, and the
+                // same rectangle is remembered for the redo.
+                if (redoStack.size >= maxUndoSnapshots) {
+                    val oldest = redoStack.removeFirst()
+                    oldest.bitmap?.let { if (!it.isRecycled) it.recycle() }
+                    oldest.dirtyBitmap?.let { if (!it.isRecycled) it.recycle() }
+                }
+                val area = previous.dirty
+                val currentPatch = copyRegion(area)
+                redoStack.addLast(
+                    UndoSnapshot(null, currentLayers, beyondPageInk.toList(), area, currentPatch)
+                )
+                applyPatch(previous.dirtyBitmap, area)
+            } else {
+                backingBitmap?.let { current ->
+                    if (redoStack.size >= maxUndoSnapshots) {
+                        val oldest = redoStack.removeFirst()
+                        oldest.bitmap?.let { if (!it.isRecycled) it.recycle() }
+                        oldest.dirtyBitmap?.let { if (!it.isRecycled) it.recycle() }
+                    }
+                    redoStack.addLast(
+                        UndoSnapshot(current.copy(Bitmap.Config.ARGB_8888, true), currentLayers, beyondPageInk.toList())
+                    )
+                }
+                backingBitmap = previous.bitmap
+                bitmapCanvas = if (previous.bitmap != null && !previous.bitmap.isRecycled) Canvas(previous.bitmap) else null
+            }
             imageLayers.clear()
             imageLayers.addAll(previous.layers.map {
                 ImageLayer(it.bitmap, it.x, it.y, it.scale, it.rotation, it.opacity, it.cropRect, it.visible, it.name, it.ink.toMutableList())
@@ -3216,21 +3324,36 @@ class DrawingCanvasView @JvmOverloads constructor(
     fun redo() {
         commitLassoSelection()
         if (redoStack.isNotEmpty()) {
-            backingBitmap?.let { current ->
-                if (undoStack.size >= maxUndoSnapshots) {
-                    val oldest = undoStack.removeFirst()
-                    if (!oldest.bitmap.isRecycled) oldest.bitmap.recycle()
-                }
-                val currentLayers = imageLayers.map {
-                    LayerStateSnapshot(it.bitmap, it.x, it.y, it.scale, it.rotation, it.opacity, it.cropRect, it.visible, it.name, it.ink.toList())
-                }
-                undoStack.addLast(
-                    UndoSnapshot(current.copy(Bitmap.Config.ARGB_8888, true), currentLayers, beyondPageInk.toList())
-                )
+            val currentLayers = imageLayers.map {
+                LayerStateSnapshot(it.bitmap, it.x, it.y, it.scale, it.rotation, it.opacity, it.cropRect, it.visible, it.name, it.ink.toList())
             }
             val next = redoStack.removeLast()
-            backingBitmap = next.bitmap
-            bitmapCanvas = if (next.bitmap != null && !next.bitmap.isRecycled) Canvas(next.bitmap) else null
+            if (next.dirty != null && next.dirtyBitmap != null) {
+                if (undoStack.size >= maxUndoSnapshots) {
+                    val oldest = undoStack.removeFirst()
+                    oldest.bitmap?.let { if (!it.isRecycled) it.recycle() }
+                    oldest.dirtyBitmap?.let { if (!it.isRecycled) it.recycle() }
+                }
+                val area = next.dirty
+                val currentPatch = copyRegion(area)
+                undoStack.addLast(
+                    UndoSnapshot(null, currentLayers, beyondPageInk.toList(), area, currentPatch)
+                )
+                applyPatch(next.dirtyBitmap, area)
+            } else {
+                backingBitmap?.let { current ->
+                    if (undoStack.size >= maxUndoSnapshots) {
+                        val oldest = undoStack.removeFirst()
+                        oldest.bitmap?.let { if (!it.isRecycled) it.recycle() }
+                        oldest.dirtyBitmap?.let { if (!it.isRecycled) it.recycle() }
+                    }
+                    undoStack.addLast(
+                        UndoSnapshot(current.copy(Bitmap.Config.ARGB_8888, true), currentLayers, beyondPageInk.toList())
+                    )
+                }
+                backingBitmap = next.bitmap
+                bitmapCanvas = if (next.bitmap != null && !next.bitmap.isRecycled) Canvas(next.bitmap) else null
+            }
             imageLayers.clear()
             imageLayers.addAll(next.layers.map {
                 ImageLayer(it.bitmap, it.x, it.y, it.scale, it.rotation, it.opacity, it.cropRect, it.visible, it.name, it.ink.toMutableList())
@@ -3257,7 +3380,8 @@ class DrawingCanvasView @JvmOverloads constructor(
     private fun clearRedoStack() {
         while (redoStack.isNotEmpty()) {
             val snapshot = redoStack.removeLast()
-            if (!snapshot.bitmap.isRecycled) snapshot.bitmap.recycle()
+            snapshot.bitmap?.let { if (!it.isRecycled) it.recycle() }
+            snapshot.dirtyBitmap?.let { if (!it.isRecycled) it.recycle() }
         }
     }
 
@@ -3293,13 +3417,8 @@ class DrawingCanvasView @JvmOverloads constructor(
             lassoPath.reset()
             lassoState = LassoState.IDLE
         }
-        // Drop the undo entry the interaction start pushed (nothing has been
-        // committed to the bitmap yet), so undo stays enabled only for
-        // real strokes.
-        if (undoStack.isNotEmpty()) {
-            val snapshot = undoStack.removeLast()
-            if (!snapshot.bitmap.isRecycled) snapshot.bitmap.recycle()
-        }
+        // Nothing was committed to the bitmap, and the stroke only takes its
+        // undo entry when it is finished - so there is no entry to drop here.
         notifyUndoRedo()
         invalidate()
     }
@@ -3514,7 +3633,8 @@ class DrawingCanvasView @JvmOverloads constructor(
         clearRedoStack()
         while (undoStack.isNotEmpty()) {
             val snapshot = undoStack.removeLast()
-            if (!snapshot.bitmap.isRecycled) snapshot.bitmap.recycle()
+            snapshot.bitmap?.let { if (!it.isRecycled) it.recycle() }
+            snapshot.dirtyBitmap?.let { if (!it.isRecycled) it.recycle() }
         }
     }
 

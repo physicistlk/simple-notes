@@ -96,6 +96,19 @@ in any earlier list.
 
 ---
 
+### How to read the states in this file
+
+| State | Meaning |
+| :--- | :--- |
+| **OPEN** | Not implemented yet. |
+| **IMPLEMENTED** | The code is written and builds, but nobody has confirmed it on the tablet. **It is not ticked.** |
+| **FIXED** | Confirmed by the user on the device (the check list at the end of this file). |
+
+A row is only ticked when the user has verified the same behaviour on the
+tablet; until then it stays **IMPLEMENTED**.
+
+---
+
 ## B — Database
 
 ### Open
@@ -147,7 +160,14 @@ in any earlier list.
 | **C21** | The floating image layers only worked in single-page mode. Every note opens in continuous mode (`pageTurningMode` defaults to 0), where the panel said "Switch to Single-Page to edit layers." and the reader never drew a layer at all — so "+ Image" appeared to do nothing. | The layers feature was dead in the mode the app actually opens in. | `CanvasScreen.kt`, `DrawingCanvasView.kt` | **FIXED** — the reader composites the layers of every page (`ReaderLayerCache`, decoded off the main thread), the panel lists the layers of the current page in both modes, and every action (eye, order, delete, opacity, crop, merge) writes that page. Verified on the tablet: insert, page isolation, restart persistence. |
 | **C22** | The floating pen dock is drawn after the layers panel, so the horizontal dock covered the panel's header and its buttons. | With the horizontal dock the panel looked broken and its "+ Image" button could not be reached. | `CanvasScreen.kt` | **FIXED** — the panel is lifted above the dock (`zIndex(3f)`). |
 | **C23** | The stroke-width popup was built once per preset chip, so a long press opened three stacked popups on top of each other, and the popup carried a preset row that duplicated the chips themselves. | The long press showed garbled overlapping text and the dead rows did nothing useful. | `CanvasScreen.kt` | **FIXED** — one popup per long press (only the chip that was held), the slider only, and it no longer closes itself because the finger is still on the chip (`dismissOnClickOutside = false`). |
-| **C24** | The "liquid glass" of the dock was a painted gradient: an opaque white slab (93-98 %) with a hairline border, no refraction and no blur. | The dock looked like a plastic bar, and the ink under it was either hidden or ran muddy under the icons. | `CanvasScreen.kt`, `ui/components/LiquidGlass.kt` | **FIXED** — the glass is now real: an AGSL shader (Android 13+) samples the page pixels under the dock, bends them at the bezel, frosts them with a nine tap disc and splits the rim into its colours; the body is a translucent tint, the icons sit on a brighter lens, and the HUD pills (Stylus Mode, zoom/lock) use the same material. On Android below 13 the old tint is used. |
+| **C24** | The "liquid glass" of the dock was a painted gradient: an opaque white slab (93-98 %) with a hairline border, no refraction and no blur. | The dock looked like a plastic bar, and the ink under it was either hidden or ran muddy under the icons. | `CanvasScreen.kt`, `ui/components/LiquidGlass.kt` | **IMPLEMENTED** — the glass is now real: an AGSL shader (Android 13+) samples the page pixels under the dock, bends them at the bezel, frosts them with a nine tap disc and splits the rim into its colours; the body is a translucent tint, the icons sit on a brighter lens, and the HUD pills (Stylus Mode, zoom/lock) use the same material. On Android below 13 the old tint is used. The material was rewritten by the user (rounded-rectangle SDF, 17-tap frost, opaque composite on the paper colour); the call sites follow `screenshots/call_site_changes.txt`. |
+| **C25** | The infinite canvas shows a page boundary: the reader draws a frame (orange for the current page, grey for the others) around **every** page, and the area outside the page is the grey desk. | The endless canvas looks like a sheet of paper with a frame - the one thing the infinite mode is supposed not to be. | `CanvasScreen.kt` (`ContinuousPageView`) | **IMPLEMENTED** — the frame is only drawn for bounded pages (A4, PDF); an infinite page has no border and no desk. |
+| **C26** | Writing outside a PDF (or A4) page is cut off at the page edge. The engine has the margin-ink machinery (`beyond_<page>_<n>.png`), but `beyondPaper` was only switched on for infinite notes, so the pan is clamped to the page and the margin strokes are dropped. | The user cannot annotate in the margin of a PDF - the most natural place for notes on an imported document. | `CanvasScreen.kt`, `DrawingCanvasView.kt` | **IMPLEMENTED** — the margin ink is enabled for every page type: the page can be panned past its edge and the strokes outside the paper are stored as page level crops and drawn on the desk. |
+| **C27** | On the infinite canvas the writing area is limited to the size of the saved page bitmap (an A4-like rectangle), even though the canvas itself is endless. | The user writes into a small box in the middle of an endless canvas. | `ContinuousInkController.kt`, `CanvasScreen.kt` | **IMPLEMENTED** — the ink session of an infinite page covers the whole visible canvas, not just the saved bitmap. |
+| **C28** | A big lag in the stroke preview: every stroke copies the whole page bitmap (26 MB for a 2160x3056 PDF page) for the undo snapshot, on the UI thread, and the reader recomposites the full page per stroke. | The pen trails behind the finger; on a PDF page the lag is seconds, not milliseconds. | `DrawingCanvasView.kt`, `ContinuousInkController.kt` | **IMPLEMENTED** — the undo snapshot only copies the dirty rectangle of the stroke, the reader composites only what changed, and the glass shader was cut from 53 to 11 texture samples per pixel. |
+| **C29** | The two pen switches in the Settings tab are confusing: "Show Pencase" (the floating tool dock) and "Pen-Tool" (the small pen palette in the corner) look like the same thing, the pen palette covers the dock's tools, and its state is not persisted with the other canvas settings. | The user ticks "Pen-Tool" and the pen tools disappear - or nothing happens at all. | `CanvasScreen.kt`, `CanvasViewModel.kt` | **IMPLEMENTED** — the switches now say what they do ("The floating tool dock" / "A small pen panel in the corner"), the pen palette is persisted with the canvas settings and never overlaps the dock. |
+| **C30** | After setting the stroke thickness, the width popup stayed open: it was a focusable popup, so it swallowed every touch outside it and the canvas never saw the tap. | The user has to hunt for a way to close it. | `CanvasScreen.kt` | **IMPLEMENTED** — the popup is no longer focusable, a touch in the canvas closes it (and the back button does too). |
+| **C31** | The glass shader cost 53 texture samples per pixel (a seventeen tap frost evaluated three times for the colour split) over the whole dock, and it is re-run on every window repaint - that is, on every stroke. | The pen lagged behind the finger. | `ui/components/LiquidGlass.kt` | **IMPLEMENTED** — nine taps for the frost and two single samples for the colour split: 11 samples per pixel, a fifth of the cost, with the same look. |
 
 ### Fixed in the recent rounds
 
@@ -194,6 +214,21 @@ in any earlier list.
 - The **page files** are written with a unique temp file and a checked rename, the **layer save** snapshots the list on the UI thread, and **cropping a layer** no longer recycles the bitmap the undo snapshot points at.
 
 ---
+
+## The check list (tick these off on the tablet)
+
+Every row below is **IMPLEMENTED** and waiting for the user's confirmation.
+The user ticks a line here; only then does the row in the tables above become
+**FIXED**.
+
+- [ ] **C25** The infinite canvas shows no page frame and no grey desk around it.
+- [ ] **C26** On a PDF page, the pen writes into the margin and the strokes stay there after a restart.
+- [ ] **C27** On an infinite note, the pen writes anywhere on the canvas, not only inside the saved rectangle.
+- [ ] **C28** Drawing a stroke on a PDF page follows the finger with no lag.
+- [ ] **C29** "Show Pencase" shows/hides the floating dock, "Pen-Tool" shows/hides the small pen panel, and neither hides the other.
+- [ ] **C30** After setting the thickness, a touch in the canvas closes the width popup.
+- [ ] **C31** The dock glass looks the same as before but the pen no longer lags.
+- [ ] **C24** The glass bends the ink at the bezel (the ink is displaced where it crosses the rim).
 
 ## Roadmap
 

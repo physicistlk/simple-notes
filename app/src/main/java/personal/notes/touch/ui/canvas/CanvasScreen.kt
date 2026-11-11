@@ -143,6 +143,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
@@ -170,6 +171,7 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.TextStyle
@@ -185,7 +187,7 @@ import personal.notes.touch.ui.components.GlassBackdrop
 import personal.notes.touch.ui.components.GlassOrigin
 import personal.notes.touch.ui.components.LiquidGlassShader
 import personal.notes.touch.ui.components.liquidGlassBackdrop
-import personal.notes.touch.ui.components.liquidGlassMeniscus
+import personal.notes.touch.ui.components.LiquidGlassStyle
 import personal.notes.touch.ui.components.liquidGlassRim
 import personal.notes.touch.ui.components.liquidStylusSpotlight
 import androidx.compose.ui.unit.sp
@@ -410,6 +412,8 @@ fun CanvasScreen(
 
     val isInfinite = (note?.pageType ?: "infinite") == "infinite"
     val isContinuous = uiState.pageTurningMode == 0
+    /** An infinite canvas is endless: no page frame, no desk, no edge. */
+    val isInfiniteNote = note?.pageType == "infinite"
     val isHorizontal = uiState.pageTurningDirection == 1
 
     var continuousScale by remember { mutableFloatStateOf(1f) }
@@ -442,6 +446,14 @@ fun CanvasScreen(
         viewModel.dismissCanvasMenus()
         showLayersPanel = false
         showShapesMenu = false
+        // The width and colour popups are floating windows: a touch in the
+        // canvas has to close them as well, or they stay on top of the page.
+        showWidthPopupHoriz = false
+        showWidthPopupVert = false
+        widthPopupChipHoriz = -1
+        widthPopupChipVert = -1
+        showColorPopupHoriz = false
+        showColorPopupVert = false
     }
 
     // ---- F-10: vector PDF page plumbing -----------------------------------
@@ -493,6 +505,22 @@ fun CanvasScreen(
     val glassDockOriginHolder = remember { GlassOrigin() }
     val glassStylusOrigin = remember { GlassOrigin() }
     val glassZoomOrigin = remember { GlassOrigin() }
+    /** The screen position of the width popup windows. */
+    val glassWidthPopupHoriz = remember { GlassOrigin() }
+    val glassWidthPopupVert = remember { GlassOrigin() }
+    /**
+     * The offset of the app's root view inside the window.
+     *
+     * A popup lives in its own window and is positioned in window
+     * coordinates, while the glass works in root coordinates: the two have to
+     * be brought into the same system.
+     */
+    val localRootView = LocalView.current
+    val rootViewOffset = remember(localRootView) {
+        val loc = IntArray(2)
+        localRootView.getLocationInWindow(loc)
+        Offset(loc[0].toFloat(), loc[1].toFloat())
+    }
 
     /**
      * The page pixels under the dock, in page coordinates.
@@ -2278,7 +2306,10 @@ fun CanvasScreen(
                     },
                     update = { view ->
                         view.pageType = note?.pageType ?: "infinite"
-                        view.beyondPaper = (note?.pageType == "infinite") && !uiState.fixPreviewPage
+                        // The margin ink (the strokes outside the paper) is
+                        // kept for every page type: on a PDF the notes in the
+                        // margin are the most useful ones.
+                        view.beyondPaper = !uiState.fixPreviewPage
                         view.currentTool = uiState.selectedTool
                         view.strokeColor = uiState.selectedColor.toArgb()
                         view.strokeWidthPx = uiState.strokeWidth
@@ -2311,7 +2342,9 @@ fun CanvasScreen(
                         Box(
                             modifier = Modifier
                                 .fillMaxSize()
-                                .background(Color(0xFFEEEEEE))
+                                // An infinite canvas has no desk: the paper
+                                // goes to the edge of the screen.
+                                .background(if (isInfiniteNote) Color.White else Color(0xFFEEEEEE))
                                 .pointerInput(Unit) {
                                     // A touch in the reader closes the open
                                     // menus, the same way a touch on the page
@@ -2366,6 +2399,7 @@ fun CanvasScreen(
                                                 backgroundDensity = uiState.backgroundDensity,
                                                 savedGeneration = savedPageGenerations[idx] ?: 0,
                                                 isCurrentPage = idx == currentPageIndex,
+                                                isInfinite = isInfiniteNote,
                                                 modifier = androidx.compose.ui.Modifier.fillMaxHeight(),
                                                 onPageBitmap = { idx, bmp ->
                                                     if (idx == currentPageIndex) {
@@ -2417,6 +2451,7 @@ fun CanvasScreen(
                                                         backgroundDensity = uiState.backgroundDensity,
                                                         savedGeneration = savedPageGenerations[idx] ?: 0,
                                                         isCurrentPage = idx == currentPageIndex,
+                                                        isInfinite = isInfiniteNote,
                                                         modifier = androidx.compose.ui.Modifier.fillMaxWidth(),
                                                         onPageBitmap = { idx, bmp ->
                                                             if (idx == currentPageIndex) {
@@ -2469,6 +2504,7 @@ fun CanvasScreen(
                                                 backgroundDensity = uiState.backgroundDensity,
                                                 savedGeneration = savedPageGenerations[idx] ?: 0,
                                                 isCurrentPage = idx == currentPageIndex,
+                                                isInfinite = isInfiniteNote,
                                                 modifier = androidx.compose.ui.Modifier.fillMaxWidth(),
                                                 onStylusDetected = { viewModel.onStylusDetected() },
                                         onPinch = { centroid, pan, zoom -> handleReaderTransform(centroid, pan, zoom) },
@@ -2527,11 +2563,9 @@ fun CanvasScreen(
                                 ) {
                                     Box(
                                         modifier = Modifier
-                                            .liquidGlassBackdrop(glassShader) {
-                                                glassBackdropAt(glassStylusOrigin)
-                                            }
-                                            .background(GlassDarkBrush, RoundedCornerShape(16.dp))
-                                            .liquidGlassMeniscus(16.dp)
+                                            .liquidGlassBackdrop(
+                                                glassShader, 16.dp, LiquidGlassStyle.Dark
+                                            ) { glassBackdropAt(glassStylusOrigin) }
                                             .liquidGlassRim(16.dp, RoundedCornerShape(16.dp))
                                     ) {
                                     Row(
@@ -2575,11 +2609,9 @@ fun CanvasScreen(
                                 ) {
                                     Box(
                                         modifier = Modifier
-                                            .liquidGlassBackdrop(glassShader) {
-                                                glassBackdropAt(glassZoomOrigin)
-                                            }
-                                            .background(GlassDarkBrush, RoundedCornerShape(16.dp))
-                                            .liquidGlassMeniscus(16.dp)
+                                            .liquidGlassBackdrop(
+                                                glassShader, 16.dp, LiquidGlassStyle.Dark
+                                            ) { glassBackdropAt(glassZoomOrigin) }
                                             .liquidGlassRim(16.dp, RoundedCornerShape(16.dp))
                                     ) {
                                     Row(
@@ -3312,10 +3344,10 @@ fun CanvasScreen(
                                 .offset { IntOffset(pencaseOffsetX.roundToInt(), pencaseOffsetY.roundToInt()) }
                                 .padding(top = 10.dp)
                                 .shadow(
-                                    elevation = 20.dp,
+                                    elevation = 14.dp,
                                     shape = RoundedCornerShape(26.dp),
-                                    ambientColor = Color(0x1A000000),
-                                    spotColor = Color(0x38001A4D)
+                                    ambientColor = Color(0x14000000),
+                                    spotColor = Color(0x26000000)
                                 )
                                 .onGloballyPositioned {
                                     glassDockOriginHolder.x = it.positionInRoot().x
@@ -3327,9 +3359,9 @@ fun CanvasScreen(
                                     // The page under the dock, bent by the
                                     // glass: drawn first, so the tint and the
                                     // icons stay on top of it.
-                                    .liquidGlassBackdrop(glassShader) { glassBackdropAt(glassDockOriginHolder) }
-                                    .background(GlassBodyBrush, RoundedCornerShape(26.dp))
-                                    .liquidGlassMeniscus(26.dp)
+                                    .liquidGlassBackdrop(glassShader, 26.dp) {
+                                        glassBackdropAt(glassDockOriginHolder)
+                                    }
                                     .liquidGlassRim(26.dp, RoundedCornerShape(26.dp))
                                     .liquidStylusSpotlight()
                             ) {
@@ -3339,7 +3371,6 @@ fun CanvasScreen(
                                     // rim of the dock stays transparent.
                                     .padding(3.dp)
                                     .height(46.dp)
-                                    .background(GlassLensBrush, RoundedCornerShape(23.dp))
                                     .padding(horizontal = 8.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -3564,6 +3595,10 @@ fun CanvasScreen(
                                             activeWidth = activeWidth,
                                             isEraser = isEraserTool,
                                             preferRight = false,
+                                            glassOrigin = glassWidthPopupHoriz,
+                                            rootOffset = rootViewOffset,
+                                            glassShader = glassShader,
+                                            glassBackdropAt = glassBackdropAt,
                                             onWidthChange = { viewModel.setStrokeWidth(it) }
                                         )
                                     }
@@ -3650,10 +3685,10 @@ fun CanvasScreen(
                                 .offset { IntOffset(pencaseOffsetX.roundToInt(), pencaseOffsetY.roundToInt()) }
                                 .padding(start = 12.dp)
                                 .shadow(
-                                    elevation = 20.dp,
+                                    elevation = 14.dp,
                                     shape = RoundedCornerShape(26.dp),
-                                    ambientColor = Color(0x1A000000),
-                                    spotColor = Color(0x38001A4D)
+                                    ambientColor = Color(0x14000000),
+                                    spotColor = Color(0x26000000)
                                 )
                                 .onGloballyPositioned {
                                     glassDockOriginHolder.x = it.positionInRoot().x
@@ -3662,9 +3697,9 @@ fun CanvasScreen(
                         ) {
                             Box(
                                 modifier = Modifier
-                                    .liquidGlassBackdrop(glassShader) { glassBackdropAt(glassDockOriginHolder) }
-                                    .background(GlassBodyBrush, RoundedCornerShape(26.dp))
-                                    .liquidGlassMeniscus(26.dp)
+                                    .liquidGlassBackdrop(glassShader, 26.dp) {
+                                        glassBackdropAt(glassDockOriginHolder)
+                                    }
                                     .liquidGlassRim(26.dp, RoundedCornerShape(26.dp))
                                     .liquidStylusSpotlight()
                             ) {
@@ -3672,7 +3707,6 @@ fun CanvasScreen(
                                 modifier = Modifier
                                     .padding(3.dp)
                                     .width(46.dp)
-                                    .background(GlassLensBrush, RoundedCornerShape(23.dp))
                                     .padding(vertical = 7.dp),
                                 horizontalAlignment = Alignment.CenterHorizontally,
                                 verticalArrangement = Arrangement.spacedBy(6.dp)
@@ -3893,6 +3927,10 @@ fun CanvasScreen(
                                             activeWidth = verticalActive,
                                             isEraser = isEraserToolVert,
                                             preferRight = true,
+                                            glassOrigin = glassWidthPopupVert,
+                                            rootOffset = rootViewOffset,
+                                            glassShader = glassShader,
+                                            glassBackdropAt = glassBackdropAt,
                                             onWidthChange = { viewModel.setStrokeWidth(it) }
                                         )
                                     }
@@ -4131,8 +4169,15 @@ fun CanvasScreen(
                         color = Color.White.copy(alpha = 0.95f),
                         shadowElevation = 3.dp,
                         modifier = Modifier
-                            .align(Alignment.BottomStart)
-                            .padding(start = 16.dp, bottom = 64.dp)
+                            // The vertical dock sits in the middle of the
+                            // left edge: the pen panel moves to the other
+                            // corner so it can never cover the tools.
+                            .align(if (uiState.dockHorizontal) Alignment.BottomStart else Alignment.BottomEnd)
+                            .padding(
+                                start = 16.dp,
+                                end = 16.dp,
+                                bottom = 64.dp
+                            )
                             .border(1.dp, Color(0xFFE0E0E0), RoundedCornerShape(16.dp))
                     ) {
                         Row(
@@ -5026,10 +5071,10 @@ fun CanvasScreen(
                                                     enabled = uiState.stylusDetected,
                                                     onCheckedChange = { viewModel.toggleStylusOnly(it) }
                                                 )
-                                                // 2. Show Pencase
+                                                // 2. Show Pencase - the floating tool dock
                                                 SettingsCheckboxRow(
                                                     title = "Show Pencase",
-                                                    subtitle = "",
+                                                    subtitle = "The floating tool dock with the pens",
                                                     checked = uiState.showPencase,
                                                     onCheckedChange = { viewModel.toggleShowPencase(it) }
                                                 )
@@ -5040,10 +5085,11 @@ fun CanvasScreen(
                                                     checked = uiState.doublePageMode,
                                                     onCheckedChange = { viewModel.toggleDoublePageMode(it) }
                                                 )
-                                                // 4. Pen-Tool
+                                                // 4. Pen-Tool - the small pen panel in the
+                                                // corner (a second, smaller palette)
                                                 SettingsCheckboxRow(
                                                     title = "Pen-Tool",
-                                                    subtitle = "",
+                                                    subtitle = "A small pen panel in the corner",
                                                     checked = uiState.penBoxEnabled,
                                                     onCheckedChange = { viewModel.togglePenBox(it) }
                                                 )
@@ -5355,7 +5401,15 @@ fun PencaseToolIcon(
  * to the right of the chip so they do not sit on top of the dock itself.
  */
 private class ChipPopupPositionProvider(
-    private val preferRight: Boolean = false
+    private val preferRight: Boolean = false,
+    /**
+     * Where the popup window ended up on the screen. The popup lives in its
+     * own window, so the glass inside it needs the screen position of that
+     * window to know which part of the page lies underneath.
+     */
+    private val glassOrigin: GlassOrigin? = null,
+    /** The offset of the app's root view inside the window. */
+    private val rootOffset: Offset = Offset.Zero
 ) : PopupPositionProvider {
     override fun calculatePosition(
         anchorBounds: IntRect,
@@ -5373,6 +5427,10 @@ private class ChipPopupPositionProvider(
         val below = anchorBounds.bottom + gap
         val above = anchorBounds.top - popupContentSize.height - gap
         val y = if (below + popupContentSize.height <= windowSize.height) below else above.coerceAtLeast(0)
+        glassOrigin?.let {
+            it.x = x - rootOffset.x
+            it.y = y - rootOffset.y
+        }
         return IntOffset(x, y)
     }
 }
@@ -5394,6 +5452,10 @@ private fun WidthPickerPopup(
     activeWidth: Float,
     isEraser: Boolean,
     preferRight: Boolean,
+    glassOrigin: GlassOrigin,
+    rootOffset: Offset,
+    glassShader: LiquidGlassShader,
+    glassBackdropAt: (GlassOrigin) -> GlassBackdrop?,
     onWidthChange: (Float) -> Unit
 ) {
     if (!expanded) return
@@ -5401,13 +5463,18 @@ private fun WidthPickerPopup(
     val maxWidth = if (isEraser) ERASER_WIDTH_MAX else PEN_WIDTH_MAX
     Popup(
         onDismissRequest = onDismiss,
-        popupPositionProvider = ChipPopupPositionProvider(preferRight),
+        popupPositionProvider = ChipPopupPositionProvider(
+            preferRight = preferRight,
+            glassOrigin = glassOrigin,
+            rootOffset = rootOffset
+        ),
         properties = PopupProperties(
-            focusable = true,
-            // The popup opens while the finger is still on the chip: a click
-            // outside would close it again right away.
+            // Not focusable: a focusable popup swallows every touch outside
+            // it, so a touch in the canvas could never close it. The canvas
+            // closes it instead (see dismissCanvasOverlays).
+            focusable = false,
             dismissOnClickOutside = false,
-            dismissOnBackPress = true
+            dismissOnBackPress = false
         )
     ) {
         // Local thumb state keeps the drag smooth; the view model is updated
@@ -5423,8 +5490,9 @@ private fun WidthPickerPopup(
         ) {
             Box(
                 modifier = Modifier
-                    .background(GlassBodyBrush, RoundedCornerShape(18.dp))
-                    .liquidGlassMeniscus(18.dp)
+                    .liquidGlassBackdrop(glassShader, 18.dp) {
+                        glassBackdropAt(glassOrigin)
+                    }
                     .liquidGlassRim(18.dp, RoundedCornerShape(18.dp))
             ) {
                 Column(
@@ -5784,6 +5852,8 @@ fun ContinuousPageView(
     backgroundDensity: Int = 40,
     savedGeneration: Int = 0,
     isCurrentPage: Boolean = false,
+    /** An infinite canvas has no page edge: no frame, no desk. */
+    isInfinite: Boolean = false,
     modifier: Modifier = Modifier,
     onStylusDetected: () -> Unit = {},
     onPageMapping: (ContinuousPageMap) -> Unit = {},
@@ -6055,6 +6125,9 @@ fun ContinuousPageView(
 
         // Page border: drawn after the page so it stays visible on top of an
         // opaque PDF page (the image would otherwise cover it).
+        // An infinite canvas has no edge at all - a frame there would turn
+        // the endless canvas into a sheet of paper.
+        if (!isInfinite) {
         androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
             val stroke = if (isCurrentPage) 1.5.dp.toPx() else 1.dp.toPx()
             val borderColor = if (isCurrentPage) {
@@ -6071,6 +6144,7 @@ fun ContinuousPageView(
                     (size.height - stroke).coerceAtLeast(1f)
                 )
             )
+        }
         }
 
         if (shown == null && !loadCompleted && !sessionReady) {
