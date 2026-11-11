@@ -106,6 +106,9 @@ data class LiquidGlassStyle(
     }
 }
 
+/** How much smaller the sampled page is than the page itself. */
+private const val SAMPLE_SCALE = 0.25f
+
 /**
  * AGSL: a real rounded-rectangle lens.
  *
@@ -233,10 +236,61 @@ class LiquidGlassShader {
     private var input: BitmapShader? = null
     private var inputBitmap: Bitmap? = null
 
+    /**
+     * The texture the shader samples: a quarter size copy of the page.
+     *
+     * The page bitmap is 26 MB for an A4 sheet, and the glass samples it
+     * every frame - the samples missed the texture cache and the dock lagged
+     * behind the page while it scrolled. The small copy is built in the
+     * background, so the sampling turns into cache hits.
+     */
+    private var sampleBitmap: Bitmap? = null
+    private var sampleSource: Bitmap? = null
+    private var sampleGeneration: Int = -1
+    private var samplePendingSource: Bitmap? = null
+    private var samplePendingGeneration: Int = -1
+
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
 
     /** The paint that draws the refracted backdrop. */
     val shaderPaint: Paint get() = paint
+
+    /**
+     * The small copy of the page the shader samples.
+     *
+     * The copy is built in the background: building it on the draw thread
+     * would cost tens of milliseconds on a 26 MB page.
+     */
+    private fun sampleFor(source: Bitmap): PageSample? {
+        val generation = try {
+            source.generationId
+        } catch (e: Exception) {
+            0
+        }
+        if (sampleSource === source && sampleGeneration == generation) {
+            val bitmap = sampleBitmap ?: return null
+            return PageSample(bitmap)
+        }
+        if (samplePendingSource !== source || samplePendingGeneration != generation) {
+            samplePendingSource = source
+            samplePendingGeneration = generation
+            SampleBuilder.execute {
+                val w = (source.width * SAMPLE_SCALE).toInt().coerceAtLeast(1)
+                val h = (source.height * SAMPLE_SCALE).toInt().coerceAtLeast(1)
+                val small = try {
+                    Bitmap.createScaledBitmap(source, w, h, true)
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    null
+                } ?: return@execute
+                sampleBitmap = small
+                sampleSource = source
+                sampleGeneration = generation
+            }
+        }
+        val bitmap = sampleBitmap ?: return null
+        return PageSample(bitmap)
+    }
 
     /**
      * The shader for the current backdrop, or null when the glass cannot be
@@ -253,18 +307,22 @@ class LiquidGlassShader {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return null
         val bmp = backdrop?.bitmap ?: return null
         if (width <= 0f || height <= 0f || backdrop.invScale <= 0f) return null
+        val sample = sampleFor(bmp) ?: return null
         return try {
-            if (inputBitmap !== bmp) {
-                input = BitmapShader(bmp, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
-                inputBitmap = bmp
+            if (inputBitmap !== sample.bitmap) {
+                input = BitmapShader(sample.bitmap, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
+                inputBitmap = sample.bitmap
             }
             val shaderIn = input ?: return null
             val rs = runtime ?: RuntimeShader(LIQUID_GLASS_AGSL).also { runtime = it }
+            // The sample is a scaled copy of the page, so every page
+            // coordinate is scaled with it.
+            val k = SAMPLE_SCALE
             rs.setFloatUniform("uSize", width, height)
             rs.setFloatUniform("uRadius", radiusPx)
-            rs.setFloatUniform("uPageOrigin", backdrop.pageOriginX, backdrop.pageOriginY)
-            rs.setFloatUniform("uInvScale", backdrop.invScale)
-            rs.setFloatUniform("uBitmapSize", bmp.width.toFloat(), bmp.height.toFloat())
+            rs.setFloatUniform("uPageOrigin", backdrop.pageOriginX * k, backdrop.pageOriginY * k)
+            rs.setFloatUniform("uInvScale", backdrop.invScale * k)
+            rs.setFloatUniform("uBitmapSize", sample.bitmap.width.toFloat(), sample.bitmap.height.toFloat())
             rs.setFloatUniform("uBezel", style.bezel.value * density)
             rs.setFloatUniform("uRefract", style.refract.value * density)
             rs.setFloatUniform("uBlur", style.blur.value * density)
@@ -283,6 +341,32 @@ class LiquidGlassShader {
             // A recycled bitmap must not take the canvas down.
             e.printStackTrace()
             null
+        }
+    }
+}
+
+/**
+ * The small copy of the page.
+ *
+ * It is rebuilt in the background when the page changes: a new stroke
+ * changes the bitmap's generation id, and the old copy stays in use until
+ * the new one is ready.
+ */
+private class PageSample(val bitmap: Bitmap)
+
+/** Builds the small page copies off the main thread. */
+private object SampleBuilder {
+    private val executor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "liquid-glass-sample").apply {
+            isDaemon = true
+            priority = Thread.MIN_PRIORITY
+        }
+    }
+    fun execute(block: () -> Unit) {
+        try {
+            executor.execute(block)
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
     }
 }

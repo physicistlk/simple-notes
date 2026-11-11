@@ -751,6 +751,15 @@ class DrawingCanvasView @JvmOverloads constructor(
      * writing again.
      */
     var onCanvasTouchStart: (() -> Unit)? = null
+
+    /**
+     * Called whenever the page moves or zooms.
+     *
+     * The glass of the floating dock samples the page under it, so it has to
+     * redraw when the page moves - otherwise the glass shows the old pixels
+     * and lags behind the page.
+     */
+    var onViewportChanged: (() -> Unit)? = null
     // Touch Path & Shapes
     private val currentPath = Path()
     private var lastTouchX = 0f
@@ -1206,6 +1215,7 @@ class DrawingCanvasView @JvmOverloads constructor(
                         panX = panX.coerceIn(minPanX, maxPanX)
                         panY = panY.coerceIn(minPanY, maxPanY)
                     }
+                    onViewportChanged?.invoke()
                     invalidate()
                     return true
                 }
@@ -1268,6 +1278,7 @@ class DrawingCanvasView @JvmOverloads constructor(
     private fun centerTransform(bitmapWidth: Int, bitmapHeight: Int) {
         panX = (width - bitmapWidth * scale) / 2f
         panY = (height - bitmapHeight * scale) / 2f
+        onViewportChanged?.invoke()
     }
 
     fun loadBitmap(bitmap: Bitmap) {

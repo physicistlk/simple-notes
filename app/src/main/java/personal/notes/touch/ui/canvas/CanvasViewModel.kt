@@ -35,11 +35,25 @@ import personal.notes.touch.ui.settings.parsePenDefaults
 import personal.notes.touch.util.BitmapUtils
 import java.io.File
 
+/**
+ * The eraser has no setting of its own: 36 px (the "Thick" chip) is the size
+ * it starts with and the size the reset button restores.
+ */
+const val DEFAULT_ERASER_WIDTH = 36f
+
 data class CanvasUiState(
     val selectedTool: CanvasTool = CanvasTool.PEN,
     val selectedColor: Color = Color.Black,
     val strokeWidth: Float = 6f,
-    val eraserWidth: Float = 36f,
+    val eraserWidth: Float = DEFAULT_ERASER_WIDTH,
+    /**
+     * The pen default from the settings - the size the pen falls back to when
+     * the user hits reset. It is kept apart from [strokeWidth], which follows
+     * the size currently in use.
+     */
+    val defaultStrokeWidth: Float = 6f,
+    /** The eraser default: there is no setting for the eraser size. */
+    val defaultEraserWidth: Float = DEFAULT_ERASER_WIDTH,
     val paperPattern: PaperPattern = PaperPattern.BLANK,
     val backgroundMode: Int = 0,
     val backgroundDensity: Int = 40,
@@ -95,6 +109,13 @@ fun CanvasUiState.withStrokeWidth(width: Float): CanvasUiState =
 /** Size the chips should highlight and the canvas should apply for the active tool. */
 fun CanvasUiState.activeStrokeWidth(): Float =
     if (selectedTool == CanvasTool.ERASER) eraserWidth else strokeWidth
+
+/**
+ * The size the reset button restores for the active tool: the pen default
+ * from the settings for the pen, the eraser default for the eraser.
+ */
+fun CanvasUiState.defaultWidthForTool(): Float =
+    if (selectedTool == CanvasTool.ERASER) defaultEraserWidth else defaultStrokeWidth
 
 /**
  * Where a note reopens: the saved page clamped into the pages that still
@@ -307,6 +328,9 @@ class CanvasViewModel(
                         _uiState.value = _uiState.value.copy(
                             selectedColor = Color(pen.color),
                             strokeWidth = pen.strokeWidth,
+                            // The reset button goes back to the setting, not to
+                            // the size that happens to be in use.
+                            defaultStrokeWidth = pen.strokeWidth,
                             pressureSensitivity = pen.pressureSensitivity
                         )
                     }

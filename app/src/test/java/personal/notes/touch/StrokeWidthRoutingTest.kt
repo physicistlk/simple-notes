@@ -4,9 +4,11 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 import personal.notes.touch.ui.canvas.CanvasTool
 import personal.notes.touch.ui.canvas.CanvasUiState
+import personal.notes.touch.ui.canvas.DEFAULT_ERASER_WIDTH
 import personal.notes.touch.ui.canvas.TouchNotesEraserPresets
 import personal.notes.touch.ui.canvas.TouchNotesWidthPresets
 import personal.notes.touch.ui.canvas.activeStrokeWidth
+import personal.notes.touch.ui.canvas.defaultWidthForTool
 import personal.notes.touch.ui.canvas.withStrokeWidth
 
 /**
@@ -57,5 +59,27 @@ class StrokeWidthRoutingTest {
         // Otherwise the eraser would show no selected chip on a fresh install.
         assertEquals(true, TouchNotesEraserPresets.any { it.first == CanvasUiState().eraserWidth })
         assertEquals(true, TouchNotesWidthPresets.any { it.first == CanvasUiState().strokeWidth })
+    }
+
+    @Test
+    fun thePenResetsToTheDefaultOfTheSettings() {
+        // The size in use may be anything; the reset button goes back to the
+        // pen default the settings hold.
+        val state = CanvasUiState(
+            selectedTool = CanvasTool.PEN,
+            strokeWidth = 24f,
+            defaultStrokeWidth = 6f
+        )
+        assertEquals(6f, state.defaultWidthForTool(), 0.001f)
+    }
+
+    @Test
+    fun theEraserResetsToItsOwnDefault() {
+        val state = CanvasUiState(
+            selectedTool = CanvasTool.ERASER,
+            eraserWidth = 80f,
+            defaultEraserWidth = DEFAULT_ERASER_WIDTH
+        )
+        assertEquals(DEFAULT_ERASER_WIDTH, state.defaultWidthForTool(), 0.001f)
     }
 }

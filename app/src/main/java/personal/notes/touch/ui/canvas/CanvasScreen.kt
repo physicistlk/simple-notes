@@ -178,6 +178,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.zIndex
 import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.IntSize
@@ -405,10 +406,14 @@ fun CanvasScreen(
     /** The width chip the slider popup belongs to (only that one shows it). */
     var widthPopupChipHoriz by remember { mutableIntStateOf(-1) }
     var showColorPopupHoriz by remember { mutableStateOf(false) }
+    /** The swatch the colour popup belongs to (only that one shows it). */
+    var colorPopupChipHoriz by remember { mutableIntStateOf(-1) }
     var showWidthPopupVert by remember { mutableStateOf(false) }
     /** The width chip the slider popup belongs to (only that one shows it). */
     var widthPopupChipVert by remember { mutableIntStateOf(-1) }
     var showColorPopupVert by remember { mutableStateOf(false) }
+    /** The swatch the colour popup belongs to (only that one shows it). */
+    var colorPopupChipVert by remember { mutableIntStateOf(-1) }
 
     val isInfinite = (note?.pageType ?: "infinite") == "infinite"
     val isContinuous = uiState.pageTurningMode == 0
@@ -454,6 +459,8 @@ fun CanvasScreen(
         widthPopupChipVert = -1
         showColorPopupHoriz = false
         showColorPopupVert = false
+        colorPopupChipHoriz = -1
+        colorPopupChipVert = -1
     }
 
     // ---- F-10: vector PDF page plumbing -----------------------------------
@@ -490,6 +497,11 @@ fun CanvasScreen(
     /** Top-left of the drawing canvas in root coordinates (single-page mode). */
     var canvasOriginInRoot by remember { mutableStateOf(androidx.compose.ui.geometry.Offset.Zero) }
 
+    // The reader's scroll state: the glass watches its offset, so the dock
+    // redraws while the page scrolls.
+    val continuousColState = androidx.compose.foundation.lazy.rememberLazyListState()
+    val continuousRowState = androidx.compose.foundation.lazy.rememberLazyListState()
+
     // ---- Liquid glass ----------------------------------------------------
     // The dock is refractive: the page under it is sampled through an AGSL
     // shader, so the ink bends at the bezel instead of being hidden by a
@@ -503,6 +515,14 @@ fun CanvasScreen(
     var glassReaderBitmapPage by remember { mutableIntStateOf(-1) }
     /** The origins of the floating glass elements. */
     val glassDockOriginHolder = remember { GlassOrigin() }
+    /**
+     * Bumped by the engine on every pan and zoom.
+     *
+     * The glass samples the page under the dock, so the dock has to redraw
+     * when the page moves. The tick is read inside the draw lambda: that
+     * invalidates the draw phase only, not the composition.
+     */
+    var glassViewportTick by remember { mutableIntStateOf(0) }
     val glassStylusOrigin = remember { GlassOrigin() }
     val glassZoomOrigin = remember { GlassOrigin() }
     /** The screen position of the width popup windows. */
@@ -531,6 +551,16 @@ fun CanvasScreen(
     val glassBackdropAt: (GlassOrigin) -> GlassBackdrop? = { origin ->
         val view = canvasViewRef
         if (isContinuous) {
+            // The reader scrolls in a Lazy list; its offset is the signal
+            // that the page under the dock moved.
+            @Suppress("UNUSED_EXPRESSION")
+            if (uiState.doublePageMode || isHorizontal) {
+                continuousRowState.firstVisibleItemIndex
+                continuousRowState.firstVisibleItemScrollOffset
+            } else {
+                continuousColState.firstVisibleItemIndex
+                continuousColState.firstVisibleItemScrollOffset
+            }
             val map = continuousPageMap.map
             val bmp = glassReaderBitmap
             if (map == null || bmp == null || map.scale <= 0f ||
@@ -546,6 +576,10 @@ fun CanvasScreen(
                 )
             }
         } else {
+            // Read inside the draw: the draw phase watches the tick and
+            // redraws the glass when the page was panned or zoomed.
+            @Suppress("UNUSED_EXPRESSION")
+            glassViewportTick
             val bmp = view?.getBackingBitmap()
             if (view == null || bmp == null) {
                 null
@@ -754,8 +788,6 @@ fun CanvasScreen(
      */
     val continuousMode = uiState.pageTurningMode == 0
 
-    val continuousColState = androidx.compose.foundation.lazy.rememberLazyListState()
-    val continuousRowState = androidx.compose.foundation.lazy.rememberLazyListState()
 
     // Load/save layers on page change. The INITIAL page/layer load lives in
     // the AndroidView factory below, bound to the view instance it creates:
@@ -2207,6 +2239,9 @@ fun CanvasScreen(
                             onThreeFingerTap = { handleClipboardPaste() }
                             // Any touch on the page closes the open menus.
                             onCanvasTouchStart = { dismissCanvasOverlays() }
+                            // The glass samples the page under the dock: it
+                            // has to redraw when the page moves.
+                            onViewportChanged = { glassViewportTick++ }
                             onImageSelectionChanged = {
                                 selectedImageIndex = it
                             }
@@ -3593,6 +3628,7 @@ fun CanvasScreen(
                                             },
                                             presets = widthPresets,
                                             activeWidth = activeWidth,
+                                            defaultWidth = uiState.defaultWidthForTool(),
                                             isEraser = isEraserTool,
                                             preferRight = false,
                                             glassOrigin = glassWidthPopupHoriz,
@@ -3613,7 +3649,7 @@ fun CanvasScreen(
 
                                 // 3 Rounded-Square Color Swatches with checkmark
                                 // Short tap picks the colour, long press opens the full palette.
-                                TouchNotesDockColors.forEach { c ->
+                                TouchNotesDockColors.forEachIndexed { cIdx, c ->
                                     val isSelected = uiState.selectedColor == c
                                     Box(
                                         modifier = Modifier
@@ -3627,7 +3663,16 @@ fun CanvasScreen(
                                             )
                                             .combinedClickable(
                                                 onClick = { viewModel.selectColor(c) },
-                                                onLongClick = { showColorPopupHoriz = true }
+                                                onLongClick = {
+                                                    // Only the swatch that was
+                                                    // held down opens the
+                                                    // palette: the popup used to
+                                                    // be built once per swatch,
+                                                    // so three of them opened
+                                                    // on top of each other.
+                                                    colorPopupChipHoriz = cIdx
+                                                    showColorPopupHoriz = true
+                                                }
                                             ),
                                         contentAlignment = Alignment.Center
                                     ) {
@@ -3640,8 +3685,11 @@ fun CanvasScreen(
                                             )
                                         }
                                         ColorPalettePopup(
-                                            expanded = showColorPopupHoriz,
-                                            onDismiss = { showColorPopupHoriz = false },
+                                            expanded = showColorPopupHoriz && colorPopupChipHoriz == cIdx,
+                                            onDismiss = {
+                                                showColorPopupHoriz = false
+                                                colorPopupChipHoriz = -1
+                                            },
                                             selectedColor = uiState.selectedColor,
                                             preferRight = false,
                                             onColorSelected = { viewModel.selectColor(it) },
@@ -3925,6 +3973,7 @@ fun CanvasScreen(
                                             },
                                             presets = verticalPresets,
                                             activeWidth = verticalActive,
+                                            defaultWidth = uiState.defaultWidthForTool(),
                                             isEraser = isEraserToolVert,
                                             preferRight = true,
                                             glassOrigin = glassWidthPopupVert,
@@ -3945,7 +3994,7 @@ fun CanvasScreen(
 
                                 // 3 Rounded-Square Color Swatches with checkmark
                                 // Short tap picks the colour, long press opens the full palette.
-                                TouchNotesDockColors.forEach { c ->
+                                TouchNotesDockColors.forEachIndexed { cIdx, c ->
                                     val isSelected = uiState.selectedColor == c
                                     Box(
                                         modifier = Modifier
@@ -3959,7 +4008,16 @@ fun CanvasScreen(
                                             )
                                             .combinedClickable(
                                                 onClick = { viewModel.selectColor(c) },
-                                                onLongClick = { showColorPopupVert = true }
+                                                onLongClick = {
+                                                    // Only the swatch that was
+                                                    // held down opens the
+                                                    // palette: the popup used to
+                                                    // be built once per swatch,
+                                                    // so three of them opened
+                                                    // on top of each other.
+                                                    colorPopupChipVert = cIdx
+                                                    showColorPopupVert = true
+                                                }
                                             ),
                                         contentAlignment = Alignment.Center
                                     ) {
@@ -3972,8 +4030,11 @@ fun CanvasScreen(
                                             )
                                         }
                                         ColorPalettePopup(
-                                            expanded = showColorPopupVert,
-                                            onDismiss = { showColorPopupVert = false },
+                                            expanded = showColorPopupVert && colorPopupChipVert == cIdx,
+                                            onDismiss = {
+                                                showColorPopupVert = false
+                                                colorPopupChipVert = -1
+                                            },
                                             selectedColor = uiState.selectedColor,
                                             preferRight = true,
                                             onColorSelected = { viewModel.selectColor(it) },
@@ -5441,8 +5502,10 @@ private fun formatPx(value: Float): String =
 
 /**
  * Long-press popup of the stroke-width chips: a slider that updates the width
- * live while dragging, the current size in px and the presets of the active
- * tool. The range follows the tool - the eraser is much larger than the pen.
+ * live while dragging, the current size in px and a reset button that puts
+ * the size back to the default of the active tool (the pen default from the
+ * settings, the eraser default for the eraser). The range follows the tool -
+ * the eraser is much larger than the pen.
  */
 @Composable
 private fun WidthPickerPopup(
@@ -5450,6 +5513,7 @@ private fun WidthPickerPopup(
     onDismiss: () -> Unit,
     presets: List<Pair<Float, String>>,
     activeWidth: Float,
+    defaultWidth: Float,
     isEraser: Boolean,
     preferRight: Boolean,
     glassOrigin: GlassOrigin,
@@ -5504,7 +5568,36 @@ private fun WidthPickerPopup(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Text("Width", fontSize = 12.sp, color = Color(0xFF444444))
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(2.dp)
+                        ) {
+                            Text("Width", fontSize = 12.sp, color = Color(0xFF444444))
+                            // Reset: back to the default of the active tool.
+                            // 32 dp is the smallest touch target we allow.
+                            Box(
+                                modifier = Modifier
+                                    .size(32.dp)
+                                    .clip(CircleShape)
+                                    .clickable(
+                                        onClickLabel = "Reset thickness",
+                                        role = Role.Button
+                                    ) {
+                                        val resetTo = defaultWidth.coerceIn(minWidth, maxWidth)
+                                        sliderValue = resetTo
+                                        onWidthChange(resetTo)
+                                        onDismiss()
+                                    },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Refresh,
+                                    contentDescription = "Reset thickness",
+                                    tint = Color(0xFF444444),
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                        }
                         Text(
                             text = "${formatPx(sliderValue)} px",
                             fontSize = 12.sp,
@@ -5528,6 +5621,16 @@ private fun WidthPickerPopup(
 }
 
 /**
+ * The colour palette is a grid of four columns. The cell size, the gap and
+ * the padding are fixed so the popup can be exactly as wide as the grid:
+ * a cell can never overlap its neighbour and no row can be cut off.
+ */
+private const val PALETTE_COLUMNS = 4
+private val PaletteCellSize = 32.dp
+private val PaletteCellGap = 8.dp
+private val PalettePadding = 12.dp
+
+/**
  * Long-press popup of the colour swatches: the full preset palette in a 4x2
  * grid (the active colour is ticked) plus a custom colour entry that opens
  * the existing colour picker dialog.
@@ -5542,6 +5645,10 @@ private fun ColorPalettePopup(
     onCustomColor: () -> Unit
 ) {
     if (!expanded) return
+    // As wide as the grid is: four cells and three gaps, plus the padding.
+    val paletteWidth = PalettePadding * 2 +
+        PaletteCellSize * PALETTE_COLUMNS +
+        PaletteCellGap * (PALETTE_COLUMNS - 1)
     Popup(
         onDismissRequest = onDismiss,
         popupPositionProvider = ChipPopupPositionProvider(preferRight),
@@ -5555,19 +5662,19 @@ private fun ColorPalettePopup(
             shape = RoundedCornerShape(18.dp),
             color = Color.White.copy(alpha = 0.97f),
             shadowElevation = 10.dp,
-            modifier = Modifier.width(180.dp)
+            modifier = Modifier.width(paletteWidth)
         ) {
             Column(
-                modifier = Modifier.padding(12.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
+                modifier = Modifier.padding(PalettePadding),
+                verticalArrangement = Arrangement.spacedBy(PaletteCellGap)
             ) {
-                TouchNotesColors.chunked(4).forEach { paletteRow ->
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TouchNotesColors.chunked(PALETTE_COLUMNS).forEach { paletteRow ->
+                    Row(horizontalArrangement = Arrangement.spacedBy(PaletteCellGap)) {
                         paletteRow.forEach { c ->
                             val isSelected = selectedColor == c
                             Box(
                                 modifier = Modifier
-                                    .size(32.dp)
+                                    .size(PaletteCellSize)
                                     .clip(RoundedCornerShape(8.dp))
                                     .background(c)
                                     .border(
