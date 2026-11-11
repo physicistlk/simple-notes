@@ -443,32 +443,35 @@ object ExportManager {
         // to the page and have to be part of the export as well.
         val beyondInk = readDiskBeyondInk(fileStore, noteId, pageIndex)
         val backgroundOverride = loadPageBackgroundOverride(fileStore, noteId, pageIndex)
+        // The annotation layer of the page (layer 1): the writing of the user,
+        // also the notes in the margin beside the page.
+        val annotationLayer = loadAnnotationLayer(fileStore, noteId, pageIndex)
         val result = if (strokesFile.exists()) {
             val baseBmp = BitmapUtils.loadBitmapFromFile(pageFile)
             val strokeBmp = BitmapUtils.loadBitmapFromFile(strokesFile)
             if (baseBmp != null && strokeBmp != null) {
-                val flat = flattenBitmap(strokeBmp, backgroundOverride ?: baseBmp, layers, beyondInk)
+                val flat = flattenBitmap(strokeBmp, backgroundOverride ?: baseBmp, layers, beyondInk, annotationLayer)
                 if (baseBmp !== flat && !baseBmp.isRecycled) baseBmp.recycle()
                 if (strokeBmp !== flat && !strokeBmp.isRecycled) strokeBmp.recycle()
                 flat
             } else if (strokeBmp != null) {
-                val flat = flattenBitmap(strokeBmp, backgroundOverride, layers, beyondInk)
+                val flat = flattenBitmap(strokeBmp, backgroundOverride, layers, beyondInk, annotationLayer)
                 if (strokeBmp !== flat && !strokeBmp.isRecycled) strokeBmp.recycle()
                 flat
             } else if (baseBmp != null) {
-                val flat = flattenBitmap(baseBmp, backgroundOverride, layers, beyondInk)
+                val flat = flattenBitmap(baseBmp, backgroundOverride, layers, beyondInk, annotationLayer)
                 if (baseBmp !== flat && !baseBmp.isRecycled) baseBmp.recycle()
                 flat
             } else null
         } else {
             val base = BitmapUtils.loadBitmapFromFile(pageFile)
             if (base != null) {
-                val flat = flattenBitmap(base, backgroundOverride, layers, beyondInk)
+                val flat = flattenBitmap(base, backgroundOverride, layers, beyondInk, annotationLayer)
                 if (base !== flat && !base.isRecycled) base.recycle()
                 flat
-            } else if (layers.isNotEmpty()) {
+            } else if (layers.isNotEmpty() || annotationLayer != null) {
                 val blank = Bitmap.createBitmap(2160, 3056, Bitmap.Config.ARGB_8888)
-                val flat = flattenBitmap(blank, backgroundOverride, layers, beyondInk)
+                val flat = flattenBitmap(blank, backgroundOverride, layers, beyondInk, annotationLayer)
                 if (blank !== flat && !blank.isRecycled) blank.recycle()
                 flat
             } else null
@@ -483,15 +486,36 @@ object ExportManager {
         for (crop in beyondInk) {
             if (!crop.bitmap.isRecycled) crop.bitmap.recycle()
         }
+        if (annotationLayer != null && !annotationLayer.isRecycled) annotationLayer.recycle()
         if (backgroundOverride != null && !backgroundOverride.isRecycled) backgroundOverride.recycle()
         return result
+    }
+
+    /**
+     * The annotation layer of a page (layer 1).
+     *
+     * The layer is as wide as the reader's page box - the page plus the
+     * margin on both sides - so the notes the user wrote beside the page are
+     * part of it.
+     */
+    private suspend fun loadAnnotationLayer(
+        fileStore: personal.notes.touch.data.files.NoteFileStore,
+        noteId: String,
+        pageIndex: Int
+    ): Bitmap? {
+        val file = fileStore.getAnnotationLayerFile(
+            noteId, pageIndex, personal.notes.touch.ui.canvas.ContinuousPageGeometry.BASE_LAYER_INDEX
+        )
+        if (!file.exists()) return null
+        return BitmapUtils.loadBitmapFromFile(file)
     }
 
     internal fun flattenBitmap(
         bitmap: Bitmap,
         backgroundBitmap: Bitmap?,
         imageLayers: List<ImageLayer> = emptyList(),
-        beyondInk: List<InkCrop> = emptyList()
+        beyondInk: List<InkCrop> = emptyList(),
+        annotationLayer: Bitmap? = null
     ): Bitmap {
         val bgW = backgroundBitmap?.width ?: 0
         val bgH = backgroundBitmap?.height ?: 0
@@ -510,55 +534,86 @@ object ExportManager {
             maxX = maxOf(maxX, crop.x + crop.bitmap.width)
             maxY = maxOf(maxY, crop.y + crop.bitmap.height)
         }
-        val outW = (maxX - minX).toInt().coerceAtLeast(1)
-        val outH = (maxY - minY).toInt().coerceAtLeast(1)
+        val contentW = (maxX - minX).toInt().coerceAtLeast(1)
+        val contentH = (maxY - minY).toInt().coerceAtLeast(1)
+        // The annotation layer of the page is wider than the page (the margin
+        // on both sides): it is the sheet of the export, and the page sits
+        // centred in it - so the writing on the layer lines up with the
+        // document.
+        val layer = annotationLayer
+        val outW = if (layer != null) layer.width.coerceAtLeast(contentW) else contentW
+        val outH = if (layer != null) layer.height.coerceAtLeast(contentH) else contentH
         val out = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(out)
         canvas.drawColor(Color.WHITE)
-        val offX = -minX
-        val offY = -minY
+        // The place of the page in the output and the scale it is drawn in.
+        var pageLeft = (outW - contentW) / 2f
+        var pageTop = (outH - contentH) / 2f
+        var pageWidth = w.toFloat()
+        var pageHeight = h.toFloat()
+        if (layer != null && layer.height > 0 && h > 0) {
+            pageWidth = (layer.height.toFloat() * w / h).coerceAtMost(layer.width.toFloat())
+            pageHeight = layer.height.toFloat()
+            pageLeft = (layer.width - pageWidth) / 2f
+            pageTop = 0f
+        }
+        val scaleX = if (w > 0) pageWidth / w else 1f
+        val scaleY = if (h > 0) pageHeight / h else 1f
+        val offX = pageLeft - minX * scaleX
+        val offY = pageTop - minY * scaleY
+        val save = canvas.save()
+        canvas.translate(offX, offY)
+        canvas.scale(scaleX, scaleY)
         if (backgroundBitmap != null && !backgroundBitmap.isRecycled) {
             val bgPaint = Paint(Paint.FILTER_BITMAP_FLAG)
-            canvas.drawBitmap(backgroundBitmap, null, android.graphics.Rect(offX.toInt(), offY.toInt(), (offX + w).toInt(), (offY + h).toInt()), bgPaint)
+            canvas.drawBitmap(backgroundBitmap, null, android.graphics.Rect(0, 0, w, h), bgPaint)
         }
         // The page raster and the stroke layer can differ in size (vector PDF
         // pages: pdfium render at zoom resolution vs. view-sized stroke layer).
-        // Both describe the same page rect, so stretch the stroke layer to the
-        // output size instead of pinning it to the top-left corner.
-        canvas.drawBitmap(bitmap, null, android.graphics.Rect(offX.toInt(), offY.toInt(), (offX + w).toInt(), (offY + h).toInt()), Paint(Paint.FILTER_BITMAP_FLAG))
+        // Both describe the same page rect, so the stroke layer is stretched
+        // to the size of the page instead of being pinned to the top-left
+        // corner.
+        canvas.drawBitmap(bitmap, null, android.graphics.Rect(0, 0, w, h), Paint(Paint.FILTER_BITMAP_FLAG))
         for (crop in beyondInk) {
             if (crop.bitmap.isRecycled) continue
-            canvas.drawBitmap(crop.bitmap, offX + crop.x, offY + crop.y, Paint(Paint.FILTER_BITMAP_FLAG))
+            canvas.drawBitmap(crop.bitmap, crop.x, crop.y, Paint(Paint.FILTER_BITMAP_FLAG))
         }
-        for (layer in imageLayers) {
-            if (!layer.visible || layer.bitmap.isRecycled) continue
+        for (layerItem in imageLayers) {
+            if (!layerItem.visible || layerItem.bitmap.isRecycled) continue
             val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG).apply {
-                alpha = (layer.opacity * 255f).toInt().coerceIn(0, 255)
+                alpha = (layerItem.opacity * 255f).toInt().coerceIn(0, 255)
             }
-            val bw = layer.bitmap.width
-            val bh = layer.bitmap.height
-            val cx = layer.x + bw * layer.scale / 2f
-            val cy = layer.y + bh * layer.scale / 2f
+            val bw = layerItem.bitmap.width
+            val bh = layerItem.bitmap.height
+            val cx = layerItem.x + bw * layerItem.scale / 2f
+            val cy = layerItem.y + bh * layerItem.scale / 2f
             canvas.save()
-            canvas.translate(cx + offX, cy + offY)
-            canvas.rotate(layer.rotation)
-            canvas.scale(layer.scale, layer.scale)
-            canvas.drawBitmap(layer.bitmap, -bw / 2f, -bh / 2f, paint)
+            canvas.translate(cx, cy)
+            canvas.rotate(layerItem.rotation)
+            canvas.scale(layerItem.scale, layerItem.scale)
+            canvas.drawBitmap(layerItem.bitmap, -bw / 2f, -bh / 2f, paint)
             // The ink written on the layer follows the same transform.
-            for (crop in layer.ink) {
+            for (crop in layerItem.ink) {
                 if (crop.bitmap.isRecycled) continue
                 val iw = crop.bitmap.width
                 val ih = crop.bitmap.height
                 val dx = (crop.x + iw / 2f) - cx
                 val dy = (crop.y + ih / 2f) - cy
-                val rad = Math.toRadians((-layer.rotation).toDouble())
+                val rad = Math.toRadians((-layerItem.rotation).toDouble())
                 val cos = Math.cos(rad).toFloat()
                 val sin = Math.sin(rad).toFloat()
-                val lx = (dx * cos - dy * sin) / layer.scale - iw / 2f
-                val ly = (dx * sin + dy * cos) / layer.scale - ih / 2f
+                val lx = (dx * cos - dy * sin) / layerItem.scale - iw / 2f
+                val ly = (dx * sin + dy * cos) / layerItem.scale - ih / 2f
                 canvas.drawBitmap(crop.bitmap, lx, ly, paint)
             }
             canvas.restore()
+        }
+        canvas.restoreToCount(save)
+        // The annotation layer is drawn over the page: the writing of the
+        // user (also the notes in the margin beside the page) is part of the
+        // export.
+        if (layer != null && !layer.isRecycled) {
+            canvas.drawBitmap(layer, 0f, 0f, Paint(Paint.FILTER_BITMAP_FLAG))
         }
         return out
     }

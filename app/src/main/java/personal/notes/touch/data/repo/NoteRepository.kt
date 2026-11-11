@@ -701,6 +701,34 @@ class NoteRepository(
         ok
     }
 
+    /**
+     * Writes the annotation layer of a page (layer 1 is the base layer).
+     *
+     * The layer is the persisted form of the writing: it is as wide as the
+     * reader's page box (the page plus the margin on both sides) and as tall
+     * as the page, so the notes in the margin are part of it. The page image
+     * (the PDF render, the page PNG) is never touched by a stroke.
+     */
+    suspend fun savePageLayer(
+        noteId: String,
+        pageIndex: Int,
+        layerIndex: Int,
+        bitmap: android.graphics.Bitmap
+    ): Boolean = withContext(Dispatchers.IO) {
+        val file = fileStore.getAnnotationLayerFile(noteId, pageIndex, layerIndex)
+        val ok = personal.notes.touch.util.BitmapUtils.saveBitmapToPng(bitmap, file)
+        if (ok) {
+            try {
+                // A narrow touch: the whole row must not be written back,
+                // or the page the user is on would be lost.
+                noteDao.touchUpdatedAt(noteId, System.currentTimeMillis())
+            } catch (e: Exception) {
+                // Ignore if the note row is gone
+            }
+        }
+        ok
+    }
+
     /** Persist the per-page paper pattern (PaperPattern.code) to the page row. */
     suspend fun savePagePattern(noteId: String, pageIndex: Int, patternCode: Int): Boolean = withContext(Dispatchers.IO) {
         try {

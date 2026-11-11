@@ -147,6 +147,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.nativeCanvas
@@ -2496,6 +2497,7 @@ fun CanvasScreen(
                                                 savedGeneration = savedPageGenerations[idx] ?: 0,
                                                 isCurrentPage = idx == currentPageIndex,
                                                 isInfinite = isInfiniteNote,
+                                                pageType = note?.pageType ?: "infinite",
                                                 modifier = androidx.compose.ui.Modifier.then(
                                                     if (isInfiniteNote) {
                                                         Modifier.fillMaxSize()
@@ -2562,6 +2564,7 @@ fun CanvasScreen(
                                                         savedGeneration = savedPageGenerations[idx] ?: 0,
                                                         isCurrentPage = idx == currentPageIndex,
                                                         isInfinite = isInfiniteNote,
+                                                        pageType = note?.pageType ?: "infinite",
                                                         modifier = androidx.compose.ui.Modifier.then(
                                                             if (isInfiniteNote) {
                                                                 Modifier.fillMaxSize()
@@ -2628,6 +2631,7 @@ fun CanvasScreen(
                                                 savedGeneration = savedPageGenerations[idx] ?: 0,
                                                 isCurrentPage = idx == currentPageIndex,
                                                 isInfinite = isInfiniteNote,
+                                                pageType = note?.pageType ?: "infinite",
                                                 modifier = androidx.compose.ui.Modifier.then(
                                                     if (isInfiniteNote) {
                                                         Modifier.fillMaxSize()
@@ -6101,6 +6105,8 @@ fun ContinuousPageView(
     isCurrentPage: Boolean = false,
     /** An infinite canvas has no page edge: no frame, no desk. */
     isInfinite: Boolean = false,
+    /** The type of the note's pages ("infinite", "a4", "pdf"). */
+    pageType: String = if (isInfinite) "infinite" else "a4",
     modifier: Modifier = Modifier,
     onStylusDetected: () -> Unit = {},
     onPageMapping: (ContinuousPageMap) -> Unit = {},
@@ -6144,11 +6150,30 @@ fun ContinuousPageView(
     }
 
     /**
+     * The aspect ratio of the page image of this page.
+     *
+     * The image that is on screen wins; an infinite page that was never
+     * drawn on keeps the shape of the saved canvas, every other page takes
+     * the ratio of its PDF.
+     */
+    fun pageRatioOf(): Float {
+        if (pageImageWidth > 0 && pageImageHeight > 0) {
+            return pageImageWidth.toFloat() / pageImageHeight
+        }
+        if (isInfinite) {
+            // An infinite page that was never drawn on has no image yet: the
+            // page keeps the shape of the saved canvas.
+            return ContinuousPageGeometry.INFINITE_PAGE_RATIO
+        }
+        return pageRatio
+    }
+
+    /**
      * Where the page image sits inside the page box.
      *
-     * A fixed page is centred in its box and keeps a margin around it (the
-     * room to write in the margin of an imported PDF); an infinite page is
-     * fitted into the box, so the endless canvas is not bounded by the
+     * A fixed page is centred in its box and keeps a margin on both sides
+     * (the room to write in the margin of an imported PDF); an infinite page
+     * is fitted into the box, so the endless canvas is not bounded by the
      * saved bitmap. The ink session knows the same rect - the strokes are
      * normalised to the box.
      */
@@ -6157,23 +6182,24 @@ fun ContinuousPageView(
         boxWidth: Float,
         boxHeight: Float
     ): ContinuousPageGeometry.BoxRect {
-        val ratio = if (pageImageWidth > 0 && pageImageHeight > 0) {
-            pageImageWidth.toFloat() / pageImageHeight
-        } else if (isInfinite) {
-            // An infinite page that was never drawn on has no image yet: the
-            // page keeps the shape of the saved canvas.
-            ContinuousPageGeometry.INFINITE_PAGE_RATIO
-        } else {
-            pageRatio
-        }
-        return ink.pageRectFor(pageIndex, boxWidth, boxHeight, ratio)
+        return ink.pageRectFor(pageIndex, boxWidth, boxHeight, pageRatioOf())
     }
 
     BoxWithConstraints(
         modifier = modifier
             // An infinite page has no edge: its box is the visible canvas,
             // not a rectangle with the aspect ratio of the saved bitmap.
-            .then(if (isInfinite) Modifier else Modifier.aspectRatio(pageRatio))
+            // A fixed page has a margin on both sides: its box is wider than
+            // the page (the page plus a quarter of its width on each side).
+            .then(
+                if (isInfinite) {
+                    Modifier
+                } else {
+                    Modifier.aspectRatio(
+                        ContinuousPageGeometry.boxRatio(pageType, pageRatio)
+                    )
+                }
+            )
             .onGloballyPositioned { coords ->
                 pageBox.originX = coords.positionInRoot().x
                 pageBox.originY = coords.positionInRoot().y
@@ -6274,16 +6300,28 @@ fun ContinuousPageView(
             )
         }
 
-        // The margin notes of the page: the strokes that left the page image.
-        // They live in their own files (the ones the single-page engine
-        // writes), so they are loaded with the page.
-        LaunchedEffect(page.id, noteId) {
-            ink.loadCrops(page, pageIndex)
+        // The annotation layer of the page as it is on the disk.
+        //
+        // The ink session holds the layer it writes on; without a session
+        // (the user only reads) the layer of the page is loaded here, so the
+        // writing of an earlier session stays on the screen.
+        var savedLayer by remember(page.id, noteId) { mutableStateOf<android.graphics.Bitmap?>(null) }
+        LaunchedEffect(page.id, noteId, savedGeneration, activeSessionReady) {
+            if (activeSessionReady) {
+                // The session has the page: it holds the layer it writes on.
+                savedLayer = null
+                return@LaunchedEffect
+            }
+            savedLayer = loadAnnotationLayerForDisplay(
+                repository.fileStore, noteId, pageIndex, displayWidthPx.roundToInt()
+            )
         }
 
         LaunchedEffect(page.id, page.updatedAt, renderWidthKey, noteId, activeSessionReady, savedGeneration) {
             ink.refreshBackground(page, pageIndex, desiredWidthPx)
-            if (activeSessionReady) {
+            if (activeSessionReady && isVector) {
+                // A vector page is drawn by the session (the clean pdfium
+                // render under the layer), so the page is not rendered twice.
                 loadCompleted = true
                 return@LaunchedEffect
             }
@@ -6314,17 +6352,44 @@ fun ContinuousPageView(
 
         val shown = when {
             sessionReady && inkSession?.isVector == true -> inkSession.background
-            sessionReady -> inkSession?.ink
             else -> pageBitmap
         }
 
+        // The desk: the part of the box that is not the page is not paper.
+        // The user writes in it, so it has to look like the desk (the grey
+        // of the reader), not like the document.
+        if (!isInfinite) {
+            androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
+                drawRect(color = Color(0xFFEEEEEE))
+            }
+        }
+
         // White page bed: an erased raster pixel has to show paper, not the
-        // reader's grey backdrop.
-        Surface(
-            modifier = Modifier.fillMaxSize(),
-            color = Color.White,
-            shape = RoundedCornerShape(4.dp)
-        ) {}
+        // reader's grey backdrop. It covers the page only - the margin
+        // beside the page stays the desk.
+        if (isInfinite) {
+            Surface(
+                modifier = Modifier.fillMaxSize(),
+                color = Color.White,
+                shape = RoundedCornerShape(4.dp)
+            ) {}
+        } else {
+            androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
+                val rect = pageRectOf(pageIndex, size.width, size.height)
+                if (rect.empty) return@Canvas
+                drawRect(
+                    color = Color.White,
+                    topLeft = androidx.compose.ui.geometry.Offset(
+                        rect.left * size.width,
+                        rect.top * size.height
+                    ),
+                    size = androidx.compose.ui.geometry.Size(
+                        rect.width * size.width,
+                        rect.height * size.height
+                    )
+                )
+            }
+        }
 
         // Draw paper pattern for non-vector pages (or vector pages with no background)
         if (!isVector) {
@@ -6341,62 +6406,71 @@ fun ContinuousPageView(
             }
             if (effectivePattern != PaperPattern.BLANK) {
                 androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
+                    // The pattern belongs to the paper: on a fixed page it
+                    // stops at the edge of the page (the margin is the
+                    // desk), on an infinite page it fills the canvas.
+                    val rect = if (isInfinite) null else pageRectOf(pageIndex, size.width, size.height)
+                    if (rect != null && rect.empty) return@Canvas
+                    val left = rect?.left?.times(size.width) ?: 0f
+                    val top = rect?.top?.times(size.height) ?: 0f
+                    val w = rect?.width?.times(size.width) ?: size.width
+                    val h = rect?.height?.times(size.height) ?: size.height
                     val density = backgroundDensity.coerceIn(20, 80).toFloat()
-                    val step = (density * (size.width / 2160f)).coerceAtLeast(8f)
-                    val w = size.width
-                    val h = size.height
+                    val step = (density * (w / 2160f)).coerceAtLeast(8f)
                     val gridColor = Color(0xFFE0E0E0)
-                    when (effectivePattern) {
-                        PaperPattern.LINES -> {
-                            var y = step
-                            while (y < h) {
-                                drawLine(
-                                    color = gridColor,
-                                    start = androidx.compose.ui.geometry.Offset(0f, y),
-                                    end = androidx.compose.ui.geometry.Offset(w, y),
-                                    strokeWidth = 1f
-                                )
-                                y += step
-                            }
-                        }
-                        PaperPattern.GRID -> {
-                            var x = step
-                            while (x < w) {
-                                drawLine(
-                                    color = gridColor,
-                                    start = androidx.compose.ui.geometry.Offset(x, 0f),
-                                    end = androidx.compose.ui.geometry.Offset(x, h),
-                                    strokeWidth = 1f
-                                )
-                                x += step
-                            }
-                            var y = step
-                            while (y < h) {
-                                drawLine(
-                                    color = gridColor,
-                                    start = androidx.compose.ui.geometry.Offset(0f, y),
-                                    end = androidx.compose.ui.geometry.Offset(w, y),
-                                    strokeWidth = 1f
-                                )
-                                y += step
-                            }
-                        }
-                        PaperPattern.DOTTED -> {
-                            var x = step
-                            while (x < w) {
+                    clipRect(left, top, left + w, top + h) {
+                        when (effectivePattern) {
+                            PaperPattern.LINES -> {
                                 var y = step
                                 while (y < h) {
-                                    drawCircle(
+                                    drawLine(
                                         color = gridColor,
-                                        radius = 1.5f,
-                                        center = androidx.compose.ui.geometry.Offset(x, y)
+                                        start = androidx.compose.ui.geometry.Offset(0f, y),
+                                        end = androidx.compose.ui.geometry.Offset(w, y),
+                                        strokeWidth = 1f
                                     )
                                     y += step
                                 }
-                                x += step
                             }
+                            PaperPattern.GRID -> {
+                                var x = step
+                                while (x < w) {
+                                    drawLine(
+                                        color = gridColor,
+                                        start = androidx.compose.ui.geometry.Offset(x, 0f),
+                                        end = androidx.compose.ui.geometry.Offset(x, h),
+                                        strokeWidth = 1f
+                                    )
+                                    x += step
+                                }
+                                var y = step
+                                while (y < h) {
+                                    drawLine(
+                                        color = gridColor,
+                                        start = androidx.compose.ui.geometry.Offset(0f, y),
+                                        end = androidx.compose.ui.geometry.Offset(w, y),
+                                        strokeWidth = 1f
+                                    )
+                                    y += step
+                                }
+                            }
+                            PaperPattern.DOTTED -> {
+                                var x = step
+                                while (x < w) {
+                                    var y = step
+                                    while (y < h) {
+                                        drawCircle(
+                                            color = gridColor,
+                                            radius = 1.5f,
+                                            center = androidx.compose.ui.geometry.Offset(x, y)
+                                        )
+                                        y += step
+                                    }
+                                    x += step
+                                }
+                            }
+                            PaperPattern.BLANK -> {}
                         }
-                        PaperPattern.BLANK -> {}
                     }
                 }
             }
@@ -6489,55 +6563,37 @@ fun ContinuousPageView(
             }
         }
 
-        // Vector pages: the annotations are a separate transparent layer drawn
-        // over the clean page, exactly like single-page mode composites them.
-        // The layer lives in the page's pixel space, so it is drawn into the
-        // page rect - the same rect the page image is drawn in.
-        if (sessionReady && inkSession?.isVector == true) {
-            val layer = inkSession.ink
-            if (layer != null && !layer.isRecycled) {
-                androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
-                    val _revision = ink.revision
-                    val rect = pageRectOf(pageIndex, size.width, size.height)
-                    if (rect.empty) return@Canvas
-                    drawImage(
-                        image = layer.asImageBitmap(),
-                        srcOffset = androidx.compose.ui.unit.IntOffset.Zero,
-                        srcSize = androidx.compose.ui.unit.IntSize(layer.width, layer.height),
-                        dstOffset = androidx.compose.ui.unit.IntOffset(
-                            (rect.left * size.width).roundToInt(),
-                            (rect.top * size.height).roundToInt()
-                        ),
-                        dstSize = androidx.compose.ui.unit.IntSize(
-                            (rect.width * size.width).roundToInt().coerceAtLeast(1),
-                            (rect.height * size.height).roundToInt().coerceAtLeast(1)
-                        ),
-                        filterQuality = androidx.compose.ui.graphics.FilterQuality.High
-                    )
-                }
-            }
-        }
-
-        // The margin notes: the strokes that left the page image. They are
-        // painted on the page (at the place they have in the page's pixel
-        // space), under the vector operations of the session.
-        androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
-            val _revision = ink.revision
-            val ratio = if (pageImageWidth > 0 && pageImageHeight > 0) {
-                pageImageWidth.toFloat() / pageImageHeight
-            } else if (isInfinite) {
-                ContinuousPageGeometry.INFINITE_PAGE_RATIO
-            } else {
-                pageRatio
-            }
-            drawIntoCanvas { canvas ->
-                ink.drawCrops(canvas.nativeCanvas, pageIndex, size.width, size.height, ratio)
+        // The annotation layer of the page: the writing of the user lives on
+        // it, and it reaches out to the left and to the right of the page -
+        // that is the room to write in the margin of an imported PDF. It is
+        // drawn over the page image, so the document underneath stays clean.
+        val sessionLayer = if (sessionReady) inkSession?.ink else null
+        val shownLayer = sessionLayer ?: savedLayer
+        if (shownLayer != null && !shownLayer.isRecycled) {
+            androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
+                val _revision = ink.revision
+                val rect = ink.layerRectFor(pageIndex, size.width, size.height, pageRatioOf())
+                if (rect.empty) return@Canvas
+                drawImage(
+                    image = shownLayer.asImageBitmap(),
+                    srcOffset = androidx.compose.ui.unit.IntOffset.Zero,
+                    srcSize = androidx.compose.ui.unit.IntSize(shownLayer.width, shownLayer.height),
+                    dstOffset = androidx.compose.ui.unit.IntOffset(
+                        (rect.left * size.width).roundToInt(),
+                        (rect.top * size.height).roundToInt()
+                    ),
+                    dstSize = androidx.compose.ui.unit.IntSize(
+                        (rect.width * size.width).roundToInt().coerceAtLeast(1),
+                        (rect.height * size.height).roundToInt().coerceAtLeast(1)
+                    ),
+                    filterQuality = androidx.compose.ui.graphics.FilterQuality.High
+                )
             }
         }
 
         // The strokes that were finished in this session: they are drawn as
         // vectors on top of the page image, so a finished stroke never
-        // rewrites the 26 MB session bitmap (and the GPU never has to take
+        // rewrites the session bitmap (and the GPU never has to take
         // that bitmap again - the pen stops lagging behind the finger).
         //
         // An eraser clears pixels, so it needs an offscreen layer: the wipe
@@ -6697,6 +6753,43 @@ fun ContinuousPageView(
                     }
                 }
         )
+    }
+}
+
+/**
+ * The annotation layer of a page, decoded for the screen.
+ *
+ * The layer is as wide as the reader's page box (the page plus the margin on
+ * both sides), so it is bigger than the screen: it is decoded downsampled,
+ * but with its alpha - it is an overlay on the page, not a picture.
+ */
+internal suspend fun loadAnnotationLayerForDisplay(
+    fileStore: personal.notes.touch.data.files.NoteFileStore,
+    noteId: String,
+    pageIndex: Int,
+    displayWidthPx: Int
+): android.graphics.Bitmap? = withContext(Dispatchers.IO) {
+    try {
+        val file = fileStore.getAnnotationLayerFile(
+            noteId, pageIndex, ContinuousPageGeometry.BASE_LAYER_INDEX
+        )
+        if (!file.exists()) return@withContext null
+        val bounds = android.graphics.BitmapFactory.Options().apply {
+            inJustDecodeBounds = true
+        }
+        android.graphics.BitmapFactory.decodeFile(file.absolutePath, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return@withContext null
+        var sample = 1
+        val target = displayWidthPx.coerceAtLeast(360)
+        while (bounds.outWidth / (sample * 2) >= target) sample *= 2
+        val opts = android.graphics.BitmapFactory.Options().apply {
+            inSampleSize = sample
+            inPreferredConfig = android.graphics.Bitmap.Config.ARGB_8888
+        }
+        android.graphics.BitmapFactory.decodeFile(file.absolutePath, opts)
+    } catch (e: Exception) {
+        e.printStackTrace()
+        null
     }
 }
 

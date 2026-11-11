@@ -97,11 +97,12 @@ internal class InkPatch(
  *
  * A [Stroke] is kept as a vector: it is drawn as a path on top of the page
  * image and never touches the session bitmap, so the reader does not have to
- * re-upload the 26 MB layer after every finished stroke.
+ * re-upload the layer after every finished stroke.
  *
  * An [Erase] is the one exception - it clears pixels, so it is rasterised into
- * the session bitmap as well (the ink layer stays the only thing the eraser
- * can touch) and it stays in the list to cut the strokes drawn before it.
+ * the session bitmap as well (the annotation layer stays the only thing the
+ * eraser can touch) and it stays in the list to cut the strokes drawn before
+ * it.
  */
 internal sealed class InkOp {
     /** A finished stroke, with the auto-shape path when one was computed. */
@@ -109,16 +110,6 @@ internal sealed class InkOp {
 
     /** An eraser stroke; [patch] holds the pixels before and after the wipe. */
     class Erase(val stroke: ContinuousStroke, val patch: InkPatch) : InkOp()
-
-    /**
-     * A stroke that left the page image.
-     *
-     * Such a stroke cannot stay a vector operation of the page: the page
-     * has no pixels there. It is rasterised into a crop - a small
-     * transparent bitmap - that is kept in the ledger of the page, at
-     * [place], the position of the crop in the page's pixel space.
-     */
-    class Crop(val id: Int, val place: ContinuousPageGeometry.CropPlace) : InkOp()
 }
 
 /**
@@ -137,12 +128,6 @@ internal sealed class InkAction {
 
     /** The page was cleared: the patch keeps the ink, [removed] the strokes. */
     class Clear(val patch: InkPatch?, val removed: List<InkOp>) : InkAction()
-
-    /**
-     * A crop was added to the page (a stroke in the margin). Undoing it
-     * takes the crop away again, redoing it brings it back.
-     */
-    class Crop(val op: InkOp.Crop) : InkAction()
 }
 
 /**
@@ -171,7 +156,6 @@ internal class InkHistory {
             when (op) {
                 is InkOp.Stroke -> InkAction.Add(op)
                 is InkOp.Erase -> InkAction.Erase(op)
-                is InkOp.Crop -> InkAction.Crop(op)
             }
         )
         redoStack.clear()
@@ -192,13 +176,10 @@ internal class InkHistory {
      *
      * [onErase] and [onClear] do the pixel work: [restore] is true when the
      * pixels have to be put back, false when the wipe has to be done again.
-     * [onCrop] does the same for a crop: an undo takes the crop out of the
-     * page, a redo puts it back.
      */
     fun undo(
         onErase: (InkOp.Erase, Boolean) -> Unit,
-        onClear: (InkPatch?, Boolean) -> Unit,
-        onCrop: (InkOp.Crop, Boolean) -> Unit = { _, _ -> }
+        onClear: (InkPatch?, Boolean) -> Unit
     ): Boolean {
         val action = undoStack.removeLastOrNull() ?: return false
         when (action) {
@@ -211,10 +192,6 @@ internal class InkHistory {
                 onClear(action.patch, true)
                 ops.addAll(0, action.removed)
             }
-            is InkAction.Crop -> {
-                ops.removeLastOrNull()
-                onCrop(action.op, true)
-            }
         }
         redoStack.addLast(action)
         return true
@@ -223,8 +200,7 @@ internal class InkHistory {
     /** Redoes the last undone operation. */
     fun redo(
         onErase: (InkOp.Erase, Boolean) -> Unit,
-        onClear: (InkPatch?, Boolean) -> Unit,
-        onCrop: (InkOp.Crop, Boolean) -> Unit = { _, _ -> }
+        onClear: (InkPatch?, Boolean) -> Unit
     ): Boolean {
         val action = redoStack.removeLastOrNull() ?: return false
         when (action) {
@@ -236,10 +212,6 @@ internal class InkHistory {
             is InkAction.Clear -> {
                 onClear(action.patch, false)
                 action.removed.forEach { op -> ops.remove(op) }
-            }
-            is InkAction.Crop -> {
-                ops.add(action.op)
-                onCrop(action.op, false)
             }
         }
         undoStack.addLast(action)
@@ -262,7 +234,6 @@ internal class InkHistory {
         is InkAction.Add -> 0L
         is InkAction.Erase -> action.op.patch.bytes
         is InkAction.Clear -> action.patch?.bytes ?: 0L
-        is InkAction.Crop -> action.op.place.width.toLong() * action.op.place.height.toLong() * 4L
     }
 }
 
@@ -329,13 +300,16 @@ object ContinuousInkMath {
 }
 
 /**
- * The writable layer of one reader page.
+ * The writable annotation layer of one reader page.
  *
- * Vector pages keep their annotations in a separate stroke layer (as in
- * single-page mode), so [ink] is that layer and [background] is a clean
- * pdfium render of the page. Raster pages have their annotations baked into
- * the page PNG, so [ink] is the page image itself and there is no separate
- * background.
+ * The writing of a page lives on its annotation layer, not on the page
+ * image: [ink] is that layer (the base layer, layer 1) and the page image
+ * (the clean pdfium render of a PDF page, the page PNG of a raster page)
+ * stays clean underneath it.
+ *
+ * The layer of a fixed page is as wide as the reader's page box (the page
+ * plus the margin on both sides) and as tall as the page, so a stroke in the
+ * margin is part of the layer.
  */
 class ContinuousInkSession internal constructor(
     val pageIndex: Int,
@@ -355,28 +329,24 @@ class ContinuousInkSession internal constructor(
     internal var live: ContinuousStroke? = null
 
     /**
+     * The layer index of the annotation layer this session writes on.
+     *
+     * Layer 1 is the base layer; the layer stack (layers 2 and 3 and the
+     * "flatten to the base" action) comes with the next step.
+     */
+    val layerIndex: Int = ContinuousPageGeometry.BASE_LAYER_INDEX
+
+    /**
      * The size of the page box the strokes are normalised to, and the
      * aspect ratio of the page image inside it.
      *
-     * The box is bigger than the page image (a fixed page has a margin, an
-     * infinite page is the visible canvas), so the strokes can reach past
-     * the page: what leaves it becomes a crop.
+     * The box is wider than the page image (a fixed page has a margin on both
+     * sides), so the strokes can reach past the page: they belong to the
+     * annotation layer, which reaches as far as the box.
      */
     var boxWidth: Float = 0f
     var boxHeight: Float = 0f
     var pageRatio: Float = ContinuousPageGeometry.defaultRatio(pageType)
-
-    /**
-     * The crops of this page: the strokes that left the page image and are
-     * therefore kept as small transparent bitmaps.
-     */
-    var crops: InkCropLedger<Bitmap> = InkCropLedger()
-
-    /**
-     * The crops a clear of the page took away. They come back when the
-     * clear is undone.
-     */
-    internal var clearedCrops: List<InkOp.Crop> = emptyList()
 
     /**
      * The strokes that were finished in this session, in the order they were
@@ -384,8 +354,8 @@ class ContinuousInkSession internal constructor(
      *
      * They are drawn as vectors on top of the page image, so the session
      * bitmap is never touched by a stroke: the reader does not have to
-     * re-upload the 26 MB layer (and the pen does not wait for it) after
-     * every stroke.
+     * re-upload the layer (and the pen does not wait for it) after every
+     * stroke.
      */
     internal val history = InkHistory()
 
@@ -395,7 +365,7 @@ class ContinuousInkSession internal constructor(
      * Guards the ink bitmap.
      *
      * The eraser clears pixels in it on the main thread, and the save takes a
-     * copy of it for the encoder - a copy of a 26 MB page must not happen on
+     * copy of it for the encoder - a copy of a 40 MB layer must not happen on
      * the main thread, it blocks the pen for tens of milliseconds.
      */
     internal val inkLock = Any()
@@ -403,11 +373,19 @@ class ContinuousInkSession internal constructor(
     /**
      * Where the page image sits inside the page box, in normalised box
      * coordinates. Everything that maps between the box (the space the
-     * strokes live in) and the page (the space the ink layer lives in) goes
-     * through this rect.
+     * strokes live in) and the page (the space the page image lives in)
+     * goes through this rect.
      */
     val pageRectInBox: ContinuousPageGeometry.BoxRect
         get() = ContinuousPageGeometry.pageRect(pageType, pageRatio, boxWidth, boxHeight)
+
+    /**
+     * Where the annotation layer sits inside the page box, in normalised box
+     * coordinates: the whole box for a fixed page (the page plus the margin
+     * on both sides), the page image itself for an infinite page.
+     */
+    val layerRectInBox: ContinuousPageGeometry.BoxRect
+        get() = ContinuousPageGeometry.layerRect(pageType, pageRatio, boxWidth, boxHeight)
 
     /** True once the layer is loaded and displayed; before that the reader's
      *  own page bitmap stays on screen and strokes are buffered. */
@@ -421,24 +399,29 @@ class ContinuousInkSession internal constructor(
  * In-place stylus inking for the continuous reader.
  *
  * The reader is a Lazy list of page bitmaps, so writing there needs its own
- * small ink engine: this controller owns one page's writable layer at a time,
- * draws the live stroke into the page box, commits it into the layer, and
- * persists through the same repository calls single-page mode uses
- * (`savePageStrokes` for vector pages, `savePageBitmap` for raster pages).
+ * small ink engine: this controller owns one page's annotation layer at a
+ * time, draws the live stroke into the page box, commits it into the layer,
+ * and persists it as the layer file of the page
+ * (`layers/page_<i>_layer_<n>.png`).
  *
- * One session, not one per page: a page layer is ~26 MB decoded and the
+ * The layer is wider than the page (the reader's page box reaches out to
+ * both sides), so the notes in the margin belong to it - the page image
+ * itself (the PDF render, the page PNG) is never written to and stays the
+ * clean document.
+ *
+ * One session, not one per page: a page layer is ~40 MB decoded and the
  * reader keeps two or three pages on screen. The session follows the stylus
  * from page to page; the previous page is flushed and released first.
  *
  * The strokes are kept as vectors: a finished stroke joins the committed
  * list of the session and is drawn as a path on top of the page image, so
- * the 26 MB session bitmap is never rewritten (and never re-uploaded to the
- * GPU) while the user writes. The list is rasterised into the bitmap once,
- * off the main thread, when the page is saved.
+ * the session bitmap is never rewritten (and never re-uploaded to the GPU)
+ * while the user writes. The list is rasterised into the bitmap once, off
+ * the main thread, when the page is saved.
  *
  * Undo/redo works on that list: a stroke leaves the list again, an eraser
  * puts back the pixels it cleared (dirty-rectangle patches, so a short
- * stroke costs a few hundred KB rather than 26 MB).
+ * stroke costs a few hundred KB rather than the whole layer).
  */
 class ContinuousInkController(
     private val noteId: String,
@@ -472,24 +455,6 @@ class ContinuousInkController(
         private set
 
     private val closingSessions = mutableMapOf<Int, ContinuousInkSession>()
-
-    /**
-     * The crops of every page: the strokes that left the page image.
-     *
-     * They live in the controller (not in the session), so the margin notes
-     * of a page stay on screen after the session that made them is gone.
-     */
-    private val cropLedgers = mutableMapOf<Int, InkCropLedger<Bitmap>>()
-
-    /** The bitmaps of the crops, by the id of the crop. They outlive an undo. */
-    private val cropBitmaps = mutableMapOf<Int, Bitmap>()
-
-    /** The pages whose crops are being read at the moment. */
-    private val loadingCrops = mutableSetOf<Int>()
-
-    /** The ledger of a page (created on demand). */
-    private fun ledgerFor(pageIndex: Int): InkCropLedger<Bitmap> =
-        cropLedgers.getOrPut(pageIndex) { InkCropLedger() }
 
     fun getSession(pageIndex: Int): ContinuousInkSession? {
         val s = session
@@ -689,23 +654,18 @@ class ContinuousInkController(
             flushNow(existing)
         }
         val isVector = page.pdfSourcePath.isNotEmpty() && page.pdfPageIndex >= 0
-        // The ink layer lives in the page's pixel space, not in the box: the
-        // box is bigger than the page (it has a margin), so the layer takes
-        // the aspect ratio of the page itself.
+        // The annotation layer lives in the box's pixel space, not in the
+        // page's: the box is wider than the page (it has a margin on both
+        // sides), so the layer is as wide as the box and as tall as the page.
         val ratio = pageRatioOf(page, isVector)
-        val inkWidth = 2160
-        val inkHeight = (inkWidth * ratio).roundToInt().coerceAtLeast(1)
-        val created = ContinuousInkSession(pageIndex, isVector, inkWidth, inkHeight, pageType)
+        val size = ContinuousPageGeometry.layerSize(pageType, ratio)
+        val created = ContinuousInkSession(pageIndex, isVector, size.width, size.height, pageType)
         created.boxWidth = boxWidth
         created.boxHeight = boxHeight
         created.pageRatio = ratio
-        created.crops = ledgerFor(pageIndex)
         session = created
         onUndoRedoChanged(false, false)
         startLoad(created, page, renderWidthPx)
-        // The margin notes of the page have to be there before the first
-        // crop is written, or the save would drop the ones on the disk.
-        scope.launch { loadCrops(page, pageIndex) }
         return created
     }
 
@@ -721,6 +681,23 @@ class ContinuousInkController(
             if (size != null && size[0] > 0f && size[1] > 0f) return size[0] / size[1]
         }
         return ContinuousPageGeometry.defaultRatio(pageType)
+    }
+
+    /**
+     * The aspect ratio (width / height) of the page image of a raster page.
+     *
+     * The page image is the description of the page: its size is the ratio
+     * the reader draws the page (and the layer) with.
+     */
+    private fun rasterPageRatio(pageIndex: Int): Float {
+        val file = repository.fileStore.getPageFile(noteId, pageIndex)
+        if (!file.exists()) return 0f
+        val bounds = android.graphics.BitmapFactory.Options().apply {
+            inJustDecodeBounds = true
+        }
+        android.graphics.BitmapFactory.decodeFile(file.absolutePath, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return 0f
+        return bounds.outWidth.toFloat() / bounds.outHeight
     }
 
     /**
@@ -751,17 +728,26 @@ class ContinuousInkController(
         fallbackRatio: Float = 0f
     ): ContinuousPageGeometry.BoxRect {
         val s = getSession(pageIndex)
-        val ratio = s?.pageRatio ?: if (fallbackRatio > 0f) fallbackRatio else ratioOfLedger(pageIndex)
+        val ratio = s?.pageRatio ?: if (fallbackRatio > 0f) fallbackRatio else ContinuousPageGeometry.defaultRatio(pageType)
         return ContinuousPageGeometry.pageRect(pageType, ratio, boxWidth, boxHeight)
     }
 
-    /** The aspect ratio of a page, taken from the crops of the page. */
-    private fun ratioOfLedger(pageIndex: Int): Float {
-        val ledger = cropLedgers[pageIndex]
-        if (ledger != null && ledger.spaceWidth > 0 && ledger.spaceHeight > 0) {
-            return ledger.spaceWidth.toFloat() / ledger.spaceHeight
-        }
-        return ContinuousPageGeometry.defaultRatio(pageType)
+    /**
+     * Where the annotation layer sits inside the page box, in normalised box
+     * coordinates.
+     *
+     * A fixed page: the layer covers the whole box (the page plus the
+     * margin on both sides). An infinite page: the layer is the page image.
+     */
+    fun layerRectFor(
+        pageIndex: Int,
+        boxWidth: Float,
+        boxHeight: Float,
+        fallbackRatio: Float = 0f
+    ): ContinuousPageGeometry.BoxRect {
+        val s = getSession(pageIndex)
+        val ratio = s?.pageRatio ?: if (fallbackRatio > 0f) fallbackRatio else ContinuousPageGeometry.defaultRatio(pageType)
+        return ContinuousPageGeometry.layerRect(pageType, ratio, boxWidth, boxHeight)
     }
 
     private fun startLoad(s: ContinuousInkSession, page: PageEntity, renderWidthPx: Int) {
@@ -769,19 +755,44 @@ class ContinuousInkController(
         s.loadJob = scope.launch {
             try {
                 val ink = withContext(Dispatchers.IO) {
-                    if (s.isVector) {
-                        val strokes = repository.loadPageStrokes(noteId, s.pageIndex)
-                        if (strokes != null) mutableCopy(strokes)
-                        else Bitmap.createBitmap(
-                            s.inkWidth, s.inkHeight, Bitmap.Config.ARGB_8888
-                        )
+                    // A raster page is described by its page image: its size
+                    // is the ratio of the page, so the layer is as tall as
+                    // the page.
+                    var pageRatio = 0f
+                    if (!s.isVector) {
+                        pageRatio = rasterPageRatio(s.pageIndex)
+                        if (pageRatio > 0f) {
+                            val size = ContinuousPageGeometry.layerSize(pageType, pageRatio)
+                            if (size.width != s.inkWidth || size.height != s.inkHeight) {
+                                s.inkWidth = size.width
+                                s.inkHeight = size.height
+                                s.pageRatio = pageRatio
+                            }
+                        }
+                    }
+                    // The annotation layer of the page (layer 1). It is the
+                    // persisted form of the writing; the page image itself is
+                    // never touched by a stroke.
+                    val file = repository.fileStore.getAnnotationLayerFile(noteId, s.pageIndex, s.layerIndex)
+                    val stored = personal.notes.touch.util.BitmapUtils.loadBitmapFromFile(file)
+                    val layer = if (stored == null) {
+                        Bitmap.createBitmap(s.inkWidth, s.inkHeight, Bitmap.Config.ARGB_8888)
+                    } else if (stored.width == s.inkWidth && stored.height == s.inkHeight) {
+                        mutableCopy(stored)
                     } else {
-                        val pageBmp = repository.loadPageBitmap(noteId, s.pageIndex)
-                        if (pageBmp != null) mutableCopy(pageBmp)
-                        else Bitmap.createBitmap(
-                            s.inkWidth, s.inkHeight, Bitmap.Config.ARGB_8888
+                        // The layer was written with another size (the page
+                        // changed): the page part of it lands on the page
+                        // part of the new layer, the margins are added.
+                        fitLayer(stored, s.inkWidth, s.inkHeight)
+                    }
+                    if (pageRatio <= 0f && layer.height > 0) {
+                        // The page image is gone: the layer describes the
+                        // page now.
+                        s.pageRatio = ContinuousPageGeometry.ratioOfLayer(
+                            pageType, layer.width, layer.height
                         )
                     }
+                    layer
                 }
                 if (session !== s) {
                     ink.recycle()
@@ -790,15 +801,11 @@ class ContinuousInkController(
                 s.ink = ink
                 s.inkWidth = ink.width
                 s.inkHeight = ink.height
-                // The ink layer describes the page: the page image sits in
-                // the box with the aspect ratio of the layer.
-                if (ink.height > 0) s.pageRatio = ink.width.toFloat() / ink.height
-                s.crops.setSpace(s.inkWidth, s.inkHeight)
                 if (s.isVector) {
                     s.background = withContext(Dispatchers.IO) {
                         renderContinuousPage(
                             page, s.pageIndex, noteId, pdfDocCache, repository,
-                            renderWidthPx.coerceAtLeast(720), includeInk = false
+                            renderWidthPx.coerceAtLeast(720), includeInk = true
                         )
                     }
                     s.backgroundWidth = renderWidthPx
@@ -833,7 +840,7 @@ class ContinuousInkController(
             val bg = withContext(Dispatchers.IO) {
                 renderContinuousPage(
                     page, s.pageIndex, noteId, pdfDocCache, repository,
-                    renderWidthPx, includeInk = false
+                    renderWidthPx, includeInk = true
                 )
             }
             if (session === s && bg != null) {
@@ -865,10 +872,10 @@ class ContinuousInkController(
      * of the page image. The bitmap is only touched by the eraser, which
      * has to clear pixels.
      *
-     * A stroke that leaves the page image cannot be a vector operation of
-     * the page - the page has no pixels there. It is rasterised into a crop
-     * instead (the mechanism the single-page engine uses for the ink outside
-     * the paper).
+     * Every stroke belongs to the annotation layer of the page - also the
+     * ones that reach past the page image into the margin: the layer is
+     * wider than the page, so the margin notes are part of it and the page
+     * image stays clean.
      */
     private fun commit(s: ContinuousInkSession, stroke: ContinuousStroke, autoShapeEnabled: Boolean = false) {
         if (stroke.points.isEmpty()) return
@@ -878,20 +885,11 @@ class ContinuousInkController(
             commitErase(s, stroke)
             return
         }
-        val bounds = strokeBoundsInBox(stroke, s)
-        if (bounds != null && !ContinuousPageGeometry.isInsidePage(s.pageRectInBox, bounds)) {
-            // The stroke left the page: it becomes a crop of the page.
-            if (commitCrop(s, stroke, bounds)) {
-                revision++
-                return
-            }
-            // No room for a crop: fall back to the vector stroke.
-        }
         var shape: Path? = null
-        val rect = s.pageRectInBox
+        val rect = s.layerRectInBox
         if (autoShapeEnabled && (stroke.tool == CanvasTool.PEN || stroke.tool == CanvasTool.FOUNTAIN_PEN) && !rect.empty) {
             // The auto-shape works on points in pixels: the stroke is
-            // normalised to the box, the path lives in the page's pixels.
+            // normalised to the box, the path lives in the layer's pixels.
             val sx = s.inkWidth / rect.width
             val sy = s.inkHeight / rect.height
             val pts = stroke.points.map { ((it.x - rect.left) * sx) to ((it.y - rect.top) * sy) }
@@ -901,46 +899,6 @@ class ContinuousInkController(
         s.history.commit(op)
         trimUndo(s)
         s.dirty = true
-    }
-
-    /**
-     * Rasterises a stroke that left the page image into a crop: a small
-     * transparent bitmap at the place the stroke has in the page's pixel
-     * space.
-     *
-     * The crop is kept in the ledger of the page, so it can be drawn, saved
-     * with the page and undone like any other operation.
-     */
-    private fun commitCrop(
-        s: ContinuousInkSession,
-        stroke: ContinuousStroke,
-        bounds: ContinuousPageGeometry.BoxRect
-    ): Boolean {
-        val rect = s.pageRectInBox
-        val place = ContinuousPageGeometry.cropPlace(rect, bounds, s.inkWidth, s.inkHeight) ?: return false
-        if (place.width > MAX_CROP_SIZE || place.height > MAX_CROP_SIZE) return false
-        val bitmap = try {
-            Bitmap.createBitmap(place.width, place.height, Bitmap.Config.ARGB_8888)
-        } catch (e: OutOfMemoryError) {
-            e.printStackTrace()
-            return false
-        }
-        val sx = s.inkWidth / rect.width
-        val sy = s.inkHeight / rect.height
-        val canvas = Canvas(bitmap)
-        // The stroke is normalised to the box: the canvas is scaled and
-        // moved so the normalised coordinates land on the page, and the
-        // crop's own origin is taken off.
-        canvas.translate(-place.x, -place.y)
-        canvas.scale(sx, sy)
-        canvas.translate(-rect.left, -rect.top)
-        drawStroke(canvas, stroke, 1f, 1f, preview = false)
-        val crop = s.crops.add(place.x, place.y, place.width, place.height, bitmap)
-        cropBitmaps[crop.id] = bitmap
-        s.history.commit(InkOp.Crop(crop.id, place))
-        trimUndo(s)
-        s.dirty = true
-        return true
     }
 
     /**
@@ -965,8 +923,8 @@ class ContinuousInkController(
      * Commits an eraser stroke.
      *
      * The eraser is the one exception to the vector strokes: it clears
-     * pixels, so it is drawn into the session bitmap (the ink layer) - the
-     * PDF text lives in the background, not in that bitmap, so the text
+     * pixels, so it is drawn into the session bitmap (the annotation layer)
+     * - the PDF text lives in the background, not in that bitmap, so the text
      * under the eraser stays. The pixels it cleared are kept in a patch so
      * the wipe can be undone, and the operation stays in the committed list
      * so it can cut the strokes that were drawn before it.
@@ -1001,14 +959,15 @@ class ContinuousInkController(
     }
 
     /**
-     * Draws a stroke into the ink layer (the page's pixel space).
+     * Draws a stroke into the annotation layer (the layer's pixel space).
      *
-     * The strokes are normalised to the box and the ink layer lives in the
-     * page's pixels, so the canvas is scaled and moved: the normalised
-     * coordinates land on the page.
+     * The strokes are normalised to the box and the layer lives in its own
+     * pixels, so the canvas is scaled and moved: the normalised coordinates
+     * land on the layer (a stroke in the margin lands in the margin of the
+     * layer, not on the page).
      */
     private fun drawStrokeInInk(canvas: Canvas, s: ContinuousInkSession, stroke: ContinuousStroke) {
-        val rect = s.pageRectInBox
+        val rect = s.layerRectInBox
         if (rect.empty) return
         val sx = s.inkWidth / rect.width
         val sy = s.inkHeight / rect.height
@@ -1069,8 +1028,7 @@ class ContinuousInkController(
         val s = session ?: return false
         val undone = s.history.undo(
             onErase = { op, restore -> restoreErase(s, op, restore) },
-            onClear = { patch, restore -> restoreClear(s, patch, restore) },
-            onCrop = { op, restore -> restoreCrop(s, op, restore) }
+            onClear = { patch, restore -> restoreClear(s, patch, restore) }
         )
         if (!undone) return false
         s.dirty = true
@@ -1085,8 +1043,7 @@ class ContinuousInkController(
         val s = session ?: return false
         val redone = s.history.redo(
             onErase = { op, restore -> restoreErase(s, op, restore) },
-            onClear = { patch, restore -> restoreClear(s, patch, restore) },
-            onCrop = { op, restore -> restoreCrop(s, op, restore) }
+            onClear = { patch, restore -> restoreClear(s, patch, restore) }
         )
         if (!redone) return false
         s.dirty = true
@@ -1094,25 +1051,6 @@ class ContinuousInkController(
         revision++
         onUndoRedoChanged(s.canUndo, s.canRedo)
         return true
-    }
-
-    /**
-     * Takes a crop out of the page (undo) or puts it back (redo).
-     *
-     * The bitmap of the crop outlives the undo: it is kept by its id, so
-     * the redo can bring the very same crop back.
-     */
-    private fun restoreCrop(s: ContinuousInkSession, op: InkOp.Crop, restore: Boolean) {
-        if (restore) {
-            s.crops.remove(op.id)
-            return
-        }
-        val bitmap = cropBitmaps[op.id] ?: return
-        s.crops.restore(
-            InkCropLedger.Crop(
-                op.id, op.place.x, op.place.y, op.place.width, op.place.height, bitmap
-            )
-        )
     }
 
     /**
@@ -1127,7 +1065,8 @@ class ContinuousInkController(
     /**
      * Puts the ink of a cleared page back (undo) or wipes it again (redo).
      *
-     * The margin notes of the page belong to the ink, so they go with it.
+     * The layer holds the writing of the page (also the notes in the
+     * margin), so it goes with it.
      */
     private fun restoreClear(s: ContinuousInkSession, patch: InkPatch?, restore: Boolean) {
         val ink = s.ink ?: return
@@ -1138,18 +1077,6 @@ class ContinuousInkController(
             } else {
                 ink.eraseColor(android.graphics.Color.TRANSPARENT)
             }
-        }
-        if (restore) {
-            s.clearedCrops.forEach { op ->
-                val bitmap = cropBitmaps[op.id] ?: return@forEach
-                s.crops.restore(
-                    InkCropLedger.Crop(
-                        op.id, op.place.x, op.place.y, op.place.width, op.place.height, bitmap
-                    )
-                )
-            }
-        } else {
-            s.clearedCrops.forEach { op -> s.crops.remove(op.id) }
         }
     }
 
@@ -1178,11 +1105,9 @@ class ContinuousInkController(
         if (page == null) return false
         val isVector = page.pdfSourcePath.isNotEmpty() && page.pdfPageIndex >= 0
         val ratio = pageRatioOf(page, isVector)
-        val created = ContinuousInkSession(
-            pageIndex, isVector, 2160, (2160f * ratio).roundToInt().coerceAtLeast(1), pageType
-        )
+        val size = ContinuousPageGeometry.layerSize(pageType, ratio)
+        val created = ContinuousInkSession(pageIndex, isVector, size.width, size.height, pageType)
         created.pageRatio = ratio
-        created.crops = ledgerFor(pageIndex)
         session = created
         onUndoRedoChanged(false, false)
         startLoad(created, page, renderWidthPx)
@@ -1208,10 +1133,6 @@ class ContinuousInkController(
         // The strokes of this session go away with the ink of the page; the
         // undo keeps both, so the clear can be taken back.
         val removed = s.history.ops.toList()
-        // The margin notes are ink of the page too: they go with it.
-        val removedCrops = removed.filterIsInstance<InkOp.Crop>()
-        removedCrops.forEach { op -> s.crops.remove(op.id) }
-        s.clearedCrops = removedCrops
         synchronized(s.inkLock) { ink.eraseColor(android.graphics.Color.TRANSPARENT) }
         s.history.commitClear(patch, removed)
         trimUndo(s)
@@ -1347,15 +1268,15 @@ class ContinuousInkController(
         }
     }
 
-    /** Bounds of what a stroke touches, in ink pixels, clamped to the layer. */
+    /** Bounds of what a stroke touches, in layer pixels, clamped to the layer. */
     private fun strokeBoundsInInk(stroke: ContinuousStroke, s: ContinuousInkSession): Rect? {
-        val rect = s.pageRectInBox
+        val rect = s.layerRectInBox
         if (rect.empty) return null
         val bounds = strokeBoundsInBox(stroke, s) ?: return null
         val sx = s.inkWidth / rect.width
         val sy = s.inkHeight / rect.height
-        // The eraser only reaches the ink of the page: a stroke in the
-        // margin has nothing to erase there.
+        // The eraser reaches the whole layer: the notes in the margin are on
+        // the layer too, so they can be wiped as well.
         val left = ((bounds.left - rect.left) * sx).toInt()
         val top = ((bounds.top - rect.top) * sy).toInt()
         val right = ((bounds.right - rect.left) * sx).toInt()
@@ -1391,7 +1312,7 @@ class ContinuousInkController(
         // failed write must stay dirty so the next save tries again.
         s.dirty = false
         // The copy and the strokes drawn into it happen off the main thread:
-        // copying a 26 MB page on the UI thread blocked the pen for tens of
+        // copying a 40 MB layer on the UI thread blocked the pen for tens of
         // milliseconds after every stroke. The lock keeps a stroke that lands
         // during the copy from tearing the snapshot.
         val copy = try {
@@ -1417,164 +1338,53 @@ class ContinuousInkController(
     }
 
     /**
-     * Writes the ink layer of a page and the crops that belong to it.
+     * Writes the annotation layer of a page.
      *
-     * The crops are the ink outside the page image: they live in their own
-     * files (the ones the single-page engine uses), so they survive a
-     * restart and reach the export.
+     * The layer is the persisted form of the writing: it is as wide as the
+     * reader's page box (the page plus the margin on both sides) and as tall
+     * as the page, so the notes in the margin are part of it. The page image
+     * itself is never written to - the PDF (or the page PNG) stays clean.
+     *
+     * The file is the layer file of the page
+     * (`layers/page_<i>_layer_<n>.png`, the format the single-page engine
+     * uses for the layers of a page).
      */
     private suspend fun savePage(s: ContinuousInkSession, copy: Bitmap): Boolean {
-        val ok = if (s.isVector) {
-            repository.savePageStrokes(noteId, s.pageIndex, copy)
-        } else {
-            repository.savePageBitmap(noteId, s.pageIndex, copy)
-        }
-        writeCrops(s.pageIndex, s.crops)
-        return ok
+        return repository.savePageLayer(noteId, s.pageIndex, s.layerIndex, copy)
     }
 
     /**
-     * Writes the crops of a page to the disk.
+     * Puts a layer that was written with another size into the size of this
+     * session.
      *
-     * The format is the one of the single-page engine: one transparent PNG
-     * per crop (`beyond_<page>_<n>.png`) and a manifest that keeps their
-     * places (`beyond_<page>.json`). Crops of the page that are gone are
-     * removed, so a crop that is no longer in the ledger cannot come back.
+     * The page part of the old layer lands on the page part of the new one
+     * (the margins on both sides of it), so the writing keeps its place when
+     * the page changed its shape.
      */
-    private fun writeCrops(pageIndex: Int, ledger: InkCropLedger<Bitmap>) {
-        try {
-            val fileStore = repository.fileStore
-            val layersDir = fileStore.getLayersDir(noteId)
-            val prefix = "beyond_${pageIndex}_"
-            val manifest = fileStore.getBeyondInkFile(noteId, pageIndex)
-            val arr = org.json.JSONArray()
-            val written = mutableSetOf<String>()
-            ledger.all().forEachIndexed { index, crop ->
-                val bitmap = crop.payload
-                if (bitmap.isRecycled) return@forEachIndexed
-                val name = "${prefix}${index}.png"
-                written.add(name)
-                java.io.FileOutputStream(java.io.File(layersDir, name)).use { fos ->
-                    bitmap.compress(Bitmap.CompressFormat.PNG, 100, fos)
-                }
-                val obj = org.json.JSONObject()
-                obj.put("file", name)
-                obj.put("x", crop.x.toDouble())
-                obj.put("y", crop.y.toDouble())
-                arr.put(obj)
-            }
-            manifest.writeText(arr.toString())
-            layersDir.listFiles()?.forEach { file ->
-                if (file.name.startsWith(prefix) && file.name.endsWith(".png") && !written.contains(file.name)) {
-                    file.delete()
-                }
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-    }
-
-    /** One crop that was read from the disk. */
-    private class LoadedCrop(
-        val bitmap: Bitmap,
-        val x: Float,
-        val y: Float,
-        val width: Int,
-        val height: Int
-    )
-
-    /** The crops of a page, with the pixel space they live in. */
-    private class LoadedCrops(
-        val crops: List<LoadedCrop>,
-        val spaceWidth: Int,
-        val spaceHeight: Int
-    )
-
-    /**
-     * Loads the crops of a page (the margin notes) from the disk.
-     *
-     * They are the files the single-page engine writes, so the notes of a
-     * page survive a restart and are visible in both modes.
-     */
-    suspend fun loadCrops(page: PageEntity, pageIndex: Int) {
-        val ledger = ledgerFor(pageIndex)
-        // The user already drew in the margin: those strokes are newer than
-        // the file, so they win and the load does not wipe them.
-        if (ledger.count > 0) return
-        if (!loadingCrops.add(pageIndex)) return
-        try {
-            val loaded = withContext(Dispatchers.IO) { readCropsFromDisk(page, pageIndex) } ?: return
-            ledger.setSpace(loaded.spaceWidth, loaded.spaceHeight)
-            for (crop in loaded.crops) {
-                val added = ledger.add(crop.x, crop.y, crop.width, crop.height, crop.bitmap)
-                cropBitmaps[added.id] = crop.bitmap
-            }
-            revision++
-        } finally {
-            loadingCrops.remove(pageIndex)
-        }
-    }
-
-    /** Reads the crops of a page from the disk (the single-page format). */
-    private fun readCropsFromDisk(page: PageEntity, pageIndex: Int): LoadedCrops? {
-        val fileStore = repository.fileStore
-        val manifest = fileStore.getBeyondInkFile(noteId, pageIndex)
-        if (!manifest.exists()) return null
-        val layersDir = fileStore.getLayersDir(noteId)
-        val crops = mutableListOf<LoadedCrop>()
-        try {
-            val arr = org.json.JSONArray(manifest.readText())
-            for (i in 0 until arr.length()) {
-                val obj = arr.optJSONObject(i) ?: continue
-                val name = obj.optString("file", "")
-                if (name.isEmpty()) continue
-                val bitmap = android.graphics.BitmapFactory
-                    .decodeFile(java.io.File(layersDir, name).absolutePath)
-                    ?.copy(Bitmap.Config.ARGB_8888, true) ?: continue
-                crops.add(
-                    LoadedCrop(
-                        bitmap,
-                        obj.optDouble("x", 0.0).toFloat(),
-                        obj.optDouble("y", 0.0).toFloat(),
-                        bitmap.width,
-                        bitmap.height
-                    )
-                )
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-        if (crops.isEmpty()) return null
-        val isVector = page.pdfSourcePath.isNotEmpty() && page.pdfPageIndex >= 0
-        val space = inkSpaceSize(pageIndex, isVector)
-        return LoadedCrops(crops, space.first, space.second)
-    }
-
-    /**
-     * The pixel space of the ink of a page: the size of its ink layer (the
-     * stroke layer of a PDF page, the page image of a raster page). The
-     * crops are placed in it.
-     */
-    private fun inkSpaceSize(pageIndex: Int, isVector: Boolean): Pair<Int, Int> {
-        val fileStore = repository.fileStore
-        val file = if (isVector) {
-            fileStore.getStrokesFile(noteId, pageIndex)
-        } else {
-            fileStore.getPageFile(noteId, pageIndex)
-        }
-        if (file.exists()) {
-            val bounds = android.graphics.BitmapFactory.Options().apply {
-                inJustDecodeBounds = true
-            }
-            android.graphics.BitmapFactory.decodeFile(file.absolutePath, bounds)
-            if (bounds.outWidth > 0 && bounds.outHeight > 0) {
-                return bounds.outWidth to bounds.outHeight
-            }
-        }
-        // No ink layer yet: the default of the note type is used, the same
-        // size the session creates.
-        val ratio = ContinuousPageGeometry.defaultRatio(pageType)
-        return 2160 to (2160f * ratio).roundToInt().coerceAtLeast(1)
+    private fun fitLayer(source: Bitmap, width: Int, height: Int): Bitmap {
+        val target = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(target)
+        val paint = Paint(Paint.FILTER_BITMAP_FLAG)
+        // The page part of a layer: a fixed page's layer is a third wider
+        // than its page (the margin on both sides), an infinite page's layer
+        // is its page.
+        val pageFraction = if (ContinuousPageGeometry.isInfinite(pageType)) 1f else 1f / 1.5f
+        val srcLeft = source.width * (1f - pageFraction) / 2f
+        val srcWidth = source.width * pageFraction
+        val dstLeft = width * (1f - pageFraction) / 2f
+        val dstWidth = width * pageFraction
+        canvas.drawBitmap(
+            source,
+            Rect(
+                srcLeft.toInt().coerceAtLeast(0),
+                0,
+                (srcLeft + srcWidth).toInt().coerceAtMost(source.width),
+                source.height
+            ),
+            RectF(dstLeft, 0f, dstLeft + dstWidth, height.toFloat()),
+            paint
+        )
+        return target
     }
 
     /**
@@ -1583,7 +1393,7 @@ class ContinuousInkController(
      *
      * The copy keeps the ink of the page as it was loaded; the strokes of
      * this session are rasterised into it here, once, off the main thread.
-     * Must not run on the main thread: the layer is ~26 MB.
+     * Must not run on the main thread: the layer is ~40 MB.
      *
      * [ops] is the list to draw; when it is null the list of the session is
      * taken under the lock, together with the copy (so the copy and the
@@ -1638,7 +1448,7 @@ class ContinuousInkController(
         s.savedWhileActive = true
         closingSessions[s.pageIndex] = s
         appScope.launch {
-            // The copy of the 26 MB layer and the strokes drawn into it
+            // The copy of the 40 MB layer and the strokes drawn into it
             // happen off the main thread: the pen must not wait for them.
             val copy = try {
                 withContext(Dispatchers.IO) { copyWithOps(s, ink) }
@@ -1807,7 +1617,7 @@ class ContinuousInkController(
      * They are drawn as paths, with exactly the code the live preview uses,
      * so a finished stroke looks the same as the one the user just drew -
      * and the session bitmap is never touched, so the GPU never has to
-     * take the 26 MB layer again.
+     * take the whole layer again.
      */
     fun drawCommitted(canvas: Canvas, pageIndex: Int, viewWidth: Float, viewHeight: Float) {
         val s = getSession(pageIndex) ?: return
@@ -1818,9 +1628,6 @@ class ContinuousInkController(
                 // The eraser clears pixels: the reader draws it into an
                 // offscreen layer, so the wipe never reaches the page image.
                 is InkOp.Erase -> drawStroke(canvas, op.stroke, viewWidth, viewHeight, preview = false)
-                // The crops are the ink outside the page: they are drawn by
-                // drawCrops, at the place they have in the page.
-                is InkOp.Crop -> Unit
             }
         }
     }
@@ -1850,13 +1657,13 @@ class ContinuousInkController(
         viewHeight: Float
     ) {
         val shape = op.shape
-        val rect = s.pageRectInBox
+        val rect = s.layerRectInBox
         if (shape == null || rect.empty || s.inkWidth <= 0 || s.inkHeight <= 0) {
             drawStroke(canvas, op.stroke, viewWidth, viewHeight, preview = false)
             return
         }
-        // The auto-shape path lives in the page's pixels: the canvas is
-        // scaled and moved so the path lands on the page inside the box.
+        // The auto-shape path lives in the layer's pixels: the canvas is
+        // scaled and moved so the path lands on the layer inside the box.
         // The paint keeps the line weight in box pixels.
         val u = rect.width * viewWidth / s.inkWidth
         val v = rect.height * viewHeight / s.inkHeight
@@ -1875,57 +1682,17 @@ class ContinuousInkController(
     }
 
     /**
-     * Draws the crops of a page: the strokes that left the page image.
+     * Draws the committed operations into the annotation layer (the layer's
+     * pixels). Used when the page is saved: the strokes are rasterised into a
+     * copy of the layer, once, off the main thread.
      *
-     * They are painted on the page (at the place they have in the page's
-     * pixel space), under the vector operations of the session.
-     */
-    fun drawCrops(
-        canvas: Canvas,
-        pageIndex: Int,
-        boxWidth: Float,
-        boxHeight: Float,
-        fallbackRatio: Float = 0f
-    ) {
-        val ledger = cropLedgers[pageIndex] ?: return
-        if (ledger.count == 0) return
-        if (boxWidth <= 0f || boxHeight <= 0f) return
-        if (ledger.spaceWidth <= 0 || ledger.spaceHeight <= 0) return
-        val rect = pageRectFor(pageIndex, boxWidth, boxHeight, fallbackRatio)
-        if (rect.empty) return
-        val sx = rect.width * boxWidth / ledger.spaceWidth
-        val sy = rect.height * boxHeight / ledger.spaceHeight
-        val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
-        for (crop in ledger.all()) {
-            val bitmap = crop.payload
-            if (bitmap.isRecycled) continue
-            val left = rect.left * boxWidth + crop.x * sx
-            val top = rect.top * boxHeight + crop.y * sy
-            canvas.drawBitmap(
-                bitmap,
-                null,
-                RectF(
-                    left,
-                    top,
-                    left + crop.width * sx,
-                    top + crop.height * sy
-                ),
-                paint
-            )
-        }
-    }
-
-    /**
-     * Draws the committed operations into the ink layer (the page's pixels).
-     * Used when the page is saved: the strokes are rasterised into a copy of
-     * the layer, once, off the main thread.
-     *
-     * The strokes are normalised to the box and the layer lives in the
-     * page's pixels, so the canvas is scaled and moved: the normalised
-     * coordinates land on the page.
+     * The strokes are normalised to the box and the layer lives in its own
+     * pixels, so the canvas is scaled and moved: the normalised coordinates
+     * land on the layer - a stroke in the margin lands in the margin of the
+     * layer and never on the page image.
      */
     private fun drawOps(canvas: Canvas, s: ContinuousInkSession, ops: List<InkOp>) {
-        val rect = s.pageRectInBox
+        val rect = s.layerRectInBox
         if (rect.empty) return
         val sx = s.inkWidth / rect.width
         val sy = s.inkHeight / rect.height
@@ -1959,9 +1726,6 @@ class ContinuousInkController(
                     drawStroke(canvas, op.stroke, 1f, 1f, preview = false)
                     canvas.restoreToCount(save)
                 }
-                // The crops are not part of the ink layer: they are the ink
-                // outside the page and live in their own files.
-                is InkOp.Crop -> Unit
             }
         }
     }
@@ -2137,7 +1901,5 @@ class ContinuousInkController(
         const val LASER_TRAIL_MS = 700L
         /** ~48 MB of patches: a few dozen ordinary strokes, bounded. */
         const val MAX_UNDO_BYTES = 48L * 1024L * 1024L
-        /** The biggest crop (a margin note) that is rasterised, in pixels. */
-        const val MAX_CROP_SIZE = 4096
     }
 }

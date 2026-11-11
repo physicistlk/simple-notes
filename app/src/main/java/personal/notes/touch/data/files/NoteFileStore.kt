@@ -117,6 +117,10 @@ class NoteFileStore(private val context: Context) {
         getBeyondInkFile(noteId, pageIndex).delete()
         getLayersDir(noteId).listFiles()?.forEach { f ->
             if (f.name.startsWith("beyond_${pageIndex}_") && f.name.endsWith(".png")) f.delete()
+            // The layers of the page (the annotation layer and the floating
+            // images) belong to it: they go with it, or a new page at the
+            // same index would inherit them.
+            if (f.name.startsWith("page_${pageIndex}_layer_") && f.name.endsWith(".png")) f.delete()
         }
         return if (file.exists()) file.delete() else true
     }
@@ -145,6 +149,16 @@ class NoteFileStore(private val context: Context) {
                 if (target.exists()) target.delete()
                 f.renameTo(target)
             }
+            // The layers of the page (the annotation layer and the floating
+            // images) move with the page.
+            if (f.name.startsWith("page_${oldIndex}_layer_") && f.name.endsWith(".png")) {
+                val target = java.io.File(
+                    layersDir,
+                    f.name.replace("page_${oldIndex}_layer_", "page_${newIndex}_layer_")
+                )
+                if (target.exists()) target.delete()
+                f.renameTo(target)
+            }
         }
         if (oldBeyond.exists()) {
             if (newBeyond.exists()) newBeyond.delete()
@@ -169,9 +183,22 @@ class NoteFileStore(private val context: Context) {
     fun getLayerInfoFile(noteId: String, pageIndex: Int): File =
         File(getLayersDir(noteId), "page_${pageIndex}_layers.json")
 
-    /** The bitmap file of one layer of a page. */
+    /** The bitmap file of one floating image layer of a page. */
     fun getLayerFile(noteId: String, pageIndex: Int, layerIndex: Int): File =
         File(getLayersDir(noteId), "page_${pageIndex}_layer_${layerIndex}.png")
+
+    /**
+     * The bitmap file of the **annotation layer** of a page.
+     *
+     * The annotation layer is the surface the writing goes on: it reaches out
+     * to both sides of the page, so the notes next to a text heavy document
+     * have room. Its name is deliberately different from the floating image
+     * layers (`page_<i>_layer_<n>.png`) - the single-page engine deletes the
+     * floating layer files it does not know, and it must not delete the
+     * notes of the page.
+     */
+    fun getAnnotationLayerFile(noteId: String, pageIndex: Int, layerIndex: Int = 0): File =
+        File(getLayersDir(noteId), "page_${pageIndex}_annot_${layerIndex}.png")
 
     /** Workspace preferences (tab bar state, dock orientation) live beside the notes. */
     fun getUiPrefsFile(): File = File(context.filesDir, "ui_prefs.json")

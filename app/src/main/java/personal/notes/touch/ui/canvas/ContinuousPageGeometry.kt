@@ -2,17 +2,24 @@ package personal.notes.touch.ui.canvas
 
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 
 /**
  * The geometry of a reader page: where the page image sits inside the
- * reader's page box, and whether a stroke still lies on the page.
+ * reader's page box, and where the annotation layer of the page sits.
  *
- * The reader's page box is bigger than the page image, so the user can
- * write in the margin of an imported PDF - the only free space on a text
- * heavy page. A fixed page (A4 or PDF) is centred in its box and keeps a
- * margin of [PAGE_MARGIN] around it; an infinite page has no edge at all:
- * its box is the visible canvas and the saved image is drawn inside it at
- * its own size, so the endless canvas is not bounded by the saved bitmap.
+ * The reader's page box is wider than the page image, so the user can write
+ * in the margin of an imported PDF - the only free space on a text heavy
+ * page. A fixed page (A4 or PDF) keeps its height and its place in the
+ * reader: the box is the page plus a quarter of the page's width on the
+ * left and on the right, so only the horizontal room is added. An infinite
+ * page has no edge at all: its box is the visible canvas and the saved image
+ * is drawn inside it at its own size.
+ *
+ * The writing does not live on the page image - it lives on the annotation
+ * layer of the page, which is as wide as the box and as tall as the page.
+ * The page (the PDF) stays clean; a stroke in the margin is part of the
+ * layer.
  *
  * Everything here is pure, so the mapping can be unit tested without a
  * device.
@@ -20,26 +27,36 @@ import kotlin.math.min
 object ContinuousPageGeometry {
 
     /**
-     * The margin around a fixed page, as a fraction of the page's own size:
-     * a quarter of the page's width on the left and on the right, a quarter
-     * of the page's height above and below.
+     * The margin around a fixed page, as a fraction of the page's own width:
+     * a quarter of the page's width on the left and on the right.
      *
-     * The margin is proportional on both axes on purpose. The box then
-     * keeps the page's aspect ratio, so the mapping between the box (the
-     * space the strokes are normalised to) and the page (the space the ink
-     * layer lives in) is a plain scale. A margin of a quarter of the page's
-     * *width* on all four sides would change the aspect ratio of an A4 page
-     * by 11 %, and every stroke would be squashed by 11 % when it is
-     * written into the page's pixel space - the live preview would not
-     * match the stroke that comes back from the disk.
+     * The margin is horizontal only on purpose. The box then has the height
+     * of the page, so the page keeps its place in the reader (the page does
+     * not move down when the margin is added) and the mapping between the
+     * box (the space the strokes are normalised to) and the layer (the
+     * space the ink lives in) is a plain scale on both axes - a stroke
+     * cannot change its shape when it is written into the layer.
      */
     const val PAGE_MARGIN = 0.25f
+
+    /**
+     * The index of the base annotation layer of a page (layer 1).
+     *
+     * The reader writes on this layer. The layer stack (layers 2 and 3, and
+     * the "flatten to the base" action) comes with the next step; the index
+     * lives here so the layers of a page share one naming
+     * (`layers/page_<i>_layer_<n>.png`).
+     */
+    const val BASE_LAYER_INDEX = 1
 
     /** The aspect ratio (width / height) of a saved A4 page. */
     const val DEFAULT_PAGE_RATIO = 2160f / 3056f
 
     /** The aspect ratio (width / height) of the saved bitmap of an infinite page. */
     const val INFINITE_PAGE_RATIO = 2160f / 3840f
+
+    /** The width of the saved page image the layer of a page is based on. */
+    const val PAGE_WIDTH = 2160
 
     /**
      * A rectangle in normalised box coordinates (0..1 of the page box).
@@ -62,8 +79,11 @@ object ContinuousPageGeometry {
             x >= left && x <= right && y >= top && y <= bottom
     }
 
-    /** The place of a crop in the pixel space of a page. */
-    data class CropPlace(val x: Float, val y: Float, val width: Int, val height: Int)
+    /** The size of the annotation layer of a page, in pixels. */
+    data class LayerSize(val width: Int, val height: Int)
+
+    /** A point in the pixel space of a layer. */
+    data class LayerPoint(val x: Float, val y: Float)
 
     /** True when the note's pages are an endless canvas. */
     fun isInfinite(pageType: String?): Boolean = pageType == "infinite"
@@ -71,6 +91,18 @@ object ContinuousPageGeometry {
     /** The aspect ratio of the page image of a note type. */
     fun defaultRatio(pageType: String?): Float =
         if (isInfinite(pageType)) INFINITE_PAGE_RATIO else DEFAULT_PAGE_RATIO
+
+    /**
+     * The aspect ratio (width / height) of the reader's page box.
+     *
+     * A fixed page: the page plus the margin on both sides, so the box is
+     * wider than the page. An infinite page: the box is the visible canvas,
+     * so its shape is the shape of the screen.
+     */
+    fun boxRatio(pageType: String?, pageRatio: Float): Float {
+        val ratio = if (pageRatio > 0f) pageRatio else defaultRatio(pageType)
+        return if (isInfinite(pageType)) ratio else ratio * (1f + 2f * PAGE_MARGIN)
+    }
 
     /**
      * The rect of the page image inside the box, in normalised box
@@ -94,14 +126,17 @@ object ContinuousPageGeometry {
     }
 
     /**
-     * A fixed page: centred in its box, with a margin of [PAGE_MARGIN] of
-     * the page's size around it.
+     * A fixed page: the full height of the box, centred in it, with a margin
+     * of [PAGE_MARGIN] of the page's width on the left and on the right.
+     *
+     * There is no margin above and below the page: the box has the height of
+     * the page, so the page keeps its place in the reader.
      */
     private fun fixedRect(ratio: Float, boxWidth: Float, boxHeight: Float): BoxRect {
-        // The page plus its margin, in units of the page's height.
+        // The page plus its margin, in units of the page's height. The
+        // height is not changed: the box is as tall as the page.
         val totalWidth = ratio * (1f + 2f * PAGE_MARGIN)
-        val totalHeight = 1f + 2f * PAGE_MARGIN
-        val scale = min(boxWidth / totalWidth, boxHeight / totalHeight)
+        val scale = min(boxWidth / totalWidth, boxHeight)
         return centredRect(ratio * scale, scale, boxWidth, boxHeight)
     }
 
@@ -128,6 +163,82 @@ object ContinuousPageGeometry {
             top / boxHeight,
             (left + width) / boxWidth,
             (top + height) / boxHeight
+        )
+    }
+
+    /**
+     * The size of the annotation layer of a page, in pixels.
+     *
+     * A fixed page: the layer is as wide as the box (the page plus the
+     * margin on both sides) and as tall as the page - that is the room the
+     * user writes in. An infinite page: the layer is the page image itself
+     * (its box is the visible canvas, which has no fixed size).
+     */
+    fun layerSize(
+        pageType: String?,
+        pageRatio: Float,
+        pageWidth: Int = PAGE_WIDTH
+    ): LayerSize {
+        val ratio = if (pageRatio > 0f) pageRatio else defaultRatio(pageType)
+        val width = if (isInfinite(pageType)) {
+            pageWidth
+        } else {
+            (pageWidth * (1f + 2f * PAGE_MARGIN)).roundToInt()
+        }
+        val height = (pageWidth / ratio).roundToInt().coerceAtLeast(1)
+        return LayerSize(width.coerceAtLeast(1), height)
+    }
+
+    /**
+     * The aspect ratio of the page a layer belongs to, taken from the size of
+     * the layer: a fixed page's layer is wider than its page (the margin on
+     * both sides), an infinite page's layer is its page.
+     */
+    fun ratioOfLayer(pageType: String?, layerWidth: Int, layerHeight: Int): Float {
+        if (layerWidth <= 0 || layerHeight <= 0) return defaultRatio(pageType)
+        val pageWidth = if (isInfinite(pageType)) {
+            layerWidth.toFloat()
+        } else {
+            layerWidth / (1f + 2f * PAGE_MARGIN)
+        }
+        return pageWidth / layerHeight
+    }
+
+    /**
+     * Where the annotation layer sits inside the box, in normalised box
+     * coordinates.
+     *
+     * A fixed page: the layer covers the whole box (the page plus the
+     * margin on both sides). An infinite page: the layer is the page image,
+     * so it sits where the page image sits.
+     */
+    fun layerRect(
+        pageType: String?,
+        pageRatio: Float,
+        boxWidth: Float,
+        boxHeight: Float
+    ): BoxRect {
+        if (isInfinite(pageType)) return pageRect(pageType, pageRatio, boxWidth, boxHeight)
+        return BoxRect(0f, 0f, 1f, 1f)
+    }
+
+    /**
+     * The place of a point of the box in the pixel space of the layer.
+     *
+     * The strokes are normalised to the box, the layer has its own pixels:
+     * the point is mapped through the rect the layer has in the box.
+     */
+    fun layerPoint(
+        rect: BoxRect,
+        x: Float,
+        y: Float,
+        layerWidth: Int,
+        layerHeight: Int
+    ): LayerPoint {
+        if (rect.empty || layerWidth <= 0 || layerHeight <= 0) return LayerPoint(0f, 0f)
+        return LayerPoint(
+            (x - rect.left) / rect.width * layerWidth,
+            (y - rect.top) / rect.height * layerHeight
         )
     }
 
@@ -160,33 +271,5 @@ object ContinuousPageGeometry {
         val padX = pad / boxWidth
         val padY = pad / boxHeight
         return BoxRect(minX - padX, minY - padY, maxX + padX, maxY + padY)
-    }
-
-    /** True when the stroke (in normalised box coordinates) lies on the page. */
-    fun isInsidePage(rect: BoxRect, bounds: BoxRect): Boolean =
-        !rect.empty &&
-            bounds.left >= rect.left && bounds.top >= rect.top &&
-            bounds.right <= rect.right && bounds.bottom <= rect.bottom
-
-    /**
-     * The place of a crop in the pixel space of the page: the bounds of the
-     * stroke (normalised box coordinates) are mapped into the page and
-     * rounded out. The crop may reach past the page - that is what a margin
-     * note is.
-     */
-    fun cropPlace(
-        rect: BoxRect,
-        bounds: BoxRect,
-        pageWidth: Int,
-        pageHeight: Int
-    ): CropPlace? {
-        if (rect.empty || pageWidth <= 0 || pageHeight <= 0) return null
-        val x0 = ((bounds.left - rect.left) / rect.width * pageWidth).toInt()
-        val y0 = ((bounds.top - rect.top) / rect.height * pageHeight).toInt()
-        val x1 = ((bounds.right - rect.left) / rect.width * pageWidth).toInt()
-        val y1 = ((bounds.bottom - rect.top) / rect.height * pageHeight).toInt()
-        val width = (x1 - x0).coerceAtLeast(1)
-        val height = (y1 - y0).coerceAtLeast(1)
-        return CropPlace(x0.toFloat(), y0.toFloat(), width, height)
     }
 }
