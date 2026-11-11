@@ -561,7 +561,10 @@ fun CanvasScreen(
                 continuousColState.firstVisibleItemIndex
                 continuousColState.firstVisibleItemScrollOffset
             }
-            val map = continuousPageMap.map
+            // The image map: the bitmap the glass samples is the page image,
+            // and it is rendered at the display resolution - the ink space
+            // (the map above) has different pixels.
+            val map = continuousPageMap.imageMap
             val bmp = glassReaderBitmap
             if (map == null || bmp == null || map.scale <= 0f ||
                 map.pageIndex != glassReaderBitmapPage
@@ -2427,6 +2430,7 @@ fun CanvasScreen(
                                                 repository = viewModel.repository,
                                                 readerLayers = readerLayers,
                                                 onPageMapping = { continuousPageMap.map = it },
+                                                onImageMapping = { continuousPageMap.imageMap = it },
                                                 zoom = continuousZoomBucket,
                                                 ink = inkController,
                                                 inkSettings = inkSettings,
@@ -2479,6 +2483,7 @@ fun CanvasScreen(
                                                         repository = viewModel.repository,
                                                         readerLayers = readerLayers,
                                                         onPageMapping = { continuousPageMap.map = it },
+                                                        onImageMapping = { continuousPageMap.imageMap = it },
                                                         zoom = continuousZoomBucket,
                                                         ink = inkController,
                                                         inkSettings = inkSettings,
@@ -2532,6 +2537,7 @@ fun CanvasScreen(
                                                 repository = viewModel.repository,
                                                 readerLayers = readerLayers,
                                                 onPageMapping = { continuousPageMap.map = it },
+                                                onImageMapping = { continuousPageMap.imageMap = it },
                                                 zoom = continuousZoomBucket,
                                                 ink = inkController,
                                                 inkSettings = inkSettings,
@@ -5896,12 +5902,29 @@ data class ContinuousPageMap(
 )
 
 /**
+ * Where the page *image* of the reader sits on the screen.
+ *
+ * The map above is the ink space (the page pixels the strokes live in), but
+ * the glass samples the page image - and the image is rendered at the
+ * display resolution, not in the ink space. Without a second map the glass
+ * sampled the wrong part of the page.
+ */
+data class ContinuousImageMap(
+    val pageIndex: Int,
+    val scale: Float,
+    val offsetX: Float,
+    val offsetY: Float
+)
+
+/**
  * Latest page-pixel -> screen map of the reader page the user is on. A plain
  * holder: it is written from the layout phase on every scroll frame and only
  * read when a gesture is committed, so it must not invalidate composition.
  */
 class ContinuousPageMapHolder {
     var map: ContinuousPageMap? = null
+    /** The same, for the page image the glass samples. */
+    var imageMap: ContinuousImageMap? = null
 }
 
 /**
@@ -5922,6 +5945,32 @@ class ReaderPageBox {
  * Publishes the page-pixel -> root map of one reader page, using the same
  * ContentScale.Fit rect the page image and its layer canvas are drawn with.
  */
+/**
+ * Publishes the map of the page *image* (the bitmap the reader draws and the
+ * glass samples).
+ */
+private fun publishImageMap(
+    pageBox: ReaderPageBox,
+    pageIndex: Int,
+    imageWidth: Int,
+    imageHeight: Int,
+    onImageMapping: (ContinuousImageMap) -> Unit
+) {
+    if (!pageBox.valid || imageWidth <= 0 || imageHeight <= 0) return
+    val fit = minOf(
+        pageBox.width / imageWidth.toFloat(),
+        pageBox.height / imageHeight.toFloat()
+    )
+    onImageMapping(
+        ContinuousImageMap(
+            pageIndex = pageIndex,
+            scale = fit,
+            offsetX = pageBox.originX + (pageBox.width - imageWidth * fit) / 2f,
+            offsetY = pageBox.originY + (pageBox.height - imageHeight * fit) / 2f
+        )
+    )
+}
+
 private fun publishPageMap(
     pageBox: ReaderPageBox,
     pageIndex: Int,
@@ -5964,6 +6013,7 @@ fun ContinuousPageView(
     modifier: Modifier = Modifier,
     onStylusDetected: () -> Unit = {},
     onPageMapping: (ContinuousPageMap) -> Unit = {},
+    onImageMapping: (ContinuousImageMap) -> Unit = {},
     onPageBitmap: (Int, android.graphics.Bitmap?) -> Unit = { _, _ -> },
     onPinch: (androidx.compose.ui.geometry.Offset, androidx.compose.ui.geometry.Offset, Float) -> Unit = { _, _, _ -> },
     onClick: () -> Unit
@@ -5975,6 +6025,16 @@ fun ContinuousPageView(
     // snapshot state on purpose — positionInRoot changes on every scroll
     // frame and recomposing the page for that would stutter the reader.
     val pageBox = remember(page.id) { ReaderPageBox() }
+
+    /**
+     * The size of the page image.
+     *
+     * The glass samples the image and maps it in the image's own pixels, not
+     * in the ink space - and the image arrives after the first layout, so the
+     * size is kept here and published with the next layout pass.
+     */
+    var pageImageWidth by remember(page.id) { mutableIntStateOf(0) }
+    var pageImageHeight by remember(page.id) { mutableIntStateOf(0) }
 
     // Opening the PDF (read + parse in pdfium) has to happen off the main
     // thread, so the page lays out at the A4 ratio until the real one arrives.
@@ -6008,6 +6068,15 @@ fun ContinuousPageView(
                         pageHeight = readerLayers.entry(pageIndex)?.pageHeight ?: 0,
                         onPageMapping = onPageMapping
                     )
+                    // The glass samples the page image: it needs the map of
+                    // the image, not of the ink space.
+                    publishImageMap(
+                        pageBox = pageBox,
+                        pageIndex = pageIndex,
+                        imageWidth = pageImageWidth,
+                        imageHeight = pageImageHeight,
+                        onImageMapping = onImageMapping
+                    )
                 }
             }
             .clickable { onClick() }
@@ -6032,6 +6101,10 @@ fun ContinuousPageView(
         }
         var loadCompleted by remember(page.id, page.updatedAt) {
             mutableStateOf(false)
+        }
+        LaunchedEffect(page.id, pageBitmap) {
+            pageImageWidth = pageBitmap?.width ?: 0
+            pageImageHeight = pageBitmap?.height ?: 0
         }
         // A raster page is a fixed-size PNG: re-decoding it for every zoom
         // bucket buys nothing, so only vector pages key on the render width.
