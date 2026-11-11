@@ -93,6 +93,150 @@ internal class InkPatch(
 }
 
 /**
+ * One committed operation of the ink layer.
+ *
+ * A [Stroke] is kept as a vector: it is drawn as a path on top of the page
+ * image and never touches the session bitmap, so the reader does not have to
+ * re-upload the 26 MB layer after every finished stroke.
+ *
+ * An [Erase] is the one exception - it clears pixels, so it is rasterised into
+ * the session bitmap as well (the ink layer stays the only thing the eraser
+ * can touch) and it stays in the list to cut the strokes drawn before it.
+ */
+internal sealed class InkOp {
+    /** A finished stroke, with the auto-shape path when one was computed. */
+    class Stroke(val stroke: ContinuousStroke, val shape: Path?) : InkOp()
+
+    /** An eraser stroke; [patch] holds the pixels before and after the wipe. */
+    class Erase(val stroke: ContinuousStroke, val patch: InkPatch) : InkOp()
+}
+
+/**
+ * One undoable change of the ink layer.
+ *
+ * Undo works on this list and not on pixels: a stroke is undone by taking it
+ * out of the committed list again, an eraser by putting back the pixels it
+ * cleared.
+ */
+internal sealed class InkAction {
+    /** A stroke was added to the committed list. */
+    class Add(val op: InkOp.Stroke) : InkAction()
+
+    /** An eraser was applied; its op holds the pixels before and after. */
+    class Erase(val op: InkOp.Erase) : InkAction()
+
+    /** The page was cleared: the patch keeps the ink, [removed] the strokes. */
+    class Clear(val patch: InkPatch?, val removed: List<InkOp>) : InkAction()
+}
+
+/**
+ * The committed operations of one page and their undo history.
+ *
+ * Pure bookkeeping - no Bitmap, no Canvas - so the order of the operations
+ * and the undo/redo can be unit-tested without a device. The controller
+ * feeds it the operations and does the pixel work (the eraser and the clear
+ * touch the ink layer, so they are handed back to the controller).
+ */
+internal class InkHistory {
+
+    /** The committed operations, in the order they were committed. */
+    val ops = mutableListOf<InkOp>()
+
+    private val undoStack = ArrayDeque<InkAction>()
+    private val redoStack = ArrayDeque<InkAction>()
+
+    val canUndo: Boolean get() = undoStack.isNotEmpty()
+    val canRedo: Boolean get() = redoStack.isNotEmpty()
+
+    /** Commits an operation and drops the redo history. */
+    fun commit(op: InkOp) {
+        ops.add(op)
+        undoStack.addLast(
+            when (op) {
+                is InkOp.Stroke -> InkAction.Add(op)
+                is InkOp.Erase -> InkAction.Erase(op)
+            }
+        )
+        redoStack.clear()
+    }
+
+    /**
+     * Commits a clear of the page: the operations of the session go away
+     * with the ink of the page, and both can be brought back.
+     */
+    fun commitClear(patch: InkPatch?, removed: List<InkOp>) {
+        ops.clear()
+        undoStack.addLast(InkAction.Clear(patch, removed))
+        redoStack.clear()
+    }
+
+    /**
+     * Undoes the last operation.
+     *
+     * [onErase] and [onClear] do the pixel work: [restore] is true when the
+     * pixels have to be put back, false when the wipe has to be done again.
+     */
+    fun undo(
+        onErase: (InkOp.Erase, Boolean) -> Unit,
+        onClear: (InkPatch?, Boolean) -> Unit
+    ): Boolean {
+        val action = undoStack.removeLastOrNull() ?: return false
+        when (action) {
+            is InkAction.Add -> ops.removeLastOrNull()
+            is InkAction.Erase -> {
+                ops.removeLastOrNull()
+                onErase(action.op, true)
+            }
+            is InkAction.Clear -> {
+                onClear(action.patch, true)
+                ops.addAll(0, action.removed)
+            }
+        }
+        redoStack.addLast(action)
+        return true
+    }
+
+    /** Redoes the last undone operation. */
+    fun redo(
+        onErase: (InkOp.Erase, Boolean) -> Unit,
+        onClear: (InkPatch?, Boolean) -> Unit
+    ): Boolean {
+        val action = redoStack.removeLastOrNull() ?: return false
+        when (action) {
+            is InkAction.Add -> ops.add(action.op)
+            is InkAction.Erase -> {
+                ops.add(action.op)
+                onErase(action.op, false)
+            }
+            is InkAction.Clear -> {
+                onClear(action.patch, false)
+                action.removed.forEach { op -> ops.remove(op) }
+            }
+        }
+        undoStack.addLast(action)
+        return true
+    }
+
+    /**
+     * Drops the oldest actions until the memory they keep is small enough.
+     * The operations themselves stay: they are on the page.
+     */
+    fun trim(maxBytes: Long) {
+        var total = undoStack.sumOf { actionBytes(it) }
+        while (total > maxBytes && undoStack.size > 1) {
+            total -= actionBytes(undoStack.removeFirst())
+        }
+    }
+
+    /** How much memory one undo action keeps alive. */
+    private fun actionBytes(action: InkAction): Long = when (action) {
+        is InkAction.Add -> 0L
+        is InkAction.Erase -> action.op.patch.bytes
+        is InkAction.Clear -> action.patch?.bytes ?: 0L
+    }
+}
+
+/**
  * Pure geometry and width helpers for reader inking. Kept free of Bitmap and
  * Canvas so the mapping can be unit-tested: the drawing code itself only adds
  * paint on top of these numbers.
@@ -178,16 +322,26 @@ class ContinuousInkSession internal constructor(
     internal var dirty: Boolean = false
     internal var savedWhileActive: Boolean = false
     internal var live: ContinuousStroke? = null
-    internal val undo = ArrayDeque<InkPatch>()
-    internal val redo = ArrayDeque<InkPatch>()
+
+    /**
+     * The strokes that were finished in this session, in the order they were
+     * committed.
+     *
+     * They are drawn as vectors on top of the page image, so the session
+     * bitmap is never touched by a stroke: the reader does not have to
+     * re-upload the 26 MB layer (and the pen does not wait for it) after
+     * every stroke.
+     */
+    internal val history = InkHistory()
+
     internal val pending = mutableListOf<ContinuousStroke>()
 
     /**
      * Guards the ink bitmap.
      *
-     * The strokes are rasterised into it on the main thread, and the save
-     * takes a copy of it for the encoder - a copy of a 26 MB page must not
-     * happen on the main thread, it blocks the pen for tens of milliseconds.
+     * The eraser clears pixels in it on the main thread, and the save takes a
+     * copy of it for the encoder - a copy of a 26 MB page must not happen on
+     * the main thread, it blocks the pen for tens of milliseconds.
      */
     internal val inkLock = Any()
 
@@ -195,8 +349,8 @@ class ContinuousInkSession internal constructor(
      *  own page bitmap stays on screen and strokes are buffered. */
     val isReady: Boolean get() = ready
 
-    val canUndo: Boolean get() = undo.isNotEmpty()
-    val canRedo: Boolean get() = redo.isNotEmpty()
+    val canUndo: Boolean get() = history.canUndo
+    val canRedo: Boolean get() = history.canRedo
 }
 
 /**
@@ -212,8 +366,15 @@ class ContinuousInkSession internal constructor(
  * reader keeps two or three pages on screen. The session follows the stylus
  * from page to page; the previous page is flushed and released first.
  *
- * Undo/redo uses dirty-rectangle pixel patches instead of whole-page
- * snapshots, so a short stroke costs a few hundred KB rather than 26 MB.
+ * The strokes are kept as vectors: a finished stroke joins the committed
+ * list of the session and is drawn as a path on top of the page image, so
+ * the 26 MB session bitmap is never rewritten (and never re-uploaded to the
+ * GPU) while the user writes. The list is rasterised into the bitmap once,
+ * off the main thread, when the page is saved.
+ *
+ * Undo/redo works on that list: a stroke leaves the list again, an eraser
+ * puts back the pixels it cleared (dirty-rectangle patches, so a short
+ * stroke costs a few hundred KB rather than 26 MB).
  */
 class ContinuousInkController(
     private val noteId: String,
@@ -265,6 +426,15 @@ class ContinuousInkController(
      * mid-stroke (observed on device: ACTION_CANCEL 12 ms after ACTION_DOWN).
      */
     var isDrawing by mutableStateOf(false)
+        private set
+
+    /**
+     * The page the stroke in progress belongs to (-1 when there is none).
+     *
+     * The reader reads it in the draw phase: only the page under the pen
+     * has to repaint while the pen moves.
+     */
+    var livePageIndex by mutableIntStateOf(-1)
         private set
 
 
@@ -343,6 +513,7 @@ class ContinuousInkController(
         addPoint(stroke, x, y, pressure, settings)
         s.live = stroke
         isDrawing = true
+        livePageIndex = pageIndex
         revision++
         return true
     }
@@ -358,6 +529,7 @@ class ContinuousInkController(
     fun endStroke(x: Float, y: Float, pressure: Float, settings: InkToolSettings) {
         val s = session ?: return
         isDrawing = false
+        livePageIndex = -1
         val stroke = s.live ?: return
         addPoint(stroke, x, y, pressure, settings)
         s.live = null
@@ -369,6 +541,7 @@ class ContinuousInkController(
     fun cancelStroke() {
         val s = session ?: return
         isDrawing = false
+        livePageIndex = -1
         s.live = null
         revision++
     }
@@ -528,50 +701,55 @@ class ContinuousInkController(
         onUndoRedoChanged(s.canUndo, s.canRedo)
     }
 
+    /**
+     * Commits a finished stroke.
+     *
+     * The stroke is NOT rasterised into the session bitmap: it joins the
+     * committed list of the session and the reader draws it as a path on top
+     * of the page image. The bitmap is only touched by the eraser, which
+     * has to clear pixels.
+     */
     private fun commit(s: ContinuousInkSession, stroke: ContinuousStroke, autoShapeEnabled: Boolean = false) {
+        if (stroke.points.isEmpty()) return
         val ink = s.ink ?: return
         if (ink.isRecycled) return
+        if (stroke.tool == CanvasTool.ERASER) {
+            commitErase(s, stroke)
+            return
+        }
         var shape: Path? = null
         if (autoShapeEnabled && (stroke.tool == CanvasTool.PEN || stroke.tool == CanvasTool.FOUNTAIN_PEN)) {
             val pts = stroke.points.map { (it.x * s.inkWidth) to (it.y * s.inkHeight) }
             shape = autoShape(pts)
         }
-        var bounds = strokeBounds(stroke, s.inkWidth, s.inkHeight) ?: return
-        if (shape != null) {
-            val shapeRectF = RectF()
-            @Suppress("DEPRECATION")
-            shape.computeBounds(shapeRectF, true)
-            val strokePad = stroke.baseWidthNorm * s.inkWidth * 0.6f + 4f
-            val sLeft = (shapeRectF.left - strokePad).toInt().coerceIn(0, s.inkWidth - 1)
-            val sTop = (shapeRectF.top - strokePad).toInt().coerceIn(0, s.inkHeight - 1)
-            val sRight = (shapeRectF.right + strokePad).toInt().coerceIn(sLeft + 1, s.inkWidth)
-            val sBottom = (shapeRectF.bottom + strokePad).toInt().coerceIn(sTop + 1, s.inkHeight)
-            bounds = Rect(
-                min(bounds.left, sLeft),
-                min(bounds.top, sTop),
-                max(bounds.right, sRight),
-                max(bounds.bottom, sBottom)
-            )
-        }
+        val op = InkOp.Stroke(stroke, shape)
+        s.history.commit(op)
+        trimUndo(s)
+        s.dirty = true
+    }
+
+    /**
+     * Commits an eraser stroke.
+     *
+     * The eraser is the one exception to the vector strokes: it clears
+     * pixels, so it is drawn into the session bitmap (the ink layer) - the
+     * PDF text lives in the background, not in that bitmap, so the text
+     * under the eraser stays. The pixels it cleared are kept in a patch so
+     * the wipe can be undone, and the operation stays in the committed list
+     * so it can cut the strokes that were drawn before it.
+     */
+    private fun commitErase(s: ContinuousInkSession, stroke: ContinuousStroke) {
+        val ink = s.ink ?: return
+        if (ink.isRecycled) return
+        val bounds = strokeBounds(stroke, s.inkWidth, s.inkHeight) ?: return
         val patch = snapshot(ink, bounds) ?: return
-        val canvas = Canvas(ink)
         synchronized(s.inkLock) {
-        if (shape != null) {
-            val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                style = Paint.Style.STROKE
-                strokeCap = Paint.Cap.ROUND
-                strokeJoin = Paint.Join.ROUND
-                color = stroke.color
-                strokeWidth = stroke.baseWidthNorm * s.inkWidth
-            }
-            canvas.drawPath(shape, paint)
-        } else {
+            val canvas = Canvas(ink)
             drawStroke(canvas, stroke, s.inkWidth.toFloat(), s.inkHeight.toFloat(), preview = false)
+            patch.after = capture(ink, bounds)
         }
-        patch.after = capture(ink, bounds)
-        }
-        s.undo.addLast(patch)
-        s.redo.clear()
+        val op = InkOp.Erase(stroke, patch)
+        s.history.commit(op)
         trimUndo(s)
         s.dirty = true
     }
@@ -616,34 +794,63 @@ class ContinuousInkController(
         return null
     }
 
+    /**
+     * Undoes the last committed operation.
+     *
+     * A stroke simply leaves the committed list again; an eraser also puts
+     * back the pixels it cleared.
+     */
     fun undo(): Boolean {
         val s = session ?: return false
-        val patch = s.undo.removeLastOrNull() ?: return false
-        val ink = s.ink
-        if (ink != null && !ink.isRecycled) {
-            restore(ink, patch, useAfter = false)
-            s.dirty = true
-            scheduleSave(s)
-        }
-        s.redo.addLast(patch)
+        val undone = s.history.undo(
+            onErase = { op, restore -> restoreErase(s, op, restore) },
+            onClear = { patch, restore -> restoreClear(s, patch, restore) }
+        )
+        if (!undone) return false
+        s.dirty = true
+        scheduleSave(s)
         revision++
         onUndoRedoChanged(s.canUndo, s.canRedo)
         return true
     }
 
+    /** Redoes the last undone operation. */
     fun redo(): Boolean {
         val s = session ?: return false
-        val patch = s.redo.removeLastOrNull() ?: return false
-        val ink = s.ink
-        if (ink != null && !ink.isRecycled) {
-            restore(ink, patch, useAfter = true)
-            s.dirty = true
-            scheduleSave(s)
-        }
-        s.undo.addLast(patch)
+        val redone = s.history.redo(
+            onErase = { op, restore -> restoreErase(s, op, restore) },
+            onClear = { patch, restore -> restoreClear(s, patch, restore) }
+        )
+        if (!redone) return false
+        s.dirty = true
+        scheduleSave(s)
         revision++
         onUndoRedoChanged(s.canUndo, s.canRedo)
         return true
+    }
+
+    /**
+     * Puts the pixels of an eraser back (undo) or wipes them again (redo).
+     */
+    private fun restoreErase(s: ContinuousInkSession, op: InkOp.Erase, restore: Boolean) {
+        val ink = s.ink ?: return
+        if (ink.isRecycled) return
+        synchronized(s.inkLock) { restore(ink, op.patch, useAfter = !restore) }
+    }
+
+    /**
+     * Puts the ink of a cleared page back (undo) or wipes it again (redo).
+     */
+    private fun restoreClear(s: ContinuousInkSession, patch: InkPatch?, restore: Boolean) {
+        val ink = s.ink ?: return
+        if (ink.isRecycled) return
+        synchronized(s.inkLock) {
+            if (restore) {
+                if (patch != null) restore(ink, patch, useAfter = false)
+            } else {
+                ink.eraseColor(android.graphics.Color.TRANSPARENT)
+            }
+        }
     }
 
     /** Clears in-place ink on a specific page, supporting undo. */
@@ -693,14 +900,12 @@ class ContinuousInkController(
         val patch = if (contentBounds != null) {
             snapshot(ink, contentBounds)
         } else null
-        ink.eraseColor(android.graphics.Color.TRANSPARENT)
-        if (patch != null) {
-            // Note: patch.after is deliberately left null to avoid allocating a second
-            // full/large array filled with zeroes. restore() handles null useAfter by clearing the rect.
-            s.undo.addLast(patch)
-            s.redo.clear()
-            trimUndo(s)
-        }
+        // The strokes of this session go away with the ink of the page; the
+        // undo keeps both, so the clear can be taken back.
+        val removed = s.history.ops.toList()
+        synchronized(s.inkLock) { ink.eraseColor(android.graphics.Color.TRANSPARENT) }
+        s.history.commitClear(patch, removed)
+        trimUndo(s)
         s.dirty = true
         scheduleSave(s)
         revision++
@@ -848,10 +1053,7 @@ class ContinuousInkController(
     }
 
     private fun trimUndo(s: ContinuousInkSession) {
-        var total = s.undo.sumOf { it.bytes }
-        while (total > MAX_UNDO_BYTES && s.undo.size > 1) {
-            total -= s.undo.removeFirst().bytes
-        }
+        s.history.trim(MAX_UNDO_BYTES)
     }
 
     // ---- saving --------------------------------------------------------
@@ -872,16 +1074,12 @@ class ContinuousInkController(
         // The page is only "clean" when the write actually succeeded: a
         // failed write must stay dirty so the next save tries again.
         s.dirty = false
-        // The copy is taken off the main thread: copying a 26 MB page on the
-        // UI thread blocked the pen for tens of milliseconds after every
-        // stroke. The lock keeps a stroke that lands during the copy from
-        // tearing the snapshot.
+        // The copy and the strokes drawn into it happen off the main thread:
+        // copying a 26 MB page on the UI thread blocked the pen for tens of
+        // milliseconds after every stroke. The lock keeps a stroke that lands
+        // during the copy from tearing the snapshot.
         val copy = try {
-            withContext(Dispatchers.IO) {
-                synchronized(s.inkLock) {
-                    ink.copy(Bitmap.Config.ARGB_8888, false)
-                }
-            }
+            withContext(Dispatchers.IO) { copyWithOps(s, ink) }
         } catch (e: OutOfMemoryError) {
             e.printStackTrace()
             s.dirty = true
@@ -904,6 +1102,28 @@ class ContinuousInkController(
         }
         s.savedWhileActive = true
         onSaved(s.pageIndex)
+    }
+
+    /**
+     * Copies the session bitmap and draws the committed strokes into the
+     * copy.
+     *
+     * The copy keeps the ink of the page as it was loaded; the strokes of
+     * this session are rasterised into it here, once, off the main thread.
+     * Must not run on the main thread: the layer is ~26 MB.
+     *
+     * [ops] is the list to draw; when it is null the list of the session is
+     * taken under the lock, together with the copy (so the copy and the
+     * strokes always match). A caller that releases the session before the
+     * copy runs passes the list it took.
+     */
+    private fun copyWithOps(s: ContinuousInkSession, ink: Bitmap, ops: List<InkOp>? = null): Bitmap? {
+        val prepared = synchronized(s.inkLock) {
+            val copied = ink.copy(Bitmap.Config.ARGB_8888, false)
+            if (copied == null) null else copied to (ops ?: s.history.ops.toList())
+        } ?: return null
+        drawOps(Canvas(prepared.first), prepared.second, s.inkWidth, s.inkHeight)
+        return prepared.first
     }
 
     /** Writes a dirty session immediately (page switch, mode exit, dispose). */
@@ -939,16 +1159,25 @@ class ContinuousInkController(
         }
         s.dirty = false
         s.savedWhileActive = true
-        val copy = try {
-            ink.copy(Bitmap.Config.ARGB_8888, false)
-        } catch (e: OutOfMemoryError) {
-            null
-        } ?: run {
-            releaseBitmaps(s)
-            return
-        }
         closingSessions[s.pageIndex] = s
         appScope.launch {
+            // The copy of the 26 MB layer and the strokes drawn into it
+            // happen off the main thread: the pen must not wait for them.
+            val copy = try {
+                withContext(Dispatchers.IO) { copyWithOps(s, ink) }
+            } catch (e: OutOfMemoryError) {
+                e.printStackTrace()
+                null
+            }
+            if (copy == null) {
+                s.dirty = true
+                withContext(Dispatchers.Main) {
+                    closingSessions.remove(s.pageIndex)
+                    releaseBitmaps(s)
+                    revision++
+                }
+                return@launch
+            }
             withContext(Dispatchers.IO) {
                 if (s.isVector) {
                     repository.savePageStrokes(noteId, s.pageIndex, copy)
@@ -1002,13 +1231,19 @@ class ContinuousInkController(
             val ink = s.ink
             if (ink != null && !ink.isRecycled) {
                 s.dirty = false
-                val copy = try {
-                    ink.copy(Bitmap.Config.ARGB_8888, false)
-                } catch (e: OutOfMemoryError) {
-                    null
-                }
-                if (copy != null) {
-                    appScope.launch {
+                // The strokes are taken now: the session is released below,
+                // and the release drops the list.
+                val ops = s.history.ops.toList()
+                appScope.launch {
+                    // The copy of the layer and the strokes drawn into it
+                    // happen off the main thread.
+                    val copy = try {
+                        withContext(Dispatchers.IO) { copyWithOps(s, ink, ops) }
+                    } catch (e: OutOfMemoryError) {
+                        e.printStackTrace()
+                        null
+                    }
+                    if (copy != null) {
                         withContext(Dispatchers.IO) {
                             if (s.isVector) {
                                 repository.savePageStrokes(noteId, s.pageIndex, copy)
@@ -1017,8 +1252,8 @@ class ContinuousInkController(
                             }
                         }
                         copy.recycle()
-                        onSaved(s.pageIndex)
                     }
+                    onSaved(s.pageIndex)
                 }
             }
         }
@@ -1060,13 +1295,19 @@ class ContinuousInkController(
             sess.loadJob?.cancel()
             val ink = sess.ink
             if (sess.dirty && ink != null && !ink.isRecycled) {
-                val copy = try {
-                    ink.copy(Bitmap.Config.ARGB_8888, false)
-                } catch (e: OutOfMemoryError) {
-                    null
-                }
-                if (copy != null) {
-                    appScope.launch {
+                // The strokes are taken now: the session is released below,
+                // and the release drops the list.
+                val ops = sess.history.ops.toList()
+                appScope.launch {
+                    // The copy of the layer and the strokes drawn into it
+                    // happen off the main thread.
+                    val copy = try {
+                        withContext(Dispatchers.IO) { copyWithOps(sess, ink, ops) }
+                    } catch (e: OutOfMemoryError) {
+                        e.printStackTrace()
+                        null
+                    }
+                    if (copy != null) {
                         withContext(Dispatchers.IO) {
                             if (sess.isVector) {
                                 repository.savePageStrokes(noteId, sess.pageIndex, copy)
@@ -1088,9 +1329,105 @@ class ContinuousInkController(
         // Clearing references allows GC and native finalizers to safely reclaim them.
         s.ink = null
         s.background = null
+        // The strokes are on disk now: the reader reloads the page from the
+        // file, so the committed list must not draw them a second time.
+        s.history.ops.clear()
     }
 
     // ---- drawing -------------------------------------------------------
+
+    /**
+     * Draws the committed strokes of a page into the page box.
+     *
+     * They are drawn as paths, with exactly the code the live preview uses,
+     * so a finished stroke looks the same as the one the user just drew -
+     * and the session bitmap is never touched, so the GPU never has to
+     * take the 26 MB layer again.
+     */
+    fun drawCommitted(canvas: Canvas, pageIndex: Int, viewWidth: Float, viewHeight: Float) {
+        val s = getSession(pageIndex) ?: return
+        if (s.history.ops.isEmpty()) return
+        for (op in s.history.ops) {
+            when (op) {
+                is InkOp.Stroke -> drawOpStroke(canvas, op, s, viewWidth, viewHeight)
+                // The eraser clears pixels: the reader draws it into an
+                // offscreen layer, so the wipe never reaches the page image.
+                is InkOp.Erase -> drawStroke(canvas, op.stroke, viewWidth, viewHeight, preview = false)
+            }
+        }
+    }
+
+    /** The committed operations of a page, in the order they were committed. */
+    internal fun committedOps(pageIndex: Int): List<InkOp> {
+        val s = getSession(pageIndex) ?: return emptyList()
+        return s.history.ops
+    }
+
+    /**
+     * True when the committed operations of a page contain an eraser. The
+     * reader needs an offscreen layer for those: a CLEAR stroke must not
+     * reach the page image (the PDF text) under it.
+     */
+    internal fun hasEraseOp(pageIndex: Int): Boolean {
+        val s = getSession(pageIndex) ?: return false
+        return s.history.ops.any { it is InkOp.Erase }
+    }
+
+    /** Draws a committed stroke into the page box (view coordinates). */
+    private fun drawOpStroke(
+        canvas: Canvas,
+        op: InkOp.Stroke,
+        s: ContinuousInkSession,
+        viewWidth: Float,
+        viewHeight: Float
+    ) {
+        val shape = op.shape
+        if (shape == null || s.inkWidth <= 0 || s.inkHeight <= 0) {
+            drawStroke(canvas, op.stroke, viewWidth, viewHeight, preview = false)
+            return
+        }
+        // The auto-shape path lives in ink pixels: scale the canvas to the
+        // box and keep the paint in ink pixels, so the line keeps its weight.
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+            color = op.stroke.color
+            strokeWidth = op.stroke.baseWidthNorm * s.inkWidth
+        }
+        val save = canvas.save()
+        canvas.scale(viewWidth / s.inkWidth, viewHeight / s.inkHeight)
+        canvas.drawPath(shape, paint)
+        canvas.restoreToCount(save)
+    }
+
+    /**
+     * Draws the committed operations into the ink layer (ink pixels). Used
+     * when the page is saved: the strokes are rasterised into a copy of the
+     * layer, once, off the main thread.
+     */
+    private fun drawOps(canvas: Canvas, ops: List<InkOp>, width: Int, height: Int) {
+        for (op in ops) {
+            when (op) {
+                is InkOp.Stroke -> {
+                    val shape = op.shape
+                    if (shape == null) {
+                        drawStroke(canvas, op.stroke, width.toFloat(), height.toFloat(), preview = false)
+                    } else {
+                        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                            style = Paint.Style.STROKE
+                            strokeCap = Paint.Cap.ROUND
+                            strokeJoin = Paint.Join.ROUND
+                            color = op.stroke.color
+                            strokeWidth = op.stroke.baseWidthNorm * width
+                        }
+                        canvas.drawPath(shape, paint)
+                    }
+                }
+                is InkOp.Erase -> drawStroke(canvas, op.stroke, width.toFloat(), height.toFloat(), preview = false)
+            }
+        }
+    }
 
     /**
      * Draws the live (uncommitted) stroke into the page box. Public because the

@@ -153,6 +153,7 @@ import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerType
 import androidx.compose.ui.input.pointer.changedToUp
 import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
@@ -2393,15 +2394,57 @@ fun CanvasScreen(
                                     }
                                 }
                                 .pointerInput(Unit) {
-                                    // Compose reports the zoom accumulated
-                                    // since the gesture started; the handler
-                                    // wants a delta, like the in-page pinch.
-                                    var previousZoom = 1f
-                                    detectTransformGestures { centroid, pan, zoom, _ ->
-                                        if (zoom == 1f) previousZoom = 1f
-                                        val delta = if (previousZoom > 0f) zoom / previousZoom else 1f
-                                        previousZoom = zoom
-                                        handleReaderTransform(centroid, pan, delta)
+                                    // The pages below take the pointers, so
+                                    // the gesture has to see them first
+                                    // (PointerEventPass.Initial) - and it may
+                                    // only take over when a SECOND finger
+                                    // arrives, so a one finger scroll still
+                                    // scrolls the list.
+                                    awaitEachGesture {
+                                        awaitFirstDown(requireUnconsumed = false)
+                                        var twoFingers = false
+                                        while (true) {
+                                            val event = awaitPointerEvent(PointerEventPass.Initial)
+                                            if (event.changes.count { it.pressed } >= 2) {
+                                                twoFingers = true
+                                                break
+                                            }
+                                            if (event.changes.none { it.pressed }) break
+                                        }
+                                        if (!twoFingers) return@awaitEachGesture
+
+                                        var previousCentroid: androidx.compose.ui.geometry.Offset? = null
+                                        var previousDistance = 0f
+                                        while (true) {
+                                            val event = awaitPointerEvent(PointerEventPass.Initial)
+                                            val pressed = event.changes.filter { it.pressed }
+                                            if (pressed.size < 2) break
+                                            var sumX = 0f
+                                            var sumY = 0f
+                                            pressed.forEach {
+                                                sumX += it.position.x
+                                                sumY += it.position.y
+                                            }
+                                            val centroid = androidx.compose.ui.geometry.Offset(
+                                                sumX / pressed.size,
+                                                sumY / pressed.size
+                                            )
+                                            val distance = (pressed[0].position - pressed[1].position).getDistance()
+                                            var pan = androidx.compose.ui.geometry.Offset.Zero
+                                            var zoom = 1f
+                                            previousCentroid?.let { previous ->
+                                                pan = centroid - previous
+                                                if (previousDistance > 0f && distance > 0f) {
+                                                    zoom = distance / previousDistance
+                                                }
+                                            }
+                                            previousCentroid = centroid
+                                            previousDistance = distance
+                                            if (pan != androidx.compose.ui.geometry.Offset.Zero || zoom != 1f) {
+                                                event.changes.forEach { it.consume() }
+                                                handleReaderTransform(centroid, pan, zoom)
+                                            }
+                                        }
                                     }
                                 }
                         ) {
@@ -6359,10 +6402,44 @@ fun ContinuousPageView(
             }
         }
 
+        // The strokes that were finished in this session: they are drawn as
+        // vectors on top of the page image, so a finished stroke never
+        // rewrites the 26 MB session bitmap (and the GPU never has to take
+        // that bitmap again - the pen stops lagging behind the finger).
+        //
+        // An eraser clears pixels, so it needs an offscreen layer: the wipe
+        // must cut the strokes of this session, never the page image (the
+        // PDF text) under them.
+        if (ink.committedOps(pageIndex).isNotEmpty()) {
+            val eraseLayer = ink.hasEraseOp(pageIndex)
+            androidx.compose.foundation.Canvas(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .then(
+                        if (eraseLayer) {
+                            Modifier.graphicsLayer(
+                                compositingStrategy = androidx.compose.ui.graphics.CompositingStrategy.Offscreen
+                            )
+                        } else {
+                            Modifier
+                        }
+                    )
+            ) {
+                val _revision = ink.revision
+                drawIntoCanvas { canvas ->
+                    ink.drawCommitted(canvas.nativeCanvas, pageIndex, size.width, size.height)
+                }
+            }
+        }
+
         // The in-progress stroke (and the eraser's swath hint) paints above
         // the committed layer; the commit lands on ACTION_UP.
+        // The preview revision is read here so the stroke follows the pen:
+        // without it the page would keep the first point of the stroke until
+        // the pen lifts.
         androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
             val _revision = ink.revision
+            val _previewRevision = if (ink.livePageIndex == pageIndex) ink.previewRevision else 0
             val _laserRevision = ink.laserRevision
             drawIntoCanvas { canvas ->
                 ink.drawPreview(canvas.nativeCanvas, pageIndex, size.width, size.height)
