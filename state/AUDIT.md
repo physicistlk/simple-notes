@@ -248,10 +248,12 @@ The user ticks a line here; only then does the row in the tables above become
 - [ ] **C33** The infinite canvas takes a stroke outside the saved rectangle (still open).
 - [ ] **C34** A PDF can be annotated in the margin with the page moved aside (still open).
 - [ ] **C35** The stroke follows the finger in the reader (the live preview repaints, the page bitmap is no longer uploaded per stroke).
+      *Verified on the tablet: the ink is drawn while the stroke is still going (two frames taken during one stroke differ by 2 900 pixels - `39_live_stroke_preview.png`). The number of slow bitmap uploads per stroke is the other half of the check.*
 - [ ] **C38** The pinch zoom is continuous, without steps (still open).
 - [ ] **C39** Two fingers move the page reliably, and the second finger cancels the stroke (still open).
 - [ ] **C40** The layers panel can add a layer to the current page (not implemented yet).
 - [ ] **C41** Two fingers move the page sideways in the reader, and one finger still scrolls.
+      *Could not be verified with a synthetic gesture: the shell user may not write to the touch device (`/dev/input/event3`), so a two finger gesture cannot be injected over adb. This one needs real fingers.*
 - [ ] **C31** The dock glass looks the same as before but the pen no longer lags.
 - [ ] **C24** The glass bends the ink at the bezel (the ink is displaced where it crosses the rim).
       *Seen on the tablet: the yellow stroke under the dock is split into a magenta/cyan fringe at the rim (`30_glass_vertical_over_ink.png`). Waiting for the user's tick.*
