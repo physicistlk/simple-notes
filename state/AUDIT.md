@@ -174,6 +174,8 @@ tablet; until then it stays **IMPLEMENTED**.
 | **C35** | The stroke lag remains in the reader: every committed stroke is rasterised into the 26 MB session bitmap, and that whole bitmap is uploaded to the GPU again for the next frame. | The pen trails behind the finger on a PDF page. | `ContinuousInkController.kt`, `CanvasScreen.kt` | **OPEN** — the reader has to keep the committed strokes as paths and rasterise them only when the page is saved, the way the single-page engine now does for its undo. |
 | **C36** | The long-press colour palette draws its swatches on top of each other, so some of them are hidden. | The palette cannot be read. | `CanvasScreen.kt` (`ColorPalettePopup`) | **IMPLEMENTED** — the grid lays out its cells without overlapping. |
 | **C37** | The stroke-width popup has no way back to the default thickness. | The user has to guess a value. | `CanvasScreen.kt` (`WidthPickerPopup`) | **IMPLEMENTED** — a reset button puts the active tool back to its default thickness and closes the popup. |
+| **C38** | The pinch zoom of the reader is stepped, not continuous: the scale and the pan are Compose state, so every gesture frame recomposes the reader (and the page under the finger). | Pinching feels like it jumps from step to step. | `CanvasScreen.kt` | **OPEN** — the transform has to leave the composition: a `TransformableState` that is read in the draw phase (or a `graphicsLayer` transform), the historical points of the gesture coalesced into one update per frame, and the PDF re-render throttled to the end of the gesture. |
+| **C39** | Two fingers on the page are not a reliable way to move the page: the drawing surface and the reader compete for the pointers, and a stroke that is already running is not always cancelled when the second finger arrives. | The user cannot push the page aside to write in the margin (the case of C34). | `DrawingCanvasView.kt`, `ContinuousInkController.kt` | **OPEN** — one gesture entry point that branches on the pointer count: one pointer draws, two pointers pan and zoom; a second pointer cancels the stroke in progress instead of leaving a stray segment. |
 
 ### Fixed in the recent rounds
 
@@ -241,6 +243,8 @@ The user ticks a line here; only then does the row in the tables above become
 - [ ] **C33** The infinite canvas takes a stroke outside the saved rectangle (still open).
 - [ ] **C34** A PDF can be annotated in the margin with the page moved aside (still open).
 - [ ] **C35** The stroke follows the finger in the reader (still open).
+- [ ] **C38** The pinch zoom is continuous, without steps (still open).
+- [ ] **C39** Two fingers move the page reliably, and the second finger cancels the stroke (still open).
 - [ ] **C31** The dock glass looks the same as before but the pen no longer lags.
 - [ ] **C24** The glass bends the ink at the bezel (the ink is displaced where it crosses the rim).
       *Seen on the tablet: the yellow stroke under the dock is split into a magenta/cyan fringe at the rim (`30_glass_vertical_over_ink.png`). Waiting for the user's tick.*
