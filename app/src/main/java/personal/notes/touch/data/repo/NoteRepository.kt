@@ -177,20 +177,21 @@ class NoteRepository(
         note
     }
 
-    suspend fun updateNote(note: NoteEntity) = withContext(Dispatchers.IO) {
-        noteDao.update(note.copy(updatedAt = System.currentTimeMillis()))
+    /**
+     * Changes the page count of a note (PDF import).
+     *
+     * A narrow UPDATE on purpose: writing the whole row would put back a
+     * `lastPageIndex` that was read before the user turned the page, and the
+     * note would reopen on the wrong page.
+     */
+    suspend fun updateNotePageCount(noteId: String, pageCount: Int) = withContext(Dispatchers.IO) {
+        noteDao.updatePageCount(noteId, pageCount, System.currentTimeMillis())
     }
 
     suspend fun updateNoteContent(id: String, title: String, content: String) = withContext(Dispatchers.IO) {
         val existing = noteDao.getById(id)
         if (existing != null) {
-            noteDao.update(
-                existing.copy(
-                    title = title,
-                    content = content,
-                    updatedAt = System.currentTimeMillis()
-                )
-            )
+            noteDao.updateContentRow(id, title, content, System.currentTimeMillis())
             syncIndex(id, content)
         }
     }
@@ -440,7 +441,7 @@ class NoteRepository(
     suspend fun updateTitle(id: String, title: String) = withContext(Dispatchers.IO) {
         val existing = noteDao.getById(id)
         if (existing != null) {
-            noteDao.update(existing.copy(title = title, updatedAt = System.currentTimeMillis()))
+            noteDao.updateTitleRow(id, title, System.currentTimeMillis())
         }
     }
 
@@ -450,6 +451,19 @@ class NoteRepository(
 
     suspend fun setFavorite(id: String, favorite: Boolean) = withContext(Dispatchers.IO) {
         noteDao.setFavorite(id, favorite, System.currentTimeMillis())
+    }
+
+    /**
+     * Remembers the page [noteId] was left on, so the canvas can reopen there.
+     *
+     * Negative values are ignored (a caller that has no page yet must not pin
+     * the note to a bogus index) and the write is a narrow UPDATE of
+     * `lastPageIndex` only: `updatedAt` deliberately does not move, otherwise
+     * merely opening and closing a note would reorder the library.
+     */
+    suspend fun saveLastPage(noteId: String, pageIndex: Int) = withContext(Dispatchers.IO) {
+        if (pageIndex < 0) return@withContext
+        noteDao.updateLastPage(noteId, pageIndex.coerceAtLeast(0))
     }
 
     suspend fun permanentlyDeleteNote(id: String) = withContext(Dispatchers.IO) {
@@ -600,10 +614,7 @@ class NoteRepository(
         )
         pageDao.insert(newPage)
 
-        val note = noteDao.getById(noteId)
-        if (note != null) {
-            noteDao.update(note.copy(pageCount = existing.size + 1, updatedAt = System.currentTimeMillis()))
-        }
+        noteDao.updatePageCount(noteId, existing.size + 1, System.currentTimeMillis())
         newPage
     }
 
@@ -634,10 +645,7 @@ class NoteRepository(
             }
         }
 
-        val note = noteDao.getById(noteId)
-        if (note != null) {
-            noteDao.update(note.copy(pageCount = pages.size, updatedAt = System.currentTimeMillis()))
-        }
+        noteDao.updatePageCount(noteId, pages.size, System.currentTimeMillis())
         true
     }
 
@@ -683,12 +691,11 @@ class NoteRepository(
         val ok = personal.notes.touch.util.BitmapUtils.saveBitmapToPng(bitmap, file)
         if (ok) {
             try {
-                val note = noteDao.getById(noteId)
-                if (note != null) {
-                    noteDao.update(note.copy(updatedAt = System.currentTimeMillis()))
-                }
+                // A narrow touch: the whole row must not be written back,
+                // or the page the user is on would be lost.
+                noteDao.touchUpdatedAt(noteId, System.currentTimeMillis())
             } catch (e: Exception) {
-                // Ignore if note lookup fails
+                // Ignore if the note row is gone
             }
         }
         ok
@@ -741,12 +748,11 @@ class NoteRepository(
         val ok = personal.notes.touch.util.BitmapUtils.saveBitmapToPng(bitmap, file)
         if (ok) {
             try {
-                val note = noteDao.getById(noteId)
-                if (note != null) {
-                    noteDao.update(note.copy(updatedAt = System.currentTimeMillis()))
-                }
+                // A narrow touch: the whole row must not be written back,
+                // or the page the user is on would be lost.
+                noteDao.touchUpdatedAt(noteId, System.currentTimeMillis())
             } catch (e: Exception) {
-                // Ignore if note lookup fails
+                // Ignore if the note row is gone
             }
         }
         ok

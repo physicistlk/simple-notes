@@ -141,6 +141,7 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -156,7 +157,9 @@ import androidx.compose.ui.input.pointer.changedToUp
 import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChanged
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.defaultMinSize
@@ -173,10 +176,18 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
+import personal.notes.touch.ui.components.GlassBackdrop
+import personal.notes.touch.ui.components.GlassOrigin
+import personal.notes.touch.ui.components.LiquidGlassShader
+import personal.notes.touch.ui.components.liquidGlassBackdrop
+import personal.notes.touch.ui.components.liquidGlassMeniscus
+import personal.notes.touch.ui.components.liquidGlassRim
+import personal.notes.touch.ui.components.liquidStylusSpotlight
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Popup
@@ -247,27 +258,58 @@ private const val MIN_CONTINUOUS_SCALE = 0.4f
 private const val MAX_CONTINUOUS_SCALE = 4f
 
 /**
- * Modern Liquid Glass material for floating tool docks:
- * A high-luminance, translucent frosted acrylic body with multi-stop refraction
- * that prevents underlying canvas ink or desk boundaries from causing jarring stripes,
- * paired with a dual-tone specular highlight edge and soft diffused ambient shadows.
+ * Liquid glass, in two layers, the way a real glass panel behaves.
+ *
+ * The shell is genuinely see-through: its alpha runs from 85% at the lit
+ * corner to 55% at the base, so paper, ink and the desk colour behind the
+ * dock all read through it. An opaque body (the previous 93-98%) looked like
+ * a plastic bar and produced a hard edge against the page.
+ *
+ * The gradient also carries a soft second reflection, so the body has depth
+ * instead of one flat wash.
  */
 private val GlassBodyBrush = Brush.linearGradient(
-    listOf(
-        Color(0xFAFFFFFF), // 98% pure luminous white highlight (top-left)
-        Color(0xF5F8FAFC), // 96% frosted crystal body
-        Color(0xEEF1F5F9), // 93% subtle optical refraction
-        Color(0xF8FFFFFF)  // 97% bottom-right rim sheen
+    colorStops = arrayOf(
+        0.00f to Color(0x8CFFFFFF), // 55% lit top-left shoulder
+        0.22f to Color(0x73FFFFFF), // 45%
+        0.46f to Color(0x5CFFFFFF), // 36% the optical body
+        0.68f to Color(0x70FFFFFF), // 44% second, softer reflection
+        1.00f to Color(0x4DFFFFFF)  // 30% base: the page shows through
     )
 )
 
-/** Specular hairline edge of the liquid glass with ambient occlusion on shadow side. */
+/** The dark variant of the glass, for the HUD pills over the reader. */
+private val GlassDarkBrush = Brush.linearGradient(
+    colorStops = arrayOf(
+        0.00f to Color(0xB01A1A1E),
+        0.55f to Color(0x8C121214),
+        1.00f to Color(0xA61A1A1E)
+    )
+)
+
+/**
+ * The brighter capsule the tools sit on. The shell alone lets dense ink run
+ * under the icons and makes them unreadable; the lens keeps the centre of the
+ * dock crisp while the rim stays transparent.
+ */
+private val GlassLensBrush = Brush.linearGradient(
+    listOf(
+        Color(0xA6FFFFFF), // 65% top of the lens
+        Color(0x99FFFFFF), // 60%
+        Color(0x8CFFFFFF)  // 55% bottom
+    )
+)
+
+/**
+ * Specular rim: a bright glint on the lit edge, a darker ambient-occlusion
+ * rim on the shadow side so the pill still has an edge over white paper.
+ */
 private val GlassEdgeBrush = Brush.linearGradient(
     listOf(
-        Color.White.copy(alpha = 0.95f), // High specular glint on lit edge
-        Color.White.copy(alpha = 0.65f), // Soft diffuse reflection
-        Color(0x1F000000),               // Subtle ambient occlusion rim on shadow side
-        Color.White.copy(alpha = 0.55f)  // Specular rim bounce
+        Color(0xF2FFFFFF), // specular glint, lit edge
+        Color(0x99FFFFFF),
+        Color(0x24000000), // ambient occlusion on the shadow side
+        Color(0xB3FFFFFF)  // rim bounce
     )
 )
 
@@ -348,10 +390,6 @@ fun CanvasScreen(
     var liveTextOffsetX by remember { mutableFloatStateOf(0f) }
     var liveTextOffsetY by remember { mutableFloatStateOf(0f) }
     var liveTextSizeSp by remember { mutableFloatStateOf(20f) }
-    // Measured size of the live text card, so the committed text lands where
-    // the card is instead of at a hard-coded guess.
-    var liveTextCardWidth by remember { mutableIntStateOf(0) }
-    var liveTextCardHeight by remember { mutableIntStateOf(0) }
     var liveTextColor by remember { mutableStateOf(Color.Black) }
     val liveTextFocusRequester = remember { FocusRequester() }
     var showGoToPageDialog by remember { mutableStateOf(false) }
@@ -362,8 +400,12 @@ fun CanvasScreen(
     var pencaseOffsetY by remember { mutableFloatStateOf(0f) }
     // Long-press popups of the dock (width slider / full colour palette).
     var showWidthPopupHoriz by remember { mutableStateOf(false) }
+    /** The width chip the slider popup belongs to (only that one shows it). */
+    var widthPopupChipHoriz by remember { mutableIntStateOf(-1) }
     var showColorPopupHoriz by remember { mutableStateOf(false) }
     var showWidthPopupVert by remember { mutableStateOf(false) }
+    /** The width chip the slider popup belongs to (only that one shows it). */
+    var widthPopupChipVert by remember { mutableIntStateOf(-1) }
     var showColorPopupVert by remember { mutableStateOf(false) }
 
     val isInfinite = (note?.pageType ?: "infinite") == "infinite"
@@ -412,6 +454,131 @@ fun CanvasScreen(
 
     // Saved generation map to re-render pages when continuous inking finishes writing to disk
     val savedPageGenerations = remember { mutableStateMapOf<Int, Int>() }
+
+    // Read-only layer cache of the continuous reader: decodes the same page
+    // layer files the single-page engine writes, off the main thread.
+    val readerLayers = remember(viewModel.noteId) {
+        ReaderLayerCache(viewModel.fileStore, viewModel.noteId)
+    }
+
+    /**
+     * Page whose pixels are currently loaded in the hidden canvas for layer
+     * editing in continuous mode (-1 = none). Reset on every page change.
+     */
+    var engineLayerPage by remember { mutableStateOf(-1) }
+
+    /**
+     * How the reader's current page maps page pixels onto the screen
+     * (root coordinates): `root = page * scale + offset`. The live text box
+     * is placed in screen coordinates, so committing it needs this map; the
+     * hidden canvas has its own transform and must not be used for it.
+     */
+    val continuousPageMap = remember { ContinuousPageMapHolder() }
+
+    /** Top-left of the drawing canvas in root coordinates (single-page mode). */
+    var canvasOriginInRoot by remember { mutableStateOf(androidx.compose.ui.geometry.Offset.Zero) }
+
+    // ---- Liquid glass ----------------------------------------------------
+    // The dock is refractive: the page under it is sampled through an AGSL
+    // shader, so the ink bends at the bezel instead of being hidden by a
+    // white slab. The shader is compiled once, only its uniforms change.
+    val glassShader = remember { LiquidGlassShader() }
+    /** Where the floating dock sits on the screen (root pixels). */
+    val glassDockOrigin = remember { GlassOrigin() }
+    /** The page bitmap the reader draws: the backdrop in reader mode. */
+    var glassReaderBitmap by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
+    /** The page the reader bitmap belongs to. */
+    var glassReaderBitmapPage by remember { mutableIntStateOf(-1) }
+    /** The origins of the floating glass elements. */
+    val glassDockOriginHolder = remember { GlassOrigin() }
+    val glassStylusOrigin = remember { GlassOrigin() }
+    val glassZoomOrigin = remember { GlassOrigin() }
+
+    /**
+     * The page pixels under the dock, in page coordinates.
+     *
+     * In the reader the page map is known (page pixels -> root pixels); in
+     * single-page mode the canvas engine maps its own view space to the page.
+     */
+    val glassBackdropAt: (GlassOrigin) -> GlassBackdrop? = { origin ->
+        val view = canvasViewRef
+        if (isContinuous) {
+            val map = continuousPageMap.map
+            val bmp = glassReaderBitmap
+            if (map == null || bmp == null || map.scale <= 0f ||
+                map.pageIndex != glassReaderBitmapPage
+            ) {
+                null
+            } else {
+                GlassBackdrop(
+                    bitmap = bmp,
+                    pageOriginX = (origin.x - map.offsetX) / map.scale,
+                    pageOriginY = (origin.y - map.offsetY) / map.scale,
+                    invScale = 1f / map.scale
+                )
+            }
+        } else {
+            val bmp = view?.getBackingBitmap()
+            if (view == null || bmp == null) {
+                null
+            } else {
+                val lx = origin.x - canvasOriginInRoot.x
+                val ly = origin.y - canvasOriginInRoot.y
+                val p0 = view.viewPointToPage(lx, ly)
+                val p1 = view.viewPointToPage(lx + 1f, ly)
+                val sx = p1[0] - p0[0]
+                if (sx <= 0.0001f) null else GlassBackdrop(bmp, p0[0], p0[1], 1f / sx)
+            }
+        }
+    }
+
+    /** Top-left of the live text field's typing area, in root coordinates. */
+    var liveTextAnchorInRoot by remember { mutableStateOf(androidx.compose.ui.geometry.Offset.Zero) }
+
+    // Single-page edits change the layer files: drop the reader copy when the
+    // user comes back to the reader so it shows the current files.
+    LaunchedEffect(uiState.pageTurningMode) {
+        if (uiState.pageTurningMode == 0) readerLayers.invalidateAll()
+        // The reader's page map is meaningless in single-page mode.
+        continuousPageMap.map = null
+    }
+
+    /**
+     * Converts a point in root/screen coordinates to page pixels, the space
+     * [ImageLayer] positions and page ink use.
+     *
+     * Continuous mode: the reader draws the page with its own fit rect, so the
+     * map it published for the current page is inverted. Single-page mode: the
+     * canvas view is on screen, so its own matrix is inverted.
+     */
+    val screenPointToPage: (androidx.compose.ui.geometry.Offset) -> androidx.compose.ui.geometry.Offset? =
+        { point ->
+            if (isContinuous) {
+                val map = continuousPageMap.map?.takeIf { it.pageIndex == currentPageIndex }
+                if (map != null && map.scale > 0f) {
+                    androidx.compose.ui.geometry.Offset(
+                        (point.x - map.offsetX) / map.scale,
+                        (point.y - map.offsetY) / map.scale
+                    )
+                } else null
+            } else {
+                val view = canvasViewRef
+                if (view == null) null else {
+                    val pts = view.viewPointToPage(
+                        point.x - canvasOriginInRoot.x,
+                        point.y - canvasOriginInRoot.y
+                    )
+                    androidx.compose.ui.geometry.Offset(pts[0], pts[1])
+                }
+            }
+        }
+
+    // A layer selection and the hidden engine's page belong to one page only.
+    LaunchedEffect(currentPageIndex) {
+        engineLayerPage = -1
+        selectedImageIndex = -1
+        canvasViewRef?.selectedImageIndex = -1
+    }
 
     // In-place stylus inking for the continuous reader: one page layer at a
     // time, saved through the same repository calls single-page mode uses.
@@ -591,6 +758,13 @@ fun CanvasScreen(
         // From here the canvas holds currentPageIndex, so saves triggered
         // before the next page flip must be filed under this index.
         viewModel.setCanvasPageIndex(currentPageIndex)
+        // The layers are page scoped: the view must name the page before it
+        // reads them, or it decodes the previous page's manifest.
+        canvasViewRef?.pageIndex = currentPageIndex
+        // A layer selection belongs to the old page.
+        selectedImageIndex = -1
+        canvasViewRef?.selectedImageIndex = -1
+        engineLayerPage = -1
         // F-10: vector PDF pages load their stroke-only layer and get the live
         // pdfium background; every other page keeps the raster path.
         val vectorPage = vectorPdfPage(currentPageIndex)
@@ -613,16 +787,10 @@ fun CanvasScreen(
             loadBeyondPageInk(currentPageIndex)
         }
         try {
-            // Layer PNG decode is file I/O: read on Dispatchers.IO, apply
-            // on main via applyLoadedLayers (invalidate() included).
-            canvasViewRef?.let { view ->
-                // Layers belong to the note, not the page, so a reload here is
-                // only a safety net. Skip it while edits are unsaved: applying
-                // the on-disk copy would silently undo a just-dragged image.
-                if (!view.layersDirty) {
-                    view.reloadLayersFromDisk(viewModel.fileStore, viewModel.noteId)
-                }
-            }
+            // Layer PNG decode is file I/O: read on Dispatchers.IO, apply on
+            // main. A page without a manifest has no layers, so the apply
+            // clears the previous page's list instead of leaking it.
+            canvasViewRef?.reloadLayersFromDisk(viewModel.fileStore, viewModel.noteId)
         } catch (e: Exception) {
             e.printStackTrace()
         }
@@ -641,29 +809,122 @@ fun CanvasScreen(
         }
     }
 
-    // Shared layer insertion helper: handles continuous mode flush, switch to
-    // single-page mode, disk hydration, and IO persistence safely.
+    /**
+     * Points the hidden engine at [page] so layer reads/writes name that
+     * page. In continuous mode [withPagePixels] also installs the page's own
+     * pixel size in the view first: a layer inserted then gets page
+     * coordinates, which is what the reader maps back onto the page.
+     */
+    suspend fun prepareLayerEngine(page: Int, withPagePixels: Boolean) {
+        val view = canvasViewRef ?: return
+        if (view.pageIndex != page) {
+            // Flush the outgoing page before the index moves: the layer save
+            // files the list under imageLayersPageIndex, but the margin ink
+            // under pageIndex, so both still have to name the old page.
+            if (view.layersDirty) {
+                view.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+            }
+            view.pageIndex = page
+        }
+        if (withPagePixels && engineLayerPage != page) {
+            val pageBitmap = withContext(Dispatchers.IO) {
+                viewModel.repository.loadPageBitmap(viewModel.noteId, page)
+            }
+            if (pageBitmap != null) {
+                view.setPageContent(pageBitmap)
+            } else {
+                // A page that has never been rasterised: the continuous
+                // reader's page box is A4-like, so use that page space.
+                val blank = withContext(Dispatchers.IO) {
+                    personal.notes.touch.util.BitmapUtils.createSafeBitmap(2160, 3056)
+                }
+                view.setPageContent(blank)
+            }
+            engineLayerPage = page
+        }
+        if (view.imageLayersPageIndex != page) {
+            // The margin crops in memory belong to the page being left, and
+            // the next save writes whatever is in memory under this page:
+            // install this page's own crops before reloading its layers.
+            val ownInk = withContext(Dispatchers.IO) {
+                view.readBeyondPageInk(viewModel.fileStore, viewModel.noteId, page)
+            }
+            view.applyBeyondPageInk(ownInk, forPageIndex = page)
+            view.reloadLayersFromDisk(viewModel.fileStore, viewModel.noteId)
+        }
+    }
+
+    // Shared layer insertion helper: hydrates the current page's layers (and
+    // page pixel space in continuous mode), appends, persists, and publishes
+    // the result to the reader so it repaints without a disk round trip.
     val insertLayerInCurrentNote: suspend (action: (DrawingCanvasView) -> Boolean) -> Boolean = { action ->
         val view = canvasViewRef
         if (view != null) {
+            val page = viewModel.currentPageIndex.value
             if (isContinuous) {
+                // The page may hold unsaved strokes in its ink session.
                 inkController.flushCurrentSuspend()
-                // Internal step: the user's page turning preference stays.
-                viewModel.setPageTurningModeTransient(1)
-                if (view.imageLayers.isEmpty() && !view.layersDirty) {
-                    view.reloadLayersFromDisk(viewModel.fileStore, viewModel.noteId)
-                }
+                prepareLayerEngine(page, withPagePixels = true)
+            } else {
+                view.pageIndex = page
             }
             val success = action(view)
             if (success) {
                 try {
                     view.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                    if (isContinuous) {
+                        val bmp = view.getBackingBitmap()
+                        readerLayers.put(
+                            page,
+                            view.imageLayers.toList(),
+                            bmp?.width ?: 0,
+                            bmp?.height ?: 0
+                        )
+                    }
                 } catch (e: Exception) {
                     e.printStackTrace()
                 }
             }
             success
         } else false
+    }
+
+    /**
+     * Applies one layer edit to the current page, persists it, and (in
+     * continuous mode) publishes the engine's list to the reader cache so the
+     * page repaints immediately.
+     */
+    val editCurrentLayers: suspend (Boolean, (DrawingCanvasView) -> Unit) -> Unit = { withPagePixels, action ->
+        val view = canvasViewRef
+        if (view != null) {
+            val page = viewModel.currentPageIndex.value
+            if (isContinuous) {
+                prepareLayerEngine(page, withPagePixels)
+            } else {
+                view.pageIndex = page
+            }
+            action(view)
+            try {
+                view.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                if (isContinuous) {
+                    if (engineLayerPage == page) {
+                        val bmp = view.getBackingBitmap()
+                        readerLayers.put(
+                            page,
+                            view.imageLayers.toList(),
+                            bmp?.width ?: 0,
+                            bmp?.height ?: 0
+                        )
+                    } else {
+                        // The backing bitmap is not this page's: keep the
+                        // page size the cache read from the page file.
+                        readerLayers.put(page, view.imageLayers.toList())
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
     }
 
     // Image Picker Launcher (for Add -> Image in Tools panel)
@@ -1857,6 +2118,20 @@ fun CanvasScreen(
                     }
                 }
 
+                // The note reopens on the page it was left on. The page index
+                // is restored from the database after the reader was built, so
+                // the list has to be told to scroll there once it arrives.
+                var restoredPageScrolled by remember(viewModel.noteId) { mutableStateOf(false) }
+                LaunchedEffect(currentPageIndex, pages.size) {
+                    if (restoredPageScrolled || !isContinuous || pages.isEmpty()) {
+                        return@LaunchedEffect
+                    }
+                    if (currentPageIndex > 0) {
+                        restoredPageScrolled = true
+                        scrollToContinuousPage(currentPageIndex)
+                    }
+                }
+
                 // The visible item index comes from a snapshotFlow: reading the
                 // list state straight in composition would recompose the whole
                 // screen on every scroll frame.
@@ -1906,7 +2181,10 @@ fun CanvasScreen(
                             onCanvasTouchStart = { dismissCanvasOverlays() }
                             onImageSelectionChanged = {
                                 selectedImageIndex = it
-                                // A new layer has to show up in the panel.
+                            }
+                            onLayersChanged = {
+                                // One signal for every engine mutation: the
+                                // panel and the reader never read a stale list.
                                 layersTick++
                             }
                             onPdfSelectionChanged = { selection -> pdfSelection = selection }
@@ -1963,11 +2241,16 @@ fun CanvasScreen(
                                     if (isContinuous) {
                                         viewModel.setCanvasPageIndex(-1)
                                         viewModel.setPageLoadedFromDisk(false)
+                                        // The reader shows the pages, but the
+                                        // hidden engine still names the page
+                                        // the user is on for layer inserts.
+                                        pageIndex = viewModel.currentPageIndex.value
                                         reloadLayersFromDisk(viewModel.fileStore, viewModel.noteId)
                                         return@launch
                                     }
                                     val pageIdx = viewModel.currentPageIndex.value
                                     viewModel.setCanvasPageIndex(pageIdx)
+                                    pageIndex = pageIdx
                                     val vectorPage = vectorPdfPage(pageIdx)
                                     if (vectorPage != null) {
                                         preloadPdfSource(vectorPage.pdfSourcePath)
@@ -2014,7 +2297,9 @@ fun CanvasScreen(
                         view.horizontalResistance = uiState.horizontalResistance
                         view.autoCenter = uiState.autoCenter
                     },
-                    modifier = Modifier.fillMaxSize()
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .onGloballyPositioned { canvasOriginInRoot = it.positionInRoot() }
                 )
 
                 // Continuous page overlay when continuous mode is active
@@ -2027,6 +2312,15 @@ fun CanvasScreen(
                             modifier = Modifier
                                 .fillMaxSize()
                                 .background(Color(0xFFEEEEEE))
+                                .pointerInput(Unit) {
+                                    // A touch in the reader closes the open
+                                    // menus, the same way a touch on the page
+                                    // does in single-page mode.
+                                    awaitEachGesture {
+                                        awaitFirstDown(requireUnconsumed = false)
+                                        dismissCanvasOverlays()
+                                    }
+                                }
                                 .pointerInput(Unit) {
                                     // Compose reports the zoom accumulated
                                     // since the gesture started; the handler
@@ -2063,6 +2357,8 @@ fun CanvasScreen(
                                                 noteId = viewModel.noteId,
                                                 pdfDocCache = pdfDocCache,
                                                 repository = viewModel.repository,
+                                                readerLayers = readerLayers,
+                                                onPageMapping = { continuousPageMap.map = it },
                                                 zoom = continuousZoomBucket,
                                                 ink = inkController,
                                                 inkSettings = inkSettings,
@@ -2071,6 +2367,12 @@ fun CanvasScreen(
                                                 savedGeneration = savedPageGenerations[idx] ?: 0,
                                                 isCurrentPage = idx == currentPageIndex,
                                                 modifier = androidx.compose.ui.Modifier.fillMaxHeight(),
+                                                onPageBitmap = { idx, bmp ->
+                                                    if (idx == currentPageIndex) {
+                                                        glassReaderBitmap = bmp
+                                                        glassReaderBitmapPage = idx
+                                                    }
+                                                },
                                                 onClick = {
                                                     viewModel.setCurrentPageIndex(idx)
                                                     dismissCanvasOverlays()
@@ -2106,6 +2408,8 @@ fun CanvasScreen(
                                                         noteId = viewModel.noteId,
                                                         pdfDocCache = pdfDocCache,
                                                         repository = viewModel.repository,
+                                                        readerLayers = readerLayers,
+                                                        onPageMapping = { continuousPageMap.map = it },
                                                         zoom = continuousZoomBucket,
                                                         ink = inkController,
                                                         inkSettings = inkSettings,
@@ -2114,6 +2418,12 @@ fun CanvasScreen(
                                                         savedGeneration = savedPageGenerations[idx] ?: 0,
                                                         isCurrentPage = idx == currentPageIndex,
                                                         modifier = androidx.compose.ui.Modifier.fillMaxWidth(),
+                                                        onPageBitmap = { idx, bmp ->
+                                                            if (idx == currentPageIndex) {
+                                                                glassReaderBitmap = bmp
+                                                                glassReaderBitmapPage = idx
+                                                            }
+                                                        },
                                                         onClick = {
                                                             viewModel.setCurrentPageIndex(idx)
                                                             dismissCanvasOverlays()
@@ -2150,6 +2460,8 @@ fun CanvasScreen(
                                                 noteId = viewModel.noteId,
                                                 pdfDocCache = pdfDocCache,
                                                 repository = viewModel.repository,
+                                                readerLayers = readerLayers,
+                                                onPageMapping = { continuousPageMap.map = it },
                                                 zoom = continuousZoomBucket,
                                                 ink = inkController,
                                                 inkSettings = inkSettings,
@@ -2160,6 +2472,12 @@ fun CanvasScreen(
                                                 modifier = androidx.compose.ui.Modifier.fillMaxWidth(),
                                                 onStylusDetected = { viewModel.onStylusDetected() },
                                         onPinch = { centroid, pan, zoom -> handleReaderTransform(centroid, pan, zoom) },
+                                                onPageBitmap = { idx, bmp ->
+                                                    if (idx == currentPageIndex) {
+                                                        glassReaderBitmap = bmp
+                                                        glassReaderBitmapPage = idx
+                                                    }
+                                                },
                                                 onClick = {
                                                     viewModel.setCurrentPageIndex(idx)
                                                     dismissCanvasOverlays()
@@ -2176,16 +2494,28 @@ fun CanvasScreen(
                         Row(
                             modifier = Modifier
                                 .align(Alignment.TopCenter)
-                                .padding(top = 10.dp),
+                                // The horizontal dock sits at the top as
+                                // well: the pills move below it.
+                                .padding(top = if (uiState.dockHorizontal) 74.dp else 10.dp),
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             if (uiState.stylusOnly) {
                                 Surface(
                                     shape = RoundedCornerShape(16.dp),
-                                    color = Color.Black.copy(alpha = 0.65f),
+                                    color = Color.Transparent,
                                     modifier = Modifier
+                                        .shadow(
+                                            elevation = 12.dp,
+                                            shape = RoundedCornerShape(16.dp),
+                                            ambientColor = Color(0x26000000),
+                                            spotColor = Color(0x40000000)
+                                        )
                                         .clip(RoundedCornerShape(16.dp))
+                                        .onGloballyPositioned {
+                                            glassStylusOrigin.x = it.positionInRoot().x
+                                            glassStylusOrigin.y = it.positionInRoot().y
+                                        }
                                         .clickable {
                                             viewModel.toggleStylusOnly()
                                             android.widget.Toast.makeText(
@@ -2195,6 +2525,15 @@ fun CanvasScreen(
                                             ).show()
                                         }
                                 ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .liquidGlassBackdrop(glassShader) {
+                                                glassBackdropAt(glassStylusOrigin)
+                                            }
+                                            .background(GlassDarkBrush, RoundedCornerShape(16.dp))
+                                            .liquidGlassMeniscus(16.dp)
+                                            .liquidGlassRim(16.dp, RoundedCornerShape(16.dp))
+                                    ) {
                                     Row(
                                         verticalAlignment = Alignment.CenterVertically,
                                         modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
@@ -2213,16 +2552,36 @@ fun CanvasScreen(
                                             fontWeight = FontWeight.Medium
                                         )
                                     }
+                                    }
                                 }
                             }
 
                             if (uiState.zoomLocked || kotlin.math.abs(continuousScale - 1f) > 0.05f) {
                                 Surface(
                                     shape = RoundedCornerShape(16.dp),
-                                    color = Color.Black.copy(alpha = 0.72f),
+                                    color = Color.Transparent,
                                     modifier = Modifier
+                                        .shadow(
+                                            elevation = 12.dp,
+                                            shape = RoundedCornerShape(16.dp),
+                                            ambientColor = Color(0x26000000),
+                                            spotColor = Color(0x40000000)
+                                        )
                                         .clip(RoundedCornerShape(16.dp))
+                                        .onGloballyPositioned {
+                                            glassZoomOrigin.x = it.positionInRoot().x
+                                            glassZoomOrigin.y = it.positionInRoot().y
+                                        }
                                 ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .liquidGlassBackdrop(glassShader) {
+                                                glassBackdropAt(glassZoomOrigin)
+                                            }
+                                            .background(GlassDarkBrush, RoundedCornerShape(16.dp))
+                                            .liquidGlassMeniscus(16.dp)
+                                            .liquidGlassRim(16.dp, RoundedCornerShape(16.dp))
+                                    ) {
                                     Row(
                                         verticalAlignment = Alignment.CenterVertically,
                                         horizontalArrangement = Arrangement.spacedBy(2.dp),
@@ -2261,6 +2620,7 @@ fun CanvasScreen(
                                             }
                                         )
                                     }
+                                    }
                                 }
                             }
                         }
@@ -2269,8 +2629,13 @@ fun CanvasScreen(
 
                 // Image layer controls
                 if (selectedImageIndex >= 0) {
-                    var layerOpacity by remember(selectedImageIndex) {
-                        mutableFloatStateOf(canvasViewRef?.imageLayers?.getOrNull(selectedImageIndex)?.opacity ?: 1f)
+                    val selectedLayer = if (isContinuous) {
+                        readerLayers.layers(currentPageIndex).getOrNull(selectedImageIndex)
+                    } else {
+                        canvasViewRef?.imageLayers?.getOrNull(selectedImageIndex)
+                    }
+                    var layerOpacity by remember(selectedImageIndex, currentPageIndex) {
+                        mutableFloatStateOf(selectedLayer?.opacity ?: 1f)
                     }
                     Surface(
                         shape = RoundedCornerShape(16.dp),
@@ -2290,23 +2655,57 @@ fun CanvasScreen(
                                 value = layerOpacity,
                                 onValueChange = { v ->
                                     layerOpacity = v
-                                    canvasViewRef?.setLayerOpacity(selectedImageIndex, v)
+                                    val view = canvasViewRef
+                                    view?.setLayerOpacity(selectedImageIndex, v)
+                                    // Live feedback in the reader: the engine
+                                    // mutates the same layer objects.
+                                    if (isContinuous && view != null &&
+                                        view.imageLayersPageIndex == currentPageIndex
+                                    ) {
+                                        readerLayers.put(currentPageIndex, view.imageLayers.toList())
+                                    }
+                                },
+                                onValueChangeFinished = {
+                                    scope.launch {
+                                        val view = canvasViewRef ?: return@launch
+                                        if (isContinuous &&
+                                            view.imageLayersPageIndex != currentPageIndex
+                                        ) {
+                                            return@launch
+                                        }
+                                        try {
+                                            view.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                                            if (isContinuous) {
+                                                readerLayers.put(
+                                                    currentPageIndex,
+                                                    view.imageLayers.toList()
+                                                )
+                                            }
+                                        } catch (e: Exception) {
+                                            e.printStackTrace()
+                                        }
+                                    }
                                 },
                                 modifier = Modifier.width(120.dp)
                             )
                             IconButton(onClick = {
-                                canvasViewRef?.deleteSelectedImageLayer()
-                                selectedImageIndex = -1
                                 scope.launch {
-                                    try {
-                                        canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                                    } catch (e: Exception) { e.printStackTrace() }
+                                    editCurrentLayers(false) { view ->
+                                        view.deleteSelectedImageLayer()
+                                    }
+                                    selectedImageIndex = -1
                                 }
                             }) {
                                 Icon(Icons.Default.Delete, contentDescription = "Delete layer", tint = Color.Red)
                             }
                             IconButton(onClick = {
-                                canvasViewRef?.cropSelectedImageLayer()
+                                scope.launch {
+                                    // Cropping needs the layer bitmap, which
+                                    // the hydrated engine already holds.
+                                    editCurrentLayers(false) { view ->
+                                        view.cropSelectedImageLayer()
+                                    }
+                                }
                             }) {
                                 Icon(Icons.Default.CropSquare, contentDescription = "Crop layer")
                             }
@@ -2317,7 +2716,13 @@ fun CanvasScreen(
                 // Layers panel
                 if (showLayersPanel) {
                     val _tick = layersTick
-                    val layers = canvasViewRef?.imageLayers ?: emptyList()
+                    // The reader draws its own decoded copy of the page's
+                    // layers; single-page mode reads the engine directly.
+                    val layers = if (isContinuous) {
+                        readerLayers.layers(currentPageIndex)
+                    } else {
+                        canvasViewRef?.imageLayers ?: emptyList()
+                    }
                     Surface(
                         shape = RoundedCornerShape(14.dp),
                         color = Color.White.copy(alpha = 0.98f),
@@ -2325,6 +2730,10 @@ fun CanvasScreen(
                         border = BorderStroke(1.dp, Color(0xFFE5E5E5)),
                         modifier = Modifier
                             .align(Alignment.TopEnd)
+                            // The floating dock is drawn over the canvas: the
+                            // panel has to sit above it, or the horizontal
+                            // dock hides its header and its buttons.
+                            .zIndex(3f)
                             .padding(top = 10.dp, end = 12.dp)
                             .widthIn(min = 220.dp, max = 280.dp)
                     ) {
@@ -2356,7 +2765,7 @@ fun CanvasScreen(
                             if (layers.isEmpty()) {
                                 Spacer(Modifier.height(6.dp))
                                 Text(
-                                    text = if (isContinuous) "Switch to Single-Page to edit layers." else "No floating layers on this page.",
+                                    text = "No floating layers on this page.",
                                     fontSize = 11.sp,
                                     color = Color.Gray
                                 )
@@ -2365,16 +2774,33 @@ fun CanvasScreen(
                                 layers.forEachIndexed { idx, layer ->
                                     Row(
                                         verticalAlignment = Alignment.CenterVertically,
-                                        modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(vertical = 2.dp)
+                                            .clickable {
+                                                // Picking a row makes it the
+                                                // layer the opacity/crop bar
+                                                // edits, in both modes.
+                                                selectedImageIndex = idx
+                                                if (isContinuous) {
+                                                    scope.launch {
+                                                        prepareLayerEngine(
+                                                            viewModel.currentPageIndex.value,
+                                                            withPagePixels = false
+                                                        )
+                                                        canvasViewRef?.selectedImageIndex = idx
+                                                    }
+                                                } else {
+                                                    canvasViewRef?.selectedImageIndex = idx
+                                                }
+                                            }
                                     ) {
                                         IconButton(
                                             onClick = {
-                                                canvasViewRef?.setLayerVisible(idx, !layer.visible)
-                                                layersTick++
                                                 scope.launch {
-                                                    try {
-                                                        canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                                                    } catch (e: Exception) { e.printStackTrace() }
+                                                    editCurrentLayers(false) { view ->
+                                                        view.setLayerVisible(idx, !layer.visible)
+                                                    }
                                                 }
                                             },
                                             modifier = Modifier.size(36.dp)
@@ -2405,12 +2831,10 @@ fun CanvasScreen(
                                         IconButton(
                                             onClick = {
                                                 if (idx > 0) {
-                                                    canvasViewRef?.moveImageLayer(idx, idx - 1)
-                                                    layersTick++
                                                     scope.launch {
-                                                        try {
-                                                            canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                                                        } catch (e: Exception) { e.printStackTrace() }
+                                                        editCurrentLayers(false) { view ->
+                                                            view.moveImageLayer(idx, idx - 1)
+                                                        }
                                                     }
                                                 }
                                             },
@@ -2422,12 +2846,10 @@ fun CanvasScreen(
                                         IconButton(
                                             onClick = {
                                                 if (idx < layers.size - 1) {
-                                                    canvasViewRef?.moveImageLayer(idx, idx + 1)
-                                                    layersTick++
                                                     scope.launch {
-                                                        try {
-                                                            canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                                                        } catch (e: Exception) { e.printStackTrace() }
+                                                        editCurrentLayers(false) { view ->
+                                                            view.moveImageLayer(idx, idx + 1)
+                                                        }
                                                     }
                                                 }
                                             },
@@ -2438,12 +2860,10 @@ fun CanvasScreen(
                                         }
                                         IconButton(
                                             onClick = {
-                                                canvasViewRef?.deleteImageLayer(idx)
-                                                layersTick++
                                                 scope.launch {
-                                                    try {
-                                                        canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                                                    } catch (e: Exception) { e.printStackTrace() }
+                                                    editCurrentLayers(false) { view ->
+                                                        view.deleteImageLayer(idx)
+                                                    }
                                                 }
                                             },
                                             modifier = Modifier.size(36.dp)
@@ -2465,7 +2885,8 @@ fun CanvasScreen(
                             ) {
                                 OutlinedButton(
                                     onClick = {
-                                        showLayersPanel = false
+                                        // Keep the panel open: the new row
+                                        // must appear immediately.
                                         imagePickerLauncher.launch("image/*")
                                     },
                                     modifier = Modifier.weight(1f).height(32.dp),
@@ -2475,7 +2896,6 @@ fun CanvasScreen(
                                 }
                                 OutlinedButton(
                                     onClick = {
-                                        showLayersPanel = false
                                         liveTextContent = ""
                                         liveTextOffsetX = 0f
                                         liveTextOffsetY = 0f
@@ -2493,29 +2913,81 @@ fun CanvasScreen(
                                 Spacer(Modifier.height(4.dp))
                                 TextButton(
                                     onClick = {
-                                        if (isContinuous) {
-                                            // The merge flattens the layers into
-                                            // the page bitmap, and the hidden
-                                            // canvas is not written while the
-                                            // reader is on: merging here would
-                                            // delete the layers without
-                                            // flattening them.
-                                            android.widget.Toast.makeText(
-                                                context,
-                                                "Switch to Single-Page to merge the layers",
-                                                android.widget.Toast.LENGTH_SHORT
-                                            ).show()
-                                            return@TextButton
-                                        }
-                                        canvasViewRef?.mergeAllLayersToBase()
-                                        layersTick++
                                         scope.launch {
-                                            try {
-                                                canvasViewRef?.getBackingBitmap()?.let { bmp ->
-                                                    viewModel.saveCurrentPageBitmapDirect(bmp)
+                                            val page = viewModel.currentPageIndex.value
+                                            if (isContinuous) {
+                                                // The reader owns the page image,
+                                                // so the merge has to write the
+                                                // flattened pixels itself - it
+                                                // must never just delete the
+                                                // layer files.
+                                                inkController.flushCurrentSuspend()
+                                                val view = canvasViewRef
+                                                if (view != null) {
+                                                    view.pageIndex = page
+                                                    val pageBitmap = withContext(Dispatchers.IO) {
+                                                        viewModel.repository.loadPageBitmap(viewModel.noteId, page)
+                                                    }
+                                                    val base = pageBitmap ?: withContext(Dispatchers.IO) {
+                                                        personal.notes.touch.util.BitmapUtils
+                                                            .createSafeBitmap(2160, 3056)
+                                                    }
+                                                    view.setPageContent(base)
+                                                    // The in-memory margin crops may
+                                                    // belong to another page; the
+                                                    // save below files whatever is
+                                                    // in memory under this page,
+                                                    // so install this page's own.
+                                                    val ownInk = withContext(Dispatchers.IO) {
+                                                        view.readBeyondPageInk(
+                                                            viewModel.fileStore,
+                                                            viewModel.noteId,
+                                                            page
+                                                        )
+                                                    }
+                                                    view.applyBeyondPageInk(
+                                                        ownInk,
+                                                        forPageIndex = page
+                                                    )
+                                                    view.reloadLayersFromDisk(viewModel.fileStore, viewModel.noteId)
+                                                    view.mergeAllLayersToBase()
+                                                    val merged = view.getBackingBitmap()
+                                                    if (merged != null) {
+                                                        withContext(Dispatchers.IO) {
+                                                            viewModel.repository.savePageBitmap(
+                                                                viewModel.noteId, page, merged
+                                                            )
+                                                        }
+                                                    }
+                                                    view.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                                                    readerLayers.put(
+                                                        page,
+                                                        emptyList(),
+                                                        merged?.width ?: 0,
+                                                        merged?.height ?: 0
+                                                    )
+                                                    engineLayerPage = page
+                                                    // The ink session's bitmap
+                                                    // predates the merge: drop
+                                                    // it and let the reader
+                                                    // reload the page.
+                                                    if (inkController.getSession(page) != null) {
+                                                        inkController.releaseSessionSuspend()
+                                                    }
+                                                    savedPageGenerations[page] =
+                                                        (savedPageGenerations[page] ?: 0) + 1
                                                 }
-                                                canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                                            } catch (e: Exception) { e.printStackTrace() }
+                                            } else {
+                                                canvasViewRef?.mergeAllLayersToBase()
+                                                try {
+                                                    canvasViewRef?.getBackingBitmap()?.let { bmp ->
+                                                        viewModel.saveCurrentPageBitmapDirect(bmp)
+                                                    }
+                                                    canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                                                } catch (e: Exception) {
+                                                    e.printStackTrace()
+                                                }
+                                            }
                                         }
                                     },
                                     modifier = Modifier.fillMaxWidth().height(32.dp),
@@ -2546,10 +3018,6 @@ fun CanvasScreen(
                             modifier = Modifier
                                 .offset { IntOffset(liveTextOffsetX.roundToInt(), liveTextOffsetY.roundToInt()) }
                                 .widthIn(min = 320.dp, max = 560.dp)
-                                .onSizeChanged { size ->
-                                    liveTextCardWidth = size.width
-                                    liveTextCardHeight = size.height
-                                }
                                 .padding(8.dp)
                         ) {
                             Column(modifier = Modifier.padding(10.dp)) {
@@ -2640,37 +3108,40 @@ fun CanvasScreen(
                                             onClick = {
                                                 val text = liveTextContent.trim()
                                                 if (text.isNotEmpty()) {
-                                                    // The card is centred in the canvas
-                                                    // area; its top-left in canvas
-                                                    // coordinates is the point the text
-                                                    // is anchored to.
-                                                    val viewW = canvasViewRef?.width ?: 0
-                                                    val viewH = canvasViewRef?.height ?: 0
-                                                    val cardW = if (liveTextCardWidth > 0) liveTextCardWidth.toFloat() else 360f * density.density
-                                                    val cardH = if (liveTextCardHeight > 0) liveTextCardHeight.toFloat() else 240f * density.density
-                                                    val centreX = viewW / 2f + liveTextOffsetX
-                                                    val centreY = (viewH - 50f * density.density) / 2f + liveTextOffsetY
-                                                    val pts = floatArrayOf(
-                                                        centreX - cardW / 2f,
-                                                        centreY - cardH / 2f
-                                                    )
-                                                    canvasViewRef?.pageInverseMatrix?.mapPoints(pts)
-                                                    val targetX = pts[0]
-                                                    val targetY = pts[1]
+                                                    // The layer is anchored where the
+                                                    // user typed: the text field's
+                                                    // top-left in screen coordinates,
+                                                    // converted to page pixels by the
+                                                    // mapping of the page actually on
+                                                    // screen (the reader's fit in
+                                                    // continuous mode, the canvas'
+                                                    // own matrix in single-page).
+                                                    val anchor = screenPointToPage(liveTextAnchorInRoot)
                                                     scope.launch {
-                                                        val inserted = insertLayerInCurrentNote {
-                                                            it.addTextBlock(
-                                                                text = text,
-                                                                color = liveTextColor.toArgb(),
-                                                                fontSizeSp = liveTextSizeSp,
-                                                                posX = targetX,
-                                                                posY = targetY
-                                                            )
-                                                        }
-                                                        if (!inserted) {
+                                                        if (anchor != null) {
+                                                            val inserted = insertLayerInCurrentNote {
+                                                                it.addTextBlock(
+                                                                    text = text,
+                                                                    color = liveTextColor.toArgb(),
+                                                                    fontSizeSp = liveTextSizeSp,
+                                                                    // The text bitmap keeps a 16 px
+                                                                    // left / 12 px top inset; anchor
+                                                                    // its glyphs, not its edge.
+                                                                    posX = anchor.x - 16f,
+                                                                    posY = anchor.y - 12f
+                                                                )
+                                                            }
+                                                            if (!inserted) {
+                                                                android.widget.Toast.makeText(
+                                                                    context,
+                                                                    "Could not insert text",
+                                                                    android.widget.Toast.LENGTH_SHORT
+                                                                ).show()
+                                                            }
+                                                        } else {
                                                             android.widget.Toast.makeText(
                                                                 context,
-                                                                "Could not insert text",
+                                                                "Could not place text on this page",
                                                                 android.widget.Toast.LENGTH_SHORT
                                                             ).show()
                                                         }
@@ -2739,6 +3210,10 @@ fun CanvasScreen(
                                                 .background(Color.White.copy(alpha = 0.6f), RoundedCornerShape(6.dp))
                                                 .border(BorderStroke(1.dp, Color(0xFFE0E0E0)), RoundedCornerShape(6.dp))
                                                 .padding(8.dp)
+                                                // Where typing actually starts: the
+                                                // committed layer is anchored here,
+                                                // not at the card's outer box.
+                                                .onGloballyPositioned { liveTextAnchorInRoot = it.positionInRoot() }
                                         ) {
                                             if (liveTextContent.isEmpty()) {
                                                 Text(
@@ -2776,10 +3251,13 @@ fun CanvasScreen(
                                 spotColor = Color(0x28000000)
                             )
                             .background(GlassBodyBrush, RoundedCornerShape(24.dp))
-                            .border(1.2.dp, GlassEdgeBrush, RoundedCornerShape(24.dp))
+                            .border(1.dp, GlassEdgeBrush, RoundedCornerShape(24.dp))
                     ) {
                         Row(
-                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                            modifier = Modifier
+                                .padding(3.dp)
+                                .background(GlassLensBrush, RoundedCornerShape(21.dp))
+                                .padding(horizontal = 6.dp, vertical = 2.dp),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(4.dp)
                         ) {
@@ -2834,18 +3312,35 @@ fun CanvasScreen(
                                 .offset { IntOffset(pencaseOffsetX.roundToInt(), pencaseOffsetY.roundToInt()) }
                                 .padding(top = 10.dp)
                                 .shadow(
-                                    elevation = 14.dp,
+                                    elevation = 20.dp,
                                     shape = RoundedCornerShape(26.dp),
-                                    ambientColor = Color(0x14000000),
-                                    spotColor = Color(0x28000000)
+                                    ambientColor = Color(0x1A000000),
+                                    spotColor = Color(0x38001A4D)
                                 )
-                                .background(GlassBodyBrush, RoundedCornerShape(26.dp))
-                                .border(1.2.dp, GlassEdgeBrush, RoundedCornerShape(26.dp))
+                                .onGloballyPositioned {
+                                    glassDockOriginHolder.x = it.positionInRoot().x
+                                    glassDockOriginHolder.y = it.positionInRoot().y
+                                }
                         ) {
+                            Box(
+                                modifier = Modifier
+                                    // The page under the dock, bent by the
+                                    // glass: drawn first, so the tint and the
+                                    // icons stay on top of it.
+                                    .liquidGlassBackdrop(glassShader) { glassBackdropAt(glassDockOriginHolder) }
+                                    .background(GlassBodyBrush, RoundedCornerShape(26.dp))
+                                    .liquidGlassMeniscus(26.dp)
+                                    .liquidGlassRim(26.dp, RoundedCornerShape(26.dp))
+                                    .liquidStylusSpotlight()
+                            ) {
                             Row(
                                 modifier = Modifier
-                                    .height(48.dp)
-                                    .padding(horizontal = 10.dp),
+                                    // The lens is inset from the shell, so the
+                                    // rim of the dock stays transparent.
+                                    .padding(3.dp)
+                                    .height(46.dp)
+                                    .background(GlassLensBrush, RoundedCornerShape(23.dp))
+                                    .padding(horizontal = 8.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(6.dp)
                             ) {
@@ -3039,7 +3534,16 @@ fun CanvasScreen(
                                             )
                                             .combinedClickable(
                                                 onClick = { viewModel.setStrokeWidth(widthPx) },
-                                                onLongClick = { showWidthPopupHoriz = true }
+                                                onLongClick = {
+                                                    // Only the chip that was
+                                                    // held down opens the
+                                                    // slider: the popup used
+                                                    // to be built once per
+                                                    // chip, so three of them
+                                                    // opened at once.
+                                                    widthPopupChipHoriz = wIdx
+                                                    showWidthPopupHoriz = true
+                                                }
                                             ),
                                         contentAlignment = Alignment.Center
                                     ) {
@@ -3051,8 +3555,11 @@ fun CanvasScreen(
                                                 .background(if (isSelected) OrangePrimary else Color(0xFF374151))
                                         )
                                         WidthPickerPopup(
-                                            expanded = showWidthPopupHoriz,
-                                            onDismiss = { showWidthPopupHoriz = false },
+                                            expanded = showWidthPopupHoriz && widthPopupChipHoriz == wIdx,
+                                            onDismiss = {
+                                                showWidthPopupHoriz = false
+                                                widthPopupChipHoriz = -1
+                                            },
                                             presets = widthPresets,
                                             activeWidth = activeWidth,
                                             isEraser = isEraserTool,
@@ -3131,6 +3638,7 @@ fun CanvasScreen(
                                     )
                                 }
                             }
+                            }
                         }
                     } else {
                         // Vertical Dock (Docked on Left) with luminous liquid glass styling
@@ -3142,18 +3650,30 @@ fun CanvasScreen(
                                 .offset { IntOffset(pencaseOffsetX.roundToInt(), pencaseOffsetY.roundToInt()) }
                                 .padding(start = 12.dp)
                                 .shadow(
-                                    elevation = 14.dp,
+                                    elevation = 20.dp,
                                     shape = RoundedCornerShape(26.dp),
-                                    ambientColor = Color(0x14000000),
-                                    spotColor = Color(0x28000000)
+                                    ambientColor = Color(0x1A000000),
+                                    spotColor = Color(0x38001A4D)
                                 )
-                                .background(GlassBodyBrush, RoundedCornerShape(26.dp))
-                                .border(1.2.dp, GlassEdgeBrush, RoundedCornerShape(26.dp))
+                                .onGloballyPositioned {
+                                    glassDockOriginHolder.x = it.positionInRoot().x
+                                    glassDockOriginHolder.y = it.positionInRoot().y
+                                }
                         ) {
+                            Box(
+                                modifier = Modifier
+                                    .liquidGlassBackdrop(glassShader) { glassBackdropAt(glassDockOriginHolder) }
+                                    .background(GlassBodyBrush, RoundedCornerShape(26.dp))
+                                    .liquidGlassMeniscus(26.dp)
+                                    .liquidGlassRim(26.dp, RoundedCornerShape(26.dp))
+                                    .liquidStylusSpotlight()
+                            ) {
                             Column(
                                 modifier = Modifier
-                                    .width(48.dp)
-                                    .padding(vertical = 10.dp),
+                                    .padding(3.dp)
+                                    .width(46.dp)
+                                    .background(GlassLensBrush, RoundedCornerShape(23.dp))
+                                    .padding(vertical = 7.dp),
                                 horizontalAlignment = Alignment.CenterHorizontally,
                                 verticalArrangement = Arrangement.spacedBy(6.dp)
                             ) {
@@ -3349,7 +3869,10 @@ fun CanvasScreen(
                                             )
                                             .combinedClickable(
                                                 onClick = { viewModel.setStrokeWidth(widthPx) },
-                                                onLongClick = { showWidthPopupVert = true }
+                                                onLongClick = {
+                                                    widthPopupChipVert = vIdx
+                                                    showWidthPopupVert = true
+                                                }
                                             ),
                                         contentAlignment = Alignment.Center
                                     ) {
@@ -3361,8 +3884,11 @@ fun CanvasScreen(
                                                 .background(if (isSelected) OrangePrimary else Color(0xFF374151))
                                         )
                                         WidthPickerPopup(
-                                            expanded = showWidthPopupVert,
-                                            onDismiss = { showWidthPopupVert = false },
+                                            expanded = showWidthPopupVert && widthPopupChipVert == vIdx,
+                                            onDismiss = {
+                                                showWidthPopupVert = false
+                                                widthPopupChipVert = -1
+                                            },
                                             presets = verticalPresets,
                                             activeWidth = verticalActive,
                                             isEraser = isEraserToolVert,
@@ -3440,6 +3966,7 @@ fun CanvasScreen(
                                         modifier = Modifier.size(15.dp)
                                     )
                                 }
+                            }
                             }
                         }
                     }
@@ -3590,86 +4117,6 @@ fun CanvasScreen(
                                 tint = if (showLayersPanel) OrangePrimary else Color.DarkGray,
                                 modifier = Modifier.size(18.dp)
                             )
-                        }
-                    }
-                }
-            }
-
-                // ==========================================
-                // 5. BOTTOM-LEFT FLOATING PAGE JUMPER (< | > split pill)
-                // ==========================================
-                if (totalPages > 1 && !uiState.isThumbnailDrawerOpen && !uiState.readingMode) {
-                    Surface(
-                    shape = RoundedCornerShape(16.dp),
-                    color = Color.White.copy(alpha = 0.95f),
-                    shadowElevation = 3.dp,
-                    modifier = Modifier
-                        .align(Alignment.BottomStart)
-                        .padding(start = 16.dp, bottom = 16.dp)
-                        .border(1.dp, Color(0xFFE0E0E0), RoundedCornerShape(16.dp))
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        IconButton(
-                            onClick = {
-                                if (isContinuous) {
-                                    val target = (currentPageIndex - 1).coerceAtLeast(0)
-                                    viewModel.setCurrentPageIndex(target)
-                                    scrollToContinuousPage(target)
-                                } else {
-                                    scope.launch {
-                                        canvasViewRef?.getBackingBitmap()?.let { bmp ->
-                                            viewModel.saveCurrentPageBitmap(bmp)
-                                        }
-                                        if (canvasViewRef?.layersDirty == true) {
-                                            canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                                        }
-                                        viewModel.previousPage(canvasViewRef?.getBackingBitmap()) { newBmp ->
-                                            applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
-                                        }
-                                    }
-                                }
-                            },
-                            enabled = currentPageIndex > 0,
-                            modifier = Modifier.size(28.dp)
-                        ) {
-                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Previous page", modifier = Modifier.size(14.dp), tint = if (currentPageIndex > 0) Color.DarkGray else Color.LightGray)
-                        }
-
-                        Divider(
-                            modifier = Modifier
-                                .height(16.dp)
-                                .width(1.dp)
-                                .padding(horizontal = 2.dp),
-                            color = Color(0xFFEEEEEE)
-                        )
-
-                        IconButton(
-                            onClick = {
-                                if (isContinuous) {
-                                    val target = (currentPageIndex + 1).coerceAtMost(totalPages - 1)
-                                    viewModel.setCurrentPageIndex(target)
-                                    scrollToContinuousPage(target)
-                                } else {
-                                    scope.launch {
-                                        canvasViewRef?.getBackingBitmap()?.let { bmp ->
-                                            viewModel.saveCurrentPageBitmap(bmp)
-                                        }
-                                        if (canvasViewRef?.layersDirty == true) {
-                                            canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                                        }
-                                        viewModel.nextPage(canvasViewRef?.getBackingBitmap()) { newBmp ->
-                                            applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
-                                        }
-                                    }
-                                }
-                            },
-                            enabled = currentPageIndex < totalPages - 1,
-                            modifier = Modifier.size(28.dp)
-                        ) {
-                            Icon(Icons.AutoMirrored.Filled.ArrowForward, contentDescription = "Next page", modifier = Modifier.size(14.dp), tint = if (currentPageIndex < totalPages - 1) Color.DarkGray else Color.LightGray)
                         }
                     }
                 }
@@ -4957,7 +5404,9 @@ private fun WidthPickerPopup(
         popupPositionProvider = ChipPopupPositionProvider(preferRight),
         properties = PopupProperties(
             focusable = true,
-            dismissOnClickOutside = true,
+            // The popup opens while the finger is still on the chip: a click
+            // outside would close it again right away.
+            dismissOnClickOutside = false,
             dismissOnBackPress = true
         )
     ) {
@@ -4966,63 +5415,44 @@ private fun WidthPickerPopup(
         var sliderValue by remember { mutableFloatStateOf(activeWidth.coerceIn(minWidth, maxWidth)) }
         Surface(
             shape = RoundedCornerShape(18.dp),
-            color = Color.White.copy(alpha = 0.97f),
-            shadowElevation = 10.dp,
-            modifier = Modifier.width(240.dp)
+            color = Color.Transparent,
+            shadowElevation = 12.dp,
+            modifier = Modifier
+                .width(220.dp)
+                .clip(RoundedCornerShape(18.dp))
         ) {
-            Column(
-                modifier = Modifier.padding(12.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp)
+            Box(
+                modifier = Modifier
+                    .background(GlassBodyBrush, RoundedCornerShape(18.dp))
+                    .liquidGlassMeniscus(18.dp)
+                    .liquidGlassRim(18.dp, RoundedCornerShape(18.dp))
             ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
+                Column(
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(2.dp)
                 ) {
-                    Text("Width", fontSize = 12.sp, color = Color(0xFF444444))
-                    Text(
-                        text = "${formatPx(sliderValue)} px",
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = OrangePrimary
-                    )
-                }
-                Slider(
-                    value = sliderValue,
-                    onValueChange = {
-                        sliderValue = it
-                        onWidthChange(it)
-                    },
-                    valueRange = minWidth..maxWidth,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    presets.forEach { (widthPx, label) ->
-                        val isSelected = activeWidth == widthPx
-                        Box(
-                            modifier = Modifier
-                                .weight(1f)
-                                .clip(RoundedCornerShape(8.dp))
-                                .background(if (isSelected) OrangePrimary.copy(alpha = 0.12f) else Color(0xFFF3F3F3))
-                                .clickable {
-                                    sliderValue = widthPx.coerceIn(minWidth, maxWidth)
-                                    onWidthChange(widthPx)
-                                    onDismiss()
-                                }
-                                .padding(vertical = 6.dp),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Text(
-                                text = label,
-                                fontSize = 11.sp,
-                                maxLines = 1,
-                                color = if (isSelected) OrangePrimary else Color(0xFF444444)
-                            )
-                        }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("Width", fontSize = 12.sp, color = Color(0xFF444444))
+                        Text(
+                            text = "${formatPx(sliderValue)} px",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = OrangePrimary
+                        )
                     }
+                    Slider(
+                        value = sliderValue,
+                        onValueChange = {
+                            sliderValue = it
+                            onWidthChange(it)
+                        },
+                        valueRange = minWidth..maxWidth,
+                        modifier = Modifier.fillMaxWidth()
+                    )
                 }
             }
         }
@@ -5220,7 +5650,10 @@ private suspend fun DrawingCanvasView.reloadLayersFromDisk(
         withContext(Dispatchers.IO) { saveImageLayers(fileStore, noteId) }
     }
     val disk = withContext(Dispatchers.IO) { readLayersFromDisk(fileStore, noteId) }
-    applyLoadedLayers(disk)
+    // No manifest means the page has no layers. Applying the empty list
+    // (rather than null, which applyLoadedLayers ignores) is what stops one
+    // page's images from being shown - and then saved - on the next page.
+    applyLoadedLayers(disk ?: emptyList())
 }
 
 /**
@@ -5274,6 +5707,68 @@ private suspend fun androidx.compose.ui.input.pointer.PointerInputScope.detectPa
     }
 }
 
+/**
+ * Maps the reader page's pixel space onto the screen (root coordinates):
+ * `root = pagePx * scale + offset`. Published by [ContinuousPageView] for the
+ * page the user is on, so screen gestures (the live text box) can be turned
+ * into the page pixels the layer engine stores.
+ */
+data class ContinuousPageMap(
+    val pageIndex: Int,
+    val scale: Float,
+    val offsetX: Float,
+    val offsetY: Float
+)
+
+/**
+ * Latest page-pixel -> screen map of the reader page the user is on. A plain
+ * holder: it is written from the layout phase on every scroll frame and only
+ * read when a gesture is committed, so it must not invalidate composition.
+ */
+class ContinuousPageMapHolder {
+    var map: ContinuousPageMap? = null
+}
+
+/**
+ * On-screen placement of one reader page, in root pixels. Plain fields: the
+ * value is written from `onGloballyPositioned`, which runs on every scroll
+ * frame, and must not invalidate composition.
+ */
+class ReaderPageBox {
+    var originX = 0f
+    var originY = 0f
+    var width = 0
+    var height = 0
+
+    val valid: Boolean get() = width > 0 && height > 0
+}
+
+/**
+ * Publishes the page-pixel -> root map of one reader page, using the same
+ * ContentScale.Fit rect the page image and its layer canvas are drawn with.
+ */
+private fun publishPageMap(
+    pageBox: ReaderPageBox,
+    pageIndex: Int,
+    pageWidth: Int,
+    pageHeight: Int,
+    onPageMapping: (ContinuousPageMap) -> Unit
+) {
+    if (!pageBox.valid || pageWidth <= 0 || pageHeight <= 0) return
+    val fit = minOf(
+        pageBox.width / pageWidth.toFloat(),
+        pageBox.height / pageHeight.toFloat()
+    )
+    onPageMapping(
+        ContinuousPageMap(
+            pageIndex = pageIndex,
+            scale = fit,
+            offsetX = pageBox.originX + (pageBox.width - pageWidth * fit) / 2f,
+            offsetY = pageBox.originY + (pageBox.height - pageHeight * fit) / 2f
+        )
+    )
+}
+
 @Composable
 fun ContinuousPageView(
     pageIndex: Int,
@@ -5281,6 +5776,7 @@ fun ContinuousPageView(
     noteId: String,
     pdfDocCache: personal.notes.touch.util.PdfDocumentCache,
     repository: personal.notes.touch.data.repo.NoteRepository,
+    readerLayers: ReaderLayerCache,
     zoom: Float,
     ink: ContinuousInkController,
     inkSettings: InkToolSettings,
@@ -5290,10 +5786,18 @@ fun ContinuousPageView(
     isCurrentPage: Boolean = false,
     modifier: Modifier = Modifier,
     onStylusDetected: () -> Unit = {},
+    onPageMapping: (ContinuousPageMap) -> Unit = {},
+    onPageBitmap: (Int, android.graphics.Bitmap?) -> Unit = { _, _ -> },
     onPinch: (androidx.compose.ui.geometry.Offset, androidx.compose.ui.geometry.Offset, Float) -> Unit = { _, _, _ -> },
     onClick: () -> Unit
 ) {
     val isVector = page.pdfSourcePath.isNotEmpty() && page.pdfPageIndex >= 0
+
+    // Where the page sits on screen: the live text box is placed in screen
+    // coordinates, so its commit needs the page's on-screen rect. Kept out of
+    // snapshot state on purpose — positionInRoot changes on every scroll
+    // frame and recomposing the page for that would stutter the reader.
+    val pageBox = remember(page.id) { ReaderPageBox() }
 
     // Opening the PDF (read + parse in pdfium) has to happen off the main
     // thread, so the page lays out at the A4 ratio until the real one arrives.
@@ -5314,6 +5818,21 @@ fun ContinuousPageView(
     BoxWithConstraints(
         modifier = modifier
             .aspectRatio(pageRatio)
+            .onGloballyPositioned { coords ->
+                pageBox.originX = coords.positionInRoot().x
+                pageBox.originY = coords.positionInRoot().y
+                pageBox.width = coords.size.width
+                pageBox.height = coords.size.height
+                if (isCurrentPage) {
+                    publishPageMap(
+                        pageBox = pageBox,
+                        pageIndex = pageIndex,
+                        pageWidth = readerLayers.entry(pageIndex)?.pageWidth ?: 0,
+                        pageHeight = readerLayers.entry(pageIndex)?.pageHeight ?: 0,
+                        onPageMapping = onPageMapping
+                    )
+                }
+            }
             .clickable { onClick() }
     ) {
         val displayWidthPx = with(LocalDensity.current) { maxWidth.toPx() }
@@ -5328,6 +5847,11 @@ fun ContinuousPageView(
         // so pinching never flashes a placeholder.
         var pageBitmap by remember(page.id, page.updatedAt) {
             mutableStateOf<android.graphics.Bitmap?>(null)
+        }
+        // The glass of the dock samples the page under it: the reader hands
+        // its page image over so the glass bends the real pixels.
+        LaunchedEffect(page.id, pageBitmap) {
+            if (isCurrentPage) onPageBitmap(pageIndex, pageBitmap)
         }
         var loadCompleted by remember(page.id, page.updatedAt) {
             mutableStateOf(false)
@@ -5344,6 +5868,35 @@ fun ContinuousPageView(
         val inkSession = ink.getSession(pageIndex)
         val sessionReady = inkSession?.isReady == true
         val activeSessionReady = ink.isActiveSession(pageIndex)
+
+        // Floating layers of this page. The cache decodes them off the main
+        // thread; the entry is observable, so an edit repaints the page.
+        val layerRevision = readerLayers.revision(pageIndex)
+        val layerEntry = readerLayers.entry(pageIndex)
+        LaunchedEffect(page.id, layerRevision) {
+            readerLayers.load(pageIndex)
+        }
+
+        // Publish the page-pixel -> screen map of the page the user is on.
+        // The layer canvas below uses exactly this fit, so a point committed
+        // through it lands where the same pixels are drawn.
+        LaunchedEffect(isCurrentPage, layerEntry) {
+            if (isCurrentPage) {
+                publishPageMap(
+                    pageBox = pageBox,
+                    pageIndex = pageIndex,
+                    pageWidth = layerEntry?.pageWidth ?: 0,
+                    pageHeight = layerEntry?.pageHeight ?: 0,
+                    onPageMapping = onPageMapping
+                )
+            }
+        }
+        val layerPaint = remember {
+            android.graphics.Paint(
+                android.graphics.Paint.FILTER_BITMAP_FLAG or
+                    android.graphics.Paint.ANTI_ALIAS_FLAG
+            )
+        }
 
         LaunchedEffect(page.id, page.updatedAt, renderWidthKey, noteId, activeSessionReady, savedGeneration) {
             ink.refreshBackground(page, pageIndex, desiredWidthPx)
@@ -5473,6 +6026,31 @@ fun ContinuousPageView(
                 modifier = Modifier.fillMaxSize(),
                 filterQuality = androidx.compose.ui.graphics.FilterQuality.High
             )
+        }
+
+        // Floating layers, composited in the page's own pixel space so they
+        // land exactly where the single-page engine placed them. The page is
+        // drawn with ContentScale.Fit, so the same fit rect is used here.
+        val pageLayers = layerEntry?.layers.orEmpty()
+        val layerPageWidth = layerEntry?.pageWidth ?: 0
+        val layerPageHeight = layerEntry?.pageHeight ?: 0
+        if (pageLayers.isNotEmpty() && layerPageWidth > 0 && layerPageHeight > 0) {
+            androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
+                val fit = minOf(
+                    size.width / layerPageWidth.toFloat(),
+                    size.height / layerPageHeight.toFloat()
+                )
+                val offsetX = (size.width - layerPageWidth * fit) / 2f
+                val offsetY = (size.height - layerPageHeight * fit) / 2f
+                drawIntoCanvas { canvas ->
+                    val native = canvas.nativeCanvas
+                    val saveCount = native.save()
+                    native.translate(offsetX, offsetY)
+                    native.scale(fit, fit)
+                    drawImageLayers(native, pageLayers, layerPaint)
+                    native.restoreToCount(saveCount)
+                }
+            }
         }
 
         // Page border: drawn after the page so it stays visible on top of an

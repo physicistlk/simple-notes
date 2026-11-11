@@ -5,12 +5,22 @@ import androidx.compose.ui.graphics.Color
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
@@ -86,6 +96,26 @@ fun CanvasUiState.withStrokeWidth(width: Float): CanvasUiState =
 fun CanvasUiState.activeStrokeWidth(): Float =
     if (selectedTool == CanvasTool.ERASER) eraserWidth else strokeWidth
 
+/**
+ * Where a note reopens: the saved page clamped into the pages that still
+ * exist ("reopen on the page you left", schema 13).
+ *
+ * Pure on purpose — the clamp is the only rule that can strand a reader, so it
+ * is unit-tested directly instead of through a Room/Compose stack:
+ * - no pages at all → 0 (the canvas has nothing to show; it must not go
+ *   negative and must not crash),
+ * - a negative saved value (legacy/garbage row) → 0,
+ * - a saved page past the end (pages were deleted since) → the last page,
+ * - otherwise the saved page itself.
+ */
+object PageRestore {
+    fun restoredPageIndex(saved: Int, pageCount: Int): Int {
+        val lastPage = (pageCount - 1).coerceAtLeast(0)
+        return saved.coerceIn(0, lastPage)
+    }
+}
+
+@OptIn(FlowPreview::class)
 class CanvasViewModel(
     val noteId: String,
     val repository: NoteRepository,
@@ -136,6 +166,107 @@ class CanvasViewModel(
             started = SharingStarted.WhileSubscribed(5000),
             initialValue = emptyList()
         )
+
+    /**
+     * True once [restoreLastPage] has resolved the page the note was closed on.
+     * Until then nothing may be written: on a slow cold start the initial
+     * `0` would otherwise reach the debounced saver before the restore read
+     * has landed and overwrite the remembered page.
+     */
+    private var lastPageRestored = false
+
+    /**
+     * Scope for the last page write when the ViewModel is cleared. [onCleared]
+     * runs after `viewModelScope` is cancelled, so the debounced saver can no
+     * longer run there; this scope is independent of the ViewModel's lifecycle
+     * and is used only for that single, bounded write.
+     */
+    private val finalPageSaveScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /**
+     * "Reopen on the page you left" (schema 13), restore half.
+     *
+     * The saved index lives on the note row (`lastPageIndex`); the number of
+     * pages that still exist lives in `pages`. Restoring therefore needs both:
+     * wait for the note row, then for the first non-empty page list, then clamp
+     * with [PageRestore]. A note whose page rows are genuinely gone times out
+     * into the 0-page clamp instead of hanging.
+     */
+    private fun restoreLastPage() {
+        viewModelScope.launch {
+            val noteRow = note.filterNotNull().first()
+            val loadedPages = withTimeoutOrNull(PAGE_RESTORE_TIMEOUT_MS) {
+                pages.first { it.isNotEmpty() }
+            }
+            val pageCount = loadedPages?.size ?: pages.value.size
+            val saved = PageRestore.restoredPageIndex(noteRow.lastPageIndex, pageCount)
+            // Only while the reader is still on the page it opened on: if the
+            // user already navigated (continuous scrolling can move the index
+            // before the DB read returns), their page wins over the saved one.
+            if (_currentPageIndex.value == 0) {
+                _currentPageIndex.value = saved
+            }
+            lastPageRestored = true
+            observePageIndexForSave()
+        }
+    }
+
+    /**
+     * "Reopen on the page you left", save half: one central saver instead of a
+     * write at every assignment of [_currentPageIndex].
+     *
+     * It covers every path that moves the page — [setCurrentPageIndex] (the
+     * continuous reader's scroll position), [goToPage] / next / previous, and
+     * the index shifts of insert and delete — because they all end in the same
+     * StateFlow. The 400 ms debounce keeps a scroll burst to one UPDATE, which
+     * is still well inside the ~500 ms budget for "turning a page is saved".
+     */
+    private fun observePageIndexForSave() {
+        viewModelScope.launch {
+            _currentPageIndex
+                .debounce(PAGE_SAVE_DEBOUNCE_MS)
+                .distinctUntilChanged()
+                .collect { persistLastPage(it) }
+        }
+    }
+
+    /** Writes one page index to the note row, unless the note is in the bin. */
+    private suspend fun persistLastPage(pageIndex: Int) {
+        if (pageIndex < 0) return
+        if (isNoteDeleted) return
+        // Deleted is a column on the row, not a session flag: a note opened
+        // from the recycle bin must not remember a page either.
+        if (note.value?.deleted == true) return
+        repository.saveLastPage(noteId, pageIndex)
+    }
+
+    /**
+     * Final page write when the screen is left.
+     *
+     * [onCleared] runs after `viewModelScope` is cancelled, so a page turned
+     * less than [PAGE_SAVE_DEBOUNCE_MS] before leaving would be dropped. The
+     * write is launched on [finalPageSaveScope] (not the cancelled
+     * `viewModelScope`) and awaited for at most
+     * [FINAL_PAGE_SAVE_TIMEOUT_MS] so it normally lands before the process can
+     * die — the wait is hard-bounded so it can never hold the main thread long
+     * enough to matter. A timed-out write is left running on IO (the scope is
+     * not cancelled here), because cancelling would lose exactly the value
+     * this method exists to keep.
+     */
+    override fun onCleared() {
+        if (lastPageRestored && !isNoteDeleted && note.value?.deleted != true) {
+            val pageIndex = _currentPageIndex.value
+            if (pageIndex >= 0) {
+                val write = finalPageSaveScope.launch {
+                    repository.saveLastPage(noteId, pageIndex)
+                }
+                runBlocking {
+                    withTimeoutOrNull(FINAL_PAGE_SAVE_TIMEOUT_MS) { write.join() }
+                }
+            }
+        }
+        super.onCleared()
+    }
 
     init {
         // Workspace preferences that survive the screen: the open-notes tab
@@ -202,6 +333,7 @@ class CanvasViewModel(
         viewModelScope.launch(Dispatchers.IO) {
             loadDrawerData()
         }
+        restoreLastPage()
     }
 
     fun selectTool(tool: CanvasTool) {
@@ -923,6 +1055,15 @@ class CanvasViewModel(
     }
 
     private companion object {
+        /** Quiet window before a page change is written to the note row. */
+        const val PAGE_SAVE_DEBOUNCE_MS = 400L
+
+        /** Max wait for the first non-empty page list when restoring. */
+        const val PAGE_RESTORE_TIMEOUT_MS = 2_000L
+
+        /** Upper bound on the blocking final write in [onCleared]. */
+        const val FINAL_PAGE_SAVE_TIMEOUT_MS = 250L
+
         const val KEY_SHOW_TABS = "show_tabs"
         const val KEY_DOCK_HORIZONTAL = "dock_horizontal"
         const val KEY_SHOW_PENCASE = "show_pencase"

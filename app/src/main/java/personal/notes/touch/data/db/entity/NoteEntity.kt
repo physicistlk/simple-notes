@@ -15,5 +15,12 @@ data class NoteEntity(
     val updatedAt: Long = System.currentTimeMillis(),
     val content: String? = null,
     val pageCount: Int = 1,
-    val pageType: String = "infinite"
+    val pageType: String = "infinite",
+    /**
+     * Page the note was last closed on (zero-based, into the note's `pages`
+     * rows). Written only by [personal.notes.touch.data.repo.NoteRepository.saveLastPage]
+     * so reopening a note never reorders the library ([updatedAt] stays put).
+     * The canvas clamps it to the pages that still exist on open.
+     */
+    val lastPageIndex: Int = 0
 )

@@ -16,6 +16,7 @@ import android.os.Looper
 import android.util.AttributeSet
 import android.view.MotionEvent
 import android.view.View
+import androidx.compose.runtime.mutableStateMapOf
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import personal.notes.touch.util.BitmapUtils
@@ -106,6 +107,223 @@ data class UndoSnapshot(
     /** Ink written outside the paper (page-level crops). */
     val beyondInk: List<InkCrop> = emptyList()
 )
+
+/**
+ * The decoded floating layers of one page plus the pixel size of the page
+ * they are positioned in. The size is read from the page PNG header (bounds
+ * only, no decode) so the continuous reader can map page pixels onto the
+ * page it draws on screen.
+ */
+class PageLayerEntry(
+    val layers: List<ImageLayer>,
+    val pageWidth: Int,
+    val pageHeight: Int
+)
+
+/**
+ * Page pixel space used for a page that has no PNG yet: layer insertion puts
+ * images in an A4-sized space, so the reader has to measure them in it.
+ */
+private const val DEFAULT_PAGE_WIDTH = 2160
+private const val DEFAULT_PAGE_HEIGHT = 3056
+
+/**
+ * Read-only layer cache for the continuous reader.
+ *
+ * The single-page [DrawingCanvasView] stays the only editor: this class reads
+ * the same per-page manifest + PNGs and publishes them as Compose snapshot
+ * state, so a reader page repaints when its layers are loaded or replaced.
+ * All decoding happens on [Dispatchers.IO] and only once per page until the
+ * entry is replaced or invalidated.
+ *
+ * Bitmaps are never recycled here: a reader frame may still be drawing the
+ * previous list when an edit replaces it, and the GC reclaims it safely.
+ */
+class ReaderLayerCache(
+    private val fileStore: personal.notes.touch.data.files.NoteFileStore,
+    private val noteId: String
+) {
+    private val entries = mutableStateMapOf<Int, PageLayerEntry>()
+    private val revisions = mutableStateMapOf<Int, Int>()
+
+    /** Observable layers of [pageIndex]; empty until [load] has run. */
+    fun layers(pageIndex: Int): List<ImageLayer> =
+        entry(pageIndex)?.layers ?: emptyList()
+
+    /** Observable entry of [pageIndex] (layers + page pixel size). */
+    fun entry(pageIndex: Int): PageLayerEntry? {
+        revisions[pageIndex] // recompose when the entry is replaced
+        return entries[pageIndex]
+    }
+
+    /** Bumped whenever the cached copy of [pageIndex] changes. */
+    fun revision(pageIndex: Int): Int = revisions[pageIndex] ?: 0
+
+    /**
+     * Publishes an engine edit without a disk round trip. A null/zero page
+     * size keeps the size of the previous entry (edits like visibility do not
+     * change the page geometry).
+     */
+    fun put(pageIndex: Int, layers: List<ImageLayer>, pageWidth: Int = 0, pageHeight: Int = 0) {
+        val previous = entries[pageIndex]
+        val w = if (pageWidth > 0) pageWidth else previous?.pageWidth ?: 0
+        val h = if (pageHeight > 0) pageHeight else previous?.pageHeight ?: 0
+        entries[pageIndex] = PageLayerEntry(
+            layers = layers,
+            pageWidth = if (w > 0) w else DEFAULT_PAGE_WIDTH,
+            pageHeight = if (h > 0) h else DEFAULT_PAGE_HEIGHT
+        )
+        revisions[pageIndex] = (revisions[pageIndex] ?: 0) + 1
+    }
+
+    /** Drops one page's copy so the next [load] re-reads its layer files. */
+    fun invalidate(pageIndex: Int) {
+        entries.remove(pageIndex)
+        revisions[pageIndex] = (revisions[pageIndex] ?: 0) + 1
+    }
+
+    /** Drops every page: used when single-page edits may have changed the files. */
+    fun invalidateAll() {
+        val pages = entries.keys.toList()
+        entries.clear()
+        for (page in pages) revisions[page] = (revisions[page] ?: 0) + 1
+    }
+
+    /**
+     * Decodes [pageIndex] off the main thread and publishes it. A load that
+     * races an edit drops its result: the edited entry wins.
+     */
+    suspend fun load(pageIndex: Int) {
+        if (entries.containsKey(pageIndex)) return
+        val revisionAtStart = revision(pageIndex)
+        val entry = withContext(Dispatchers.IO) {
+            val layers = readPageLayersFromDisk(fileStore, noteId, pageIndex) ?: emptyList()
+            val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            val pageFile = fileStore.getPageFile(noteId, pageIndex)
+            if (pageFile.exists()) {
+                android.graphics.BitmapFactory.decodeFile(pageFile.absolutePath, bounds)
+            }
+            PageLayerEntry(
+                layers = layers,
+                // A page that has never been rasterised has no PNG to take
+                // the size from, yet its layers are still positioned in the
+                // A4 pixel space layer insertion uses for it (2160×3056).
+                pageWidth = if (bounds.outWidth > 0) bounds.outWidth else DEFAULT_PAGE_WIDTH,
+                pageHeight = if (bounds.outHeight > 0) bounds.outHeight else DEFAULT_PAGE_HEIGHT
+            )
+        }
+        if (revision(pageIndex) != revisionAtStart || entries.containsKey(pageIndex)) return
+        entries[pageIndex] = entry
+        revisions[pageIndex] = revisionAtStart + 1
+    }
+}
+
+/**
+ * Pure-I/O read of one page's floating layers. Safe on Dispatchers.IO.
+ *
+ * Returns `null` when the page has no layer manifest yet. A partially parsed
+ * list is returned on JSON failure; ordinary IO failures produce an empty
+ * list. This is the single decoder both the editor ([DrawingCanvasView]) and
+ * the continuous reader ([ReaderLayerCache]) use.
+ */
+fun readPageLayersFromDisk(
+    fileStore: personal.notes.touch.data.files.NoteFileStore,
+    noteId: String,
+    pageIndex: Int
+): List<ImageLayer>? {
+    val infoFile = fileStore.getLayerInfoFile(noteId, pageIndex)
+    if (!infoFile.exists()) return null
+    val layers = mutableListOf<ImageLayer>()
+    try {
+        val arr = org.json.JSONArray(infoFile.readText())
+        val layersDir = fileStore.getLayersDir(noteId)
+        for (i in 0 until arr.length()) {
+            val obj = arr.getJSONObject(i)
+            val fileName = obj.getString("file")
+            val bitmapFile = java.io.File(layersDir, fileName)
+            val bitmap = android.graphics.BitmapFactory
+                .decodeFile(bitmapFile.absolutePath)
+                ?.copy(android.graphics.Bitmap.Config.ARGB_8888, true)
+            if (bitmap != null) {
+                val ink = mutableListOf<InkCrop>()
+                val inkArr = obj.optJSONArray("ink")
+                if (inkArr != null) {
+                    for (k in 0 until inkArr.length()) {
+                        val inkObj = inkArr.optJSONObject(k) ?: continue
+                        val inkFile = inkObj.optString("file", "")
+                        if (inkFile.isEmpty()) continue
+                        val inkBitmap = android.graphics.BitmapFactory
+                            .decodeFile(java.io.File(layersDir, inkFile).absolutePath)
+                            ?.copy(android.graphics.Bitmap.Config.ARGB_8888, true) ?: continue
+                        ink.add(
+                            InkCrop(
+                                inkBitmap,
+                                inkObj.optDouble("x", 0.0).toFloat(),
+                                inkObj.optDouble("y", 0.0).toFloat()
+                            )
+                        )
+                    }
+                }
+                layers.add(ImageLayer(
+                    bitmap = bitmap,
+                    x = obj.optDouble("x", 0.0).toFloat(),
+                    y = obj.optDouble("y", 0.0).toFloat(),
+                    scale = obj.optDouble("scale", 1.0).toFloat(),
+                    rotation = obj.optDouble("rotation", 0.0).toFloat(),
+                    opacity = obj.optDouble("opacity", 1.0).toFloat(),
+                    visible = obj.optBoolean("visible", true),
+                    cropRect = null,
+                    name = obj.optString("name", "Layer ${i + 1}"),
+                    ink = ink
+                ))
+            }
+        }
+    } catch (e: Exception) {
+        e.printStackTrace()
+    }
+    return layers
+}
+
+/**
+ * Paints floating layers in page-pixel space (the coordinate space the layer
+ * manifest stores). Shared by the single-page engine and the continuous
+ * reader so both composite a page identically: bitmap, rotation, scale,
+ * opacity and the ink crops that travel with the layer.
+ */
+fun drawImageLayers(
+    canvas: Canvas,
+    layers: List<ImageLayer>,
+    paint: Paint
+) {
+    for (layer in layers) {
+        if (!layer.visible) continue
+        if (layer.bitmap.isRecycled) continue
+        paint.alpha = (layer.opacity * 255f).toInt().coerceIn(0, 255)
+        val w = layer.bitmap.width
+        val h = layer.bitmap.height
+        val cx = layer.x + w * layer.scale / 2f
+        val cy = layer.y + h * layer.scale / 2f
+        canvas.save()
+        canvas.translate(cx, cy)
+        canvas.rotate(layer.rotation)
+        canvas.scale(layer.scale, layer.scale)
+        canvas.drawBitmap(layer.bitmap, -w / 2f, -h / 2f, paint)
+        for (crop in layer.ink) {
+            if (crop.bitmap.isRecycled) continue
+            val iw = crop.bitmap.width
+            val ih = crop.bitmap.height
+            val dx = (crop.x + iw / 2f) - cx
+            val dy = (crop.y + ih / 2f) - cy
+            val rad = Math.toRadians((-layer.rotation).toDouble())
+            val cos = Math.cos(rad).toFloat()
+            val sin = Math.sin(rad).toFloat()
+            val lx = (dx * cos - dy * sin) / layer.scale - iw / 2f
+            val ly = (dx * sin + dy * cos) / layer.scale - ih / 2f
+            canvas.drawBitmap(crop.bitmap, lx, ly, paint)
+        }
+        canvas.restore()
+    }
+}
 
 class DrawingCanvasView @JvmOverloads constructor(
     context: Context,
@@ -481,6 +699,16 @@ class DrawingCanvasView @JvmOverloads constructor(
     var pageIndex: Int = 0
 
     /**
+     * Page whose layer files [imageLayers] came from. Saves are filed under
+     * this page: [pageIndex] can already name the page the view is switching
+     * to, and writing the old list there would put a page's images on the
+     * next page.
+     */
+    @Volatile
+    var imageLayersPageIndex: Int = 0
+        private set
+
+    /**
      * True when a layer's geometry or content changed since the last
      * [saveImageLayers]. Layer edits are not part of the backing bitmap, so
      * this is what tells the screen a layer write is still owed when it is
@@ -495,6 +723,14 @@ class DrawingCanvasView @JvmOverloads constructor(
             onImageSelectionChanged?.invoke(value)
         }
     var onImageSelectionChanged: ((Int) -> Unit)? = null
+
+    /**
+     * Fired after every mutation of [imageLayers] (add, delete, reorder,
+     * visibility, merge, undo). The screen refreshes the panel and the
+     * continuous reader from this single signal instead of guessing after
+     * each button press.
+     */
+    var onLayersChanged: (() -> Unit)? = null
 
     /**
      * Fired on the first pointer-down of a gesture on the page (stylus or
@@ -1092,6 +1328,16 @@ class DrawingCanvasView @JvmOverloads constructor(
 
     fun getBackingBitmap(): Bitmap? = backingBitmap
 
+    /**
+     * Maps a point in this view's local pixel space to page pixels (the space
+     * [ImageLayer.x] / [ImageLayer.y] and the layer manifest use).
+     */
+    fun viewPointToPage(x: Float, y: Float): FloatArray {
+        val pts = floatArrayOf(x, y)
+        pageInverseMatrix.mapPoints(pts)
+        return pts
+    }
+
     fun addImageLayer(image: Bitmap): Boolean = addImageLayerDirect(image, null, null)
 
     fun addImageLayerDirect(image: Bitmap, posX: Float? = null, posY: Float? = null): Boolean {
@@ -1124,9 +1370,11 @@ class DrawingCanvasView @JvmOverloads constructor(
             centerPts[1] - dstH / 2f
         }
         imageLayers.add(ImageLayer(image, left, top, scale, 0f, 1f, null, true, "Layer ${imageLayers.size + 1}"))
+        imageLayersPageIndex = pageIndex
         layersDirty = true
         selectedImageIndex = imageLayers.lastIndex
         invalidate()
+        onLayersChanged?.invoke()
         onStrokeFinishedListener?.invoke()
         return true
     }
@@ -1205,76 +1453,26 @@ class DrawingCanvasView @JvmOverloads constructor(
      * decodes the layer PNGs. Contains no view mutation, so it is safe to
      * call from a background thread (callers should use Dispatchers.IO).
      *
-     * Returns `null` when the note has no layer file yet — the caller must
-     * then leave the in-memory layers untouched (same early-return the
-     * original [loadImageLayers] performed). A partially parsed list is
-     * returned on parse failure (mirrors the original behavior of keeping
-     * whatever was read); ordinary IO failures produce an empty list.
+     * Returns `null` when the page has no layer file yet. See
+     * [readPageLayersFromDisk].
      */
-    fun readLayersFromDisk(fileStore: personal.notes.touch.data.files.NoteFileStore, noteId: String): List<ImageLayer>? {
-        val infoFile = fileStore.getLayerInfoFile(noteId, pageIndex)
-        if (!infoFile.exists()) return null
-        val layers = mutableListOf<ImageLayer>()
-        try {
-            val arr = org.json.JSONArray(infoFile.readText())
-            val layersDir = fileStore.getLayersDir(noteId)
-            for (i in 0 until arr.length()) {
-                val obj = arr.getJSONObject(i)
-                val fileName = obj.getString("file")
-                val bitmapFile = java.io.File(layersDir, fileName)
-                val bitmap = android.graphics.BitmapFactory.decodeFile(bitmapFile.absolutePath)?.copy(android.graphics.Bitmap.Config.ARGB_8888, true)
-                if (bitmap != null) {
-                    val ink = mutableListOf<InkCrop>()
-                    val inkArr = obj.optJSONArray("ink")
-                    if (inkArr != null) {
-                        for (k in 0 until inkArr.length()) {
-                            val inkObj = inkArr.optJSONObject(k) ?: continue
-                            val inkFile = inkObj.optString("file", "")
-                            if (inkFile.isEmpty()) continue
-                            val inkBitmap = android.graphics.BitmapFactory
-                                .decodeFile(java.io.File(layersDir, inkFile).absolutePath)
-                                ?.copy(android.graphics.Bitmap.Config.ARGB_8888, true) ?: continue
-                            ink.add(
-                                InkCrop(
-                                    inkBitmap,
-                                    inkObj.optDouble("x", 0.0).toFloat(),
-                                    inkObj.optDouble("y", 0.0).toFloat()
-                                )
-                            )
-                        }
-                    }
-                    layers.add(ImageLayer(
-                        bitmap = bitmap,
-                        x = obj.optDouble("x", 0.0).toFloat(),
-                        y = obj.optDouble("y", 0.0).toFloat(),
-                        scale = obj.optDouble("scale", 1.0).toFloat(),
-                        rotation = obj.optDouble("rotation", 0.0).toFloat(),
-                        opacity = obj.optDouble("opacity", 1.0).toFloat(),
-                        visible = obj.optBoolean("visible", true),
-                        cropRect = null,
-                        name = obj.optString("name", "Layer ${i + 1}"),
-                        ink = ink
-                    ))
-                }
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-        return layers
-    }
+    fun readLayersFromDisk(fileStore: personal.notes.touch.data.files.NoteFileStore, noteId: String): List<ImageLayer>? =
+        readPageLayersFromDisk(fileStore, noteId, pageIndex)
 
     /**
      * UI-apply part of [loadImageLayers] — main thread only. Extracts the
      * decoded data into the view state and repaints. A `null` input (no
-     * layer file for this note) leaves the current layers untouched.
+     * layer file for this page) leaves the current layers untouched.
      */
     fun applyLoadedLayers(layers: List<ImageLayer>?) {
         if (layers == null) return
         imageLayers.clear()
         imageLayers.addAll(layers)
+        imageLayersPageIndex = pageIndex
         layersDirty = false
         selectedImageIndex = -1
         invalidate()
+        onLayersChanged?.invoke()
     }
 
     /** Immutable copy of one image layer's geometry + bitmap reference. */
@@ -1415,7 +1613,10 @@ class DrawingCanvasView @JvmOverloads constructor(
         noteId: String
     ) {
         val layersDir = fileStore.getLayersDir(noteId)
-        val infoFile = fileStore.getLayerInfoFile(noteId, pageIndex)
+        // The list is saved under the page it was loaded from; pageIndex may
+        // already point at the next page when a flip is in flight.
+        val layerPage = imageLayersPageIndex
+        val infoFile = fileStore.getLayerInfoFile(noteId, layerPage)
         try {
             // The layer list belongs to the UI thread: take the snapshot
             // before the file work moves to another thread, so a concurrent
@@ -1438,7 +1639,7 @@ class DrawingCanvasView @JvmOverloads constructor(
             val writtenFiles = mutableSetOf<String>()
             withContext(Dispatchers.IO) {
             snapshot.forEachIndexed { index, layer ->
-                val fileName = "page_${pageIndex}_layer_$index.png"
+                val fileName = "page_${layerPage}_layer_$index.png"
                 writtenFiles.add(fileName)
                 val file = java.io.File(layersDir, fileName)
                 // Atomic: a kill during the write must not leave a truncated
@@ -1463,7 +1664,7 @@ class DrawingCanvasView @JvmOverloads constructor(
                 val inkArr = org.json.JSONArray()
                 layer.ink.forEachIndexed { inkIdx, crop ->
                     if (crop.bitmap.isRecycled) return@forEachIndexed
-                    val inkName = "page_${pageIndex}_layer_${index}_ink_${inkIdx}.png"
+                    val inkName = "page_${layerPage}_layer_${index}_ink_${inkIdx}.png"
                     writtenFiles.add(inkName)
                     val inkFile = java.io.File(layersDir, inkName)
                     val inkTmp = java.io.File(layersDir, "$inkName.tmp")
@@ -1493,7 +1694,7 @@ class DrawingCanvasView @JvmOverloads constructor(
             layersDir.listFiles()?.forEach { file ->
                 // Only this page's files are cleaned up: the layers of the
                 // other pages must stay.
-                if (file.name.startsWith("page_${pageIndex}_layer_") &&
+                if (file.name.startsWith("page_${layerPage}_layer_") &&
                     file.name.endsWith(".png") &&
                     !writtenFiles.contains(file.name)
                 ) {
@@ -1512,6 +1713,7 @@ class DrawingCanvasView @JvmOverloads constructor(
             imageLayers[index].visible = visible
             layersDirty = true
             invalidate()
+            onLayersChanged?.invoke()
         }
     }
 
@@ -1525,6 +1727,7 @@ class DrawingCanvasView @JvmOverloads constructor(
             if (selectedImageIndex == index) selectedImageIndex = -1
             else if (selectedImageIndex > index) selectedImageIndex -= 1
             invalidate()
+            onLayersChanged?.invoke()
             onStrokeFinishedListener?.invoke()
         }
     }
@@ -1538,6 +1741,7 @@ class DrawingCanvasView @JvmOverloads constructor(
         else if (selectedImageIndex > fromIndex && selectedImageIndex <= toIndex) selectedImageIndex -= 1
         else if (selectedImageIndex < fromIndex && selectedImageIndex >= toIndex) selectedImageIndex += 1
         invalidate()
+        onLayersChanged?.invoke()
         onStrokeFinishedListener?.invoke()
         return true
     }
@@ -1606,7 +1810,9 @@ class DrawingCanvasView @JvmOverloads constructor(
         imageLayers.clear()
         layersDirty = true
         selectedImageIndex = -1
+        imageLayersPageIndex = pageIndex
         invalidate()
+        onLayersChanged?.invoke()
         onStrokeFinishedListener?.invoke()
     }
 
@@ -1617,6 +1823,7 @@ class DrawingCanvasView @JvmOverloads constructor(
             imageLayers[index].opacity = value.coerceIn(0f, 1f)
             layersDirty = true
             invalidate()
+            onLayersChanged?.invoke()
         }
     }
 
@@ -1678,6 +1885,7 @@ class DrawingCanvasView @JvmOverloads constructor(
         // not be recycled here - the garbage collector takes it.
         layersDirty = true
         invalidate()
+        onLayersChanged?.invoke()
         onStrokeFinishedListener?.invoke()
     }
 
@@ -1854,37 +2062,7 @@ class DrawingCanvasView @JvmOverloads constructor(
         }
 
         // 3b. Draw transformable image layers
-        for (i in imageLayers.indices) {
-            val layer = imageLayers[i]
-            if (!layer.visible) continue
-            if (layer.bitmap.isRecycled) continue
-            layerPaint.alpha = (layer.opacity * 255f).toInt().coerceIn(0, 255)
-            val w = layer.bitmap.width
-            val h = layer.bitmap.height
-            val cx = layer.x + w * layer.scale / 2f
-            val cy = layer.y + h * layer.scale / 2f
-            canvas.save()
-            canvas.translate(cx, cy)
-            canvas.rotate(layer.rotation)
-            canvas.scale(layer.scale, layer.scale)
-            canvas.drawBitmap(layer.bitmap, -w / 2f, -h / 2f, layerPaint)
-            // Ink written on this layer follows the layer's own transform, so
-            // moving or rotating the layer carries its marks along.
-            for (crop in layer.ink) {
-                if (crop.bitmap.isRecycled) continue
-                val iw = crop.bitmap.width
-                val ih = crop.bitmap.height
-                val dx = (crop.x + iw / 2f) - cx
-                val dy = (crop.y + ih / 2f) - cy
-                val rad = Math.toRadians((-layer.rotation).toDouble())
-                val cos = Math.cos(rad).toFloat()
-                val sin = Math.sin(rad).toFloat()
-                val lx = (dx * cos - dy * sin) / layer.scale - iw / 2f
-                val ly = (dx * sin + dy * cos) / layer.scale - ih / 2f
-                canvas.drawBitmap(crop.bitmap, lx, ly, layerPaint)
-            }
-            canvas.restore()
-        }
+        drawImageLayers(canvas, imageLayers, layerPaint)
 
         // 3c. Ink written outside the paper: page-level crops painted over the
         // canvas surround, so a PDF page can be annotated in its margins.
@@ -2395,6 +2573,16 @@ class DrawingCanvasView @JvmOverloads constructor(
             return true
         }
 
+        // First touch of a gesture: let the screen close its slide-over menus
+        // so the user does not need a separate "close" tap after configuring.
+        // This has to happen before the drawing check below: in stylus mode a
+        // finger touch never draws, and it used to return early - so the
+        // menus stayed open and the tap did nothing.
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+            onCanvasTouchStart?.invoke()
+            multiTouchCancelsStroke = false
+        }
+
         // Check if drawing / single-pointer editing is blocked (reading mode or non-stylus finger)
         // Stylus mode: only the pen writes. The hand may still pinch, pan and
         // use the tools - it just cannot draw.
@@ -2405,13 +2593,6 @@ class DrawingCanvasView @JvmOverloads constructor(
         if (isDrawingBlocked) {
             // Return true on ACTION_DOWN and moves so multi-touch pinch/pan or tap up is delivered
             return true
-        }
-
-        // First touch of a gesture: let the screen close its slide-over menus
-        // so the user does not need a separate "close" tap after configuring.
-        if (event.actionMasked == MotionEvent.ACTION_DOWN) {
-            onCanvasTouchStart?.invoke()
-            multiTouchCancelsStroke = false
         }
 
         val pts = floatArrayOf(event.x, event.y)
@@ -3027,6 +3208,7 @@ class DrawingCanvasView @JvmOverloads constructor(
             layersDirty = true
             notifyUndoRedo()
             invalidate()
+            onLayersChanged?.invoke()
             onStrokeFinishedListener?.invoke()
         }
     }
@@ -3059,6 +3241,7 @@ class DrawingCanvasView @JvmOverloads constructor(
             layersDirty = true
             notifyUndoRedo()
             invalidate()
+            onLayersChanged?.invoke()
             onStrokeFinishedListener?.invoke()
         }
     }

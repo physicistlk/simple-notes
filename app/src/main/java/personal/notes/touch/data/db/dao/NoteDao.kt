@@ -4,7 +4,6 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
-import androidx.room.Update
 import kotlinx.coroutines.flow.Flow
 import personal.notes.touch.data.db.entity.NoteEntity
 
@@ -44,11 +43,35 @@ interface NoteDao {
     @Query("SELECT * FROM notes WHERE deleted = 1 ORDER BY updatedAt DESC")
     fun getRecycled(): Flow<List<NoteEntity>>
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    /**
+     * Inserts a brand-new note row. [OnConflictStrategy.ABORT] on purpose, not
+     * REPLACE: REPLACE deletes the existing row and re-inserts the entity, so
+     * a duplicate id would silently reset `lastPageIndex` (and every other
+     * column) to the entity's defaults. Ids are UUIDs, so a collision is a bug
+     * that should fail loudly instead of quietly losing the remembered page.
+     */
+    @Insert(onConflict = OnConflictStrategy.ABORT)
     suspend fun insert(note: NoteEntity)
 
-    @Update
-    suspend fun update(note: NoteEntity)
+    // ------------------------------------------------------------------
+    // Narrow column updates. There is deliberately NO whole-row @Update on
+    // `notes`: `lastPageIndex` (the page a note reopens on) must only ever be
+    // changed by [updateLastPage], because every other writer (rename, text
+    // autosave, page bookkeeping) holds a NoteEntity that may predate the
+    // last page turn and would write a stale index back.
+    // ------------------------------------------------------------------
+
+    @Query("UPDATE notes SET title = :title, updatedAt = :updatedAt WHERE id = :id")
+    suspend fun updateTitleRow(id: String, title: String, updatedAt: Long)
+
+    @Query("UPDATE notes SET content = :content, title = :title, updatedAt = :updatedAt WHERE id = :id")
+    suspend fun updateContentRow(id: String, title: String, content: String?, updatedAt: Long)
+
+    @Query("UPDATE notes SET pageCount = :pageCount, updatedAt = :updatedAt WHERE id = :id")
+    suspend fun updatePageCount(id: String, pageCount: Int, updatedAt: Long)
+
+    @Query("UPDATE notes SET updatedAt = :updatedAt WHERE id = :id")
+    suspend fun touchUpdatedAt(id: String, updatedAt: Long)
 
     @Query("DELETE FROM notes WHERE id = :id")
     suspend fun delete(id: String)
@@ -97,6 +120,16 @@ interface NoteDao {
 
     @Query("SELECT * FROM notes WHERE deleted = 0 ORDER BY updatedAt DESC")
     suspend fun getAllLive(): List<NoteEntity>
+
+    /**
+     * Remembers the page a note was left on. Deliberately a narrow UPDATE:
+     * `updatedAt` must not move, or merely reopening a note would reorder the
+     * library (`getAll` is ordered by `updatedAt`), and writing the whole row
+     * (the `@Update` path) would race the canvas autosave for every other
+     * column.
+     */
+    @Query("UPDATE notes SET lastPageIndex = :pageIndex WHERE id = :id")
+    suspend fun updateLastPage(id: String, pageIndex: Int)
 
     /** Resolved `[[Title]]` links, for the knowledge graph. */
     @Query(

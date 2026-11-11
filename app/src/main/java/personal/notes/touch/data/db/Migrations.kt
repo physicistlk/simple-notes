@@ -195,4 +195,16 @@ internal val MIGRATION_11_12: Migration = object : Migration(11, 12) {
     }
 }
 
-internal val APP_MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12)
+/**
+ * "Reopen on the page you left" (schema 13): the note row remembers the page
+ * it was closed on. Additive column with a 0 default, so every existing note
+ * reopens exactly where it reopens today (page 1) and no row is rewritten.
+ * `updatedAt` is left alone — this column is navigation state, not an edit.
+ */
+internal val MIGRATION_12_13: Migration = object : Migration(12, 13) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE notes ADD COLUMN lastPageIndex INTEGER NOT NULL DEFAULT 0")
+    }
+}
+
+internal val APP_MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13)

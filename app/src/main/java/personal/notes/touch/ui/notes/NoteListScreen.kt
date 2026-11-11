@@ -333,7 +333,7 @@ fun NoteListScreen(
                         )
                     }
                     // Update note page count
-                    viewModel.repository.updateNote(note.copy(pageCount = imported.pageCount))
+                    viewModel.repository.updateNotePageCount(note.id, imported.pageCount)
                     onNoteClick(noteId)
                 } catch (e: Exception) {
                     e.printStackTrace()
