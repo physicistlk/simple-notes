@@ -261,6 +261,18 @@ The user ticks a line here; only then does the row in the tables above become
 - [ ] **C24** The glass bends the ink at the bezel (the ink is displaced where it crosses the rim).
       *Seen on the tablet: the yellow stroke under the dock is split into a magenta/cyan fringe at the rim (`30_glass_vertical_over_ink.png`). Waiting for the user's tick.*
 
+## The builds
+
+| Kind | Where |
+| :--- | :--- |
+| Debug APK | `app/build/outputs/apk/debug/app-debug.apk` (installed on the tablet) |
+| **Release APK** | the GitHub release `v0.1.0` - `simple-notes-v0.1.0.apk` (signed with the project release key) |
+| Release key | `~/.android/simple-notes-release.jks` - the path and the passwords live in `local.properties` (not in the repository), so the key never lands in the git history |
+
+The release APK cannot be installed over the debug build (Android refuses a
+package whose signature changed); uninstalling the debug build removes its
+data, so the tablet keeps the debug build until that is wanted.
+
 ## Roadmap
 
 1. **Close the data-loss findings** — `C1`–`C4` and `B1`–`B3` are the ones that can cost a user their work; they are all small, local changes.
