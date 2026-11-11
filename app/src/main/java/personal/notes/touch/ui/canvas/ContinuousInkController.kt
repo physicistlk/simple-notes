@@ -182,6 +182,15 @@ class ContinuousInkSession internal constructor(
     internal val redo = ArrayDeque<InkPatch>()
     internal val pending = mutableListOf<ContinuousStroke>()
 
+    /**
+     * Guards the ink bitmap.
+     *
+     * The strokes are rasterised into it on the main thread, and the save
+     * takes a copy of it for the encoder - a copy of a 26 MB page must not
+     * happen on the main thread, it blocks the pen for tens of milliseconds.
+     */
+    internal val inkLock = Any()
+
     /** True once the layer is loaded and displayed; before that the reader's
      *  own page bitmap stays on screen and strokes are buffered. */
     val isReady: Boolean get() = ready
@@ -546,6 +555,7 @@ class ContinuousInkController(
         }
         val patch = snapshot(ink, bounds) ?: return
         val canvas = Canvas(ink)
+        synchronized(s.inkLock) {
         if (shape != null) {
             val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 style = Paint.Style.STROKE
@@ -559,6 +569,7 @@ class ContinuousInkController(
             drawStroke(canvas, stroke, s.inkWidth.toFloat(), s.inkHeight.toFloat(), preview = false)
         }
         patch.after = capture(ink, bounds)
+        }
         s.undo.addLast(patch)
         s.redo.clear()
         trimUndo(s)
@@ -848,7 +859,9 @@ class ContinuousInkController(
     private fun scheduleSave(s: ContinuousInkSession) {
         s.saveJob?.cancel()
         s.saveJob = scope.launch {
-            delay(700)
+            // Long enough that a page of writing is saved once, not after
+            // every single stroke.
+            delay(1200)
             persist(s)
         }
     }
@@ -859,11 +872,16 @@ class ContinuousInkController(
         // The page is only "clean" when the write actually succeeded: a
         // failed write must stay dirty so the next save tries again.
         s.dirty = false
-        // Copy on the main thread (drawing also happens there); the PNG
-        // encoder then reads the copy off-thread, so a stroke landing during
-        // the encode can never tear the file.
+        // The copy is taken off the main thread: copying a 26 MB page on the
+        // UI thread blocked the pen for tens of milliseconds after every
+        // stroke. The lock keeps a stroke that lands during the copy from
+        // tearing the snapshot.
         val copy = try {
-            ink.copy(Bitmap.Config.ARGB_8888, false)
+            withContext(Dispatchers.IO) {
+                synchronized(s.inkLock) {
+                    ink.copy(Bitmap.Config.ARGB_8888, false)
+                }
+            }
         } catch (e: OutOfMemoryError) {
             e.printStackTrace()
             s.dirty = true
