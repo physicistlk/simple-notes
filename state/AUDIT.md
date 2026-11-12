@@ -38,7 +38,7 @@ Rules for a new finding:
 | `uses-permission` in the built APK | **0** (only the AndroidX self-permission) | `aapt2 dump permissions` |
 | `!!` in the sources | **0** | `grep -ro '!!'` |
 | Room schema | v12, exported schema in `app/schemas/…/12.json` | `DatabaseSchemaPolicyTest` |
-| Unit tests | **299 passing / 2 skipped / 0 failures** | `./gradlew testDebugUnitTest` |
+| Unit tests | **353 passing / 2 skipped / 0 failures** | `./gradlew testDebugUnitTest` |
 | Lint | 0 errors | `./gradlew lintDebug` |
 | Network | impossible (no permission, no cleartext) | manifest + `aapt2` |
 | Platform backup | **off** (`allowBackup=false` + `data_extraction_rules`) | manifest |
@@ -175,7 +175,7 @@ tablet; until then it stays **IMPLEMENTED**.
 | **C36** | The long-press colour palette draws its swatches on top of each other, so some of them are hidden. | The palette cannot be read. | `CanvasScreen.kt` (`ColorPalettePopup`) | **IMPLEMENTED** — the grid lays out its cells without overlapping. |
 | **C37** | The stroke-width popup has no way back to the default thickness. | The user has to guess a value. | `CanvasScreen.kt` (`WidthPickerPopup`) | **IMPLEMENTED** — a reset button puts the active tool back to its default thickness and closes the popup. |
 | **C38** | The pinch zoom of the reader is stepped, not continuous: the scale and the pan are Compose state, so every gesture frame recomposes the reader (and the page under the finger). | Pinching feels like it jumps from step to step. | `CanvasScreen.kt` | **OPEN** — the transform has to leave the composition: a `TransformableState` that is read in the draw phase (or a `graphicsLayer` transform), the historical points of the gesture coalesced into one update per frame, and the PDF re-render throttled to the end of the gesture. |
-| **C39** | Two fingers on the page are not a reliable way to move the page: the drawing surface and the reader compete for the pointers, and a stroke that is already running is not always cancelled when the second finger arrives. | The user cannot push the page aside to write in the margin (the case of C34). | `DrawingCanvasView.kt`, `ContinuousInkController.kt` | **OPEN** — one gesture entry point that branches on the pointer count: one pointer draws, two pointers pan and zoom; a second pointer cancels the stroke in progress instead of leaving a stray segment. |
+| **C39** | Two fingers on the page are not a reliable way to move the page: the drawing surface and the reader compete for the pointers, and a stroke that is already running is not always cancelled when the second finger arrives. | The user cannot push the page aside to write in the margin (the case of C34). | `DrawingCanvasView.kt`, `ContinuousInkController.kt` | **FIXED** — one gesture entry point that branches on the pointer count: one pointer draws, two pointers pan and zoom; a second pointer cancels the stroke in progress instead of leaving a stray segment. |
 | **C40** | The Layers button under the page opens the layer panel, but there is no way to **add** a layer to the current page - the panel only shows the floating images that are already there, and the original's "add a layer to the page" has no counterpart. | The panel looks like a manager but cannot create anything; the user has to fall back to "+ Image". | `CanvasScreen.kt`, `ContinuousInkController.kt`, `PageLayerStack.kt`, `LayerPanel.kt` | **FIXED** - confirmed by the user ("c40 is ok"; the base layer cannot be deleted, which is the rule) - every reader page has a real stack of drawing layers, the way the original has one: **layer 1 is the base layer and is always there** (it can be hidden, never deleted - its menu has no Delete), the user can add two more, and **all the writing goes on the current layer**. The **eye button masks a layer**: its content disappears from the page and comes back when the eye is pressed again - nothing is deleted. The panel is the floating card of the original (drag handle, close, a row per layer with eye / name / thumbnail / "...", and "+" plus a check at the bottom); the "..." offers **Merge** (the layer is folded into the base and removed) and **Delete**, both undoable. The entry point is the layers button of the right hand page strip (the top bar's button still opens the floating images panel, a different feature). |
 | **C43** | The eraser in the reader does nothing at all: the erase computes the rectangle to clear in the ink bitmap's pixel space, while the strokes live in the reader's box space, so the snapshot of the pixels lands outside the bitmap and the erase is dropped before it is committed. | The eraser is dead: nothing can be removed in the reader. | `ContinuousInkController.kt` | **FIXED** - confirmed by the user ("c43 is ok") - the eraser clears the **annotation layer** now, in the layer's own pixel space, and the pixels it removed are kept for the undo. Verified on the tablet: the stroke is cut where the eraser went and the printed PDF text under the eraser stays. |
 | **C42** | The stylus mode was forced on from the start and its switch was **disabled** until a stylus had been seen - so on a device (or in a session) without a stylus the hand could never write, and the switch could not be turned off. | The app was unusable with the finger, and every test with an injected finger stroke was silently doing nothing. | `CanvasViewModel.kt` | **IMPLEMENTED** — the mode arms itself the first time a stylus is used (as the rule says) and stays off until then; the user's own choice is remembered across restarts. |
@@ -236,71 +236,143 @@ tablet; until then it stays **IMPLEMENTED**.
 
 ## The check list (tick these off on the tablet)
 
-Every entry has a **test number**: tell me the numbers that pass (or the
-number and what you saw) and I tick exactly those rows.
+The build that is on the tablet is the one of `7bcdc57` - it has the pinch of
+the reader (C45, C51) and everything that came before it.
 
-Every row below is **IMPLEMENTED** and waiting for the user's confirmation.
-The user ticks a line here; only then does the row in the tables above become
-**FIXED**.
+**How to report it back:** tell me the numbers that pass (for example
+"T5, T6, T8, T13 ok"), or the number and what you saw. I tick **exactly**
+those rows in the tables above and nothing else. A ticked row becomes
+**FIXED**; a row that stays unticked stays **IMPLEMENTED**.
 
-- [ ] **C25** The infinite canvas: no page frame, no grey desk, and it keeps up.
-      **T2** The canvas shows no frame and no desk around it.
-      **T3** On the endless canvas, draw a **big** stroke after a pinch zoom out and after a few pans to the side: it must be **drawn** and must not lag.
-      **T4** The eraser still works on the new strokes after those zoom outs and pans.
-      *T2 is confirmed. T3 and T4: the strokes were clamped to the page and the save copied the whole layer (80 MB of garbage per save) - both are fixed; the layer still has to become tiles.*
-      *Seen on the tablet (`30_glass_vertical_over_ink.png`, the canvas runs to the edge). Waiting for the user's tick.*
-- [ ] **C26** The plain **A4 sheets** (not an imported PDF).
-      **T5** Open an A4 note in the reader: the page fills the screen (not two thirds of it).
-      **T6** Pull the page aside with two fingers at the original size and when zoomed out: the page must move.
-      **T7** Write in the margin that appears: the stroke must be drawn and must stay there after a restart.
-      **T8** The "reset zoom" puts the zoom back to 100 %; the new "centre" button brings the canvas back to its origin (two different actions).
-      *The single page editor keeps the ink on the page - the margin belongs to the reader.*
-- [ ] **C27** The infinite canvas shows no frame and no grey desk. (The writing area is still the saved rectangle in the reader - that half is open.)
-- [ ] **C28** Drawing a stroke on a PDF page follows the finger with no lag.
-      *Measured on the tablet with the synthetic input: the app is 77 % CPU idle while drawing, so the remaining jank of the measurement is the injected events, not the app. The real check is the stylus.*
-- [x] **C29** "Show Pencase" shows/hides the floating dock, "Pen-Tool" shows/hides the small pen panel, and neither hides the other. **CONFIRMED by the user.**
-- [x] **C30** After setting the thickness, a touch in the canvas closes the width popup. **CONFIRMED by the user.**
-- [ ] **C32** The glass follows the page while it scrolls and while the dock is dragged.
-      **T14** Scroll the page: the glass must show the new content under it, without a lag.
-      **T15** Drag the dock over the ink: the glass must follow the dock.
-      *The mapping was wrong (the image of the page instead of the layer); the glass now samples the layer and follows the pan.*
-      *Verified on the tablet: the glass shows the PDF text under it, frosted and refracted (`37_glass_over_pdf_text.png`, `38_glass_over_pdf_text_closeup.png`), and 46 % of the dock's pixels change while the page scrolls. Waiting for the user's tick.*
-- [ ] **C36** The colour palette.
-      **T16** Long press a colour chip: the palette must show every swatch, none on top of another.
-      **T17** Pick a colour: the chip the palette was opened from must **keep** that colour (not only the "+" chip).
-      *Verified on the tablet: one palette, a clean 4x2 grid, all eight swatches visible (`34_color_palette.png`). Waiting for the user's tick.*
-- [ ] **C37** The thickness.
-      **T18** Long press a thickness chip: the popup must show the slider and a reset button.
-      **T19** Press reset: the thickness goes back to the default (6 px for the pen).
-      **T20** Set a thickness with the slider: the dock must show which thickness is in use.
-      *Verified on the tablet: the button is in the popup (`35_width_popup_with_reset.png`); the width went from 40 px back to the 6 px default when it was pressed (`36_width_after_reset.png`). Waiting for the user's tick.*
-- [x] **C33** The infinite canvas takes a stroke outside the saved rectangle. **CONFIRMED by the user ("c33 works").**
-      *Verified on the tablet: the annotation layer of an infinite page is now 3240 x 3019 px for a 1600 x 2236 px page image (the page plus a quarter of its width on both sides), and the layer holds only the new stroke - the page image stays clean. Writing next to the saved canvas is kept instead of being clipped. The zoom-out itself still needs a real pinch to be seen.*
-- [ ] **C34** An **imported PDF** and its layer stack.
-      **T9** Open the imported PDF: the page fills the screen.
-      **T10** Pull it aside with two fingers: the page must move, at the original size and zoomed out.
-      **T11** Write in the margin: the stroke must be drawn, survive a restart, and reach the export.
-      **T12** The layers of the PDF: "+" adds a layer, the eye masks it, the "..." merges or deletes it, the base layer cannot be deleted.
-      **T13** The pinch zoom must be centred on the **pinch point**, and the page must zoom in far enough (now up to 8x).
-      *T9-T12 are implemented. T13 is implemented too (C45): the page grows around the fingers, the pinch is applied once and not twice, and the zoom reaches 8x. It needs a real pinch to be confirmed.*
-      *Verified on the tablet: the PDF is drawn centred with a grey margin on both sides (like the original TouchNotes, see `40_reference_original_touchnotes_margin_writing.png`), a stroke in the margin is drawn, it lands in the page's annotation layer (`layers/page_<i>_annot_1.png`), it survives a restart, and the PDF text is untouched.*
-- [ ] **C35** The stroke follows the finger in the reader (the live preview repaints, the page bitmap is no longer uploaded per stroke).
-      *Verified on the tablet: the ink is drawn while the stroke is still going (two frames taken during one stroke differ by 2 900 pixels - `39_live_stroke_preview.png`), the user confirms "live stroke with instant feedback", and the stroke survives a restart. Two defects the tablet found are fixed: the save copied the page into an **immutable** bitmap and then drew into it (`IllegalStateException: Immutable bitmap passed to Canvas constructor` - the crash on the first stroke), and the eraser changed the ink bitmap without invalidating the page, so the wiped stroke stayed on the screen. The eraser is **broken and now proven to be**: with the display awake and the finger writing (a finger stroke changes 12 000 pixels), the eraser changes **nothing**. The reason is the coordinate space: the strokes are normalised to the reader's **box**, but the erase computes its bounds in the **ink bitmap's** space, so the snapshot of the pixels to erase lands outside the bitmap, fails, and the erase is dropped before it is ever committed. It has to be fixed together with the layer rework (the layer *is* the writing surface, so the eraser has to clear the layer, in the box space).*
-- [ ] **C38** The pinch zoom is continuous, without steps (still open).
-- [x] **C43** The eraser in the reader removes the ink (and not the PDF text). **CONFIRMED by the user ("c43 is ok").**
-      *Verified on the tablet: the stroke is cut where the eraser went, the printed text under it stays.*
-- [x] **C39** Two fingers move the page reliably, and the second finger cancels the stroke. **CONFIRMED by the user ("c39 works").**
-- [x] **C40** The layers panel can add a layer to the current page, the base layer is always there, and the eye button masks a layer. **CONFIRMED by the user ("c40 is ok").**
-      *Verified on the tablet: the panel of the original (`41_reference_layer_panel_one_layer.png` .. `44_reference_layer_panel_layer_hidden.png`) is reproduced - the base layer with an eye, the "+" adds a second layer and it becomes the current one (the dashed outline, like the original), the eye masks the layer (the stroke on the page disappears - 2 946 pixels - and comes back unchanged), the "..." menu offers Merge and Delete, and the base layer's menu has **no Delete** (only a greyed Merge). After a restart both layers are still there (`49_layer_panel_after_restart.png`).*
-- [ ] **C41** Two fingers move the page sideways in the reader, and one finger still scrolls.
-      *The pan was clamped to zero at the original size and when zoomed out; it is free at every zoom level now.*
-- [ ] **C51** The pinch of the reader was applied **twice** per event: the detector on the backdrop (which sees the pointers first) and the detector inside the page (which sees them before the list) both handled it. | The zoom ran at twice the speed of the fingers and the page jumped away from the fingers. | `CanvasScreen.kt` | **IMPLEMENTED** - the detector inside the page is gone; the one on the backdrop handles the pinch once, for every layout. |
-      *Could not be verified with a synthetic gesture: the shell user may not write to the touch device (`/dev/input/event3`), so a two finger gesture cannot be injected over adb. This one needs real fingers.*
-- [ ] **C31** The dock glass looks the same as before but the pen no longer lags.
-- [ ] **C24** The glass bends the ink at the bezel.
-      **T1** Draw a stroke under the dock: the ink must be **displaced** where it crosses the rim, with a colour fringe.
-      *The first version bent the page image, which has no ink in it, so the strokes never dispersed. The glass now samples the annotation layer, where the writing lives.*
-      *Seen on the tablet: the yellow stroke under the dock is split into a magenta/cyan fringe at the rim (`30_glass_vertical_over_ink.png`). Waiting for the user's tick.*
+**Three tests need your real fingers** - a two-finger gesture cannot be
+injected over adb, so **T6**, **T10** and **T13** are yours.
+
+### Already confirmed - no need to redo them
+
+| Row | What it was |
+| :--- | :--- |
+| **C29** | "Show Pencase" and "Pen-Tool" show and hide their panels independently. |
+| **C30** | A touch in the canvas closes the width popup. |
+| **C33** | The infinite canvas takes a stroke outside the saved rectangle. |
+| **C39** | Two fingers move the page, and the second finger cancels the stroke. |
+| **C40** | The layers panel: add a layer, the base layer is always there, the eye masks. |
+| **C43** | The eraser in the reader removes the ink and not the PDF text. |
+
+### 1 - The plain A4 sheets (C26)
+
+| # | Do this | You must see |
+| :--- | :--- | :--- |
+| **T5** | Open an A4 note in the reader | The page **fills the screen** (it was two thirds of it). |
+| **T6** | Two fingers, drag the page aside - once at 100 %, once zoomed out | The page **moves** both times. |
+| **T7** | Write in the margin that appears | The stroke is drawn there, and it is **still there after a restart**. |
+| **T8** | Press **the reset (zoom)**, then **the centre** | The reset puts the zoom back to **100 %** and leaves the page where it is; the centre brings the canvas back to its **origin** and leaves the zoom. Two different actions, each with its own toast. |
+
+### 2 - The imported PDF and its layers (C34)
+
+| # | Do this | You must see |
+| :--- | :--- | :--- |
+| **T9** | Open the imported PDF | The page **fills the screen**. |
+| **T10** | Two fingers, drag the PDF aside - at 100 % and zoomed out | The page **moves** both times. |
+| **T11** | Write in the margin | The stroke is drawn, it **survives a restart**, and it **reaches the export**. |
+| **T12** | The layers panel of the PDF | **+** adds a layer, the **eye** masks it, **...** merges or deletes it, and the **base layer cannot be deleted**. |
+
+### 3 - The endless canvas (C25)
+
+| # | Do this | You must see |
+| :--- | :--- | :--- |
+| **T2** | Open an infinite note in the reader | **No page frame and no grey desk** - the canvas runs to the edge of the screen. |
+| **T3** | Pinch **out**, pan 3-4 times to the side, then draw a **big** stroke | The stroke is drawn **whole**, and it does **not lag** behind the finger. |
+| **T4** | Right after T3, erase that new stroke with the eraser | The eraser **wipes it**. |
+
+### 4 - The glass (C24, C32)
+
+| # | Do this | You must see |
+| :--- | :--- | :--- |
+| **T1** | Draw a stroke **under the dock** | The ink is **displaced** where it crosses the rim, with a **magenta/cyan fringe**. |
+| **T14** | Scroll the page | The glass shows the **new** content under it, without a lag. |
+| **T15** | Drag the dock over the ink | The glass **follows the dock**. |
+
+### 5 - The palette and the thickness (C36, C37)
+
+| # | Do this | You must see |
+| :--- | :--- | :--- |
+| **T16** | Long press a colour chip | Every swatch is visible, **none on top of another**. |
+| **T17** | Pick a colour | **That chip** keeps the colour (not only the "+" chip). |
+| **T18** | Long press a thickness chip | The popup shows the **slider and a reset button**. |
+| **T19** | Press reset | The thickness goes back to the **default (6 px)** for the pen. |
+| **T20** | Set a thickness with the slider | The dock **shows which thickness is in use** (the closest chip is marked). |
+
+### 6 - The pinch and the zoom buttons (C45, C51, C41)
+
+These are the parts the pinch rework touched, so they are worth a look even
+if they look right.
+
+| # | Do this | You must see |
+| :--- | :--- | :--- |
+| **T13** | Pinch to zoom in the reader | The page grows **around the fingers** (not around its own centre), it goes **up to 8x**, and it must **not** run at double speed. |
+| **T21** | Pinch out as far as it goes | The **whole page** still fits on the screen. |
+| **T22** | Pinch in as far as it goes | The page is **sharp** enough to write small text on it (not a blurred enlargement). |
+| **T23** | Scroll with **one** finger | The reader still scrolls - the pinch must not have taken the one-finger scroll away. |
+| **T24** | Write with the stylus right after a pinch | The stroke lands **under the stylus**. |
+
+### 7 - The dock and the pen (C28, C31, C35)
+
+| # | Do this | You must see |
+| :--- | :--- | :--- |
+| **T25** | Draw on a PDF page with the stylus | The stroke follows the stylus, with no lag. |
+| **T26** | Draw a long stroke with the stylus | The preview follows the stylus **while the stroke is still going**. |
+| **T27** | Draw on the endless canvas | The pen does not lag behind the finger. |
+
+### Known limits - not tests, I know these
+
+| Row | The limit | What happens |
+| :--- | :--- | :--- |
+| **C50** | The annotation layer of a page is **one bitmap** (the page plus a page width of margin on each side, about 80 MB) and every save encodes all of it. | A very big drawing is still heavy. The layer has to become **tiles**, so only the written part is saved. That is the next piece of work. |
+| **C38** | The pinch of the reader is stepped, not continuous - the scale is Compose state, so every frame recomposes the reader. | Pinching feels like it jumps from step to step. |
+| **C27** | The layers of an **infinite** page are not confirmed yet. | The panel opens, but the layer actions on the endless canvas are unproven. |
+| **C26** | The **single page editor** keeps the ink on the page - the margin belongs to the reader. | By design: the margin is a reader feature. |
+| **C45** | Above about 3x the page is enlarged rather than drawn again (the render stops at 4800 px). | The page is sharp up to 3x and enlarged beyond it. A separate change would render it again. |
+
+### The evidence behind the tests
+
+What the tablet showed so far, for the rows that are still unticked.
+
+**C24**
+  *The first version bent the page image, which has no ink in it, so the strokes never dispersed. The glass now samples the annotation layer, where the writing lives.*
+  *Seen on the tablet: the yellow stroke under the dock is split into a magenta/cyan fringe at the rim (`30_glass_vertical_over_ink.png`). Waiting for the user's tick.*
+
+**C25**
+  *T2 is confirmed. T3 and T4: the strokes were clamped to the page and the save copied the whole layer (80 MB of garbage per save) - both are fixed; the layer still has to become tiles.*
+  *Seen on the tablet (`30_glass_vertical_over_ink.png`, the canvas runs to the edge). Waiting for the user's tick.*
+
+**C32**
+  *The mapping was wrong (the image of the page instead of the layer); the glass now samples the layer and follows the pan.*
+  *Verified on the tablet: the glass shows the PDF text under it, frosted and refracted (`37_glass_over_pdf_text.png`, `38_glass_over_pdf_text_closeup.png`), and 46 % of the dock's pixels change while the page scrolls. Waiting for the user's tick.*
+
+**C33**
+  *Verified on the tablet: the annotation layer of an infinite page is now 3240 x 3019 px for a 1600 x 2236 px page image (the page plus a quarter of its width on both sides), and the layer holds only the new stroke - the page image stays clean. Writing next to the saved canvas is kept instead of being clipped. The zoom-out itself still needs a real pinch to be seen.*
+
+**C34**
+  *T9-T12 are implemented. T13 is implemented too (C45): the page grows around the fingers, the pinch is applied once and not twice, and the zoom reaches 8x. It needs a real pinch to be confirmed.*
+  *Verified on the tablet: the PDF is drawn centred with a grey margin on both sides (like the original TouchNotes, see `40_reference_original_touchnotes_margin_writing.png`), a stroke in the margin is drawn, it lands in the page's annotation layer (`layers/page_<i>_annot_1.png`), it survives a restart, and the PDF text is untouched.*
+
+**C35**
+  *Verified on the tablet: the ink is drawn while the stroke is still going (two frames taken during one stroke differ by 2 900 pixels - `39_live_stroke_preview.png`), the user confirms "live stroke with instant feedback", and the stroke survives a restart. Two defects the tablet found are fixed: the save copied the page into an **immutable** bitmap and then drew into it (`IllegalStateException: Immutable bitmap passed to Canvas constructor` - the crash on the first stroke), and the eraser changed the ink bitmap without invalidating the page, so the wiped stroke stayed on the screen. The eraser is **broken and now proven to be**: with the display awake and the finger writing (a finger stroke changes 12 000 pixels), the eraser changes **nothing**. The reason is the coordinate space: the strokes are normalised to the reader's **box**, but the erase computes its bounds in the **ink bitmap's** space, so the snapshot of the pixels to erase lands outside the bitmap, fails, and the erase is dropped before it is ever committed. It has to be fixed together with the layer rework (the layer *is* the writing surface, so the eraser has to clear the layer, in the box space).*
+
+**C36**
+  *Verified on the tablet: one palette, a clean 4x2 grid, all eight swatches visible (`34_color_palette.png`). Waiting for the user's tick.*
+
+**C37**
+  *Verified on the tablet: the button is in the popup (`35_width_popup_with_reset.png`); the width went from 40 px back to the 6 px default when it was pressed (`36_width_after_reset.png`). Waiting for the user's tick.*
+
+**C40**
+  *Verified on the tablet: the panel of the original (`41_reference_layer_panel_one_layer.png` .. `44_reference_layer_panel_layer_hidden.png`) is reproduced - the base layer with an eye, the "+" adds a second layer and it becomes the current one (the dashed outline, like the original), the eye masks the layer (the stroke on the page disappears - 2 946 pixels - and comes back unchanged), the "..." menu offers Merge and Delete, and the base layer's menu has **no Delete** (only a greyed Merge). After a restart both layers are still there (`49_layer_panel_after_restart.png`).*
+
+**C41**
+  *The pan was clamped to zero at the original size and when zoomed out; it is free at every zoom level now.*
+
+**C51**
+  *Could not be verified with a synthetic gesture: the shell user may not write to the touch device (`/dev/input/event3`), so a two finger gesture cannot be injected over adb. This one needs real fingers.*
 
 ## The builds
 
