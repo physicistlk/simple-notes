@@ -303,9 +303,23 @@ class NoteListViewModel(
     fun createNote(title: String = "Untitled Note", pageType: String = "infinite", onCreated: (String) -> Unit) {
         viewModelScope.launch {
             val folderId = _uiState.value.selectedFolderId
-            val newNote = repository.createNote(title = title, folderId = folderId, pageType = pageType)
+            val resolvedTitle = if (title == "Untitled Note") {
+                when (pageType) {
+                    "infinite" -> nextAvailableName(folderId, "canvas")
+                    "a4" -> nextAvailableName(folderId, "note")
+                    else -> title
+                }
+            } else title
+            val newNote = repository.createNote(title = resolvedTitle, folderId = folderId, pageType = pageType)
             onCreated(newNote.id)
         }
+    }
+
+    private suspend fun nextAvailableName(folderId: String?, base: String): String {
+        val existing = repository.existingTitlesInFolder(folderId).toSet()
+        var n = 1
+        while ("$base $n" in existing) n++
+        return "$base $n"
     }
 
     /**

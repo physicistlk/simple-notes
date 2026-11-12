@@ -88,6 +88,14 @@ object ContinuousPageGeometry {
     /** True when the note's pages are an endless canvas. */
     fun isInfinite(pageType: String?): Boolean = pageType == "infinite"
 
+    /**
+     * The margin around a page, as a fraction of the page's own width: a
+     * whole page width on the left and on the right for PDF and infinite
+     * pages (the user writes in the margin), and no margin for A4 pages
+     * (the page is limited to its A4 size).
+     */
+    fun marginFor(pageType: String?): Float = if (pageType == "a4") 0.0f else 1.0f
+
     /** The aspect ratio of the page image of a note type. */
     fun defaultRatio(pageType: String?): Float =
         if (isInfinite(pageType)) INFINITE_PAGE_RATIO else DEFAULT_PAGE_RATIO
@@ -183,7 +191,7 @@ object ContinuousPageGeometry {
         pageWidth: Int = PAGE_WIDTH
     ): LayerSize {
         val ratio = if (pageRatio > 0f) pageRatio else defaultRatio(pageType)
-        val width = (pageWidth * (1f + 2f * PAGE_MARGIN)).roundToInt()
+        val width = (pageWidth * (1f + 2f * marginFor(pageType))).roundToInt()
         val height = (pageWidth / ratio).roundToInt().coerceAtLeast(1)
         return LayerSize(width.coerceAtLeast(1), height)
     }
@@ -194,7 +202,7 @@ object ContinuousPageGeometry {
      */
     fun ratioOfLayer(pageType: String?, layerWidth: Int, layerHeight: Int): Float {
         if (layerWidth <= 0 || layerHeight <= 0) return defaultRatio(pageType)
-        val pageWidth = layerWidth / (1f + 2f * PAGE_MARGIN)
+        val pageWidth = layerWidth / (1f + 2f * marginFor(pageType))
         return pageWidth / layerHeight
     }
 
@@ -219,7 +227,7 @@ object ContinuousPageGeometry {
         // side, centred on the page. Its page part therefore lands exactly on
         // the page, and the margin reaches past the screen: the page is
         // pulled aside to write in it.
-        val grow = PAGE_MARGIN
+        val grow = marginFor(pageType)
         val width = page.width * (1f + 2f * grow)
         val left = page.left - page.width * grow
         return BoxRect(left, page.top, left + width, page.bottom)

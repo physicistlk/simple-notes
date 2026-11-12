@@ -300,9 +300,19 @@ fun NoteListScreen(
                     android.widget.Toast.makeText(context, "Could not open PDF", android.widget.Toast.LENGTH_SHORT).show()
                     return@launch
                 }
+                val pdfTitle = withContext(Dispatchers.IO) {
+                    var name: String? = null
+                    context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                        val idx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                        if (idx >= 0 && cursor.moveToFirst()) name = cursor.getString(idx)
+                    }
+                    val base = (name ?: uri.lastPathSegment).orEmpty()
+                    val stripped = base.substringBeforeLast('.')
+                    if (stripped.isBlank()) "Imported PDF" else stripped
+                }
                 try {
                     val note = viewModel.repository.createNote(
-                        title = "Imported PDF",
+                        title = pdfTitle,
                         folderId = uiState.selectedFolderId,
                         pageType = "pdf"
                     )
