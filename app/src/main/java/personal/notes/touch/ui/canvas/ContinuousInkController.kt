@@ -1085,9 +1085,12 @@ class ContinuousInkController(
                         stores[layer] = store
                         // Read the ops of the layer (the strokes and the erases
                         // as vectors). They are drawn on top of the tiles.
+                        val opsFile = repository.fileStore.getAnnotationLayerOpsFile(noteId, s.pageIndex, layer.index)
+                        android.util.Log.d("TouchNotes", "load: page=${s.pageIndex} layer=${layer.index} opsFile=${opsFile.absolutePath} exists=${opsFile.exists()} size=${if (opsFile.exists()) opsFile.length() else 0}")
                         val ops = try {
                             repository.loadPageLayerOps(noteId, s.pageIndex, layer.index)
                         } catch (e: Exception) {
+                            android.util.Log.e("TouchNotes", "load: exception reading ops", e)
                             null
                         }
                         if (ops != null) {
@@ -1896,6 +1899,7 @@ class ContinuousInkController(
     }
 
     private suspend fun persist(s: ContinuousInkSession) {
+        android.util.Log.d("TouchNotes", "persist: called for page=${s.pageIndex} dirty=${s.dirty} layers=${s.stack.layers.size}")
         // The stack of the page has to be known before the layers are
         // written: otherwise the save would write the base layer only and
         // delete the files of the other layers.
