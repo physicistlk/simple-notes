@@ -484,6 +484,16 @@ class ContinuousInkSession internal constructor(
      */
     internal val layerTiles = mutableMapOf<PageLayer, LayerTiles>()
 
+    /**
+     * The layers whose file could not be read.
+     *
+     * The file of such a layer must not be written and must not be deleted:
+     * the writing of the user is in that file, and the session simply does
+     * not have it in memory (the decode failed, most likely because the
+     * layer is big). Writing an empty layer over it would destroy it.
+     */
+    internal val unreadableLayers = mutableSetOf<Int>()
+
     /** The layers that were merged into a layer (only the base layer). */
     internal val merged = mutableMapOf<PageLayer, MutableList<PageLayer>>()
 
@@ -1013,7 +1023,14 @@ class ContinuousInkController(
                         // mutable, so the big bitmap does not have to be
                         // copied (a copy of it is 80 MB of memory).
                         val stored = decodeLayerBitmap(file)
-                        if (stored == null) continue
+                        if (stored == null) {
+                            // The file is there but could not be read: the
+                            // writing of the user is in it, so it must not be
+                            // overwritten by an empty layer.
+                            if (file.exists()) s.unreadableLayers.add(layer.index)
+                            continue
+                        }
+                        s.unreadableLayers.remove(layer.index)
                         val bitmap = if (stored.width == s.inkWidth && stored.height == s.inkHeight) {
                             stored
                         } else {
@@ -1834,6 +1851,17 @@ class ContinuousInkController(
         // (the layers, their names and the current one) goes to the metadata
         // file of the page.
         for (layer in s.stack.layers) {
+            if (s.unreadableLayers.contains(layer.index)) {
+                // The file of this layer could not be read: writing it now
+                // would replace the writing of the user with an empty layer.
+                // The file stays as it is.
+                s.dirty = true
+                android.util.Log.w(
+                    "TouchNotes",
+                    "Layer ${layer.index} of page ${s.pageIndex} could not be read - not saved"
+                )
+                continue
+            }
             // The layer is composed off the main thread. It is NOT copied
             // first: a copy of the layer (the page plus a page width of
             // margin on each side) is tens of megabytes of garbage per save,
