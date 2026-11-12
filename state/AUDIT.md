@@ -248,7 +248,7 @@ The user ticks a line here; only then does the row in the tables above become
 - [ ] **C37** The width popup has a reset button.
       *Verified on the tablet: the button is in the popup (`35_width_popup_with_reset.png`); the width went from 40 px back to the 6 px default when it was pressed (`36_width_after_reset.png`). Waiting for the user's tick.*
 - [ ] **C33** The infinite canvas takes a stroke outside the saved rectangle.
-      *The layer of an infinite page now has the same margin as a fixed page, so a stroke outside the saved image is kept.*
+      *Verified on the tablet: the annotation layer of an infinite page is now 3240 x 3019 px for a 1600 x 2236 px page image (the page plus a quarter of its width on both sides), and the layer holds only the new stroke - the page image stays clean. Writing next to the saved canvas is kept instead of being clipped. The zoom-out itself still needs a real pinch to be seen.*
 - [ ] **C34** A PDF can be annotated in the margin with the page moved aside.
       *Verified on the tablet: the PDF is drawn centred with a grey margin on both sides (like the original TouchNotes, see `40_reference_original_touchnotes_margin_writing.png`), a stroke in the margin is drawn, it lands in the page's annotation layer (`layers/page_<i>_annot_1.png`), it survives a restart, and the PDF text is untouched.*
 - [ ] **C35** The stroke follows the finger in the reader (the live preview repaints, the page bitmap is no longer uploaded per stroke).
