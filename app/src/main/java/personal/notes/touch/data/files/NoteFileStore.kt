@@ -2,6 +2,7 @@ package personal.notes.touch.data.files
 
 import android.content.Context
 import android.net.Uri
+import personal.notes.touch.ui.canvas.LayerTileGrid
 import java.io.File
 
 class NoteFileStore(private val context: Context) {
@@ -121,13 +122,32 @@ class NoteFileStore(private val context: Context) {
             // images) belong to it: they go with it, or a new page at the
             // same index would inherit them.
             if (f.name.startsWith("page_${pageIndex}_layer_") && f.name.endsWith(".png")) f.delete()
-            // The annotation layers of the page (the writing of the user)
-            // and their metadata belong to it as well.
-            if (f.name.startsWith("page_${pageIndex}_annot_") &&
-                (f.name.endsWith(".png") || f.name.endsWith(".json"))
-            ) f.delete()
+            // The annotation layers of the page (the writing of the user),
+            // their tiles and their metadata belong to it as well: they go
+            // with it, or the layers of a deleted page would come back on the
+            // page that takes its place.
+            if (isAnnotationFileOfPage(f.name, pageIndex)) f.delete()
         }
         return if (file.exists()) file.delete() else true
+    }
+
+    /**
+     * True when a file of the layers folder belongs to the annotation layers
+     * of a page.
+     *
+     * The files of a page are `page_<i>_annot_<n>.png` (its layers),
+     * `page_<i>_annot_<n>_t<tx>_<ty>.png` (the tiles of a layer) and
+     * `page_<i>_annot.json` (the metadata of the page: the names of its
+     * layers and the layer the writing goes on).
+     *
+     * The metadata has no underscore behind "annot", so the prefix is
+     * matched WITHOUT it: the metadata of a page has to follow its page, or
+     * the layers of a deleted page come back on the page that takes its
+     * place.
+     */
+    private fun isAnnotationFileOfPage(name: String, pageIndex: Int): Boolean {
+        if (!name.startsWith("page_${pageIndex}_annot")) return false
+        return name.endsWith(".png") || name.endsWith(".json")
     }
 
     fun renamePageFile(noteId: String, oldIndex: Int, newIndex: Int): Boolean {
@@ -164,14 +184,14 @@ class NoteFileStore(private val context: Context) {
                 if (target.exists()) target.delete()
                 f.renameTo(target)
             }
-            // The annotation layers of the page (the writing of the user)
-            // and their metadata move with the page.
-            if (f.name.startsWith("page_${oldIndex}_annot_") &&
-                (f.name.endsWith(".png") || f.name.endsWith(".json"))
-            ) {
+            // The annotation layers of the page (the writing of the user),
+            // their tiles and their metadata move with the page. The metadata
+            // has no underscore behind "annot", so the prefix is matched
+            // without it: the metadata of a page has to follow its page.
+            if (isAnnotationFileOfPage(f.name, oldIndex)) {
                 val target = java.io.File(
                     layersDir,
-                    f.name.replace("page_${oldIndex}_annot_", "page_${newIndex}_annot_")
+                    f.name.replace("page_${oldIndex}_annot", "page_${newIndex}_annot")
                 )
                 if (target.exists()) target.delete()
                 f.renameTo(target)
@@ -226,6 +246,32 @@ class NoteFileStore(private val context: Context) {
      */
     fun getAnnotationMetaFile(noteId: String, pageIndex: Int): File =
         File(getLayersDir(noteId), "page_${pageIndex}_annot.json")
+
+    fun getAnnotationLayerOpsFile(noteId: String, pageIndex: Int, layerIndex: Int): File =
+        File(getLayersDir(noteId), "page_${pageIndex}_annot_${layerIndex}_ops.json")
+
+    /**
+     * The bitmap file of ONE tile of an annotation layer (C50).
+     *
+     * A layer that is cut into tiles has one PNG per tile:
+     * `page_<i>_annot_<n>_t<tx>_<ty>.png`. The name of the tile comes from
+     * the grid ([LayerTileGrid]), so the file store and the metadata always
+     * agree on it.
+     *
+     * The name keeps the prefix of the layer file (`page_<i>_annot_`), so
+     * the files of a page are found and moved with it.
+     */
+    fun getAnnotationLayerTileFile(
+        noteId: String,
+        pageIndex: Int,
+        layerIndex: Int,
+        tx: Int,
+        ty: Int
+    ): File =
+        File(
+            getLayersDir(noteId),
+            "page_${pageIndex}_annot_${layerIndex}_${LayerTileGrid.tileName(tx, ty)}.png"
+        )
 
     /** Workspace preferences (tab bar state, dock orientation) live beside the notes. */
     fun getUiPrefsFile(): File = File(context.filesDir, "ui_prefs.json")

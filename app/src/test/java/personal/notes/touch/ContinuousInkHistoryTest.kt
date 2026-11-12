@@ -36,8 +36,12 @@ class ContinuousInkHistoryTest {
         return s
     }
 
+    /**
+     * A patch of one tile: the tile (0, 0), a rectangle of 4 x 4 pixels
+     * inside it and the pixels before and after the wipe.
+     */
     private fun patch(): InkPatch =
-        InkPatch(0, 0, 4, 4, IntArray(16) { 1 }, IntArray(16) { 2 })
+        InkPatch(0, 0, 0, 0, 4, 4, IntArray(16) { 1 }, IntArray(16) { 2 })
 
     @Test
     fun committedStrokeStaysInTheListAndUndoTakesItOutAgain() {

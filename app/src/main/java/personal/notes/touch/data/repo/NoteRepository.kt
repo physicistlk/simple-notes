@@ -751,6 +751,118 @@ class NoteRepository(
         }
     }
 
+    /**
+     * Writes ONE tile of an annotation layer (C50).
+     *
+     * A layer that is cut into tiles has one PNG per tile: only the tiles
+     * that changed are written, so a save no longer encodes the whole
+     * layer. The note row is touched like every other write of a layer.
+     */
+    suspend fun savePageLayerTile(
+        noteId: String,
+        pageIndex: Int,
+        layerIndex: Int,
+        tx: Int,
+        ty: Int,
+        bitmap: android.graphics.Bitmap
+    ): Boolean = withContext(Dispatchers.IO) {
+        val file = fileStore.getAnnotationLayerTileFile(noteId, pageIndex, layerIndex, tx, ty)
+        val ok = personal.notes.touch.util.BitmapUtils.saveBitmapToPng(bitmap, file)
+        if (ok) {
+            try {
+                // A narrow touch: the whole row must not be written back,
+                // or the page the user is on would be lost.
+                noteDao.touchUpdatedAt(noteId, System.currentTimeMillis())
+            } catch (e: Exception) {
+                // Ignore if the note row is gone
+            }
+        }
+        ok
+    }
+
+    /**
+     * Reads the tiles of a layer back from the disk.
+     *
+     * The metadata says which tiles exist; every one of them is decoded
+     * with its alpha (ARGB_8888), so the ink keeps its transparency. The
+     * answer holds the place of the tile and its pixels.
+     *
+     * A layer without tile information (a legacy layer) has no tiles: the
+     * answer is empty and the layer is read from its full-size PNG.
+     */
+    suspend fun loadPageLayerTiles(
+        noteId: String,
+        pageIndex: Int,
+        layerIndex: Int,
+        meta: personal.notes.touch.ui.canvas.PageLayerMeta.LayerTilesInfo?
+    ): List<Pair<Pair<Int, Int>, android.graphics.Bitmap>> = withContext(Dispatchers.IO) {
+        val info = meta ?: return@withContext emptyList()
+        val out = mutableListOf<Pair<Pair<Int, Int>, android.graphics.Bitmap>>()
+        for (position in info.positions()) {
+            val file = fileStore.getAnnotationLayerTileFile(
+                noteId, pageIndex, layerIndex, position.first, position.second
+            )
+            val bitmap = personal.notes.touch.util.BitmapUtils.loadBitmapFromFile(file) ?: continue
+            out.add(Pair(position, bitmap))
+        }
+        out
+    }
+
+    internal suspend fun savePageLayerOps(
+        noteId: String,
+        pageIndex: Int,
+        layerIndex: Int,
+        ops: List<personal.notes.touch.ui.canvas.InkOp>
+    ): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val file = fileStore.getAnnotationLayerOpsFile(noteId, pageIndex, layerIndex)
+            file.parentFile?.mkdirs()
+            file.writeText(personal.notes.touch.ui.canvas.ContinuousOpCodec.encode(ops))
+            true
+        } catch (e: Exception) {
+            e.printStackTrace()
+            false
+        }
+    }
+
+    internal suspend fun loadPageLayerOps(
+        noteId: String,
+        pageIndex: Int,
+        layerIndex: Int
+    ): List<personal.notes.touch.ui.canvas.InkOp>? = withContext(Dispatchers.IO) {
+        val file = fileStore.getAnnotationLayerOpsFile(noteId, pageIndex, layerIndex)
+        if (!file.exists()) return@withContext null
+        personal.notes.touch.ui.canvas.ContinuousOpCodec.decode(file.readText())
+    }
+
+    internal suspend fun deletePageLayerOps(noteId: String, pageIndex: Int, layerIndex: Int): Boolean =
+        withContext(Dispatchers.IO) {
+            try {
+                fileStore.getAnnotationLayerOpsFile(noteId, pageIndex, layerIndex).delete()
+            } catch (e: Exception) {
+                false
+            }
+        }
+
+    /**
+     * Deletes the tile files of a layer (C50).
+     *
+     * The full-size PNG of the layer is not touched: it belongs to the
+     * legacy form of a layer.
+     */
+    suspend fun deletePageLayerTiles(noteId: String, pageIndex: Int, layerIndex: Int): Boolean =
+        withContext(Dispatchers.IO) {
+            val dir = fileStore.getLayersDir(noteId)
+            val prefix = "page_${pageIndex}_annot_${layerIndex}_t"
+            var ok = true
+            dir.listFiles()?.forEach { file ->
+                if (file.name.startsWith(prefix) && file.name.endsWith(".png")) {
+                    if (!file.delete()) ok = false
+                }
+            }
+            ok
+        }
+
     /** Persist the per-page paper pattern (PaperPattern.code) to the page row. */
     suspend fun savePagePattern(noteId: String, pageIndex: Int, patternCode: Int): Boolean = withContext(Dispatchers.IO) {
         try {

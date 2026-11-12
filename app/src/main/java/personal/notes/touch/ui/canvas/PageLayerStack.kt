@@ -191,6 +191,11 @@ class PageLayerStack {
  * holds the layers of the page (their number, their name and whether they
  * are visible) and the layer the writing goes on.
  *
+ * A layer that is cut into tiles (audit C50) says so as well: its size
+ * ("w", "h"), the size of a tile ("tile") and the tiles that exist
+ * ("tiles"). A layer without those fields is a **legacy layer**: one
+ * full-size PNG, no tile files. The old files keep reading.
+ *
  * The format is read and written by hand: `org.json` is not available in
  * the unit tests, and the round trip of the metadata is worth a test.
  */
@@ -199,8 +204,39 @@ object PageLayerMeta {
     /** The version of the format (a reader of an older file ignores it). */
     const val VERSION = 1
 
-    /** Writes the stack of a page as JSON. */
-    fun encode(stack: PageLayerStack): String {
+    /**
+     * The tile information of ONE layer (audit C50).
+     *
+     * A layer that is cut into tiles needs to say how big it is, how big a
+     * tile is and which tiles exist - then the reader knows which files to
+     * read and where their pixels belong.
+     *
+     * A layer that has no such information is a **legacy layer**: one
+     * full-size PNG (`page_<i>_annot_<n>.png`), no tile files at all.
+     */
+    data class LayerTilesInfo(
+        /** The width of the layer in pixels ("w"). */
+        val width: Int,
+        /** The height of the layer in pixels ("h"). */
+        val height: Int,
+        /** The size of a tile in pixels ("tile"). */
+        val tileSize: Int,
+        /** The names of the tiles that exist ("t0_0", "t1_0", ...). */
+        val tiles: List<String>
+    ) {
+        /** The places of the tiles that exist ("t0_0" becomes (0, 0)). */
+        fun positions(): List<Pair<Int, Int>> =
+            tiles.mapNotNull { LayerTileGrid.parseTileName(it) }
+    }
+
+    /**
+     * Writes the stack of a page as JSON.
+     *
+     * The tile information of the layers is optional: a layer without an
+     * entry in [tiles] is written the old way, so a file that is written
+     * today does not change.
+     */
+    fun encode(stack: PageLayerStack, tiles: Map<Int, LayerTilesInfo> = emptyMap()): String {
         val sb = StringBuilder()
         sb.append("{\"version\":").append(VERSION)
         sb.append(",\"current\":").append(stack.currentIndex)
@@ -210,6 +246,18 @@ object PageLayerMeta {
             sb.append("{\"index\":").append(layer.index)
             sb.append(",\"name\":\"").append(escape(layer.name)).append('"')
             sb.append(",\"visible\":").append(if (layer.visible) "true" else "false")
+            val info = tiles[layer.index]
+            if (info != null) {
+                sb.append(",\"w\":").append(info.width)
+                sb.append(",\"h\":").append(info.height)
+                sb.append(",\"tile\":").append(info.tileSize)
+                sb.append(",\"tiles\":[")
+                info.tiles.forEachIndexed { position2, name ->
+                    if (position2 > 0) sb.append(',')
+                    sb.append('"').append(escape(name)).append('"')
+                }
+                sb.append(']')
+            }
             sb.append('}')
         }
         sb.append("]}")
@@ -241,6 +289,40 @@ object PageLayerMeta {
         return stack
     }
 
+    /**
+     * Reads the tile information of the layers of a page back.
+     *
+     * The answer holds one entry per layer that HAS tile information: a
+     * layer that is not in it is a **legacy layer** (one full-size PNG, no
+     * tile files). A broken file gives an empty map - the caller then keeps
+     * the layers it has.
+     */
+    fun decodeTiles(text: String): Map<Int, LayerTilesInfo> {
+        val root = MiniJson.parse(text) as? Map<*, *> ?: return emptyMap()
+        val entries = root["layers"] as? List<*> ?: return emptyMap()
+        val out = LinkedHashMap<Int, LayerTilesInfo>()
+        for (entry in entries) {
+            val map = entry as? Map<*, *> ?: continue
+            val index = (map["index"] as? Number)?.toInt() ?: continue
+            // No "tiles" field: the layer is an old, full-size one.
+            val raw = map["tiles"] as? List<*> ?: continue
+            val names = raw.mapNotNull { it as? String }
+                .filter { LayerTileGrid.parseTileName(it) != null }
+            val width = (map["w"] as? Number)?.toInt() ?: 0
+            val height = (map["h"] as? Number)?.toInt() ?: 0
+            val tileSize = (map["tile"] as? Number)?.toInt() ?: LayerTileGrid.DEFAULT_TILE_SIZE
+            out[index] = LayerTilesInfo(width, height, tileSize, names)
+        }
+        return out
+    }
+
+    /**
+     * True when the layer has no tile information: it is a legacy layer
+     * (one full-size PNG, no tile files).
+     */
+    fun isLegacyLayer(tiles: Map<Int, LayerTilesInfo>, layerIndex: Int): Boolean =
+        !tiles.containsKey(layerIndex)
+
     private fun escape(text: String): String {
         val sb = StringBuilder()
         for (c in text) {
@@ -265,7 +347,7 @@ object PageLayerMeta {
  * strings, numbers, booleans and null) and nothing else - it is not a
  * general purpose parser, it is a small one that a unit test can check.
  */
-private object MiniJson {
+internal object MiniJson {
 
     /** Parses a JSON text; null when the text is broken. */
     fun parse(text: String): Any? {

@@ -83,18 +83,30 @@ class ContinuousStroke(
 /**
  * Pixel patch saved before a stroke so it can be undone (and redone).
  *
- * [target] is the bitmap the patch belongs to: a layer can hold more than
- * one bitmap (the pixels of a layer that was merged into it), and the undo
- * has to put the pixels back into the one it took them from.
+ * The layer is a grid of tiles, so a patch belongs to **one tile**: it holds
+ * the rectangle inside that tile (in the tile's own pixels) and the pixels
+ * before and after the wipe.
+ *
+ * [target] is the store the patch belongs to: a layer can hold more than
+ * one store (the tiles of a layer that was merged into it), and the undo has
+ * to put the pixels back into the one it took them from.
  */
 internal class InkPatch(
+    /** The column of the tile the patch belongs to. */
+    val tx: Int,
+    /** The row of the tile the patch belongs to. */
+    val ty: Int,
+    /** The left edge of the patch inside the tile. */
     val x: Int,
+    /** The top edge of the patch inside the tile. */
     val y: Int,
+    /** The width of the patch inside the tile. */
     val w: Int,
+    /** The height of the patch inside the tile. */
     val h: Int,
     val before: IntArray,
     var after: IntArray? = null,
-    val target: android.graphics.Bitmap? = null
+    val target: LayerTiles? = null
 ) {
     val bytes: Long get() = w.toLong() * h.toLong() * 4L * (if (after == null) 1 else 2)
 }
@@ -461,16 +473,59 @@ class ContinuousInkSession internal constructor(
     var stackLoaded: Boolean = false
 
     /**
-     * The pixels of every layer of the page.
+     * The tiles of every layer of the page.
      *
-     * A layer normally holds one bitmap (the layer file of the page); a
-     * layer that was merged into the base layer keeps its own bitmap, and
-     * the base layer draws it as part of itself.
+     * A layer normally holds one store of tiles (the layer file of the page
+     * cut into tiles); a layer that was merged into the base layer keeps its
+     * own store, and the base layer draws it as part of itself.
+     *
+     * Only the tiles that carry ink are in memory: an empty layer costs
+     * nothing at all (audit C50).
      */
-    internal val layerInk = mutableMapOf<PageLayer, MutableList<Bitmap>>()
+    internal val layerTiles = mutableMapOf<PageLayer, LayerTiles>()
+
+    /**
+     * The layers whose file could not be read.
+     *
+     * The file of such a layer must not be written and must not be deleted:
+     * the writing of the user is in that file, and the session simply does
+     * not have it in memory (the decode failed, most likely because the
+     * layer is big). Writing an empty layer over it would destroy it.
+     */
+    internal val unreadableLayers = mutableSetOf<Int>()
 
     /** The layers that were merged into a layer (only the base layer). */
     internal val merged = mutableMapOf<PageLayer, MutableList<PageLayer>>()
+
+    /**
+     * Bumped whenever the pixels of the tiles change.
+     *
+     * The small copy the glass samples is built from the tiles, so it has to
+     * be built again when they change.
+     */
+    internal var tilesRevision: Int = 0
+
+    /**
+     * The small copy of the layer the glass samples.
+     *
+     * The glass wants the writing of the layer under the dock, and the layer
+     * is a grid of tiles now - so the tiles are composed into one small
+     * bitmap (a quarter of the size of the layer: the glass reads the page
+     * at that resolution anyway).
+     */
+    internal var glassBitmap: Bitmap? = null
+
+    /** The tiles revision the glass copy was built from. */
+    internal var glassRevision: Int = -1
+
+    /** The layer the glass copy belongs to. */
+    internal var glassLayer: PageLayer? = null
+
+    /** True while a new glass copy is being built (the old one is used). */
+    internal var glassPending: Boolean = false
+
+    /** The layer the copy that is being built belongs to. */
+    internal var glassPendingLayer: PageLayer? = null
 
     internal var background: Bitmap? = null
     internal var backgroundWidth: Int = 0
@@ -487,19 +542,24 @@ class ContinuousInkSession internal constructor(
     val currentLayer: PageLayer? get() = stack.current
 
     /**
-     * The pixels of the current layer (null when the layer is empty).
+     * The tiles of a layer: its own and the ones of the layers that were
+     * merged into it.
+     *
+     * Every placement knows where its tiles live in the layer's pixels, so
+     * the drawing code can put each tile where it belongs.
      */
-    internal val ink: Bitmap? get() = stack.current?.let { layerInk[it]?.firstOrNull() }
-
-    /**
-     * Every bitmap of a layer: its own pixels and the pixels of the layers
-     * that were merged into it.
-     */
-    fun bitmapsOf(layer: PageLayer): List<Bitmap> {
-        val own = layerInk[layer].orEmpty()
-        val folded = merged[layer].orEmpty().flatMap { layerInk[it].orEmpty() }
+    fun tilesOf(layer: PageLayer): List<LayerTilePlacement> {
+        val own = layerTiles[layer]?.let { listOf(LayerTilePlacement(it, it.grid)) }.orEmpty()
+        val folded = merged[layer].orEmpty().mapNotNull { other ->
+            layerTiles[other]?.let { LayerTilePlacement(it, it.grid) }
+        }
         return own + folded
     }
+
+    /**
+     * The size of a tile of the layer, in pixels.
+     */
+    var tileSize: Int = LayerTileGrid.DEFAULT_TILE_SIZE
 
     /**
      * The size of the page box the strokes are normalised to, and the
@@ -527,11 +587,12 @@ class ContinuousInkSession internal constructor(
     internal val pending = mutableListOf<ContinuousStroke>()
 
     /**
-     * Guards the ink bitmap.
+     * Guards the pixels of the tiles.
      *
-     * The eraser clears pixels in it on the main thread, and the save takes a
-     * copy of it for the encoder - a copy of a 40 MB layer must not happen on
-     * the main thread, it blocks the pen for tens of milliseconds.
+     * The eraser clears pixels in them on the main thread, and the save
+     * takes a copy of them for the encoder - a copy of the whole layer must
+     * not happen on the main thread, it blocks the pen for tens of
+     * milliseconds.
      */
     internal val inkLock = Any()
 
@@ -947,36 +1008,103 @@ class ContinuousInkController(
                     // The pixels of every layer: the persisted form of the
                     // writing. The page image itself is never touched by a
                     // stroke.
-                    val inks = LinkedHashMap<PageLayer, MutableList<Bitmap>>()
+                    //
+                    // The layer file is still ONE bitmap (the old format), so
+                    // it is cut into tiles here and the big bitmap is given
+                    // back: the session holds the tiles, not the whole layer
+                    // (audit C50).
+                    // Read the tile information of the layers from
+                    // the metadata.
+                    val tilesInfo = PageLayerMeta.decodeTiles(
+                        try {
+                            val f = repository.fileStore.getAnnotationMetaFile(noteId, s.pageIndex)
+                            if (f.exists()) f.readText() else ""
+                        } catch (e: Exception) {
+                            ""
+                        }
+                    )
+                    val stores = LinkedHashMap<PageLayer, LayerTiles>()
                     var loadedHeight = 0
                     for (layer in stack.layers) {
-                        val file = repository.fileStore.getAnnotationLayerFile(
-                            noteId, s.pageIndex, layer.index
-                        )
-                        val stored = personal.notes.touch.util.BitmapUtils.loadBitmapFromFile(file)
-                        if (stored == null) continue
-                        val bitmap = if (stored.width == s.inkWidth && stored.height == s.inkHeight) {
-                            mutableCopy(stored)
+                        val info = tilesInfo[layer.index]
+                        val store: LayerTiles?
+                        if (info != null && info.tiles.isNotEmpty()) {
+                            // Tiled layer: read the tile files.
+                            val grid = LayerTileGrid(info.width, info.height, info.tileSize)
+                            val t = LayerTiles(grid)
+                            val loaded = try {
+                                repository.loadPageLayerTiles(noteId, s.pageIndex, layer.index, info)
+                            } catch (e: Exception) {
+                                e.printStackTrace()
+                                emptyList()
+                            }
+                            for ((pos, bitmap) in loaded) {
+                                val (tx, ty) = pos
+                                if (tx < 0 || ty < 0 || tx >= grid.columns || ty >= grid.rows) continue
+                                if (bitmap.isRecycled) continue
+                                val tile = t.requireTile(tx, ty)
+                                val canvas = Canvas(tile)
+                                canvas.drawBitmap(bitmap, 0f, 0f, null)
+                                bitmap.recycle()
+                            }
+                            for (tx in 0 until grid.columns) {
+                                for (ty in 0 until grid.rows) {
+                                    t.releaseIfEmpty(tx, ty)
+                                }
+                            }
+                            store = t
+                            loadedHeight = max(loadedHeight, info.height)
+                            s.unreadableLayers.remove(layer.index)
                         } else {
-                            // The layer was written with another size (the
-                            // page changed): the page part of it lands on the
-                            // page part of the new layer, the margins are
-                            // added.
-                            fitLayer(stored, s.inkWidth, s.inkHeight)
+                            // Legacy layer: one full-size PNG. Decode it and
+                            // split it into tiles.
+                            val file = repository.fileStore.getAnnotationLayerFile(
+                                noteId, s.pageIndex, layer.index
+                            )
+                            val stored = decodeLayerBitmap(file)
+                            if (stored == null) {
+                                if (file.exists()) s.unreadableLayers.add(layer.index)
+                                continue
+                            }
+                            s.unreadableLayers.remove(layer.index)
+                            val bitmap = if (stored.width == s.inkWidth && stored.height == s.inkHeight) {
+                                stored
+                            } else {
+                                fitLayer(stored, s.inkWidth, s.inkHeight)
+                            }
+                            loadedHeight = max(loadedHeight, bitmap.height)
+                            store = tilesFromBitmap(s, bitmap)
+                            if (!bitmap.isRecycled) bitmap.recycle()
                         }
-                        loadedHeight = max(loadedHeight, bitmap.height)
-                        inks[layer] = mutableListOf(bitmap)
+                        stores[layer] = store
+                        // Read the ops of the layer (the strokes and the erases
+                        // as vectors). They are drawn on top of the tiles.
+                        val ops = try {
+                            repository.loadPageLayerOps(noteId, s.pageIndex, layer.index)
+                        } catch (e: Exception) {
+                            null
+                        }
+                        if (ops != null) {
+                            for (op in ops) {
+                                when (op) {
+                                    is InkOp.Stroke -> op.layer = layer
+                                    is InkOp.Erase -> op.layer = layer
+                                }
+                            }
+                            s.history.ops.addAll(ops)
+                        }
                     }
-                    LoadedLayers(stack, inks, loadedHeight)
+                    LoadedLayers(stack, stores, loadedHeight)
                 }
                 if (session !== s) {
-                    loaded.inks.values.forEach { list -> list.forEach { it.recycle() } }
+                    loaded.stores.values.forEach { store -> store.release() }
                     return@launch
                 }
                 s.stack.load(loaded.stack.layers, loaded.stack.currentIndex)
                 s.stackLoaded = true
-                s.layerInk.clear()
-                s.layerInk.putAll(loaded.inks)
+                s.layerTiles.clear()
+                s.layerTiles.putAll(loaded.stores)
+                s.tilesRevision++
                 if (loaded.height > 0) {
                     s.inkHeight = loaded.height
                     if (loaded.stack.layers.isNotEmpty() && !s.isVector && s.pageRatio <= 0f) {
@@ -1003,6 +1131,9 @@ class ContinuousInkController(
                 for (stroke in queued) commit(s, stroke, stroke.autoShapeEnabled)
                 s.ready = true
                 if (s.dirty) scheduleSave(s)
+                // The glass wants the writing of the layer: its copy is built
+                // in the background, so it is there when the dock is drawn.
+                scheduleGlassCopy(s)
                 onUndoRedoChanged(s.canUndo, s.canRedo)
                 revision++
                 layersRevision++
@@ -1015,9 +1146,78 @@ class ContinuousInkController(
     /** The layers of a page and their pixels, as they were read from the disk. */
     private class LoadedLayers(
         val stack: PageLayerStack,
-        val inks: Map<PageLayer, MutableList<Bitmap>>,
+        val stores: Map<PageLayer, LayerTiles>,
         val height: Int
     )
+
+    /**
+     * Decodes the layer file of a page.
+     *
+     * The bitmap is decoded as it is - it is not copied into a mutable one:
+     * the tiles of the layer are mutable, so the big bitmap is only read and
+     * given back right away. A copy of it would be 80 MB of memory for
+     * nothing.
+     */
+    private fun decodeLayerBitmap(file: java.io.File): Bitmap? {
+        return try {
+            if (!file.exists()) return null
+            val options = android.graphics.BitmapFactory.Options().apply {
+                inPreferredConfig = android.graphics.Bitmap.Config.ARGB_8888
+            }
+            android.graphics.BitmapFactory.decodeFile(file.absolutePath, options)
+        } catch (e: Exception) {
+            e.printStackTrace()
+            null
+        }
+    }
+
+    /**
+     * Cuts a layer bitmap into the tiles of the layer.
+     *
+     * The layer file is still one bitmap (the old format), so it is read
+     * once and cut into tiles here: only the tiles that hold ink stay in
+     * memory, the empty ones are given back at once. The bitmap itself is
+     * released by the caller - the session must not hold 80 MB.
+     */
+    private fun tilesFromBitmap(s: ContinuousInkSession, source: Bitmap): LayerTiles {
+        val grid = LayerTileGrid(s.inkWidth, s.inkHeight, s.tileSize)
+        val store = LayerTiles(grid)
+        val paint = Paint(Paint.FILTER_BITMAP_FLAG)
+        for (ty in 0 until grid.rows) {
+            for (tx in 0 until grid.columns) {
+                val left = grid.tileLeft(tx)
+                val top = grid.tileTop(ty)
+                val width = grid.tileWidth(tx)
+                val height = grid.tileHeight(ty)
+                if (width <= 0 || height <= 0) continue
+                // The part of the tile the source covers (the source can be
+                // smaller than the layer).
+                val sx = max(0, left)
+                val sy = max(0, top)
+                val ex = min(source.width, left + width)
+                val ey = min(source.height, top + height)
+                if (ex <= sx || ey <= sy) continue
+                val tile = store.requireTile(tx, ty)
+                if (tile.isRecycled) continue
+                val canvas = Canvas(tile)
+                canvas.drawBitmap(
+                    source,
+                    Rect(sx, sy, ex, ey),
+                    RectF(
+                        (sx - left).toFloat(),
+                        (sy - top).toFloat(),
+                        (ex - left).toFloat(),
+                        (ey - top).toFloat()
+                    ),
+                    paint
+                )
+                // A tile without ink costs nothing: it goes back to the
+                // system right away.
+                store.releaseIfEmpty(tx, ty)
+            }
+        }
+        return store
+    }
 
     /**
      * The layer stack of a page as it is on the disk.
@@ -1171,71 +1371,85 @@ class ContinuousInkController(
      *
      * The eraser only touches the layer the writing goes on: the other
      * layers of the page keep their writing.
+     *
+     * The layer is a grid of tiles, so the wipe happens tile by tile: every
+     * tile the stroke touches gets its own patch (the rectangle inside that
+     * tile and the pixels before and after), and a tile that holds nothing
+     * any more is given back to the system.
      */
     private fun commitErase(s: ContinuousInkSession, stroke: ContinuousStroke) {
         val layer = s.stack.current ?: return
         val bounds = strokeBoundsInInk(stroke, s) ?: return
         val patches = mutableListOf<InkPatch>()
-        for (ink in s.bitmapsOf(layer)) {
-            if (ink.isRecycled) continue
-            // A Canvas needs a mutable bitmap. The ink layer is mutable, but
-            // if it ever is not, the erase must not take the app down: the
-            // copy takes its place.
-            var target = ink
-            if (!ink.isMutable) {
-                val mutable = ink.copy(Bitmap.Config.ARGB_8888, true) ?: continue
-                replaceBitmap(s, layer, ink, mutable)
-                target = mutable
+        for (placement in s.tilesOf(layer)) {
+            val store = placement.tiles
+            val grid = placement.grid
+            val touched = grid.tilesForRect(bounds.left, bounds.top, bounds.right, bounds.bottom)
+            for (index in touched) {
+                val tx = grid.tileColumn(index)
+                val ty = grid.tileRow(index)
+                if (tx < 0 || ty < 0) continue
+                // Nothing to wipe in a tile that does not exist: it is not
+                // created just to be emptied again.
+                val tile = store.tile(tx, ty) ?: continue
+                if (tile.isRecycled) continue
+                val rect = LayerTilePatch.rectInTile(
+                    grid, tx, ty, bounds.left, bounds.top, bounds.right, bounds.bottom
+                ) ?: continue
+                val before = capture(tile, Rect(rect[0], rect[1], rect[2], rect[3])) ?: continue
+                val after: IntArray?
+                synchronized(s.inkLock) {
+                    val canvas = Canvas(tile)
+                    drawEraseInTile(canvas, s, stroke, grid, tx, ty)
+                    after = capture(tile, Rect(rect[0], rect[1], rect[2], rect[3]))
+                }
+                patches.add(
+                    InkPatch(
+                        tx, ty,
+                        rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1],
+                        before, after, store
+                    )
+                )
+                // A tile without ink costs nothing: it goes back to the
+                // system right away.
+                store.releaseIfEmpty(tx, ty)
             }
-            val patch = snapshot(target, bounds, target) ?: continue
-            synchronized(s.inkLock) {
-                val canvas = Canvas(target)
-                drawStrokeInInk(canvas, s, stroke)
-                patch.after = capture(target, bounds)
-            }
-            patches.add(patch)
         }
         val op = InkOp.Erase(stroke, patches, layer)
         s.history.commit(op)
         trimUndo(s)
         s.dirty = true
-        // The erase changed the ink bitmap, so the reader has to redraw it:
+        s.tilesRevision++
+        scheduleGlassCopy(s)
+        // The erase changed the tiles, so the reader has to redraw them:
         // without this the wiped stroke stayed on the screen until something
         // else invalidated the page.
         revision++
     }
 
     /**
-     * Swaps an immutable bitmap of a layer for a mutable copy of it.
+     * Draws an eraser stroke into ONE tile of a layer.
      *
-     * The eraser needs a mutable bitmap to clear pixels in; the copy takes
-     * the place of the old one, so the layer keeps its pixels.
+     * The stroke is drawn in the layer's pixel space; the tile has its own
+     * origin, so the canvas is moved by it: the part of the stroke that lies
+     * in the tile is wiped and the rest of it falls outside the tile.
      */
-    private fun replaceBitmap(s: ContinuousInkSession, layer: PageLayer, old: Bitmap, fresh: Bitmap) {
-        val own = s.layerInk[layer] ?: return
-        val index = own.indexOfFirst { it === old }
-        if (index >= 0) own[index] = fresh
-        s.merged[layer].orEmpty().forEach { other ->
-            val list = s.layerInk[other] ?: return@forEach
-            val at = list.indexOfFirst { it === old }
-            if (at >= 0) list[at] = fresh
-        }
-    }
-
-    /**
-     * Draws a stroke into the annotation layer (the layer's pixel space).
-     *
-     * The strokes are normalised to the box and the layer lives in its own
-     * pixels, so the canvas is scaled and moved: the normalised coordinates
-     * land on the layer (a stroke in the margin lands in the margin of the
-     * layer, not on the page).
-     */
-    private fun drawStrokeInInk(canvas: Canvas, s: ContinuousInkSession, stroke: ContinuousStroke) {
+    private fun drawEraseInTile(
+        canvas: Canvas,
+        s: ContinuousInkSession,
+        stroke: ContinuousStroke,
+        grid: LayerTileGrid,
+        tx: Int,
+        ty: Int
+    ) {
         val rect = s.layerRectInBox
         if (rect.empty) return
         val sx = s.inkWidth / rect.width
         val sy = s.inkHeight / rect.height
         val save = canvas.save()
+        // The order matters: the tile's origin first (in layer pixels), then
+        // the box -> layer mapping.
+        canvas.translate(-grid.tileLeft(tx).toFloat(), -grid.tileTop(ty).toFloat())
         canvas.scale(sx, sy)
         canvas.translate(-rect.left, -rect.top)
         drawStroke(canvas, stroke, 1f, 1f, preview = false)
@@ -1331,60 +1545,114 @@ class ContinuousInkController(
     private fun applyLayerAction(s: ContinuousInkSession, action: InkAction, restored: Boolean) {
         when (action) {
             is InkAction.RemoveLayer -> {
-                if (!action.merged) return
-                val base = s.stack.layerAt(PageLayerStack.BASE_LAYER_INDEX) ?: return
-                val folded = s.merged.getOrPut(base) { mutableListOf() }
-                if (restored) {
-                    folded.removeAll { it === action.layer }
-                } else if (!folded.any { it === action.layer }) {
-                    folded.add(action.layer)
+                // A deleted layer keeps its tiles (the undo brings the
+                // writing back); a merged one is folded into the base layer.
+                if (action.merged) {
+                    val base = s.stack.layerAt(PageLayerStack.BASE_LAYER_INDEX)
+                    if (base != null) {
+                        val folded = s.merged.getOrPut(base) { mutableListOf() }
+                        if (restored) {
+                            folded.removeAll { it === action.layer }
+                        } else if (!folded.any { it === action.layer }) {
+                            folded.add(action.layer)
+                        }
+                    }
                 }
             }
             is InkAction.AddLayer -> {
-                s.layerInk.remove(action.layer)
+                s.layerTiles.remove(action.layer)
                 s.merged.values.forEach { list -> list.removeAll { it === action.layer } }
             }
             else -> {}
         }
+        // The layers of the page changed: the glass shows the writing of the
+        // current one.
+        s.tilesRevision++
+        scheduleGlassCopy(s)
     }
 
     /**
      * Puts the pixels of an eraser back (undo) or wipes them again (redo).
      *
-     * Every patch knows the bitmap it belongs to: a layer can hold more than
-     * one bitmap (the pixels of a layer that was merged into it).
+     * Every patch knows the store and the tile it belongs to: a layer can
+     * hold more than one store (the tiles of a layer that was merged into
+     * it).
      */
     private fun restoreErase(s: ContinuousInkSession, op: InkOp.Erase, restore: Boolean) {
         synchronized(s.inkLock) {
             op.patches.forEach { patch ->
-                val ink = patch.target ?: return@forEach
-                if (ink.isRecycled) return@forEach
-                restore(ink, patch, useAfter = !restore)
+                val store = patch.target ?: return@forEach
+                restorePatch(store, patch, useAfter = !restore)
             }
         }
+        s.tilesRevision++
+        scheduleGlassCopy(s)
     }
 
     /**
      * Puts the ink of a cleared layer back (undo) or wipes it again (redo).
      *
      * The layer holds the writing of the page (also the notes in the
-     * margin), so it goes with it. Every patch knows the bitmap it belongs
-     * to, so the ink of the right layer comes back.
+     * margin), so it goes with it. Every patch knows the store and the tile
+     * it belongs to, so the ink of the right layer comes back.
      */
     private fun restoreClear(s: ContinuousInkSession, patches: List<InkPatch>, restore: Boolean) {
         synchronized(s.inkLock) {
             if (restore) {
                 patches.forEach { patch ->
-                    val ink = patch.target ?: return@forEach
-                    if (!ink.isRecycled) restore(ink, patch, useAfter = false)
+                    val store = patch.target ?: return@forEach
+                    restorePatch(store, patch, useAfter = false)
                 }
             } else {
                 patches.forEach { patch ->
-                    val ink = patch.target ?: return@forEach
-                    if (!ink.isRecycled) ink.eraseColor(android.graphics.Color.TRANSPARENT)
+                    val store = patch.target ?: return@forEach
+                    val tile = store.tile(patch.tx, patch.ty) ?: return@forEach
+                    if (tile.isRecycled) return@forEach
+                    tile.eraseColor(android.graphics.Color.TRANSPARENT)
+                    store.markDirty(patch.tx, patch.ty)
+                    store.releaseIfEmpty(patch.tx, patch.ty)
                 }
             }
         }
+        s.tilesRevision++
+        scheduleGlassCopy(s)
+    }
+
+    /**
+     * Puts the pixels of a patch back into its tile (or wipes them again).
+     *
+     * The patch holds the rectangle inside the tile and the pixels before
+     * and after the wipe. A tile that was emptied by the wipe is not there
+     * any more, so it is created again for the pixels that go back into it.
+     */
+    private fun restorePatch(store: LayerTiles, patch: InkPatch, useAfter: Boolean) {
+        val pixels = if (useAfter) patch.after else patch.before
+        if (pixels == null) {
+            // Nothing to put back: the wipe is done again with CLEAR.
+            if (useAfter) {
+                // The patch holds the rectangle inside the tile; the store
+                // wants it in the layer's pixels.
+                val originX = store.grid.tileLeft(patch.tx)
+                val originY = store.grid.tileTop(patch.ty)
+                store.eraseRect(
+                    originX + patch.x,
+                    originY + patch.y,
+                    originX + patch.x + patch.w,
+                    originY + patch.y + patch.h
+                )
+            }
+            return
+        }
+        val tile = store.requireTile(patch.tx, patch.ty)
+        if (tile.isRecycled) return
+        try {
+            tile.setPixels(pixels, 0, patch.w, patch.x, patch.y, patch.w, patch.h)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        store.markDirty(patch.tx, patch.ty)
+        // A tile without ink costs nothing: it goes back to the system.
+        store.releaseIfEmpty(patch.tx, patch.ty)
     }
 
     /** Clears in-place ink on a specific page, supporting undo. */
@@ -1435,19 +1703,41 @@ class ContinuousInkController(
      *
      * Only the layer the writing goes on is cleared: the other layers of the
      * page keep their writing. The undo brings the ink and the strokes back.
+     *
+     * The layer is a grid of tiles, so every tile is cleared on its own and
+     * gets its own patch: the undo puts the pixels of each tile back.
      */
     private fun clearSession(s: ContinuousInkSession): Boolean {
         val layer = s.stack.current ?: return false
-        val bitmaps = s.bitmapsOf(layer)
+        val placements = s.tilesOf(layer)
         val layerOps = s.history.ops.filter { it.layer === layer }
-        if (bitmaps.isEmpty() && layerOps.isEmpty()) return false
+        val hasInk = placements.any { !it.tiles.isEmpty() }
+        if (!hasInk && layerOps.isEmpty()) return false
         val patches = mutableListOf<InkPatch>()
-        bitmaps.forEach { ink ->
-            if (ink.isRecycled) return@forEach
-            val contentBounds = findContentBounds(ink)
-            val patch = if (contentBounds != null) snapshot(ink, contentBounds, ink) else null
-            synchronized(s.inkLock) { ink.eraseColor(android.graphics.Color.TRANSPARENT) }
-            if (patch != null) patches.add(patch)
+        for (placement in placements) {
+            val store = placement.tiles
+            val grid = placement.grid
+            for (index in store.existingTiles()) {
+                val tx = grid.tileColumn(index)
+                val ty = grid.tileRow(index)
+                if (tx < 0 || ty < 0) continue
+                val tile = store.tile(tx, ty) ?: continue
+                if (tile.isRecycled) continue
+                val contentBounds = findContentBounds(tile) ?: continue
+                val before = capture(tile, contentBounds) ?: continue
+                synchronized(s.inkLock) { tile.eraseColor(android.graphics.Color.TRANSPARENT) }
+                patches.add(
+                    InkPatch(
+                        tx, ty,
+                        contentBounds.left, contentBounds.top,
+                        contentBounds.width(), contentBounds.height(),
+                        before, null, store
+                    )
+                )
+                // A tile without ink costs nothing: it goes back to the
+                // system right away.
+                store.releaseIfEmpty(tx, ty)
+            }
         }
         // The strokes of this layer go away with its ink; the undo keeps
         // both, so the clear can be taken back.
@@ -1458,6 +1748,8 @@ class ContinuousInkController(
         s.history.commitClear(patches, removed)
         trimUndo(s)
         s.dirty = true
+        s.tilesRevision++
+        scheduleGlassCopy(s)
         scheduleSave(s)
         revision++
         onUndoRedoChanged(s.canUndo, s.canRedo)
@@ -1555,40 +1847,6 @@ class ContinuousInkController(
         }
     }
 
-    private fun snapshot(bitmap: Bitmap, r: Rect, target: Bitmap? = null): InkPatch? {
-        val before = capture(bitmap, r) ?: return null
-        return InkPatch(r.left, r.top, r.width(), r.height(), before, null, target)
-    }
-
-    private fun restore(bitmap: Bitmap, patch: InkPatch, useAfter: Boolean) {
-        val pixels = if (useAfter) patch.after else patch.before
-        if (pixels == null) {
-            if (useAfter) {
-                try {
-                    val c = Canvas(bitmap)
-                    val p = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.CLEAR) }
-                    c.drawRect(
-                        RectF(
-                            patch.x.toFloat(),
-                            patch.y.toFloat(),
-                            (patch.x + patch.w).toFloat(),
-                            (patch.y + patch.h).toFloat()
-                        ),
-                        p
-                    )
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                }
-            }
-            return
-        }
-        try {
-            bitmap.setPixels(pixels, 0, patch.w, patch.x, patch.y, patch.w, patch.h)
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-    }
-
     /** Bounds of what a stroke touches, in layer pixels, clamped to the layer. */
     private fun strokeBoundsInInk(stroke: ContinuousStroke, s: ContinuousInkSession): Rect? {
         val rect = s.layerRectInBox
@@ -1637,49 +1895,97 @@ class ContinuousInkController(
         // The page is only "clean" when the write actually succeeded: a
         // failed write must stay dirty so the next save tries again.
         s.dirty = false
-        // Every layer of the page is written to its own file, and the stack
-        // (the layers, their names and the current one) goes to the metadata
-        // file of the page.
+        // Every layer of the page is written to its own files: the tiles
+        // (one PNG per tile, only the ones that changed) and the ops (the
+        // strokes and the erases as vectors). The stack (the layers, their
+        // names and the current one) goes to the metadata file of the page.
         for (layer in s.stack.layers) {
-            // The layer is composed off the main thread. It is NOT copied
-            // first: a copy of the layer (the page plus a page width of
-            // margin on each side) is tens of megabytes of garbage per save,
-            // and the garbage is what made the pen lag and killed the eraser
-            // on a big drawing. The strokes are drawn into the layer as
-            // vectors, so the layer only changes when the eraser wipes
-            // something - the lock keeps that from tearing the file.
-            val copy = try {
-                withContext(Dispatchers.IO) { composeLayer(s, layer) }
-            } catch (e: OutOfMemoryError) {
-                e.printStackTrace()
+            if (s.unreadableLayers.contains(layer.index)) {
+                // The file of this layer could not be read: writing it now
+                // would replace the writing of the user with an empty layer.
+                // The file stays as it is.
                 s.dirty = true
-                return
-            } ?: run { s.dirty = true; return }
-            if (copy == null) {
-                // The layer is empty: the file of an earlier life of it
-                // goes away, or the layer would come back with the writing
-                // it had before.
-                withContext(Dispatchers.IO) {
-                    repository.fileStore.getAnnotationLayerFile(
-                        noteId, s.pageIndex, layer.index
-                    ).delete()
-                }
+                android.util.Log.w(
+                    "TouchNotes",
+                    "Layer ${layer.index} of page ${s.pageIndex} could not be read - not saved"
+                )
                 continue
             }
-            val ok = withContext(Dispatchers.IO) {
-                repository.savePageLayer(noteId, s.pageIndex, layer.index, copy)
+            val store = s.layerTiles[layer]
+            // Write the tiles that changed: each tile is already a small
+            // bitmap in memory, so this is cheap (no 80 MB allocation, no
+            // full-size PNG encode).
+            if (store != null) {
+                for (index in store.dirtyTiles()) {
+                    val tx = store.grid.tileColumn(index)
+                    val ty = store.grid.tileRow(index)
+                    if (tx < 0 || ty < 0) continue
+                    val bitmap = store.tile(tx, ty)
+                    if (bitmap != null && !bitmap.isRecycled) {
+                        val ok = withContext(Dispatchers.IO) {
+                            repository.savePageLayerTile(
+                                noteId, s.pageIndex, layer.index, tx, ty, bitmap
+                            )
+                        }
+                        if (!ok) {
+                            s.dirty = true
+                            android.util.Log.w(
+                                "TouchNotes",
+                                "Could not save tile $tx,$ty of layer ${layer.index}"
+                            )
+                        }
+                    } else {
+                        // The tile was released (the eraser emptied it): its
+                        // file must go, or the old writing would come back.
+                        withContext(Dispatchers.IO) {
+                            repository.fileStore.getAnnotationLayerTileFile(
+                                noteId, s.pageIndex, layer.index, tx, ty
+                            ).delete()
+                        }
+                    }
+                }
+                store.markClean()
             }
-            copy.recycle()
+            // Write the ops of the layer (the strokes and the erases as
+            // vectors). Only the ops of this layer are written.
+            val ops = s.history.ops.filter { it.layer === layer }
+            val ok = withContext(Dispatchers.IO) {
+                repository.savePageLayerOps(noteId, s.pageIndex, layer.index, ops)
+            }
             if (!ok) {
-                // The write failed: keep the session dirty so the next
-                // autosave or the flush on exit tries again.
                 s.dirty = true
-                android.util.Log.w("TouchNotes", "Could not save page ${s.pageIndex}")
-                return
+                android.util.Log.w("TouchNotes", "Could not save ops of layer ${layer.index}")
+            }
+            // The migration: a legacy layer (one full-size PNG) is now
+            // stored as tiles + ops. The legacy PNG goes away, but only
+            // after the new files are written.
+            withContext(Dispatchers.IO) {
+                val legacyFile = repository.fileStore.getAnnotationLayerFile(
+                    noteId, s.pageIndex, layer.index
+                )
+                if (legacyFile.exists() && store != null && store.existingTiles().isNotEmpty()) {
+                    // The tiles are already on the disk (written above); the
+                    // legacy PNG is no longer needed.
+                    legacyFile.delete()
+                }
             }
         }
+        // The metadata of the page: the stack and the tile information of
+        // every layer.
+        val tilesInfo = s.stack.layers.associate { layer ->
+            val store = s.layerTiles[layer]
+            val grid = store?.grid ?: LayerTileGrid(s.inkWidth, s.inkHeight)
+            layer.index to PageLayerMeta.LayerTilesInfo(
+                s.inkWidth, s.inkHeight, grid.tileSize,
+                store?.existingTiles()?.map { index ->
+                    grid.tileName(grid.tileColumn(index), grid.tileRow(index))
+                } ?: emptyList()
+            )
+        }
         withContext(Dispatchers.IO) {
-            repository.savePageLayerMeta(noteId, s.pageIndex, PageLayerMeta.encode(s.stack))
+            repository.savePageLayerMeta(
+                noteId, s.pageIndex, PageLayerMeta.encode(s.stack, tilesInfo)
+            )
             deleteStaleLayerFiles(s)
         }
         storedStacks[s.pageIndex] = s.stack
@@ -1696,17 +2002,30 @@ class ContinuousInkController(
      * land on the layer - a stroke in the margin lands in the margin of the
      * layer and never on the page image.
      *
+     * The pixels of the layer are the tiles: every tile is drawn at its own
+     * place in the layer, so the result is the same picture as the one the
+     * old single bitmap produced.
+     *
      * Returns null when the layer is empty (nothing to write).
      */
     private fun composeLayer(s: ContinuousInkSession, layer: PageLayer): Bitmap? {
-        val pixels = s.bitmapsOf(layer)
+        val placements = s.tilesOf(layer)
         val ops = s.history.ops.filter { it.layer === layer }
-        if (pixels.isEmpty() && ops.isEmpty()) return null
+        val hasTiles = placements.any { it.tiles.existingTiles().isNotEmpty() }
+        if (!hasTiles && ops.isEmpty()) return null
         val target = Bitmap.createBitmap(s.inkWidth, s.inkHeight, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(target)
         val paint = Paint(Paint.FILTER_BITMAP_FLAG)
-        pixels.forEach { bitmap ->
-            if (!bitmap.isRecycled) canvas.drawBitmap(bitmap, 0f, 0f, paint)
+        for (placement in placements) {
+            val grid = placement.grid
+            for (index in placement.tiles.existingTiles()) {
+                val tx = grid.tileColumn(index)
+                val ty = grid.tileRow(index)
+                if (tx < 0 || ty < 0) continue
+                val bitmap = placement.tiles.tile(tx, ty) ?: continue
+                if (bitmap.isRecycled) continue
+                canvas.drawBitmap(bitmap, grid.tileLeft(tx).toFloat(), grid.tileTop(ty).toFloat(), paint)
+            }
         }
         drawOps(canvas, s, ops)
         return target
@@ -1907,12 +2226,15 @@ class ContinuousInkController(
     }
 
     private fun releaseBitmaps(s: ContinuousInkSession) {
-        // Do not call .recycle() on the layers or the background: they may
+        // Do not call .recycle() on the tiles or the background: they may
         // still be actively rendered or queued in Compose frames
         // (Image/Canvas drawImage). Clearing references allows GC and native
         // finalizers to safely reclaim them.
-        s.layerInk.clear()
+        s.layerTiles.clear()
         s.merged.clear()
+        s.glassBitmap = null
+        s.glassRevision = -1
+        s.glassLayer = null
         s.background = null
         // The strokes are on disk now: the reader reloads the page from the
         // file, so the committed list must not draw them a second time.
@@ -1946,13 +2268,17 @@ class ContinuousInkController(
      * The glass of the floating dock samples it: the layer holds the writing,
      * so the strokes disperse through the lens - the page image alone has no
      * ink in it.
+     *
+     * The bitmap is the small copy of the layer (the tiles composed at the
+     * resolution the glass reads the page at), so the scale is the scale of
+     * THAT copy.
      */
     data class LayerScreenMapping(
         val bitmap: Bitmap,
         /** The screen position of the layer's top-left corner. */
         val originX: Float,
         val originY: Float,
-        /** The layer's pixels per screen pixel. */
+        /** The bitmap's pixels per screen pixel. */
         val scale: Float
     )
 
@@ -1968,15 +2294,133 @@ class ContinuousInkController(
         val s = getSession(pageIndex) ?: return null
         val layer = s.stack.current ?: return null
         if (!layer.visible) return null
-        val bitmap = s.layerInk[layer]?.firstOrNull() ?: return null
+        val bitmap = glassCopy(s, layer) ?: return null
         if (bitmap.isRecycled) return null
         val rect = s.layerRectInBox
         if (rect.empty || s.boxWidth <= 0f || s.boxHeight <= 0f) return null
         val originX = panX + rect.left * s.boxWidth
         val originY = panY + rect.top * s.boxHeight
-        val scale = bitmap.width / (rect.width * s.boxWidth)
+        // The copy is a quarter of the layer, so it has a quarter of its
+        // pixels per screen pixel.
+        val scale = s.inkWidth / (rect.width * s.boxWidth) / GLASS_COPY_SCALE
         if (!scale.isFinite() || scale <= 0f) return null
         return LayerScreenMapping(bitmap, originX, originY, scale)
+    }
+
+    /**
+     * The small copy of the layer the glass samples.
+     *
+     * The layer is a grid of tiles, so there is no single bitmap of it any
+     * more. The glass wants the writing of the layer under the dock, so the
+     * tiles are composed into one small bitmap - a quarter of the size of
+     * the layer, because the glass reads the page at that resolution anyway
+     * (it samples a quarter size copy of the backdrop).
+     *
+     * The copy is built in the background when the tiles change: building it
+     * on the draw thread would cost tens of milliseconds.
+     */
+    private fun glassCopy(s: ContinuousInkSession, layer: PageLayer): Bitmap? {
+        val store = s.layerTiles[layer] ?: return null
+        if (store.existingTiles().isEmpty()) return null
+        val cached = s.glassBitmap
+        if (cached != null && s.glassRevision == s.tilesRevision && s.glassLayer === layer) {
+            return cached
+        }
+        if (s.glassPending && s.glassPendingLayer === layer) {
+            // A new copy of this layer is on its way: the old one is used
+            // until it is there.
+            return cached
+        }
+        return buildGlassCopy(s, layer, store)
+    }
+
+    /**
+     * Builds the small copy of a layer out of its tiles.
+     */
+    private fun buildGlassCopy(
+        s: ContinuousInkSession,
+        layer: PageLayer,
+        store: LayerTiles
+    ): Bitmap? {
+        val copy = composeGlassCopy(s, store) ?: return null
+        s.glassBitmap = copy
+        s.glassRevision = s.tilesRevision
+        s.glassLayer = layer
+        return copy
+    }
+
+    /**
+     * Composes the tiles of a layer into one small bitmap.
+     *
+     * The copy is a quarter of the size of the layer: the glass samples the
+     * page at that resolution anyway, so nothing is lost.
+     */
+    private fun composeGlassCopy(s: ContinuousInkSession, store: LayerTiles): Bitmap? {
+        val grid = store.grid
+        if (grid.width <= 0 || grid.height <= 0) return null
+        val width = (grid.width / GLASS_COPY_SCALE).toInt().coerceAtLeast(1)
+        val height = (grid.height / GLASS_COPY_SCALE).toInt().coerceAtLeast(1)
+        val out = try {
+            Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        } catch (e: OutOfMemoryError) {
+            e.printStackTrace()
+            null
+        } ?: return null
+        val canvas = Canvas(out)
+        val paint = Paint(Paint.FILTER_BITMAP_FLAG)
+        synchronized(s.inkLock) {
+            for (index in store.existingTiles()) {
+                val tx = grid.tileColumn(index)
+                val ty = grid.tileRow(index)
+                if (tx < 0 || ty < 0) continue
+                val bitmap = store.tile(tx, ty) ?: continue
+                if (bitmap.isRecycled) continue
+                val left = grid.tileLeft(tx)
+                val top = grid.tileTop(ty)
+                val right = left + grid.tileWidth(tx)
+                val bottom = top + grid.tileHeight(ty)
+                canvas.drawBitmap(
+                    bitmap,
+                    // The source is the tile itself (its own pixels), the
+                    // destination is its place in the small picture.
+                    Rect(0, 0, grid.tileWidth(tx), grid.tileHeight(ty)),
+                    RectF(
+                        left / grid.width.toFloat() * width,
+                        top / grid.height.toFloat() * height,
+                        right / grid.width.toFloat() * width,
+                        bottom / grid.height.toFloat() * height
+                    ),
+                    paint
+                )
+            }
+        }
+        return out
+    }
+
+    /**
+     * Schedules a new small copy of the layer the glass samples.
+     *
+     * The copy is built off the main thread: the eraser must not wait for
+     * it.
+     */
+    private fun scheduleGlassCopy(s: ContinuousInkSession) {
+        val layer = s.stack.current ?: return
+        val store = s.layerTiles[layer] ?: return
+        if (store.existingTiles().isEmpty()) return
+        if (s.glassPending && s.glassPendingLayer === layer) return
+        s.glassPending = true
+        s.glassPendingLayer = layer
+        scope.launch {
+            val copy = withContext(Dispatchers.IO) { composeGlassCopy(s, store) }
+            s.glassPending = false
+            s.glassPendingLayer = null
+            if (session === s || closingSessions.containsValue(s)) {
+                s.glassBitmap = copy
+                s.glassRevision = s.tilesRevision
+                s.glassLayer = layer
+                revision++
+            }
+        }
     }
 
     fun layerStack(pageIndex: Int): PageLayerStack {
@@ -2023,6 +2467,9 @@ class ContinuousInkController(
         val s = getSession(pageIndex)
         if (s == null || !s.ready) return false
         if (!s.stack.select(index)) return false
+        // The glass shows the writing of the current layer: it needs the
+        // copy of the new one.
+        scheduleGlassCopy(s)
         revision++
         layersRevision++
         return true
@@ -2059,6 +2506,7 @@ class ContinuousInkController(
         s.history.commitRemoveLayer(layer, merged = false)
         s.dirty = true
         scheduleSave(s)
+        scheduleGlassCopy(s)
         revision++
         layersRevision++
         onUndoRedoChanged(s.canUndo, s.canRedo)
@@ -2083,17 +2531,26 @@ class ContinuousInkController(
         if (!folded.any { it === layer }) folded.add(layer)
         s.history.commitRemoveLayer(layer, merged = true)
         s.dirty = true
+        // The writing of the layer is part of the base layer now: the tiles
+        // of the base layer changed.
+        s.tilesRevision++
         scheduleSave(s)
+        scheduleGlassCopy(s)
         revision++
         layersRevision++
         onUndoRedoChanged(s.canUndo, s.canRedo)
         return true
     }
 
-    /** The bitmaps of a layer as they are on screen (the session's pixels). */
-    fun layerBitmaps(pageIndex: Int, layer: PageLayer): List<Bitmap> {
+    /**
+     * The tiles of a layer as they are on screen (the session's pixels).
+     *
+     * Every placement knows where its tiles live in the layer's pixels, so
+     * the reader can draw each tile where it belongs.
+     */
+    fun layerTiles(pageIndex: Int, layer: PageLayer): List<LayerTilePlacement> {
         val s = getSession(pageIndex) ?: return emptyList()
-        return s.bitmapsOf(layer)
+        return s.tilesOf(layer)
     }
 
     /**
@@ -2101,21 +2558,46 @@ class ContinuousInkController(
      *
      * The preview is what the layer panel shows next to the name of the
      * layer: it is scaled down, so it must not run on the main thread.
+     *
+     * The layer is a grid of tiles, so the preview is composed from the
+     * tiles: every tile is drawn at its own place in the small bitmap.
      */
     fun layerThumbnail(pageIndex: Int, layer: PageLayer): Bitmap? {
-        val source = layerBitmaps(pageIndex, layer).firstOrNull() ?: return null
-        if (source.isRecycled || source.width <= 0 || source.height <= 0) return null
+        val s = getSession(pageIndex) ?: return null
+        val store = s.layerTiles[layer] ?: return null
+        val grid = store.grid
+        if (grid.width <= 0 || grid.height <= 0) return null
+        if (store.existingTiles().isEmpty()) return null
         return try {
             val width = THUMBNAIL_SIZE
-            val height = (width * source.height.toFloat() / source.width).roundToInt().coerceAtLeast(1)
+            val height = (width * grid.height.toFloat() / grid.width).roundToInt().coerceAtLeast(1)
             val thumb = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
             val canvas = Canvas(thumb)
-            canvas.drawBitmap(
-                source,
-                null,
-                Rect(0, 0, width, height),
-                Paint(Paint.FILTER_BITMAP_FLAG)
-            )
+            val paint = Paint(Paint.FILTER_BITMAP_FLAG)
+            for (index in store.existingTiles()) {
+                val tx = grid.tileColumn(index)
+                val ty = grid.tileRow(index)
+                if (tx < 0 || ty < 0) continue
+                val bitmap = store.tile(tx, ty) ?: continue
+                if (bitmap.isRecycled) continue
+                val left = grid.tileLeft(tx)
+                val top = grid.tileTop(ty)
+                val right = left + grid.tileWidth(tx)
+                val bottom = top + grid.tileHeight(ty)
+                canvas.drawBitmap(
+                    bitmap,
+                    // The source is the tile itself (its own pixels), the
+                    // destination is its place in the small picture.
+                    Rect(0, 0, grid.tileWidth(tx), grid.tileHeight(ty)),
+                    RectF(
+                        left / grid.width.toFloat() * width,
+                        top / grid.height.toFloat() * height,
+                        right / grid.width.toFloat() * width,
+                        bottom / grid.height.toFloat() * height
+                    ),
+                    paint
+                )
+            }
             thumb
         } catch (e: Throwable) {
             e.printStackTrace()
@@ -2159,6 +2641,131 @@ class ContinuousInkController(
     internal fun layerOps(pageIndex: Int, layer: PageLayer): List<InkOp> {
         val s = getSession(pageIndex) ?: return emptyList()
         return s.history.ops.filter { it.layer === layer }
+    }
+
+    /**
+     * Composes the display bitmap of a layer from the files on the disk.
+     *
+     * The tiles are composed into a downsampled bitmap (one tile at a
+     * time, so no 80 MB allocation), and the ops of the layer are drawn
+     * on top of them. Used by the reader when there is no session (the
+     * user only reads).
+     */
+    suspend fun composeDisplayLayer(
+        pageIndex: Int,
+        layer: PageLayer,
+        displayWidthPx: Int
+    ): Bitmap? = withContext(Dispatchers.IO) {
+        val metaText = try {
+            val f = repository.fileStore.getAnnotationMetaFile(noteId, pageIndex)
+            if (f.exists()) f.readText() else null
+        } catch (e: Exception) {
+            null
+        }
+        val tilesInfo = metaText?.let { PageLayerMeta.decodeTiles(it)[layer.index] }
+        val layerWidth: Int
+        val layerHeight: Int
+        val tiles: List<Pair<Pair<Int, Int>, Bitmap>> = if (tilesInfo != null && tilesInfo.tiles.isNotEmpty()) {
+            layerWidth = tilesInfo.width
+            layerHeight = tilesInfo.height
+            repository.loadPageLayerTiles(noteId, pageIndex, layer.index, tilesInfo)
+        } else {
+            // Legacy layer: read the PNG and treat it as one tile.
+            val file = repository.fileStore.getAnnotationLayerFile(noteId, pageIndex, layer.index)
+            if (!file.exists()) return@withContext null
+            val bitmap = decodeLayerBitmap(file) ?: return@withContext null
+            layerWidth = bitmap.width
+            layerHeight = bitmap.height
+            listOf(Pair(Pair(0, 0), bitmap))
+        }
+        if (layerWidth <= 0 || layerHeight <= 0) return@withContext null
+        val displayHeight = (displayWidthPx * layerHeight / layerWidth).coerceAtLeast(1)
+        val out = try {
+            Bitmap.createBitmap(displayWidthPx, displayHeight, Bitmap.Config.ARGB_8888)
+        } catch (e: OutOfMemoryError) {
+            e.printStackTrace()
+            null
+        } ?: return@withContext null
+        val canvas = Canvas(out)
+        val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
+        // Draw the tiles.
+        for ((pos, bitmap) in tiles) {
+            if (bitmap.isRecycled) continue
+            val (tx, ty) = pos
+            val tileSize = tilesInfo?.tileSize ?: layerWidth
+            val left = tx * tileSize
+            val top = ty * tileSize
+            val srcRect = Rect(0, 0, bitmap.width, bitmap.height)
+            val dstRect = RectF(
+                left.toFloat() / layerWidth * displayWidthPx,
+                top.toFloat() / layerHeight * displayHeight,
+                (left + bitmap.width).toFloat() / layerWidth * displayWidthPx,
+                (top + bitmap.height).toFloat() / layerHeight * displayHeight
+            )
+            canvas.drawBitmap(bitmap, srcRect, dstRect, paint)
+            bitmap.recycle()
+        }
+        // Draw the ops (the strokes and the erases as vectors).
+        val ops = repository.loadPageLayerOps(noteId, pageIndex, layer.index)
+        if (ops != null) {
+            for (op in ops) {
+                when (op) {
+                    is InkOp.Stroke -> {
+                        val stroke = op.stroke
+                        val w = displayWidthPx.toFloat()
+                        val h = displayHeight.toFloat()
+                        val paint2 = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                            style = Paint.Style.STROKE
+                            strokeCap = Paint.Cap.ROUND
+                            strokeJoin = Paint.Join.ROUND
+                            color = stroke.color
+                            strokeWidth = stroke.baseWidthNorm * w
+                        }
+                        // Auto-shape is re-derived on the load; for the
+                        // display path we draw the raw points (the same
+                        // look as the live preview).
+                        val path = Path()
+                        val points = stroke.points
+                        if (points.isNotEmpty()) {
+                            path.moveTo(points[0].x * w, points[0].y * h)
+                            for (i in 1 until points.size) {
+                                path.lineTo(points[i].x * w, points[i].y * h)
+                            }
+                        }
+                        canvas.drawPath(path, paint2)
+                    }
+                    is InkOp.Erase -> {
+                        // The eraser clears pixels: in the display bitmap we
+                        // just skip it (the tiles already have the hole).
+                    }
+                }
+            }
+        }
+        return@withContext out
+    }
+
+    /**
+     * Composes the display bitmaps of all the layers of a page from the
+     * files on the disk. Used by the reader when there is no session (the
+     * user only reads).
+     */
+    suspend fun composeDisplayLayers(
+        pageIndex: Int,
+        displayWidthPx: Int
+    ): Map<Int, Bitmap?> {
+        val result = LinkedHashMap<Int, Bitmap?>()
+        try {
+            val metaFile = repository.fileStore.getAnnotationMetaFile(noteId, pageIndex)
+            val text = if (metaFile.exists()) metaFile.readText() else null
+            val stack = text?.let { PageLayerMeta.decode(it) } ?: PageLayerStack.base()
+            for (layer in stack.layers) {
+                if (!layer.visible) continue
+                result[layer.index] = composeDisplayLayer(pageIndex, layer, displayWidthPx)
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        return result
     }
 
     /**
@@ -2414,14 +3021,19 @@ class ContinuousInkController(
         return path
     }
 
-    private fun mutableCopy(bitmap: Bitmap): Bitmap {
-        if (bitmap.isMutable && bitmap.config == Bitmap.Config.ARGB_8888) return bitmap
-        return bitmap.copy(Bitmap.Config.ARGB_8888, true)
-    }
-
     private companion object {
         /** How long the laser tail stays visible, in milliseconds. */
         const val LASER_TRAIL_MS = 700L
+        /**
+         * The size of the copy of the layer the glass samples, as a fraction
+         * of the layer.
+         *
+         * The glass reads the page at a quarter of its resolution anyway (it
+         * samples a quarter size copy of the backdrop), so the copy of the
+         * layer is built at that size: nothing is lost and the layer itself
+         * (80 MB) is not in memory.
+         */
+        const val GLASS_COPY_SCALE = 4f
         /** ~48 MB of patches: a few dozen ordinary strokes, bounded. */
         const val MAX_UNDO_BYTES = 48L * 1024L * 1024L
         /** The width of the preview of a layer in the layer panel. */
