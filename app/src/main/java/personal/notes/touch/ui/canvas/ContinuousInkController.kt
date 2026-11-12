@@ -1998,6 +1998,7 @@ class ContinuousInkController(
             )
             deleteStaleLayerFiles(s)
         }
+        storedStacks.remove(s.pageIndex)
         storedStacks[s.pageIndex] = s.stack
         s.savedWhileActive = true
         onSaved(s.pageIndex)
