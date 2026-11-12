@@ -219,3 +219,14 @@
 - Removed unnecessary collapse chevron (`KeyboardArrowUp` / `KeyboardArrowLeft`) and floating collapsed mini restore pill from the floating pen dock.
 - Simplified dock presentation to keep tools and drag handle directly accessible without accidental collapsing.
 - Verified with 299 passing unit tests and clean `assembleDebug` APK build.
+
+## Decisions appended 68        68. 2026-11-12 (auditor): Fix stroke data loss on tab close/reopen and multi-page rendering (`C50`):
+- Root Cause Analysis:
+  1. `startLoad` skipped loading `_ops.json` when neither tiles nor legacy PNG existed (`continue`), leaving `s.history.ops` empty on note reload.
+  2. `composeDisplayLayer` returned null when no tiles or legacy PNG existed (`if (!file.exists()) return null`), leaving non-active pages and newly reopened notes completely blank.
+  3. `dispose()` and `releaseSession()` called `releaseBitmaps()` synchronously on the calling thread before the background `appScope.launch { persist() }` executed, wiping `s.history.ops` before save could write to disk.
+  4. `PageLayer` lacked `equals`/`hashCode`, causing identity mismatch (`===`) between reconstructed `PageLayer` instances and existing stroke ops.
+- Fixes Applied:
+  - In `ContinuousInkController.kt`: Always load layer ops regardless of whether tile bitmaps exist. In `composeDisplayLayer`, render vector ops into the display bitmap using box-to-layer coordinate mapping. In `dispose()` and `releaseSession()`, defer `releaseBitmaps()` until after `persist()` completes. In `PageLayerStack.kt`, implemented index-based `equals` and `hashCode`, and updated op filters to compare by `layer.index`.
+  - In `ExportManager.kt`: Added support for compositing C50 tiled layers and vector ops during document export.
+- Verified with 377 passing unit tests and clean `assembleDebug` APK build.

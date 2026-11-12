@@ -1068,21 +1068,24 @@ class ContinuousInkController(
                                 noteId, s.pageIndex, layer.index
                             )
                             val stored = decodeLayerBitmap(file)
-                            if (stored == null) {
-                                if (file.exists()) s.unreadableLayers.add(layer.index)
-                                continue
-                            }
-                            s.unreadableLayers.remove(layer.index)
-                            val bitmap = if (stored.width == s.inkWidth && stored.height == s.inkHeight) {
-                                stored
+                            if (stored != null) {
+                                s.unreadableLayers.remove(layer.index)
+                                val bitmap = if (stored.width == s.inkWidth && stored.height == s.inkHeight) {
+                                    stored
+                                } else {
+                                    fitLayer(stored, s.inkWidth, s.inkHeight)
+                                }
+                                loadedHeight = max(loadedHeight, bitmap.height)
+                                store = tilesFromBitmap(s, bitmap)
+                                if (!bitmap.isRecycled) bitmap.recycle()
                             } else {
-                                fitLayer(stored, s.inkWidth, s.inkHeight)
+                                if (file.exists()) s.unreadableLayers.add(layer.index)
+                                store = null
                             }
-                            loadedHeight = max(loadedHeight, bitmap.height)
-                            store = tilesFromBitmap(s, bitmap)
-                            if (!bitmap.isRecycled) bitmap.recycle()
                         }
-                        stores[layer] = store
+                        if (store != null) {
+                            stores[layer] = store
+                        }
                         // Read the ops of the layer (the strokes and the erases
                         // as vectors). They are drawn on top of the tiles.
                         val opsFile = repository.fileStore.getAnnotationLayerOpsFile(noteId, s.pageIndex, layer.index)
@@ -1722,7 +1725,7 @@ class ContinuousInkController(
     private fun clearSession(s: ContinuousInkSession): Boolean {
         val layer = s.stack.current ?: return false
         val placements = s.tilesOf(layer)
-        val layerOps = s.history.ops.filter { it.layer === layer }
+        val layerOps = s.history.ops.filter { it.layer.index == layer.index }
         val hasInk = placements.any { !it.tiles.isEmpty() }
         if (!hasInk && layerOps.isEmpty()) return false
         val patches = mutableListOf<InkPatch>()
@@ -1755,7 +1758,7 @@ class ContinuousInkController(
         // both, so the clear can be taken back.
         val removed = mutableListOf<OpEntry>()
         s.history.ops.forEachIndexed { position, op ->
-            if (op.layer === layer) removed.add(OpEntry(position, op))
+            if (op.layer.index == layer.index) removed.add(OpEntry(position, op))
         }
         s.history.commitClear(patches, removed)
         trimUndo(s)
@@ -1961,7 +1964,7 @@ class ContinuousInkController(
             }
             // Write the ops of the layer (the strokes and the erases as
             // vectors). Only the ops of this layer are written.
-            val ops = s.history.ops.filter { it.layer === layer }
+            val ops = s.history.ops.filter { it.layer.index == layer.index }
             android.util.Log.d("TouchNotes", "persist: page=${s.pageIndex} layer=${layer.index} ops=${ops.size} dirty=${s.dirty}")
             val ok = withContext(Dispatchers.IO) {
                 repository.savePageLayerOps(noteId, s.pageIndex, layer.index, ops)
@@ -2025,7 +2028,7 @@ class ContinuousInkController(
      */
     private fun composeLayer(s: ContinuousInkSession, layer: PageLayer): Bitmap? {
         val placements = s.tilesOf(layer)
-        val ops = s.history.ops.filter { it.layer === layer }
+        val ops = s.history.ops.filter { it.layer.index == layer.index }
         val hasTiles = placements.any { it.tiles.existingTiles().isNotEmpty() }
         if (!hasTiles && ops.isEmpty()) return null
         val target = Bitmap.createBitmap(s.inkWidth, s.inkHeight, Bitmap.Config.ARGB_8888)
@@ -2174,6 +2177,8 @@ class ContinuousInkController(
     fun releaseSession() {
         val s = session ?: return
         session = null
+        s.saveJob?.cancel()
+        s.loadJob?.cancel()
         if (s.dirty) {
             s.dirty = false
             appScope.launch {
@@ -2185,12 +2190,12 @@ class ContinuousInkController(
                     e.printStackTrace()
                     s.dirty = true
                 }
+                releaseBitmaps(s)
                 onSaved(s.pageIndex)
             }
+        } else {
+            releaseBitmaps(s)
         }
-        s.saveJob?.cancel()
-        s.loadJob?.cancel()
-        releaseBitmaps(s)
         revision++
         onUndoRedoChanged(false, false)
     }
@@ -2234,9 +2239,11 @@ class ContinuousInkController(
                         e.printStackTrace()
                         sess.dirty = true
                     }
+                    releaseBitmaps(sess)
                 }
+            } else {
+                releaseBitmaps(sess)
             }
-            releaseBitmaps(sess)
         }
     }
 
@@ -2642,7 +2649,7 @@ class ContinuousInkController(
     ) {
         val s = getSession(pageIndex) ?: return
         for (op in s.history.ops) {
-            if (op.layer !== layer) continue
+            if (op.layer.index != layer.index) continue
             when (op) {
                 is InkOp.Stroke -> drawOpStroke(canvas, op, s, viewWidth, viewHeight)
                 // The eraser clears pixels: the reader draws it into an
@@ -2655,7 +2662,7 @@ class ContinuousInkController(
     /** The committed operations of one layer of a page. */
     internal fun layerOps(pageIndex: Int, layer: PageLayer): List<InkOp> {
         val s = getSession(pageIndex) ?: return emptyList()
-        return s.history.ops.filter { it.layer === layer }
+        return s.history.ops.filter { it.layer.index == layer.index }
     }
 
     /**
@@ -2678,20 +2685,48 @@ class ContinuousInkController(
             null
         }
         val tilesInfo = metaText?.let { PageLayerMeta.decodeTiles(it)[layer.index] }
+        val ops = repository.loadPageLayerOps(noteId, pageIndex, layer.index)
+        val hasOps = !ops.isNullOrEmpty()
+        val hasTiles = tilesInfo != null && tilesInfo.tiles.isNotEmpty()
+        val legacyFile = repository.fileStore.getAnnotationLayerFile(noteId, pageIndex, layer.index)
+        val hasLegacy = legacyFile.exists()
+
+        if (!hasOps && !hasTiles && !hasLegacy) return@withContext null
+
         val layerWidth: Int
         val layerHeight: Int
-        val tiles: List<Pair<Pair<Int, Int>, Bitmap>> = if (tilesInfo != null && tilesInfo.tiles.isNotEmpty()) {
+        val tiles: List<Pair<Pair<Int, Int>, Bitmap>>
+        if (hasTiles && tilesInfo != null) {
             layerWidth = tilesInfo.width
             layerHeight = tilesInfo.height
-            repository.loadPageLayerTiles(noteId, pageIndex, layer.index, tilesInfo)
+            tiles = repository.loadPageLayerTiles(noteId, pageIndex, layer.index, tilesInfo)
+        } else if (hasLegacy) {
+            val bitmap = decodeLayerBitmap(legacyFile)
+            if (bitmap != null) {
+                layerWidth = bitmap.width
+                layerHeight = bitmap.height
+                tiles = listOf(Pair(Pair(0, 0), bitmap))
+            } else {
+                tiles = emptyList()
+                val ratio = rasterPageRatio(pageIndex)
+                val size = if (tilesInfo != null && tilesInfo.width > 0 && tilesInfo.height > 0) {
+                    ContinuousPageGeometry.LayerSize(tilesInfo.width, tilesInfo.height)
+                } else {
+                    ContinuousPageGeometry.layerSize(pageType, ratio)
+                }
+                layerWidth = size.width
+                layerHeight = size.height
+            }
         } else {
-            // Legacy layer: read the PNG and treat it as one tile.
-            val file = repository.fileStore.getAnnotationLayerFile(noteId, pageIndex, layer.index)
-            if (!file.exists()) return@withContext null
-            val bitmap = decodeLayerBitmap(file) ?: return@withContext null
-            layerWidth = bitmap.width
-            layerHeight = bitmap.height
-            listOf(Pair(Pair(0, 0), bitmap))
+            tiles = emptyList()
+            val ratio = rasterPageRatio(pageIndex)
+            val size = if (tilesInfo != null && tilesInfo.width > 0 && tilesInfo.height > 0) {
+                ContinuousPageGeometry.LayerSize(tilesInfo.width, tilesInfo.height)
+            } else {
+                ContinuousPageGeometry.layerSize(pageType, ratio)
+            }
+            layerWidth = size.width
+            layerHeight = size.height
         }
         if (layerWidth <= 0 || layerHeight <= 0) return@withContext null
         val displayHeight = (displayWidthPx * layerHeight / layerWidth).coerceAtLeast(1)
@@ -2721,37 +2756,39 @@ class ContinuousInkController(
             bitmap.recycle()
         }
         // Draw the ops (the strokes and the erases as vectors).
-        val ops = repository.loadPageLayerOps(noteId, pageIndex, layer.index)
-        if (ops != null) {
-            for (op in ops) {
-                when (op) {
-                    is InkOp.Stroke -> {
-                        val stroke = op.stroke
-                        val w = displayWidthPx.toFloat()
-                        val h = displayHeight.toFloat()
-                        val paint2 = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                            style = Paint.Style.STROKE
-                            strokeCap = Paint.Cap.ROUND
-                            strokeJoin = Paint.Join.ROUND
-                            color = stroke.color
-                            strokeWidth = stroke.baseWidthNorm * w
-                        }
-                        // Auto-shape is re-derived on the load; for the
-                        // display path we draw the raw points (the same
-                        // look as the live preview).
-                        val path = Path()
-                        val points = stroke.points
-                        if (points.isNotEmpty()) {
-                            path.moveTo(points[0].x * w, points[0].y * h)
-                            for (i in 1 until points.size) {
-                                path.lineTo(points[i].x * w, points[i].y * h)
+        if (!ops.isNullOrEmpty()) {
+            val ratio = rasterPageRatio(pageIndex)
+            val rect = ContinuousPageGeometry.layerRect(pageType, ratio, 1f, 1f)
+            if (!rect.empty) {
+                val sx = displayWidthPx.toFloat() / rect.width
+                val sy = displayHeight.toFloat() / rect.height
+                for (op in ops) {
+                    when (op) {
+                        is InkOp.Stroke -> {
+                            val shape = op.shape
+                            if (shape == null) {
+                                val save = canvas.save()
+                                canvas.scale(sx, sy)
+                                canvas.translate(-rect.left, -rect.top)
+                                drawStroke(canvas, op.stroke, 1f, 1f, preview = false)
+                                canvas.restoreToCount(save)
+                            } else {
+                                val paint2 = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                                    style = Paint.Style.STROKE
+                                    strokeCap = Paint.Cap.ROUND
+                                    strokeJoin = Paint.Join.ROUND
+                                    color = op.stroke.color
+                                    strokeWidth = op.stroke.baseWidthNorm * displayWidthPx / rect.width
+                                }
+                                val save = canvas.save()
+                                canvas.scale(displayWidthPx.toFloat() / layerWidth, displayHeight.toFloat() / layerHeight)
+                                canvas.drawPath(shape, paint2)
+                                canvas.restoreToCount(save)
                             }
                         }
-                        canvas.drawPath(path, paint2)
-                    }
-                    is InkOp.Erase -> {
-                        // The eraser clears pixels: in the display bitmap we
-                        // just skip it (the tiles already have the hole).
+                        is InkOp.Erase -> {
+                            // Eraser clears pixels
+                        }
                     }
                 }
             }
@@ -2790,7 +2827,7 @@ class ContinuousInkController(
      */
     internal fun layerHasErase(pageIndex: Int, layer: PageLayer): Boolean {
         val s = getSession(pageIndex) ?: return false
-        return s.history.ops.any { it.layer === layer && it is InkOp.Erase }
+        return s.history.ops.any { it.layer.index == layer.index && it is InkOp.Erase }
     }
 
     /** Draws a committed stroke into the page box (view coordinates). */

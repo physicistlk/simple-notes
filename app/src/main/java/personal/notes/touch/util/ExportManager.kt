@@ -6,6 +6,7 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.Rect
 import android.graphics.pdf.PdfDocument
 import android.net.Uri
@@ -509,14 +510,64 @@ object ExportManager {
         for (layer in stack.layers) {
             if (!layer.visible) continue
             val file = fileStore.getAnnotationLayerFile(noteId, pageIndex, layer.index)
-            if (!file.exists()) continue
-            val bitmap = BitmapUtils.loadBitmapFromFile(file) ?: continue
-            if (result == null) {
+            val metaFile = fileStore.getAnnotationMetaFile(noteId, pageIndex)
+            val metaText = try { if (metaFile.exists()) metaFile.readText() else null } catch (e: Exception) { null }
+            val tilesInfo = metaText?.let { personal.notes.touch.ui.canvas.PageLayerMeta.decodeTiles(it)[layer.index] }
+            val opsFile = fileStore.getAnnotationLayerOpsFile(noteId, pageIndex, layer.index)
+            val ops = try { if (opsFile.exists()) personal.notes.touch.ui.canvas.ContinuousOpCodec.decode(opsFile.readText()) else null } catch (e: Exception) { null }
+            val bitmap: Bitmap = (if (file.exists()) {
+                BitmapUtils.loadBitmapFromFile(file)
+            } else if ((tilesInfo != null && tilesInfo.tiles.isNotEmpty()) || !ops.isNullOrEmpty()) {
+                val layerWidth = tilesInfo?.width ?: 2160
+                val layerHeight = tilesInfo?.height ?: 3056
+                val target = Bitmap.createBitmap(layerWidth, layerHeight, Bitmap.Config.ARGB_8888)
+                val canvas = Canvas(target)
+                if (tilesInfo != null) {
+                    for (name in tilesInfo.tiles) {
+                        val pos = personal.notes.touch.ui.canvas.LayerTileGrid.parseTileName(name) ?: continue
+                        val tileFile = fileStore.getAnnotationLayerTileFile(noteId, pageIndex, layer.index, pos.first, pos.second)
+                        if (tileFile.exists()) {
+                            val tileBmp = BitmapUtils.loadBitmapFromFile(tileFile)
+                            if (tileBmp != null) {
+                                canvas.drawBitmap(tileBmp, (pos.first * tilesInfo.tileSize).toFloat(), (pos.second * tilesInfo.tileSize).toFloat(), null)
+                                tileBmp.recycle()
+                            }
+                        }
+                    }
+                }
+                if (!ops.isNullOrEmpty()) {
+                    for (op in ops) {
+                        if (op is personal.notes.touch.ui.canvas.InkOp.Stroke) {
+                            val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                                style = Paint.Style.STROKE
+                                strokeCap = Paint.Cap.ROUND
+                                strokeJoin = Paint.Join.ROUND
+                                color = op.stroke.color
+                                strokeWidth = op.stroke.baseWidthNorm * layerWidth
+                            }
+                            val path = Path()
+                            val points = op.stroke.points
+                            if (points.isNotEmpty()) {
+                                path.moveTo(points[0].x * layerWidth, points[0].y * layerHeight)
+                                for (i in 1 until points.size) {
+                                    path.lineTo(points[i].x * layerWidth, points[i].y * layerHeight)
+                                }
+                            }
+                            canvas.drawPath(path, paint)
+                        }
+                    }
+                }
+                target
+            } else {
+                null
+            }) ?: continue
+            val current = result
+            if (current == null) {
                 result = bitmap
                 continue
             }
             // The layer above the first one goes on top of it.
-            val canvas = Canvas(result)
+            val canvas = Canvas(current)
             canvas.drawBitmap(bitmap, 0f, 0f, null)
             if (!bitmap.isRecycled) bitmap.recycle()
         }
