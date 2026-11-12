@@ -169,10 +169,10 @@ object ContinuousPageGeometry {
     /**
      * The size of the annotation layer of a page, in pixels.
      *
-     * A fixed page: the layer is as wide as the box (the page plus the
-     * margin on both sides) and as tall as the page - that is the room the
-     * user writes in. An infinite page: the layer is the page image itself
-     * (its box is the visible canvas, which has no fixed size).
+     * The layer is the page plus a margin on both sides - the room the user
+     * writes in. That is the same rule for every page type: an infinite page
+     * gets the margin as well, so a stroke that lands outside the saved
+     * canvas is kept instead of being clipped (audit C33).
      */
     fun layerSize(
         pageType: String?,
@@ -180,27 +180,18 @@ object ContinuousPageGeometry {
         pageWidth: Int = PAGE_WIDTH
     ): LayerSize {
         val ratio = if (pageRatio > 0f) pageRatio else defaultRatio(pageType)
-        val width = if (isInfinite(pageType)) {
-            pageWidth
-        } else {
-            (pageWidth * (1f + 2f * PAGE_MARGIN)).roundToInt()
-        }
+        val width = (pageWidth * (1f + 2f * PAGE_MARGIN)).roundToInt()
         val height = (pageWidth / ratio).roundToInt().coerceAtLeast(1)
         return LayerSize(width.coerceAtLeast(1), height)
     }
 
     /**
      * The aspect ratio of the page a layer belongs to, taken from the size of
-     * the layer: a fixed page's layer is wider than its page (the margin on
-     * both sides), an infinite page's layer is its page.
+     * the layer: the layer is wider than its page (the margin on both sides).
      */
     fun ratioOfLayer(pageType: String?, layerWidth: Int, layerHeight: Int): Float {
         if (layerWidth <= 0 || layerHeight <= 0) return defaultRatio(pageType)
-        val pageWidth = if (isInfinite(pageType)) {
-            layerWidth.toFloat()
-        } else {
-            layerWidth / (1f + 2f * PAGE_MARGIN)
-        }
+        val pageWidth = layerWidth / (1f + 2f * PAGE_MARGIN)
         return pageWidth / layerHeight
     }
 
@@ -209,8 +200,9 @@ object ContinuousPageGeometry {
      * coordinates.
      *
      * A fixed page: the layer covers the whole box (the page plus the
-     * margin on both sides). An infinite page: the layer is the page image,
-     * so it sits where the page image sits.
+     * margin on both sides). An infinite page: the layer is the page image
+     * plus its margin, so it reaches past the saved canvas - that is the room
+     * the user writes in on an endless canvas.
      */
     fun layerRect(
         pageType: String?,
@@ -218,8 +210,17 @@ object ContinuousPageGeometry {
         boxWidth: Float,
         boxHeight: Float
     ): BoxRect {
-        if (isInfinite(pageType)) return pageRect(pageType, pageRatio, boxWidth, boxHeight)
-        return BoxRect(0f, 0f, 1f, 1f)
+        if (!isInfinite(pageType)) return BoxRect(0f, 0f, 1f, 1f)
+        val page = pageRect(pageType, pageRatio, boxWidth, boxHeight)
+        if (page.empty) return page
+        // The layer is the page plus a quarter of the page's width on each
+        // side, centred on the page.
+        val grow = PAGE_MARGIN
+        val width = page.width * (1f + 2f * grow)
+        val height = page.height
+        val left = page.left - page.width * grow
+        val top = page.top - page.height * grow
+        return BoxRect(left, top, left + width, top + height)
     }
 
     /**

@@ -1,5 +1,6 @@
 package personal.notes.touch
 
+import kotlin.math.roundToInt
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -115,12 +116,30 @@ class ContinuousPageGeometryTest {
     }
 
     @Test
-    fun theLayerOfAnInfinitePageIsItsPageImage() {
+    fun theLayerOfAnInfinitePageHasTheMarginAsWell() {
+        // The endless canvas gets the same room around its saved image as a
+        // fixed page, so a stroke outside the saved canvas is kept (C33).
         val size = ContinuousPageGeometry.layerSize(
             "infinite", ContinuousPageGeometry.INFINITE_PAGE_RATIO
         )
-        assertEquals(2160, size.width)
+        assertEquals((2160 * 1.5f).roundToInt(), size.width)
         assertEquals(3840, size.height)
+    }
+
+    @Test
+    fun theLayerOfAnInfinitePageReachesPastTheSavedCanvas() {
+        val boxWidth = 1600f
+        val boxHeight = 2263f
+        val page = ContinuousPageGeometry.pageRect(
+            "infinite", ContinuousPageGeometry.INFINITE_PAGE_RATIO, boxWidth, boxHeight
+        )
+        val layer = ContinuousPageGeometry.layerRect(
+            "infinite", ContinuousPageGeometry.INFINITE_PAGE_RATIO, boxWidth, boxHeight
+        )
+        // The layer is wider than the page and centred on it.
+        assertTrue("the layer has to reach past the page", layer.left < page.left)
+        assertTrue("the layer has to reach past the page", layer.right > page.right)
+        assertEquals(page.left - (page.right - page.left) * ContinuousPageGeometry.PAGE_MARGIN, layer.left, 0.0001f)
     }
 
     @Test
