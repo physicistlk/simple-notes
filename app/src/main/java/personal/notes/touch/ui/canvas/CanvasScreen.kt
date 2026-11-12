@@ -389,6 +389,15 @@ fun CanvasScreen(
     var showShapesMenu by remember { mutableStateOf(false) }
     var showLayersPanel by remember { mutableStateOf(false) }
     var layersTick by remember { mutableStateOf(0) }
+    /**
+     * The layer panel of the reader: the drawing layers of the current page
+     * (the base layer and the ones the user added on top of it).
+     */
+    var showLayerPanel by remember { mutableStateOf(false) }
+    /** The layer whose menu is open in the layer panel (-1 = none). */
+    var layerActionIndex by remember { mutableIntStateOf(-1) }
+    /** Where the user dragged the layer panel to. */
+    var layerPanelOffset by remember { mutableStateOf(Offset.Zero) }
     var showAddChapterDialog by remember { mutableStateOf(false) }
     var newChapterTitle by remember { mutableStateOf("") }
     var newTitleText by remember { mutableStateOf("") }
@@ -455,6 +464,8 @@ fun CanvasScreen(
         viewModel.dismissCanvasMenus()
         showLayersPanel = false
         showShapesMenu = false
+        showLayerPanel = false
+        layerActionIndex = -1
         // The width and colour popups are floating windows: a touch in the
         // canvas has to close them as well, or they stay on top of the page.
         showWidthPopupHoriz = false
@@ -4305,17 +4316,109 @@ fun CanvasScreen(
 
                         // Layers popover toggle inside right-edge capsule
                         IconButton(
-                            onClick = { showLayersPanel = !showLayersPanel },
+                            onClick = {
+                                // The reader opens the drawing layers of the
+                                // page (the layer panel); the single page
+                                // mode opens the floating images.
+                                if (isContinuous) {
+                                    showLayerPanel = !showLayerPanel
+                                    layerActionIndex = -1
+                                } else {
+                                    showLayersPanel = !showLayersPanel
+                                }
+                            },
                             modifier = Modifier.size(32.dp)
                         ) {
                             Icon(
                                 imageVector = Icons.Default.Layers,
                                 contentDescription = "Layers",
-                                tint = if (showLayersPanel) OrangePrimary else Color.DarkGray,
+                                tint = if (showLayerPanel || showLayersPanel) OrangePrimary else Color.DarkGray,
                                 modifier = Modifier.size(18.dp)
                             )
                         }
                     }
+                }
+
+                // ==========================================
+                // 4b. THE LAYER PANEL OF THE PAGE
+                // ==========================================
+                // The floating card of the original: the layers of the
+                // current page, the eye that masks a layer and the menu
+                // with the actions of a layer.
+                if (showLayerPanel && isContinuous) {
+                    val panelPage = pages.getOrNull(currentPageIndex)
+                    // The layer stack of a page lives in its ink session, so
+                    // the panel needs one.
+                    LaunchedEffect(currentPageIndex, panelPage?.id) {
+                        if (panelPage != null) {
+                            inkController.ensureSessionForPage(panelPage, currentPageIndex)
+                        }
+                    }
+                    val layerTick = inkController.layersRevision
+                    val layerStack = inkController.layerStack(currentPageIndex)
+                    val layerThumbs by produceState<Map<Int, android.graphics.Bitmap?>>(
+                        emptyMap(), currentPageIndex, layerTick
+                    ) {
+                        value = withContext(Dispatchers.IO) {
+                            val map = LinkedHashMap<Int, android.graphics.Bitmap?>()
+                            layerStack.layers.forEach { layer ->
+                                map[layer.index] = inkController.layerThumbnail(currentPageIndex, layer)
+                            }
+                            map
+                        }
+                    }
+                    // The panel is dragged by its handle, but it never leaves
+                    // the screen.
+                    val maxDragX = with(density) { (screenWidthPx - 260.dp.toPx()).coerceAtLeast(0f) }
+                    val maxDragY = with(density) { (screenHeightPx - 360.dp.toPx()).coerceAtLeast(0f) }
+                    LayerPanel(
+                        stack = layerStack,
+                        thumbnails = layerThumbs,
+                        actionIndex = layerActionIndex,
+                        onSelect = { index -> inkController.selectLayer(currentPageIndex, index) },
+                        onToggleVisible = { index ->
+                            val layer = layerStack.layerAt(index)
+                            if (layer != null) {
+                                inkController.setLayerVisible(currentPageIndex, index, !layer.visible)
+                            }
+                        },
+                        onMore = { index -> layerActionIndex = index },
+                        onAdd = { inkController.addLayer(currentPageIndex) },
+                        onMerge = { index ->
+                            inkController.mergeLayer(currentPageIndex, index)
+                            layerActionIndex = -1
+                        },
+                        onDelete = { index ->
+                            inkController.deleteLayer(currentPageIndex, index)
+                            layerActionIndex = -1
+                        },
+                        onCloseActions = { layerActionIndex = -1 },
+                        onClose = {
+                            showLayerPanel = false
+                            layerActionIndex = -1
+                        },
+                        onDrag = { drag ->
+                            layerPanelOffset = Offset(
+                                (layerPanelOffset.x + drag.x).coerceIn(-maxDragX, 0f),
+                                (layerPanelOffset.y + drag.y).coerceIn(-maxDragY, 0f)
+                            )
+                        },
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            // The pen box sits in the same corner: the panel
+                            // goes above it.
+                            .padding(
+                                end = 16.dp,
+                                bottom = if (uiState.penBoxEnabled) 116.dp else 16.dp
+                            )
+                            .offset {
+                                IntOffset(
+                                    layerPanelOffset.x.roundToInt(),
+                                    layerPanelOffset.y.roundToInt()
+                                )
+                            }
+                            .zIndex(4f)
+                    )
                 }
             }
 
@@ -6270,6 +6373,12 @@ fun ContinuousPageView(
         val sessionReady = inkSession?.isReady == true
         val activeSessionReady = ink.isActiveSession(pageIndex)
 
+        // The layer stack of the page: the layers are drawn in order (the
+        // base layer first), and a hidden layer is not drawn at all - that
+        // is the mask of the eye button.
+        val layerTick = ink.layersRevision
+        val layerStack = ink.layerStack(pageIndex)
+
         // Floating layers of this page. The cache decodes them off the main
         // thread; the entry is observable, so an edit repaints the page.
         val layerRevision = readerLayers.revision(pageIndex)
@@ -6300,19 +6409,21 @@ fun ContinuousPageView(
             )
         }
 
-        // The annotation layer of the page as it is on the disk.
+        // The annotation layers of the page as they are on the disk.
         //
-        // The ink session holds the layer it writes on; without a session
-        // (the user only reads) the layer of the page is loaded here, so the
-        // writing of an earlier session stays on the screen.
-        var savedLayer by remember(page.id, noteId) { mutableStateOf<android.graphics.Bitmap?>(null) }
-        LaunchedEffect(page.id, noteId, savedGeneration, activeSessionReady) {
+        // The ink session holds the layers it writes on; without a session
+        // (the user only reads) the layers of the page are loaded here, so
+        // the writing of an earlier session stays on the screen.
+        var savedLayers by remember(page.id, noteId) {
+            mutableStateOf<Map<Int, android.graphics.Bitmap?>>(emptyMap())
+        }
+        LaunchedEffect(page.id, noteId, savedGeneration, activeSessionReady, layerTick) {
             if (activeSessionReady) {
-                // The session has the page: it holds the layer it writes on.
-                savedLayer = null
+                // The session has the page: it holds the layers it writes on.
+                savedLayers = emptyMap()
                 return@LaunchedEffect
             }
-            savedLayer = loadAnnotationLayerForDisplay(
+            savedLayers = loadPageLayersForDisplay(
                 repository.fileStore, noteId, pageIndex, displayWidthPx.roundToInt()
             )
         }
@@ -6563,60 +6674,75 @@ fun ContinuousPageView(
             }
         }
 
-        // The annotation layer of the page: the writing of the user lives on
-        // it, and it reaches out to the left and to the right of the page -
-        // that is the room to write in the margin of an imported PDF. It is
-        // drawn over the page image, so the document underneath stays clean.
-        val sessionLayer = if (sessionReady) inkSession?.ink else null
-        val shownLayer = sessionLayer ?: savedLayer
-        if (shownLayer != null && !shownLayer.isRecycled) {
-            androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
-                val _revision = ink.revision
-                val rect = ink.layerRectFor(pageIndex, size.width, size.height, pageRatioOf())
-                if (rect.empty) return@Canvas
-                drawImage(
-                    image = shownLayer.asImageBitmap(),
-                    srcOffset = androidx.compose.ui.unit.IntOffset.Zero,
-                    srcSize = androidx.compose.ui.unit.IntSize(shownLayer.width, shownLayer.height),
-                    dstOffset = androidx.compose.ui.unit.IntOffset(
-                        (rect.left * size.width).roundToInt(),
-                        (rect.top * size.height).roundToInt()
-                    ),
-                    dstSize = androidx.compose.ui.unit.IntSize(
-                        (rect.width * size.width).roundToInt().coerceAtLeast(1),
-                        (rect.height * size.height).roundToInt().coerceAtLeast(1)
-                    ),
-                    filterQuality = androidx.compose.ui.graphics.FilterQuality.High
-                )
-            }
-        }
-
-        // The strokes that were finished in this session: they are drawn as
-        // vectors on top of the page image, so a finished stroke never
-        // rewrites the session bitmap (and the GPU never has to take
-        // that bitmap again - the pen stops lagging behind the finger).
+        // The annotation layers of the page: the writing of the user lives on
+        // them, and they reach out to the left and to the right of the page -
+        // that is the room to write in the margin of an imported PDF. They
+        // are drawn over the page image, so the document underneath stays
+        // clean.
         //
-        // An eraser clears pixels, so it needs an offscreen layer: the wipe
-        // must cut the strokes of this session, never the page image (the
-        // PDF text) under them.
-        if (ink.committedOps(pageIndex).isNotEmpty()) {
-            val eraseLayer = ink.hasEraseOp(pageIndex)
-            androidx.compose.foundation.Canvas(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .then(
-                        if (eraseLayer) {
-                            Modifier.graphicsLayer(
-                                compositingStrategy = androidx.compose.ui.graphics.CompositingStrategy.Offscreen
-                            )
-                        } else {
-                            Modifier
-                        }
+        // The layers are drawn in order (the base layer first, the layer the
+        // user added on top of it last) and a hidden layer is not drawn at
+        // all: that is the mask of the eye button.
+        layerStack.layers.forEach { layer ->
+            if (!layer.visible) return@forEach
+            val pixels = if (sessionReady) {
+                ink.layerBitmaps(pageIndex, layer)
+            } else {
+                listOfNotNull(savedLayers[layer.index])
+            }
+            val ops = ink.layerOps(pageIndex, layer)
+            if (pixels.isEmpty() && ops.isEmpty()) return@forEach
+            if (pixels.isNotEmpty()) {
+                androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
+                    val _revision = ink.revision
+                    val rect = ink.layerRectFor(pageIndex, size.width, size.height, pageRatioOf())
+                    if (rect.empty) return@Canvas
+                    val dest = android.graphics.RectF(
+                        rect.left * size.width,
+                        rect.top * size.height,
+                        rect.right * size.width,
+                        rect.bottom * size.height
                     )
-            ) {
-                val _revision = ink.revision
-                drawIntoCanvas { canvas ->
-                    ink.drawCommitted(canvas.nativeCanvas, pageIndex, size.width, size.height)
+                    drawIntoCanvas { canvas ->
+                        val native = canvas.nativeCanvas
+                        pixels.forEach { bitmap ->
+                            if (!bitmap.isRecycled) {
+                                native.drawBitmap(bitmap, null, dest, layerPaint)
+                            }
+                        }
+                    }
+                }
+            }
+
+            // The strokes that were finished in this session: they are drawn
+            // as vectors on top of the page image, so a finished stroke never
+            // rewrites the session bitmap (and the GPU never has to take
+            // that bitmap again - the pen stops lagging behind the finger).
+            //
+            // An eraser clears pixels, so it needs an offscreen layer: the
+            // wipe must cut the strokes of this layer, never the page image
+            // (the PDF text) or the layer below it.
+            if (ops.isNotEmpty()) {
+                val eraseLayer = ink.layerHasErase(pageIndex, layer)
+                androidx.compose.foundation.Canvas(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .then(
+                            if (eraseLayer) {
+                                Modifier.graphicsLayer(
+                                    compositingStrategy = androidx.compose.ui.graphics.CompositingStrategy.Offscreen
+                                )
+                            } else {
+                                Modifier
+                            }
+                        )
+                ) {
+                    val _revision = ink.revision
+                    drawIntoCanvas { canvas ->
+                        ink.drawLayerOps(
+                            canvas.nativeCanvas, pageIndex, layer, size.width, size.height
+                        )
+                    }
                 }
             }
         }
@@ -6757,6 +6883,40 @@ fun ContinuousPageView(
 }
 
 /**
+ * The annotation layers of a page, decoded for the screen.
+ *
+ * The layers are as wide as the reader's page box (the page plus the margin
+ * on both sides), so they are bigger than the screen: they are decoded
+ * downsampled, but with their alpha - they are an overlay on the page, not a
+ * picture.
+ *
+ * Only the visible layers are decoded: a hidden layer is not drawn at all.
+ * The key of the map is the number of the layer.
+ */
+internal suspend fun loadPageLayersForDisplay(
+    fileStore: personal.notes.touch.data.files.NoteFileStore,
+    noteId: String,
+    pageIndex: Int,
+    displayWidthPx: Int
+): Map<Int, android.graphics.Bitmap?> = withContext(Dispatchers.IO) {
+    val result = LinkedHashMap<Int, android.graphics.Bitmap?>()
+    try {
+        val metaFile = fileStore.getAnnotationMetaFile(noteId, pageIndex)
+        val text = if (metaFile.exists()) metaFile.readText() else null
+        val stack = text?.let { PageLayerMeta.decode(it) } ?: PageLayerStack.base()
+        for (layer in stack.layers) {
+            if (!layer.visible) continue
+            result[layer.index] = loadAnnotationLayerForDisplay(
+                fileStore, noteId, pageIndex, displayWidthPx, layer.index
+            )
+        }
+    } catch (e: Exception) {
+        e.printStackTrace()
+    }
+    result
+}
+
+/**
  * The annotation layer of a page, decoded for the screen.
  *
  * The layer is as wide as the reader's page box (the page plus the margin on
@@ -6767,12 +6927,11 @@ internal suspend fun loadAnnotationLayerForDisplay(
     fileStore: personal.notes.touch.data.files.NoteFileStore,
     noteId: String,
     pageIndex: Int,
-    displayWidthPx: Int
+    displayWidthPx: Int,
+    layerIndex: Int = ContinuousPageGeometry.BASE_LAYER_INDEX
 ): android.graphics.Bitmap? = withContext(Dispatchers.IO) {
     try {
-        val file = fileStore.getAnnotationLayerFile(
-            noteId, pageIndex, ContinuousPageGeometry.BASE_LAYER_INDEX
-        )
+        val file = fileStore.getAnnotationLayerFile(noteId, pageIndex, layerIndex)
         if (!file.exists()) return@withContext null
         val bounds = android.graphics.BitmapFactory.Options().apply {
             inJustDecodeBounds = true

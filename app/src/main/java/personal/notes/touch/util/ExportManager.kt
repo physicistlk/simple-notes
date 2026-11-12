@@ -492,22 +492,56 @@ object ExportManager {
     }
 
     /**
-     * The annotation layer of a page (layer 1).
+     * The annotation layers of a page, drawn on top of each other.
      *
-     * The layer is as wide as the reader's page box - the page plus the
+     * The layers are as wide as the reader's page box - the page plus the
      * margin on both sides - so the notes the user wrote beside the page are
-     * part of it.
+     * part of them. A hidden layer is not part of the export: it is not
+     * drawn on the page either.
      */
     private suspend fun loadAnnotationLayer(
         fileStore: personal.notes.touch.data.files.NoteFileStore,
         noteId: String,
         pageIndex: Int
     ): Bitmap? {
-        val file = fileStore.getAnnotationLayerFile(
-            noteId, pageIndex, personal.notes.touch.ui.canvas.ContinuousPageGeometry.BASE_LAYER_INDEX
-        )
-        if (!file.exists()) return null
-        return BitmapUtils.loadBitmapFromFile(file)
+        val stack = readAnnotationStack(fileStore, noteId, pageIndex)
+        var result: Bitmap? = null
+        for (layer in stack.layers) {
+            if (!layer.visible) continue
+            val file = fileStore.getAnnotationLayerFile(noteId, pageIndex, layer.index)
+            if (!file.exists()) continue
+            val bitmap = BitmapUtils.loadBitmapFromFile(file) ?: continue
+            if (result == null) {
+                result = bitmap
+                continue
+            }
+            // The layer above the first one goes on top of it.
+            val canvas = Canvas(result)
+            canvas.drawBitmap(bitmap, 0f, 0f, null)
+            if (!bitmap.isRecycled) bitmap.recycle()
+        }
+        return result
+    }
+
+    /**
+     * The layer stack of a page as it is on the disk.
+     *
+     * A page without a metadata file has the base layer only.
+     */
+    private fun readAnnotationStack(
+        fileStore: personal.notes.touch.data.files.NoteFileStore,
+        noteId: String,
+        pageIndex: Int
+    ): personal.notes.touch.ui.canvas.PageLayerStack {
+        val file = fileStore.getAnnotationMetaFile(noteId, pageIndex)
+        val text = try {
+            if (file.exists()) file.readText() else null
+        } catch (e: Exception) {
+            e.printStackTrace()
+            null
+        }
+        return text?.let { personal.notes.touch.ui.canvas.PageLayerMeta.decode(it) }
+            ?: personal.notes.touch.ui.canvas.PageLayerStack.base()
     }
 
     internal fun flattenBitmap(

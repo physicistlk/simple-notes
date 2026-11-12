@@ -121,6 +121,11 @@ class NoteFileStore(private val context: Context) {
             // images) belong to it: they go with it, or a new page at the
             // same index would inherit them.
             if (f.name.startsWith("page_${pageIndex}_layer_") && f.name.endsWith(".png")) f.delete()
+            // The annotation layers of the page (the writing of the user)
+            // and their metadata belong to it as well.
+            if (f.name.startsWith("page_${pageIndex}_annot_") &&
+                (f.name.endsWith(".png") || f.name.endsWith(".json"))
+            ) f.delete()
         }
         return if (file.exists()) file.delete() else true
     }
@@ -155,6 +160,18 @@ class NoteFileStore(private val context: Context) {
                 val target = java.io.File(
                     layersDir,
                     f.name.replace("page_${oldIndex}_layer_", "page_${newIndex}_layer_")
+                )
+                if (target.exists()) target.delete()
+                f.renameTo(target)
+            }
+            // The annotation layers of the page (the writing of the user)
+            // and their metadata move with the page.
+            if (f.name.startsWith("page_${oldIndex}_annot_") &&
+                (f.name.endsWith(".png") || f.name.endsWith(".json"))
+            ) {
+                val target = java.io.File(
+                    layersDir,
+                    f.name.replace("page_${oldIndex}_annot_", "page_${newIndex}_annot_")
                 )
                 if (target.exists()) target.delete()
                 f.renameTo(target)
@@ -199,6 +216,16 @@ class NoteFileStore(private val context: Context) {
      */
     fun getAnnotationLayerFile(noteId: String, pageIndex: Int, layerIndex: Int = 0): File =
         File(getLayersDir(noteId), "page_${pageIndex}_annot_${layerIndex}.png")
+
+    /**
+     * The metadata of the annotation layers of a page.
+     *
+     * It names the layers of the page (their number, their name and whether
+     * they are hidden) and the layer the writing goes on. It sits next to
+     * the layer files (`page_<i>_annot_<n>.png`).
+     */
+    fun getAnnotationMetaFile(noteId: String, pageIndex: Int): File =
+        File(getLayersDir(noteId), "page_${pageIndex}_annot.json")
 
     /** Workspace preferences (tab bar state, dock orientation) live beside the notes. */
     fun getUiPrefsFile(): File = File(context.filesDir, "ui_prefs.json")

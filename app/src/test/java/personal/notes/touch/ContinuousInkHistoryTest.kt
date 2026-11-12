@@ -10,6 +10,9 @@ import personal.notes.touch.ui.canvas.ContinuousStroke
 import personal.notes.touch.ui.canvas.InkHistory
 import personal.notes.touch.ui.canvas.InkOp
 import personal.notes.touch.ui.canvas.InkPatch
+import personal.notes.touch.ui.canvas.OpEntry
+import personal.notes.touch.ui.canvas.PageLayer
+import personal.notes.touch.ui.canvas.PageLayerStack
 
 /**
  * Tests of the ink history of the continuous reader.
@@ -18,8 +21,13 @@ import personal.notes.touch.ui.canvas.InkPatch
  * session bitmap), so the undo/redo works on the list of committed
  * operations - and the eraser, which does clear pixels, hands its pixel
  * patch back to the controller.
+ *
+ * Every operation belongs to a layer of the page: the undo of a deleted or
+ * a merged layer brings the layer back.
  */
 class ContinuousInkHistoryTest {
+
+    private fun layer(index: Int = 1): PageLayer = PageLayer(index, "Layer$index", true)
 
     private fun stroke(tool: CanvasTool = CanvasTool.PEN, width: Float = 0.01f): ContinuousStroke {
         val s = ContinuousStroke(tool, 0xFF000000.toInt(), width)
@@ -33,8 +41,8 @@ class ContinuousInkHistoryTest {
 
     @Test
     fun committedStrokeStaysInTheListAndUndoTakesItOutAgain() {
-        val history = InkHistory()
-        val op = InkOp.Stroke(stroke(), null)
+        val history = InkHistory(PageLayerStack.base())
+        val op = InkOp.Stroke(stroke(), null, layer())
         history.commit(op)
 
         assertEquals(1, history.ops.size)
@@ -55,9 +63,9 @@ class ContinuousInkHistoryTest {
 
     @Test
     fun strokesKeepTheirOrder() {
-        val history = InkHistory()
-        val first = InkOp.Stroke(stroke(), null)
-        val second = InkOp.Stroke(stroke(CanvasTool.HIGHLIGHTER), null)
+        val history = InkHistory(PageLayerStack.base())
+        val first = InkOp.Stroke(stroke(), null, layer())
+        val second = InkOp.Stroke(stroke(CanvasTool.HIGHLIGHTER), null, layer())
         history.commit(first)
         history.commit(second)
 
@@ -68,19 +76,19 @@ class ContinuousInkHistoryTest {
 
     @Test
     fun aNewStrokeDropsTheRedoHistory() {
-        val history = InkHistory()
-        history.commit(InkOp.Stroke(stroke(), null))
+        val history = InkHistory(PageLayerStack.base())
+        history.commit(InkOp.Stroke(stroke(), null, layer()))
         history.undo({ _, _ -> }, { _, _ -> })
         assertTrue(history.canRedo)
 
-        history.commit(InkOp.Stroke(stroke(), null))
+        history.commit(InkOp.Stroke(stroke(), null, layer()))
         assertFalse(history.canRedo)
     }
 
     @Test
     fun undoOfAnEraserPutsThePixelsBackAndRedoWipesThemAgain() {
-        val history = InkHistory()
-        val erase = InkOp.Erase(stroke(CanvasTool.ERASER), patch())
+        val history = InkHistory(PageLayerStack.base())
+        val erase = InkOp.Erase(stroke(CanvasTool.ERASER), listOf(patch()), layer())
         history.commit(erase)
 
         var restored = false
@@ -97,14 +105,14 @@ class ContinuousInkHistoryTest {
 
     @Test
     fun undoOfAClearBringsTheStrokesAndTheInkBack() {
-        val history = InkHistory()
-        val first = InkOp.Stroke(stroke(), null)
-        val second = InkOp.Stroke(stroke(), null)
+        val history = InkHistory(PageLayerStack.base())
+        val first = InkOp.Stroke(stroke(), null, layer())
+        val second = InkOp.Stroke(stroke(), null, layer())
         history.commit(first)
         history.commit(second)
 
-        val cleared = history.ops.toList()
-        history.commitClear(patch(), cleared)
+        val cleared = history.ops.mapIndexed { index, op -> OpEntry(index, op) }
+        history.commitClear(listOf(patch()), cleared)
         assertEquals(0, history.ops.size)
 
         var restored = false
@@ -121,7 +129,7 @@ class ContinuousInkHistoryTest {
 
     @Test
     fun undoOnAnEmptyHistoryDoesNothing() {
-        val history = InkHistory()
+        val history = InkHistory(PageLayerStack.base())
         assertFalse(history.undo({ _, _ -> }, { _, _ -> }))
         assertFalse(history.redo({ _, _ -> }, { _, _ -> }))
         assertEquals(0, history.ops.size)
@@ -129,11 +137,52 @@ class ContinuousInkHistoryTest {
 
     @Test
     fun theOldestActionsAreDroppedWhenTheyTakeTooMuchMemory() {
-        val history = InkHistory()
-        repeat(4) { history.commit(InkOp.Erase(stroke(CanvasTool.ERASER), patch())) }
+        val history = InkHistory(PageLayerStack.base())
+        repeat(4) { history.commit(InkOp.Erase(stroke(CanvasTool.ERASER), listOf(patch()), layer())) }
         // Every erase keeps 4x4 pixels twice: 128 bytes per action.
         history.trim(200)
         assertTrue(history.canUndo)
         assertTrue(history.ops.size >= 1)
+    }
+
+    @Test
+    fun aDeletedLayerTakesItsStrokesWithItAndComesBackWithTheUndo() {
+        val stack = PageLayerStack.base()
+        val history = InkHistory(stack)
+        val second = stack.add() ?: return
+        val stroke = InkOp.Stroke(stroke(), null, second)
+        history.commit(stroke)
+
+        history.commitRemoveLayer(second, merged = false)
+        assertEquals(1, stack.size)
+        assertEquals(0, history.ops.size)
+
+        assertTrue(history.undo({ _, _ -> }, { _, _ -> }))
+        assertEquals(2, stack.size)
+        assertEquals(1, history.ops.size)
+        assertTrue(history.ops[0] === stroke)
+        assertTrue(history.ops[0].layer === second)
+    }
+
+    @Test
+    fun aMergedLayerGoesIntoTheBaseLayerAndComesBackWithTheUndo() {
+        val stack = PageLayerStack.base()
+        val history = InkHistory(stack)
+        val base = stack.layers[0]
+        val second = stack.add() ?: return
+        val stroke = InkOp.Stroke(stroke(), null, second)
+        history.commit(stroke)
+
+        history.commitRemoveLayer(second, merged = true)
+        // The layer is gone and its stroke is part of the base layer now.
+        assertEquals(1, stack.size)
+        assertEquals(1, history.ops.size)
+        assertTrue(history.ops[0].layer === base)
+
+        // The undo brings the layer back with its stroke.
+        assertTrue(history.undo({ _, _ -> }, { _, _ -> }))
+        assertEquals(2, stack.size)
+        assertEquals(1, history.ops.size)
+        assertTrue(history.ops[0].layer === second)
     }
 }

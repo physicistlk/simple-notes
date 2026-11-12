@@ -80,14 +80,21 @@ class ContinuousStroke(
     val endY: Float get() = points.last().y
 }
 
-/** Pixel patch saved before a stroke so it can be undone (and redone). */
+/**
+ * Pixel patch saved before a stroke so it can be undone (and redone).
+ *
+ * [target] is the bitmap the patch belongs to: a layer can hold more than
+ * one bitmap (the pixels of a layer that was merged into it), and the undo
+ * has to put the pixels back into the one it took them from.
+ */
 internal class InkPatch(
     val x: Int,
     val y: Int,
     val w: Int,
     val h: Int,
     val before: IntArray,
-    var after: IntArray? = null
+    var after: IntArray? = null,
+    val target: android.graphics.Bitmap? = null
 ) {
     val bytes: Long get() = w.toLong() * h.toLong() * 4L * (if (after == null) 1 else 2)
 }
@@ -100,16 +107,36 @@ internal class InkPatch(
  * re-upload the layer after every finished stroke.
  *
  * An [Erase] is the one exception - it clears pixels, so it is rasterised into
- * the session bitmap as well (the annotation layer stays the only thing the
- * eraser can touch) and it stays in the list to cut the strokes drawn before
- * it.
+ * the pixels of its layer as well (the annotation layer stays the only thing
+ * the eraser can touch) and it stays in the list to cut the strokes drawn
+ * before it.
+ *
+ * Every operation knows the [layer] it was drawn on: the writing goes on the
+ * current layer of the page, and a stroke stays on its layer until the layer
+ * is merged into the base layer.
  */
 internal sealed class InkOp {
-    /** A finished stroke, with the auto-shape path when one was computed. */
-    class Stroke(val stroke: ContinuousStroke, val shape: Path?) : InkOp()
+    /**
+     * The layer the operation belongs to.
+     *
+     * It is a var because a layer that is merged into the base layer hands
+     * its strokes over to it.
+     */
+    abstract var layer: PageLayer
 
-    /** An eraser stroke; [patch] holds the pixels before and after the wipe. */
-    class Erase(val stroke: ContinuousStroke, val patch: InkPatch) : InkOp()
+    /** A finished stroke, with the auto-shape path when one was computed. */
+    class Stroke(
+        val stroke: ContinuousStroke,
+        val shape: Path?,
+        override var layer: PageLayer
+    ) : InkOp()
+
+    /** An eraser stroke; [patches] holds the pixels before and after the wipe. */
+    class Erase(
+        val stroke: ContinuousStroke,
+        val patches: List<InkPatch>,
+        override var layer: PageLayer
+    ) : InkOp()
 }
 
 /**
@@ -126,9 +153,32 @@ internal sealed class InkAction {
     /** An eraser was applied; its op holds the pixels before and after. */
     class Erase(val op: InkOp.Erase) : InkAction()
 
-    /** The page was cleared: the patch keeps the ink, [removed] the strokes. */
-    class Clear(val patch: InkPatch?, val removed: List<InkOp>) : InkAction()
+    /** The page was cleared: the patches keep the ink, [removed] the strokes. */
+    class Clear(val patches: List<InkPatch>, val removed: List<OpEntry>) : InkAction()
+
+    /** A layer was added to the stack of the page. */
+    class AddLayer(val layer: PageLayer) : InkAction()
+
+    /**
+     * A layer was removed from the stack of the page.
+     *
+     * A deleted layer takes its strokes with it ([merged] is false), a layer
+     * that was merged into the base layer hands its strokes over to the base
+     * layer ([merged] is true).
+     */
+    class RemoveLayer(
+        val layer: PageLayer,
+        /** The number the layer had: the undo puts it back at that place. */
+        val position: Int,
+        /** The strokes that were on the layer. */
+        val entries: List<OpEntry>,
+        val merged: Boolean,
+        val wasCurrent: Boolean
+    ) : InkAction()
 }
+
+/** One committed operation and the place it had in the list. */
+internal class OpEntry(val position: Int, val op: InkOp)
 
 /**
  * The committed operations of one page and their undo history.
@@ -137,8 +187,11 @@ internal sealed class InkAction {
  * and the undo/redo can be unit-tested without a device. The controller
  * feeds it the operations and does the pixel work (the eraser and the clear
  * touch the ink layer, so they are handed back to the controller).
+ *
+ * The history knows the [stack] of the page: a stroke belongs to a layer,
+ * and the undo of a deleted or merged layer brings the layer back.
  */
-internal class InkHistory {
+internal class InkHistory(private val stack: PageLayerStack) {
 
     /** The committed operations, in the order they were committed. */
     val ops = mutableListOf<InkOp>()
@@ -162,12 +215,40 @@ internal class InkHistory {
     }
 
     /**
-     * Commits a clear of the page: the operations of the session go away
-     * with the ink of the page, and both can be brought back.
+     * Commits a clear of a layer: the operations of the layer go away with
+     * its ink, and both can be brought back.
      */
-    fun commitClear(patch: InkPatch?, removed: List<InkOp>) {
-        ops.clear()
-        undoStack.addLast(InkAction.Clear(patch, removed))
+    fun commitClear(patches: List<InkPatch>, removed: List<OpEntry>) {
+        removed.forEach { entry -> ops.removeAll { it === entry.op } }
+        undoStack.addLast(InkAction.Clear(patches, removed))
+        redoStack.clear()
+    }
+
+    /** A layer was added to the stack of the page. */
+    fun commitAddLayer(layer: PageLayer) {
+        undoStack.addLast(InkAction.AddLayer(layer))
+        redoStack.clear()
+    }
+
+    /**
+     * A layer was removed from the stack of the page.
+     *
+     * The strokes of a deleted layer go away with it; the strokes of a layer
+     * that was merged into the base layer become part of the base layer.
+     */
+    fun commitRemoveLayer(layer: PageLayer, merged: Boolean) {
+        val position = layer.index
+        val wasCurrent = stack.current === layer
+        val entries = mutableListOf<OpEntry>()
+        ops.forEachIndexed { index, op -> if (op.layer === layer) entries.add(OpEntry(index, op)) }
+        if (merged) {
+            val base = stack.layerAt(PageLayerStack.BASE_LAYER_INDEX)
+            if (base != null) entries.forEach { it.op.layer = base }
+        } else {
+            entries.sortedByDescending { it.position }.forEach { ops.removeAt(it.position) }
+        }
+        stack.remove(position)
+        undoStack.addLast(InkAction.RemoveLayer(layer, position, entries, merged, wasCurrent))
         redoStack.clear()
     }
 
@@ -176,10 +257,13 @@ internal class InkHistory {
      *
      * [onErase] and [onClear] do the pixel work: [restore] is true when the
      * pixels have to be put back, false when the wipe has to be done again.
+     * [onLayer] is told about the layers: [restored] is true when a layer
+     * comes back, false when it goes away.
      */
     fun undo(
         onErase: (InkOp.Erase, Boolean) -> Unit,
-        onClear: (InkPatch?, Boolean) -> Unit
+        onClear: (List<InkPatch>, Boolean) -> Unit,
+        onLayer: (InkAction, Boolean) -> Unit = { _, _ -> }
     ): Boolean {
         val action = undoStack.removeLastOrNull() ?: return false
         when (action) {
@@ -189,8 +273,29 @@ internal class InkHistory {
                 onErase(action.op, true)
             }
             is InkAction.Clear -> {
-                onClear(action.patch, true)
-                ops.addAll(0, action.removed)
+                onClear(action.patches, true)
+                action.removed.sortedBy { it.position }.forEach { entry ->
+                    ops.add(entry.position.coerceIn(0, ops.size), entry.op)
+                }
+            }
+            is InkAction.AddLayer -> {
+                // The layer goes away again, with the strokes on it.
+                ops.removeAll { it.layer === action.layer }
+                stack.remove(action.layer.index)
+                onLayer(action, false)
+            }
+            is InkAction.RemoveLayer -> {
+                // The layer comes back at its old place.
+                stack.restore(action.layer, action.position)
+                if (action.merged) {
+                    action.entries.forEach { it.op.layer = action.layer }
+                } else {
+                    action.entries.sortedBy { it.position }.forEach { entry ->
+                        ops.add(entry.position.coerceIn(0, ops.size), entry.op)
+                    }
+                }
+                if (action.wasCurrent) stack.select(action.layer.index)
+                onLayer(action, true)
             }
         }
         redoStack.addLast(action)
@@ -200,7 +305,8 @@ internal class InkHistory {
     /** Redoes the last undone operation. */
     fun redo(
         onErase: (InkOp.Erase, Boolean) -> Unit,
-        onClear: (InkPatch?, Boolean) -> Unit
+        onClear: (List<InkPatch>, Boolean) -> Unit,
+        onLayer: (InkAction, Boolean) -> Unit = { _, _ -> }
     ): Boolean {
         val action = redoStack.removeLastOrNull() ?: return false
         when (action) {
@@ -210,8 +316,24 @@ internal class InkHistory {
                 onErase(action.op, false)
             }
             is InkAction.Clear -> {
-                onClear(action.patch, false)
-                action.removed.forEach { op -> ops.remove(op) }
+                onClear(action.patches, false)
+                action.removed.forEach { entry -> ops.removeAll { it === entry.op } }
+            }
+            is InkAction.AddLayer -> {
+                // The layer is there again.
+                stack.restore(action.layer, action.layer.index)
+                onLayer(action, true)
+            }
+            is InkAction.RemoveLayer -> {
+                // The layer goes away again.
+                if (action.merged) {
+                    val base = stack.layerAt(PageLayerStack.BASE_LAYER_INDEX)
+                    if (base != null) action.entries.forEach { it.op.layer = base }
+                } else {
+                    action.entries.forEach { entry -> ops.removeAll { it === entry.op } }
+                }
+                stack.remove(action.layer.index)
+                onLayer(action, false)
             }
         }
         undoStack.addLast(action)
@@ -232,8 +354,10 @@ internal class InkHistory {
     /** How much memory one undo action keeps alive. */
     private fun actionBytes(action: InkAction): Long = when (action) {
         is InkAction.Add -> 0L
-        is InkAction.Erase -> action.op.patch.bytes
-        is InkAction.Clear -> action.patch?.bytes ?: 0L
+        is InkAction.Erase -> action.op.patches.sumOf { it.bytes }
+        is InkAction.Clear -> action.patches.sumOf { it.bytes }
+        is InkAction.AddLayer -> 0L
+        is InkAction.RemoveLayer -> 0L
     }
 }
 
@@ -302,10 +426,11 @@ object ContinuousInkMath {
 /**
  * The writable annotation layer of one reader page.
  *
- * The writing of a page lives on its annotation layer, not on the page
- * image: [ink] is that layer (the base layer, layer 1) and the page image
- * (the clean pdfium render of a PDF page, the page PNG of a raster page)
- * stays clean underneath it.
+ * The writing of a page lives on its annotation layers, not on the page
+ * image: every layer of the stack (the base layer, layer 1, and the two
+ * layers the user can add on top of it) is a bitmap that reaches out to both
+ * sides of the page, and the page image (the clean pdfium render of a PDF
+ * page, the page PNG of a raster page) stays clean underneath them.
  *
  * The layer of a fixed page is as wide as the reader's page box (the page
  * plus the margin on both sides) and as tall as the page, so a stroke in the
@@ -318,7 +443,35 @@ class ContinuousInkSession internal constructor(
     var inkHeight: Int,
     val pageType: String
 ) {
-    internal var ink: Bitmap? = null
+    /**
+     * The layer stack of the page.
+     *
+     * The base layer (layer 1) is always there, the user can add two more,
+     * and the writing goes on the current layer of the stack.
+     */
+    val stack = PageLayerStack()
+
+    /**
+     * True once the stack of the page has been read from the disk.
+     *
+     * A save that runs before that would write the *default* stack (the base
+     * layer only) and delete the files of the other layers - the layers of the
+     * page would be lost.
+     */
+    var stackLoaded: Boolean = false
+
+    /**
+     * The pixels of every layer of the page.
+     *
+     * A layer normally holds one bitmap (the layer file of the page); a
+     * layer that was merged into the base layer keeps its own bitmap, and
+     * the base layer draws it as part of itself.
+     */
+    internal val layerInk = mutableMapOf<PageLayer, MutableList<Bitmap>>()
+
+    /** The layers that were merged into a layer (only the base layer). */
+    internal val merged = mutableMapOf<PageLayer, MutableList<PageLayer>>()
+
     internal var background: Bitmap? = null
     internal var backgroundWidth: Int = 0
     internal var ready: Boolean = false
@@ -329,12 +482,24 @@ class ContinuousInkSession internal constructor(
     internal var live: ContinuousStroke? = null
 
     /**
-     * The layer index of the annotation layer this session writes on.
-     *
-     * Layer 1 is the base layer; the layer stack (layers 2 and 3 and the
-     * "flatten to the base" action) comes with the next step.
+     * The layer the writing goes on (the current layer of the stack).
      */
-    val layerIndex: Int = ContinuousPageGeometry.BASE_LAYER_INDEX
+    val currentLayer: PageLayer? get() = stack.current
+
+    /**
+     * The pixels of the current layer (null when the layer is empty).
+     */
+    internal val ink: Bitmap? get() = stack.current?.let { layerInk[it]?.firstOrNull() }
+
+    /**
+     * Every bitmap of a layer: its own pixels and the pixels of the layers
+     * that were merged into it.
+     */
+    fun bitmapsOf(layer: PageLayer): List<Bitmap> {
+        val own = layerInk[layer].orEmpty()
+        val folded = merged[layer].orEmpty().flatMap { layerInk[it].orEmpty() }
+        return own + folded
+    }
 
     /**
      * The size of the page box the strokes are normalised to, and the
@@ -357,7 +522,7 @@ class ContinuousInkSession internal constructor(
      * re-upload the layer (and the pen does not wait for it) after every
      * stroke.
      */
-    internal val history = InkHistory()
+    internal val history = InkHistory(stack)
 
     internal val pending = mutableListOf<ContinuousStroke>()
 
@@ -754,7 +919,7 @@ class ContinuousInkController(
         if (s.loadJob != null) return
         s.loadJob = scope.launch {
             try {
-                val ink = withContext(Dispatchers.IO) {
+                val loaded = withContext(Dispatchers.IO) {
                     // A raster page is described by its page image: its size
                     // is the ratio of the page, so the layer is as tall as
                     // the page.
@@ -770,37 +935,53 @@ class ContinuousInkController(
                             }
                         }
                     }
-                    // The annotation layer of the page (layer 1). It is the
-                    // persisted form of the writing; the page image itself is
-                    // never touched by a stroke.
-                    val file = repository.fileStore.getAnnotationLayerFile(noteId, s.pageIndex, s.layerIndex)
-                    val stored = personal.notes.touch.util.BitmapUtils.loadBitmapFromFile(file)
-                    val layer = if (stored == null) {
-                        Bitmap.createBitmap(s.inkWidth, s.inkHeight, Bitmap.Config.ARGB_8888)
-                    } else if (stored.width == s.inkWidth && stored.height == s.inkHeight) {
-                        mutableCopy(stored)
-                    } else {
-                        // The layer was written with another size (the page
-                        // changed): the page part of it lands on the page
-                        // part of the new layer, the margins are added.
-                        fitLayer(stored, s.inkWidth, s.inkHeight)
+                    // The layer stack of the page: the metadata file names
+                    // the layers (their number, their name and whether they
+                    // are hidden) and the layer the writing goes on.
+                    val stack = readStack(s.pageIndex)
+                    // The pixels of every layer: the persisted form of the
+                    // writing. The page image itself is never touched by a
+                    // stroke.
+                    val inks = LinkedHashMap<PageLayer, MutableList<Bitmap>>()
+                    var loadedHeight = 0
+                    for (layer in stack.layers) {
+                        val file = repository.fileStore.getAnnotationLayerFile(
+                            noteId, s.pageIndex, layer.index
+                        )
+                        val stored = personal.notes.touch.util.BitmapUtils.loadBitmapFromFile(file)
+                        if (stored == null) continue
+                        val bitmap = if (stored.width == s.inkWidth && stored.height == s.inkHeight) {
+                            mutableCopy(stored)
+                        } else {
+                            // The layer was written with another size (the
+                            // page changed): the page part of it lands on the
+                            // page part of the new layer, the margins are
+                            // added.
+                            fitLayer(stored, s.inkWidth, s.inkHeight)
+                        }
+                        loadedHeight = max(loadedHeight, bitmap.height)
+                        inks[layer] = mutableListOf(bitmap)
                     }
-                    if (pageRatio <= 0f && layer.height > 0) {
+                    LoadedLayers(stack, inks, loadedHeight)
+                }
+                if (session !== s) {
+                    loaded.inks.values.forEach { list -> list.forEach { it.recycle() } }
+                    return@launch
+                }
+                s.stack.load(loaded.stack.layers, loaded.stack.currentIndex)
+                s.stackLoaded = true
+                s.layerInk.clear()
+                s.layerInk.putAll(loaded.inks)
+                if (loaded.height > 0) {
+                    s.inkHeight = loaded.height
+                    if (loaded.stack.layers.isNotEmpty() && !s.isVector && s.pageRatio <= 0f) {
                         // The page image is gone: the layer describes the
                         // page now.
                         s.pageRatio = ContinuousPageGeometry.ratioOfLayer(
-                            pageType, layer.width, layer.height
+                            pageType, s.inkWidth, s.inkHeight
                         )
                     }
-                    layer
                 }
-                if (session !== s) {
-                    ink.recycle()
-                    return@launch
-                }
-                s.ink = ink
-                s.inkWidth = ink.width
-                s.inkHeight = ink.height
                 if (s.isVector) {
                     s.background = withContext(Dispatchers.IO) {
                         renderContinuousPage(
@@ -819,10 +1000,65 @@ class ContinuousInkController(
                 if (s.dirty) scheduleSave(s)
                 onUndoRedoChanged(s.canUndo, s.canRedo)
                 revision++
+                layersRevision++
             } catch (e: Exception) {
                 e.printStackTrace()
             }
         }
+    }
+
+    /** The layers of a page and their pixels, as they were read from the disk. */
+    private class LoadedLayers(
+        val stack: PageLayerStack,
+        val inks: Map<PageLayer, MutableList<Bitmap>>,
+        val height: Int
+    )
+
+    /**
+     * The layer stack of a page as it is on the disk.
+     *
+     * A page without a metadata file has the default stack: the base layer
+     * only. The stack is copied: the session of a page owns its own layers,
+     * and a layer that is renamed or removed there must not change the
+     * stack that is on the disk.
+     */
+    private fun readStack(pageIndex: Int): PageLayerStack {
+        val cached = storedStacks[pageIndex]
+        if (cached != null) return copyStack(cached)
+        val file = repository.fileStore.getAnnotationMetaFile(noteId, pageIndex)
+        val text = try {
+            if (file.exists()) file.readText() else null
+        } catch (e: Exception) {
+            e.printStackTrace()
+            null
+        }
+        val stack = text?.let { PageLayerMeta.decode(it) } ?: PageLayerStack.base()
+        storedStacks[pageIndex] = stack
+        return copyStack(stack)
+    }
+
+    /**
+     * Makes sure the stack of the page is the one on the disk.
+     *
+     * The session loads it in the background; a save that runs before that
+     * would write the default stack (the base layer only) and delete the
+     * files of the other layers.
+     */
+    private fun ensureStackLoaded(s: ContinuousInkSession) {
+        if (s.stackLoaded) return
+        val stack = readStack(s.pageIndex)
+        s.stack.load(stack.layers, stack.currentIndex)
+        s.stackLoaded = true
+    }
+
+    /** A copy of a stack: the layers of the copy are new objects. */
+    private fun copyStack(stack: PageLayerStack): PageLayerStack {
+        val copy = PageLayerStack()
+        copy.load(
+            stack.layers.map { PageLayer(it.index, it.name, it.visible) },
+            stack.currentIndex
+        )
+        return copy
     }
 
     /** Re-renders the clean page under the ink when the zoom changed enough. */
@@ -872,15 +1108,14 @@ class ContinuousInkController(
      * of the page image. The bitmap is only touched by the eraser, which
      * has to clear pixels.
      *
-     * Every stroke belongs to the annotation layer of the page - also the
+     * Every stroke belongs to the current layer of the page - also the
      * ones that reach past the page image into the margin: the layer is
      * wider than the page, so the margin notes are part of it and the page
      * image stays clean.
      */
     private fun commit(s: ContinuousInkSession, stroke: ContinuousStroke, autoShapeEnabled: Boolean = false) {
         if (stroke.points.isEmpty()) return
-        val ink = s.ink ?: return
-        if (ink.isRecycled) return
+        val layer = s.stack.current ?: return
         if (stroke.tool == CanvasTool.ERASER) {
             commitErase(s, stroke)
             return
@@ -895,7 +1130,7 @@ class ContinuousInkController(
             val pts = stroke.points.map { ((it.x - rect.left) * sx) to ((it.y - rect.top) * sy) }
             shape = autoShape(pts)
         }
-        val op = InkOp.Stroke(stroke, shape)
+        val op = InkOp.Stroke(stroke, shape, layer)
         s.history.commit(op)
         trimUndo(s)
         s.dirty = true
@@ -923,32 +1158,39 @@ class ContinuousInkController(
      * Commits an eraser stroke.
      *
      * The eraser is the one exception to the vector strokes: it clears
-     * pixels, so it is drawn into the session bitmap (the annotation layer)
-     * - the PDF text lives in the background, not in that bitmap, so the text
-     * under the eraser stays. The pixels it cleared are kept in a patch so
-     * the wipe can be undone, and the operation stays in the committed list
-     * so it can cut the strokes that were drawn before it.
+     * pixels, so it is drawn into the pixels of the current layer - the PDF
+     * text lives in the background, not in that layer, so the text under the
+     * eraser stays. The pixels it cleared are kept in a patch so the wipe
+     * can be undone, and the operation stays in the committed list so it can
+     * cut the strokes that were drawn before it.
+     *
+     * The eraser only touches the layer the writing goes on: the other
+     * layers of the page keep their writing.
      */
     private fun commitErase(s: ContinuousInkSession, stroke: ContinuousStroke) {
-        val ink = s.ink ?: return
-        if (ink.isRecycled) return
+        val layer = s.stack.current ?: return
         val bounds = strokeBoundsInInk(stroke, s) ?: return
-        val patch = snapshot(ink, bounds) ?: return
-        synchronized(s.inkLock) {
+        val patches = mutableListOf<InkPatch>()
+        for (ink in s.bitmapsOf(layer)) {
+            if (ink.isRecycled) continue
             // A Canvas needs a mutable bitmap. The ink layer is mutable, but
-            // if it ever is not, the erase must not take the app down.
+            // if it ever is not, the erase must not take the app down: the
+            // copy takes its place.
+            var target = ink
             if (!ink.isMutable) {
-                val mutable = ink.copy(Bitmap.Config.ARGB_8888, true) ?: return@synchronized
-                s.ink = mutable
-                drawStrokeInInk(Canvas(mutable), s, stroke)
-                patch.after = capture(mutable, bounds)
-            } else {
-                val canvas = Canvas(ink)
-                drawStrokeInInk(canvas, s, stroke)
-                patch.after = capture(ink, bounds)
+                val mutable = ink.copy(Bitmap.Config.ARGB_8888, true) ?: continue
+                replaceBitmap(s, layer, ink, mutable)
+                target = mutable
             }
+            val patch = snapshot(target, bounds, target) ?: continue
+            synchronized(s.inkLock) {
+                val canvas = Canvas(target)
+                drawStrokeInInk(canvas, s, stroke)
+                patch.after = capture(target, bounds)
+            }
+            patches.add(patch)
         }
-        val op = InkOp.Erase(stroke, patch)
+        val op = InkOp.Erase(stroke, patches, layer)
         s.history.commit(op)
         trimUndo(s)
         s.dirty = true
@@ -956,6 +1198,23 @@ class ContinuousInkController(
         // without this the wiped stroke stayed on the screen until something
         // else invalidated the page.
         revision++
+    }
+
+    /**
+     * Swaps an immutable bitmap of a layer for a mutable copy of it.
+     *
+     * The eraser needs a mutable bitmap to clear pixels in; the copy takes
+     * the place of the old one, so the layer keeps its pixels.
+     */
+    private fun replaceBitmap(s: ContinuousInkSession, layer: PageLayer, old: Bitmap, fresh: Bitmap) {
+        val own = s.layerInk[layer] ?: return
+        val index = own.indexOfFirst { it === old }
+        if (index >= 0) own[index] = fresh
+        s.merged[layer].orEmpty().forEach { other ->
+            val list = s.layerInk[other] ?: return@forEach
+            val at = list.indexOfFirst { it === old }
+            if (at >= 0) list[at] = fresh
+        }
     }
 
     /**
@@ -1028,12 +1287,14 @@ class ContinuousInkController(
         val s = session ?: return false
         val undone = s.history.undo(
             onErase = { op, restore -> restoreErase(s, op, restore) },
-            onClear = { patch, restore -> restoreClear(s, patch, restore) }
+            onClear = { patches, restore -> restoreClear(s, patches, restore) },
+            onLayer = { action, restored -> applyLayerAction(s, action, restored) }
         )
         if (!undone) return false
         s.dirty = true
         scheduleSave(s)
         revision++
+        layersRevision++
         onUndoRedoChanged(s.canUndo, s.canRedo)
         return true
     }
@@ -1043,39 +1304,80 @@ class ContinuousInkController(
         val s = session ?: return false
         val redone = s.history.redo(
             onErase = { op, restore -> restoreErase(s, op, restore) },
-            onClear = { patch, restore -> restoreClear(s, patch, restore) }
+            onClear = { patches, restore -> restoreClear(s, patches, restore) },
+            onLayer = { action, restored -> applyLayerAction(s, action, restored) }
         )
         if (!redone) return false
         s.dirty = true
         scheduleSave(s)
         revision++
+        layersRevision++
         onUndoRedoChanged(s.canUndo, s.canRedo)
         return true
     }
 
     /**
-     * Puts the pixels of an eraser back (undo) or wipes them again (redo).
+     * The pixel side of a layer that was removed or brought back.
+     *
+     * A merged layer keeps its own pixels; the base layer draws them as
+     * part of itself while the merge lasts. A layer that was added and then
+     * undone away was empty, so its pixels are dropped.
      */
-    private fun restoreErase(s: ContinuousInkSession, op: InkOp.Erase, restore: Boolean) {
-        val ink = s.ink ?: return
-        if (ink.isRecycled) return
-        synchronized(s.inkLock) { restore(ink, op.patch, useAfter = !restore) }
+    private fun applyLayerAction(s: ContinuousInkSession, action: InkAction, restored: Boolean) {
+        when (action) {
+            is InkAction.RemoveLayer -> {
+                if (!action.merged) return
+                val base = s.stack.layerAt(PageLayerStack.BASE_LAYER_INDEX) ?: return
+                val folded = s.merged.getOrPut(base) { mutableListOf() }
+                if (restored) {
+                    folded.removeAll { it === action.layer }
+                } else if (!folded.any { it === action.layer }) {
+                    folded.add(action.layer)
+                }
+            }
+            is InkAction.AddLayer -> {
+                s.layerInk.remove(action.layer)
+                s.merged.values.forEach { list -> list.removeAll { it === action.layer } }
+            }
+            else -> {}
+        }
     }
 
     /**
-     * Puts the ink of a cleared page back (undo) or wipes it again (redo).
+     * Puts the pixels of an eraser back (undo) or wipes them again (redo).
+     *
+     * Every patch knows the bitmap it belongs to: a layer can hold more than
+     * one bitmap (the pixels of a layer that was merged into it).
+     */
+    private fun restoreErase(s: ContinuousInkSession, op: InkOp.Erase, restore: Boolean) {
+        synchronized(s.inkLock) {
+            op.patches.forEach { patch ->
+                val ink = patch.target ?: return@forEach
+                if (ink.isRecycled) return@forEach
+                restore(ink, patch, useAfter = !restore)
+            }
+        }
+    }
+
+    /**
+     * Puts the ink of a cleared layer back (undo) or wipes it again (redo).
      *
      * The layer holds the writing of the page (also the notes in the
-     * margin), so it goes with it.
+     * margin), so it goes with it. Every patch knows the bitmap it belongs
+     * to, so the ink of the right layer comes back.
      */
-    private fun restoreClear(s: ContinuousInkSession, patch: InkPatch?, restore: Boolean) {
-        val ink = s.ink ?: return
-        if (ink.isRecycled) return
+    private fun restoreClear(s: ContinuousInkSession, patches: List<InkPatch>, restore: Boolean) {
         synchronized(s.inkLock) {
             if (restore) {
-                if (patch != null) restore(ink, patch, useAfter = false)
+                patches.forEach { patch ->
+                    val ink = patch.target ?: return@forEach
+                    if (!ink.isRecycled) restore(ink, patch, useAfter = false)
+                }
             } else {
-                ink.eraseColor(android.graphics.Color.TRANSPARENT)
+                patches.forEach { patch ->
+                    val ink = patch.target ?: return@forEach
+                    if (!ink.isRecycled) ink.eraseColor(android.graphics.Color.TRANSPARENT)
+                }
             }
         }
     }
@@ -1123,18 +1425,32 @@ class ContinuousInkController(
     /** Clears in-place ink on the active session, supporting undo. */
     fun clearCurrentPage(): Boolean = session?.let { clearSession(it) } ?: false
 
+    /**
+     * Clears the current layer of the page.
+     *
+     * Only the layer the writing goes on is cleared: the other layers of the
+     * page keep their writing. The undo brings the ink and the strokes back.
+     */
     private fun clearSession(s: ContinuousInkSession): Boolean {
-        val ink = s.ink ?: return false
-        if (ink.isRecycled) return false
-        val contentBounds = findContentBounds(ink)
-        val patch = if (contentBounds != null) {
-            snapshot(ink, contentBounds)
-        } else null
-        // The strokes of this session go away with the ink of the page; the
-        // undo keeps both, so the clear can be taken back.
-        val removed = s.history.ops.toList()
-        synchronized(s.inkLock) { ink.eraseColor(android.graphics.Color.TRANSPARENT) }
-        s.history.commitClear(patch, removed)
+        val layer = s.stack.current ?: return false
+        val bitmaps = s.bitmapsOf(layer)
+        val layerOps = s.history.ops.filter { it.layer === layer }
+        if (bitmaps.isEmpty() && layerOps.isEmpty()) return false
+        val patches = mutableListOf<InkPatch>()
+        bitmaps.forEach { ink ->
+            if (ink.isRecycled) return@forEach
+            val contentBounds = findContentBounds(ink)
+            val patch = if (contentBounds != null) snapshot(ink, contentBounds, ink) else null
+            synchronized(s.inkLock) { ink.eraseColor(android.graphics.Color.TRANSPARENT) }
+            if (patch != null) patches.add(patch)
+        }
+        // The strokes of this layer go away with its ink; the undo keeps
+        // both, so the clear can be taken back.
+        val removed = mutableListOf<OpEntry>()
+        s.history.ops.forEachIndexed { position, op ->
+            if (op.layer === layer) removed.add(OpEntry(position, op))
+        }
+        s.history.commitClear(patches, removed)
         trimUndo(s)
         s.dirty = true
         scheduleSave(s)
@@ -1234,9 +1550,9 @@ class ContinuousInkController(
         }
     }
 
-    private fun snapshot(bitmap: Bitmap, r: Rect): InkPatch? {
+    private fun snapshot(bitmap: Bitmap, r: Rect, target: Bitmap? = null): InkPatch? {
         val before = capture(bitmap, r) ?: return null
-        return InkPatch(r.left, r.top, r.width(), r.height(), before)
+        return InkPatch(r.left, r.top, r.width(), r.height(), before, null, target)
     }
 
     private fun restore(bitmap: Bitmap, patch: InkPatch, useAfter: Boolean) {
@@ -1306,51 +1622,103 @@ class ContinuousInkController(
     }
 
     private suspend fun persist(s: ContinuousInkSession) {
-        val ink = s.ink
-        if (ink == null || ink.isRecycled) return
+        // The stack of the page has to be known before the layers are
+        // written: otherwise the save would write the base layer only and
+        // delete the files of the other layers.
+        withContext(Dispatchers.IO) { ensureStackLoaded(s) }
+        if (s.stack.layers.isEmpty()) return
         // The page is only "clean" when the write actually succeeded: a
         // failed write must stay dirty so the next save tries again.
         s.dirty = false
-        // The copy and the strokes drawn into it happen off the main thread:
-        // copying a 40 MB layer on the UI thread blocked the pen for tens of
-        // milliseconds after every stroke. The lock keeps a stroke that lands
-        // during the copy from tearing the snapshot.
-        val copy = try {
-            withContext(Dispatchers.IO) { copyWithOps(s, ink) }
-        } catch (e: OutOfMemoryError) {
-            e.printStackTrace()
-            s.dirty = true
-            return
-        } ?: run { s.dirty = true; return }
-        val ok = withContext(Dispatchers.IO) {
-            savePage(s, copy)
+        // Every layer of the page is written to its own file, and the stack
+        // (the layers, their names and the current one) goes to the metadata
+        // file of the page.
+        for (layer in s.stack.layers) {
+            // The copy and the strokes drawn into it happen off the main
+            // thread: copying a 40 MB layer on the UI thread blocked the pen
+            // for tens of milliseconds after every stroke. The lock keeps a
+            // stroke that lands during the copy from tearing the snapshot.
+            val copy = try {
+                withContext(Dispatchers.IO) { composeLayer(s, layer) }
+            } catch (e: OutOfMemoryError) {
+                e.printStackTrace()
+                s.dirty = true
+                return
+            } ?: run { s.dirty = true; return }
+            if (copy == null) {
+                // The layer is empty: the file of an earlier life of it
+                // goes away, or the layer would come back with the writing
+                // it had before.
+                withContext(Dispatchers.IO) {
+                    repository.fileStore.getAnnotationLayerFile(
+                        noteId, s.pageIndex, layer.index
+                    ).delete()
+                }
+                continue
+            }
+            val ok = withContext(Dispatchers.IO) {
+                repository.savePageLayer(noteId, s.pageIndex, layer.index, copy)
+            }
+            copy.recycle()
+            if (!ok) {
+                // The write failed: keep the session dirty so the next
+                // autosave or the flush on exit tries again.
+                s.dirty = true
+                android.util.Log.w("TouchNotes", "Could not save page ${s.pageIndex}")
+                return
+            }
         }
-        copy.recycle()
-        if (!ok) {
-            // The write failed: keep the session dirty so the next autosave
-            // or the flush on exit tries again.
-            s.dirty = true
-            android.util.Log.w("TouchNotes", "Could not save page ${s.pageIndex}")
-            return
+        withContext(Dispatchers.IO) {
+            repository.savePageLayerMeta(noteId, s.pageIndex, PageLayerMeta.encode(s.stack))
+            deleteStaleLayerFiles(s)
         }
+        storedStacks[s.pageIndex] = s.stack
         s.savedWhileActive = true
         onSaved(s.pageIndex)
     }
 
     /**
-     * Writes the annotation layer of a page.
+     * The saved form of one layer: its pixels and the strokes that were
+     * drawn on it.
      *
-     * The layer is the persisted form of the writing: it is as wide as the
-     * reader's page box (the page plus the margin on both sides) and as tall
-     * as the page, so the notes in the margin are part of it. The page image
-     * itself is never written to - the PDF (or the page PNG) stays clean.
+     * The strokes are normalised to the box and the layer lives in its own
+     * pixels, so the canvas is scaled and moved: the normalised coordinates
+     * land on the layer - a stroke in the margin lands in the margin of the
+     * layer and never on the page image.
      *
-     * The file is the layer file of the page
-     * (`layers/page_<i>_layer_<n>.png`, the format the single-page engine
-     * uses for the layers of a page).
+     * Returns null when the layer is empty (nothing to write).
      */
-    private suspend fun savePage(s: ContinuousInkSession, copy: Bitmap): Boolean {
-        return repository.savePageLayer(noteId, s.pageIndex, s.layerIndex, copy)
+    private fun composeLayer(s: ContinuousInkSession, layer: PageLayer): Bitmap? {
+        val pixels = s.bitmapsOf(layer)
+        val ops = s.history.ops.filter { it.layer === layer }
+        if (pixels.isEmpty() && ops.isEmpty()) return null
+        val target = Bitmap.createBitmap(s.inkWidth, s.inkHeight, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(target)
+        val paint = Paint(Paint.FILTER_BITMAP_FLAG)
+        pixels.forEach { bitmap ->
+            if (!bitmap.isRecycled) canvas.drawBitmap(bitmap, 0f, 0f, paint)
+        }
+        drawOps(canvas, s, ops)
+        return target
+    }
+
+    /**
+     * Deletes the layer files of the layers that are gone.
+     *
+     * A deleted layer leaves its file behind: the next save would write the
+     * layer again under a number that belongs to another layer.
+     */
+    private suspend fun deleteStaleLayerFiles(s: ContinuousInkSession) {
+        val dir = repository.fileStore.getLayersDir(noteId)
+        val files = dir.listFiles() ?: return
+        val keep = s.stack.layers.map { it.index }.toSet()
+        files.forEach { file ->
+            val name = file.name
+            if (!name.startsWith("page_${s.pageIndex}_annot_") || !name.endsWith(".png")) return@forEach
+            val number = name.removePrefix("page_${s.pageIndex}_annot_").removeSuffix(".png")
+            val index = number.toIntOrNull() ?: return@forEach
+            if (!keep.contains(index)) file.delete()
+        }
     }
 
     /**
@@ -1387,32 +1755,6 @@ class ContinuousInkController(
         return target
     }
 
-    /**
-     * Copies the session bitmap and draws the committed strokes into the
-     * copy.
-     *
-     * The copy keeps the ink of the page as it was loaded; the strokes of
-     * this session are rasterised into it here, once, off the main thread.
-     * Must not run on the main thread: the layer is ~40 MB.
-     *
-     * [ops] is the list to draw; when it is null the list of the session is
-     * taken under the lock, together with the copy (so the copy and the
-     * strokes always match). A caller that releases the session before the
-     * copy runs passes the list it took.
-     */
-    private fun copyWithOps(s: ContinuousInkSession, ink: Bitmap, ops: List<InkOp>? = null): Bitmap? {
-        val prepared = synchronized(s.inkLock) {
-            // The copy has to be MUTABLE: the strokes of this session are
-            // drawn into it, and a Canvas over an immutable bitmap throws
-            // ("Immutable bitmap passed to Canvas constructor") - that was
-            // the crash on the first stroke.
-            val copied = ink.copy(Bitmap.Config.ARGB_8888, true)
-            if (copied == null) null else copied to (ops ?: s.history.ops.toList())
-        } ?: return null
-        drawOps(Canvas(prepared.first), s, prepared.second)
-        return prepared.first
-    }
-
     /** Writes a dirty session immediately (page switch, mode exit, dispose). */
     fun flushNow(s: ContinuousInkSession) {
         s.saveJob?.cancel()
@@ -1436,39 +1778,17 @@ class ContinuousInkController(
             }
             return
         }
-        val ink = s.ink ?: run {
-            releaseBitmaps(s)
-            return
-        }
-        if (ink.isRecycled) {
-            releaseBitmaps(s)
-            return
-        }
-        s.dirty = false
         s.savedWhileActive = true
         closingSessions[s.pageIndex] = s
         appScope.launch {
-            // The copy of the 40 MB layer and the strokes drawn into it
+            // The copies of the layers and the strokes drawn into them
             // happen off the main thread: the pen must not wait for them.
-            val copy = try {
-                withContext(Dispatchers.IO) { copyWithOps(s, ink) }
+            try {
+                persist(s)
             } catch (e: OutOfMemoryError) {
                 e.printStackTrace()
-                null
-            }
-            if (copy == null) {
                 s.dirty = true
-                withContext(Dispatchers.Main) {
-                    closingSessions.remove(s.pageIndex)
-                    releaseBitmaps(s)
-                    revision++
-                }
-                return@launch
             }
-            withContext(Dispatchers.IO) {
-                savePage(s, copy)
-            }
-            copy.recycle()
             withContext(Dispatchers.Main) {
                 closingSessions.remove(s.pageIndex)
                 releaseBitmaps(s)
@@ -1511,29 +1831,17 @@ class ContinuousInkController(
         val s = session ?: return
         session = null
         if (s.dirty) {
-            val ink = s.ink
-            if (ink != null && !ink.isRecycled) {
-                s.dirty = false
-                // The strokes are taken now: the session is released below,
-                // and the release drops the list.
-                val ops = s.history.ops.toList()
-                appScope.launch {
-                    // The copy of the layer and the strokes drawn into it
-                    // happen off the main thread.
-                    val copy = try {
-                        withContext(Dispatchers.IO) { copyWithOps(s, ink, ops) }
-                    } catch (e: OutOfMemoryError) {
-                        e.printStackTrace()
-                        null
-                    }
-                    if (copy != null) {
-                        withContext(Dispatchers.IO) {
-                            savePage(s, copy)
-                        }
-                        copy.recycle()
-                    }
-                    onSaved(s.pageIndex)
+            s.dirty = false
+            appScope.launch {
+                // The copies of the layers and the strokes drawn into them
+                // happen off the main thread.
+                try {
+                    persist(s)
+                } catch (e: OutOfMemoryError) {
+                    e.printStackTrace()
+                    s.dirty = true
                 }
+                onSaved(s.pageIndex)
             }
         }
         s.saveJob?.cancel()
@@ -1572,25 +1880,15 @@ class ContinuousInkController(
         for (sess in allSessions) {
             sess.saveJob?.cancel()
             sess.loadJob?.cancel()
-            val ink = sess.ink
-            if (sess.dirty && ink != null && !ink.isRecycled) {
-                // The strokes are taken now: the session is released below,
-                // and the release drops the list.
-                val ops = sess.history.ops.toList()
+            if (sess.dirty) {
                 appScope.launch {
-                    // The copy of the layer and the strokes drawn into it
+                    // The copies of the layers and the strokes drawn into them
                     // happen off the main thread.
-                    val copy = try {
-                        withContext(Dispatchers.IO) { copyWithOps(sess, ink, ops) }
+                    try {
+                        persist(sess)
                     } catch (e: OutOfMemoryError) {
                         e.printStackTrace()
-                        null
-                    }
-                    if (copy != null) {
-                        withContext(Dispatchers.IO) {
-                            savePage(sess, copy)
-                        }
-                        copy.recycle()
+                        sess.dirty = true
                     }
                 }
             }
@@ -1599,30 +1897,206 @@ class ContinuousInkController(
     }
 
     private fun releaseBitmaps(s: ContinuousInkSession) {
-        // Do not call .recycle() on s.ink or s.background: they may still be
-        // actively rendered or queued in Compose frames (Image/Canvas drawImage).
-        // Clearing references allows GC and native finalizers to safely reclaim them.
-        s.ink = null
+        // Do not call .recycle() on the layers or the background: they may
+        // still be actively rendered or queued in Compose frames
+        // (Image/Canvas drawImage). Clearing references allows GC and native
+        // finalizers to safely reclaim them.
+        s.layerInk.clear()
+        s.merged.clear()
         s.background = null
         // The strokes are on disk now: the reader reloads the page from the
         // file, so the committed list must not draw them a second time.
         s.history.ops.clear()
     }
 
+    // ---- layers ---------------------------------------------------------
+
+    /**
+     * Bumped when the layer stack of a page changes (a layer was added,
+     * hidden, merged or deleted).
+     *
+     * The reader reads this, so a hidden layer disappears from the page and
+     * a new one shows up.
+     */
+    var layersRevision by mutableIntStateOf(0)
+        private set
+
+    /** The layer stack of the pages that were read from the disk. */
+    private val storedStacks = mutableMapOf<Int, PageLayerStack>()
+
+    /**
+     * The layer stack of a page: the one of the session, or the one that is
+     * on the disk.
+     *
+     * The base layer (layer 1) is always there; the user can add two more.
+     */
+    fun layerStack(pageIndex: Int): PageLayerStack {
+        val s = getSession(pageIndex)
+        // A session that is still loading has no layers yet: the stack of the
+        // disk is the one of the page until it is there.
+        if (s != null && s.ready) return s.stack
+        return readStack(pageIndex)
+    }
+
+    /**
+     * Makes sure the page has an ink session.
+     *
+     * The layer stack of a page lives in its session, so the layer panel
+     * needs one: without it the panel could only read the stack of the
+     * disk.
+     */
+    fun ensureSessionForPage(page: PageEntity, pageIndex: Int): ContinuousInkSession? {
+        val existing = session
+        if (existing != null && existing.pageIndex == pageIndex) return existing
+        if (existing != null) flushNow(existing)
+        return ensureSession(page, pageIndex, 0f, 0f, 0)
+    }
+
+    /**
+     * Adds a layer to the page (three at most) and makes it the current one:
+     * the writing goes on the new layer.
+     */
+    fun addLayer(pageIndex: Int): Boolean {
+        val s = getSession(pageIndex)
+        if (s == null || !s.ready) return false
+        val layer = s.stack.add() ?: return false
+        s.history.commitAddLayer(layer)
+        s.dirty = true
+        scheduleSave(s)
+        revision++
+        layersRevision++
+        onUndoRedoChanged(s.canUndo, s.canRedo)
+        return true
+    }
+
+    /** Makes a layer the current one: the writing goes on it. */
+    fun selectLayer(pageIndex: Int, index: Int): Boolean {
+        val s = getSession(pageIndex)
+        if (s == null || !s.ready) return false
+        if (!s.stack.select(index)) return false
+        revision++
+        layersRevision++
+        return true
+    }
+
+    /**
+     * Hides a layer (it is masked, not deleted) or shows it again.
+     *
+     * The writing of a hidden layer is not drawn on the page; it comes back
+     * when the eye is pressed again.
+     */
+    fun setLayerVisible(pageIndex: Int, index: Int, visible: Boolean): Boolean {
+        val s = getSession(pageIndex)
+        if (s == null || !s.ready) return false
+        if (!s.stack.setVisible(index, visible)) return false
+        s.dirty = true
+        scheduleSave(s)
+        revision++
+        layersRevision++
+        return true
+    }
+
+    /**
+     * Deletes a layer.
+     *
+     * The base layer is never deleted (it can only be hidden); the undo
+     * brings a deleted layer back.
+     */
+    fun deleteLayer(pageIndex: Int, index: Int): Boolean {
+        val s = getSession(pageIndex)
+        if (s == null || !s.ready) return false
+        if (index == PageLayerStack.BASE_LAYER_INDEX) return false
+        val layer = s.stack.layerAt(index) ?: return false
+        s.history.commitRemoveLayer(layer, merged = false)
+        s.dirty = true
+        scheduleSave(s)
+        revision++
+        layersRevision++
+        onUndoRedoChanged(s.canUndo, s.canRedo)
+        return true
+    }
+
+    /**
+     * Merges a layer into the base layer: the writing of the layer becomes
+     * part of the base layer and the layer itself is gone.
+     *
+     * The undo brings the layer back with its writing.
+     */
+    fun mergeLayer(pageIndex: Int, index: Int): Boolean {
+        val s = getSession(pageIndex)
+        if (s == null || !s.ready) return false
+        if (index == PageLayerStack.BASE_LAYER_INDEX) return false
+        val layer = s.stack.layerAt(index) ?: return false
+        val base = s.stack.layerAt(PageLayerStack.BASE_LAYER_INDEX) ?: return false
+        // The pixels of the layer become part of the base layer: the base
+        // draws them as its own while the merge lasts.
+        val folded = s.merged.getOrPut(base) { mutableListOf() }
+        if (!folded.any { it === layer }) folded.add(layer)
+        s.history.commitRemoveLayer(layer, merged = true)
+        s.dirty = true
+        scheduleSave(s)
+        revision++
+        layersRevision++
+        onUndoRedoChanged(s.canUndo, s.canRedo)
+        return true
+    }
+
+    /** The bitmaps of a layer as they are on screen (the session's pixels). */
+    fun layerBitmaps(pageIndex: Int, layer: PageLayer): List<Bitmap> {
+        val s = getSession(pageIndex) ?: return emptyList()
+        return s.bitmapsOf(layer)
+    }
+
+    /**
+     * A small preview of a layer (null when the layer is empty).
+     *
+     * The preview is what the layer panel shows next to the name of the
+     * layer: it is scaled down, so it must not run on the main thread.
+     */
+    fun layerThumbnail(pageIndex: Int, layer: PageLayer): Bitmap? {
+        val source = layerBitmaps(pageIndex, layer).firstOrNull() ?: return null
+        if (source.isRecycled || source.width <= 0 || source.height <= 0) return null
+        return try {
+            val width = THUMBNAIL_SIZE
+            val height = (width * source.height.toFloat() / source.width).roundToInt().coerceAtLeast(1)
+            val thumb = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(thumb)
+            canvas.drawBitmap(
+                source,
+                null,
+                Rect(0, 0, width, height),
+                Paint(Paint.FILTER_BITMAP_FLAG)
+            )
+            thumb
+        } catch (e: Throwable) {
+            e.printStackTrace()
+            null
+        }
+    }
+
     // ---- drawing -------------------------------------------------------
 
     /**
-     * Draws the committed strokes of a page into the page box.
+     * Draws the committed strokes of one layer of a page into the page box.
      *
      * They are drawn as paths, with exactly the code the live preview uses,
      * so a finished stroke looks the same as the one the user just drew -
      * and the session bitmap is never touched, so the GPU never has to
      * take the whole layer again.
+     *
+     * Every layer is drawn on its own, so the eraser of a layer never cuts
+     * the writing of the layer below it.
      */
-    fun drawCommitted(canvas: Canvas, pageIndex: Int, viewWidth: Float, viewHeight: Float) {
+    fun drawLayerOps(
+        canvas: Canvas,
+        pageIndex: Int,
+        layer: PageLayer,
+        viewWidth: Float,
+        viewHeight: Float
+    ) {
         val s = getSession(pageIndex) ?: return
-        if (s.history.ops.isEmpty()) return
         for (op in s.history.ops) {
+            if (op.layer !== layer) continue
             when (op) {
                 is InkOp.Stroke -> drawOpStroke(canvas, op, s, viewWidth, viewHeight)
                 // The eraser clears pixels: the reader draws it into an
@@ -1632,20 +2106,20 @@ class ContinuousInkController(
         }
     }
 
-    /** The committed operations of a page, in the order they were committed. */
-    internal fun committedOps(pageIndex: Int): List<InkOp> {
+    /** The committed operations of one layer of a page. */
+    internal fun layerOps(pageIndex: Int, layer: PageLayer): List<InkOp> {
         val s = getSession(pageIndex) ?: return emptyList()
-        return s.history.ops
+        return s.history.ops.filter { it.layer === layer }
     }
 
     /**
-     * True when the committed operations of a page contain an eraser. The
+     * True when the committed operations of a layer contain an eraser. The
      * reader needs an offscreen layer for those: a CLEAR stroke must not
      * reach the page image (the PDF text) under it.
      */
-    internal fun hasEraseOp(pageIndex: Int): Boolean {
+    internal fun layerHasErase(pageIndex: Int, layer: PageLayer): Boolean {
         val s = getSession(pageIndex) ?: return false
-        return s.history.ops.any { it is InkOp.Erase }
+        return s.history.ops.any { it.layer === layer && it is InkOp.Erase }
     }
 
     /** Draws a committed stroke into the page box (view coordinates). */
@@ -1901,5 +2375,7 @@ class ContinuousInkController(
         const val LASER_TRAIL_MS = 700L
         /** ~48 MB of patches: a few dozen ordinary strokes, bounded. */
         const val MAX_UNDO_BYTES = 48L * 1024L * 1024L
+        /** The width of the preview of a layer in the layer panel. */
+        const val THUMBNAIL_SIZE = 120
     }
 }

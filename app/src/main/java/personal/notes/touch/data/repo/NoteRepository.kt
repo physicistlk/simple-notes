@@ -729,6 +729,28 @@ class NoteRepository(
         ok
     }
 
+    /**
+     * Writes the metadata of the annotation layers of a page.
+     *
+     * The metadata names the layers of the page (their number, their name
+     * and whether they are hidden) and the layer the writing goes on.
+     */
+    suspend fun savePageLayerMeta(
+        noteId: String,
+        pageIndex: Int,
+        json: String
+    ): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val file = fileStore.getAnnotationMetaFile(noteId, pageIndex)
+            file.parentFile?.mkdirs()
+            file.writeText(json)
+            true
+        } catch (e: Exception) {
+            e.printStackTrace()
+            false
+        }
+    }
+
     /** Persist the per-page paper pattern (PaperPattern.code) to the page row. */
     suspend fun savePagePattern(noteId: String, pageIndex: Int, patternCode: Int): Boolean = withContext(Dispatchers.IO) {
         try {
