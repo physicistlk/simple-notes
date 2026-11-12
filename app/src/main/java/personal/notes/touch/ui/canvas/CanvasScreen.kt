@@ -667,15 +667,25 @@ fun CanvasScreen(
             // The glass samples the **annotation layer** of the page: the
             // layer holds the writing, the page image does not - so with the
             // page image the strokes never dispersed through the lens.
+            //
+            // The layer is a grid of tiles now, so the glass samples a small
+            // copy of it (the tiles composed at the resolution the glass
+            // reads the page at). The origin of the copy is the top-left
+            // corner of the layer, so the glass still looks at the writing
+            // that lies under it.
             val panX = if (isHorizontal) 0f else continuousPanX
             val panY = if (isHorizontal) continuousPanY else 0f
             val mapping = inkController.layerScreenMapping(currentPageIndex, panX, panY)
             if (mapping != null) {
                 GlassBackdrop(
                     bitmap = mapping.bitmap,
-                    pageOriginX = origin.x - mapping.originX,
-                    pageOriginY = origin.y - mapping.originY,
-                    invScale = mapping.scale
+                    // The origin of the glass in the pixels of the copy.
+                    pageOriginX = (origin.x - mapping.originX) * mapping.scale,
+                    pageOriginY = (origin.y - mapping.originY) * mapping.scale,
+                    invScale = mapping.scale,
+                    // The copy is already as small as the glass reads the
+                    // page: it is sampled as it is.
+                    sampleScale = 1f
                 )
             } else {
                 // No layer (yet): the page image is the next best thing.
@@ -6856,14 +6866,23 @@ fun ContinuousPageView(
         // all: that is the mask of the eye button.
         layerStack.layers.forEach { layer ->
             if (!layer.visible) return@forEach
-            val pixels = if (sessionReady) {
-                ink.layerBitmaps(pageIndex, layer)
+            // The layer of the session is a grid of tiles: every tile is
+            // drawn into its own part of the layer's rect. Without a session
+            // (the user only reads) the layer comes from the disk as one
+            // bitmap and is drawn as it is.
+            val placements = if (sessionReady) {
+                ink.layerTiles(pageIndex, layer)
+            } else {
+                emptyList()
+            }
+            val saved = if (sessionReady) {
+                emptyList()
             } else {
                 listOfNotNull(savedLayers[layer.index])
             }
             val ops = ink.layerOps(pageIndex, layer)
-            if (pixels.isEmpty() && ops.isEmpty()) return@forEach
-            if (pixels.isNotEmpty()) {
+            if (placements.isEmpty() && saved.isEmpty() && ops.isEmpty()) return@forEach
+            if (placements.isNotEmpty() || saved.isNotEmpty()) {
                 androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
                     val _revision = ink.revision
                     val rect = ink.layerRectFor(pageIndex, size.width, size.height, pageRatioOf())
@@ -6876,9 +6895,31 @@ fun ContinuousPageView(
                     )
                     drawIntoCanvas { canvas ->
                         val native = canvas.nativeCanvas
-                        pixels.forEach { bitmap ->
+                        saved.forEach { bitmap ->
                             if (!bitmap.isRecycled) {
                                 native.drawBitmap(bitmap, null, dest, layerPaint)
+                            }
+                        }
+                        placements.forEach placementLoop@ { placement ->
+                            val grid = placement.grid
+                            placement.tiles.existingTiles().forEach tileLoop@ { index ->
+                                val tx = grid.tileColumn(index)
+                                val ty = grid.tileRow(index)
+                                if (tx < 0 || ty < 0) return@tileLoop
+                                val bitmap = placement.tiles.tile(tx, ty) ?: return@tileLoop
+                                if (bitmap.isRecycled) return@tileLoop
+                                val tile = LayerTileMapping.tileRect(
+                                    grid, tx, ty, rect, size.width, size.height
+                                )
+                                if (tile.empty) return@tileLoop
+                                native.drawBitmap(
+                                    bitmap,
+                                    null,
+                                    android.graphics.RectF(
+                                        tile.left, tile.top, tile.right, tile.bottom
+                                    ),
+                                    layerPaint
+                                )
                             }
                         }
                     }

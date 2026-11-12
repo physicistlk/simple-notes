@@ -47,12 +47,19 @@ import androidx.compose.ui.unit.dp
  * `bitmap` is the page in page pixels, `pageOriginX/Y` is the page coordinate
  * of the glass' own top-left corner and `invScale` says how many page pixels
  * one screen pixel covers.
+ *
+ * `sampleScale` says how much the backdrop is scaled down before the shader
+ * samples it: the shader reads a small copy of the backdrop, and the copy of
+ * a page is a quarter of it. A backdrop that is already that small (the
+ * tiles of an annotation layer, composed at that size) says `1f` and is
+ * sampled as it is.
  */
 data class GlassBackdrop(
     val bitmap: Bitmap?,
     val pageOriginX: Float,
     val pageOriginY: Float,
-    val invScale: Float
+    val invScale: Float,
+    val sampleScale: Float = SAMPLE_SCALE
 )
 
 /** Where a floating element sits on the screen (root pixels). */
@@ -247,8 +254,10 @@ class LiquidGlassShader {
     private var sampleBitmap: Bitmap? = null
     private var sampleSource: Bitmap? = null
     private var sampleGeneration: Int = -1
+    private var sampleScale: Float = SAMPLE_SCALE
     private var samplePendingSource: Bitmap? = null
     private var samplePendingGeneration: Int = -1
+    private var samplePendingScale: Float = SAMPLE_SCALE
 
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
 
@@ -260,23 +269,33 @@ class LiquidGlassShader {
      *
      * The copy is built in the background: building it on the draw thread
      * would cost tens of milliseconds on a 26 MB page.
+     *
+     * A backdrop that is sampled as it is (a scale of 1) needs no copy: it
+     * is used directly.
      */
-    private fun sampleFor(source: Bitmap): PageSample? {
+    private fun sampleFor(source: Bitmap, scale: Float): PageSample? {
         val generation = try {
             source.generationId
         } catch (e: Exception) {
             0
         }
-        if (sampleSource === source && sampleGeneration == generation) {
+        if (scale >= 0.999f) {
+            // No copy: the backdrop is sampled as it is.
+            return PageSample(source)
+        }
+        if (sampleSource === source && sampleGeneration == generation && sampleScale == scale) {
             val bitmap = sampleBitmap ?: return null
             return PageSample(bitmap)
         }
-        if (samplePendingSource !== source || samplePendingGeneration != generation) {
+        if (samplePendingSource !== source || samplePendingGeneration != generation ||
+            samplePendingScale != scale
+        ) {
             samplePendingSource = source
             samplePendingGeneration = generation
+            samplePendingScale = scale
             SampleBuilder.execute {
-                val w = (source.width * SAMPLE_SCALE).toInt().coerceAtLeast(1)
-                val h = (source.height * SAMPLE_SCALE).toInt().coerceAtLeast(1)
+                val w = (source.width * scale).toInt().coerceAtLeast(1)
+                val h = (source.height * scale).toInt().coerceAtLeast(1)
                 val small = try {
                     Bitmap.createScaledBitmap(source, w, h, true)
                 } catch (e: Exception) {
@@ -286,6 +305,7 @@ class LiquidGlassShader {
                 sampleBitmap = small
                 sampleSource = source
                 sampleGeneration = generation
+                sampleScale = scale
             }
         }
         val bitmap = sampleBitmap ?: return null
@@ -307,7 +327,10 @@ class LiquidGlassShader {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return null
         val bmp = backdrop?.bitmap ?: return null
         if (width <= 0f || height <= 0f || backdrop.invScale <= 0f) return null
-        val sample = sampleFor(bmp) ?: return null
+        // The sample is a scaled copy of the page, so every page coordinate
+        // is scaled with it.
+        val k = backdrop.sampleScale
+        val sample = sampleFor(bmp, k) ?: return null
         return try {
             if (inputBitmap !== sample.bitmap) {
                 input = BitmapShader(sample.bitmap, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
@@ -315,9 +338,6 @@ class LiquidGlassShader {
             }
             val shaderIn = input ?: return null
             val rs = runtime ?: RuntimeShader(LIQUID_GLASS_AGSL).also { runtime = it }
-            // The sample is a scaled copy of the page, so every page
-            // coordinate is scaled with it.
-            val k = SAMPLE_SCALE
             rs.setFloatUniform("uSize", width, height)
             rs.setFloatUniform("uRadius", radiusPx)
             rs.setFloatUniform("uPageOrigin", backdrop.pageOriginX * k, backdrop.pageOriginY * k)

@@ -7,6 +7,20 @@ import android.graphics.PorterDuff
 import android.graphics.PorterDuffXfermode
 
 /**
+ * The tiles of one layer and the grid they live in.
+ *
+ * A layer normally holds one store (the tiles of the layer file of the
+ * page); a layer that was merged into the base layer keeps its own store,
+ * and the base layer draws it as part of itself.
+ */
+data class LayerTilePlacement(
+    /** The tiles of the layer. */
+    val tiles: LayerTiles,
+    /** The geometry of the tiles (where they are in the layer's pixels). */
+    val grid: LayerTileGrid
+)
+
+/**
  * The tiles of an annotation layer.
  *
  * The layer is not one bitmap any more (audit C50): it is a grid of tiles
@@ -170,6 +184,25 @@ class LayerTiles(val grid: LayerTileGrid) {
                 tiles.remove(index)
             }
         }
+    }
+
+    /**
+     * Gives a tile back to the system when it holds nothing any more.
+     *
+     * An erased tile that is empty costs nothing, so it goes: the pixels are
+     * given back and the tile leaves the store. A tile that still holds ink
+     * stays where it is.
+     */
+    @Synchronized
+    fun releaseIfEmpty(tx: Int, ty: Int) {
+        val index = grid.tileIndex(tx, ty)
+        if (index < 0) return
+        val bitmap = tiles[index] ?: return
+        if (!bitmap.isRecycled && !isBitmapEmpty(bitmap)) return
+        if (!bitmap.isRecycled) bitmap.recycle()
+        tiles.remove(index)
+        // The tile changed: the file of it has to go (or be written again).
+        dirty.add(index)
     }
 
     /**
