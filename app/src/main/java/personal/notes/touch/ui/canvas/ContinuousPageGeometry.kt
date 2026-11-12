@@ -28,7 +28,7 @@ object ContinuousPageGeometry {
 
     /**
      * The margin around a fixed page, as a fraction of the page's own width:
-     * a quarter of the page's width on the left and on the right.
+     * **a whole page width** on the left and on the right.
      *
      * The margin is horizontal only on purpose. The box then has the height
      * of the page, so the page keeps its place in the reader (the page does
@@ -37,7 +37,7 @@ object ContinuousPageGeometry {
      * space the ink lives in) is a plain scale on both axes - a stroke
      * cannot change its shape when it is written into the layer.
      */
-    const val PAGE_MARGIN = 0.25f
+    const val PAGE_MARGIN = 1.0f
 
     /**
      * The index of the base annotation layer of a page (layer 1).
@@ -101,7 +101,10 @@ object ContinuousPageGeometry {
      */
     fun boxRatio(pageType: String?, pageRatio: Float): Float {
         val ratio = if (pageRatio > 0f) pageRatio else defaultRatio(pageType)
-        return if (isInfinite(pageType)) ratio else ratio * (1f + 2f * PAGE_MARGIN)
+        // The box of a page is the page: the document fills the screen and the
+        // margin of the annotation layer reaches past it - the page is pulled
+        // aside to write in it.
+        return ratio
     }
 
     /**
@@ -133,10 +136,10 @@ object ContinuousPageGeometry {
      * the page, so the page keeps its place in the reader.
      */
     private fun fixedRect(ratio: Float, boxWidth: Float, boxHeight: Float): BoxRect {
-        // The page plus its margin, in units of the page's height. The
-        // height is not changed: the box is as tall as the page.
-        val totalWidth = ratio * (1f + 2f * PAGE_MARGIN)
-        val scale = min(boxWidth / totalWidth, boxHeight)
+        // The page is fitted into the box: it fills the screen, which is what
+        // the "reset zoom" has to show. The margin of the annotation layer
+        // reaches past the box (see layerRect).
+        val scale = min(boxWidth / ratio, boxHeight)
         return centredRect(ratio * scale, scale, boxWidth, boxHeight)
     }
 
@@ -210,17 +213,16 @@ object ContinuousPageGeometry {
         boxWidth: Float,
         boxHeight: Float
     ): BoxRect {
-        if (!isInfinite(pageType)) return BoxRect(0f, 0f, 1f, 1f)
         val page = pageRect(pageType, pageRatio, boxWidth, boxHeight)
         if (page.empty) return page
-        // The layer is the page plus a quarter of the page's width on each
-        // side, centred on the page.
+        // The layer is the page plus a whole page width of margin on each
+        // side, centred on the page. Its page part therefore lands exactly on
+        // the page, and the margin reaches past the screen: the page is
+        // pulled aside to write in it.
         val grow = PAGE_MARGIN
         val width = page.width * (1f + 2f * grow)
-        val height = page.height
         val left = page.left - page.width * grow
-        val top = page.top - page.height * grow
-        return BoxRect(left, top, left + width, top + height)
+        return BoxRect(left, page.top, left + width, page.bottom)
     }
 
     /**

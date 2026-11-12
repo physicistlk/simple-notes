@@ -48,11 +48,12 @@ class ContinuousPageGeometryTest {
     }
 
     @Test
-    fun theBoxOfAFixedPageIsAWiderRectangleThanItsPage() {
+    fun theBoxOfAFixedPageIsThePageItself() {
+        // The document fills the screen: the box of a fixed page has the
+        // aspect ratio of the page. The margin of the annotation layer
+        // reaches past the box - the page is pulled aside to write in it.
         val boxRatio = ContinuousPageGeometry.boxRatio("a4", a4)
-        assertEquals(a4 * 1.5f, boxRatio, 0.0001f)
-        // The page is two thirds of the box.
-        assertTrue("the box is wider", boxRatio > a4)
+        assertEquals(a4, boxRatio, 0.0001f)
     }
 
     @Test
@@ -104,14 +105,14 @@ class ContinuousPageGeometryTest {
     // ---- the annotation layer -------------------------------------------
 
     @Test
-    fun theLayerOfAFixedPageIsAsWideAsTheBoxAndAsTallAsThePage() {
-        // The layer of an A4 page (2160 px wide): the page plus the margin
-        // on both sides, so a third wider than the page, and as tall as the
-        // page.
+    fun theLayerOfAFixedPageHasAWholePageOfMarginOnEachSide() {
+        // The layer of an A4 page (2160 px wide): the page plus a whole page
+        // width of margin on both sides - three times as wide as the page -
+        // and as tall as the page.
         val size = ContinuousPageGeometry.layerSize(
             "a4", ContinuousPageGeometry.DEFAULT_PAGE_RATIO
         )
-        assertEquals(3240, size.width)
+        assertEquals(6480, size.width)
         assertEquals(3056, size.height)
     }
 
@@ -122,7 +123,7 @@ class ContinuousPageGeometryTest {
         val size = ContinuousPageGeometry.layerSize(
             "infinite", ContinuousPageGeometry.INFINITE_PAGE_RATIO
         )
-        assertEquals((2160 * 1.5f).roundToInt(), size.width)
+        assertEquals((2160 * 3f).roundToInt(), size.width)
         assertEquals(3840, size.height)
     }
 
@@ -143,36 +144,48 @@ class ContinuousPageGeometryTest {
     }
 
     @Test
-    fun theLayerOfAFixedPageCoversTheWholeBox() {
+    fun theLayerOfAFixedPageReachesPastTheBox() {
+        // The margin of the layer reaches past the screen on both sides: the
+        // page is pulled aside to write in it.
         val boxHeight = 1000f
-        val boxWidth = boxHeight * a4 * 1.5f
-        val rect = ContinuousPageGeometry.layerRect("a4", a4, boxWidth, boxHeight)
-        assertEquals(0f, rect.left, 0.0001f)
-        assertEquals(0f, rect.top, 0.0001f)
-        assertEquals(1f, rect.right, 0.0001f)
-        assertEquals(1f, rect.bottom, 0.0001f)
+        val boxWidth = boxHeight * a4
+        val page = ContinuousPageGeometry.pageRect("a4", a4, boxWidth, boxHeight)
+        val layer = ContinuousPageGeometry.layerRect("a4", a4, boxWidth, boxHeight)
+        assertTrue("the layer reaches past the page on the left", layer.left < page.left)
+        assertTrue("the layer reaches past the page on the right", layer.right > page.right)
+        // A whole page width on each side.
+        assertEquals(page.width, page.left - layer.left, 0.0001f)
+        assertEquals(page.width, layer.right - page.right, 0.0001f)
+        // The page part of the layer is the middle third, so the page and the
+        // strokes on the layer stay aligned.
+        assertEquals(page.left, layer.left + layer.width / 3f, 0.0001f)
     }
 
     @Test
     fun aStrokeInTheMarginIsInsideTheLayerAndOutsideThePage() {
         val boxHeight = 1000f
-        val boxWidth = boxHeight * a4 * 1.5f
+        val boxWidth = boxHeight * a4
         val page = ContinuousPageGeometry.pageRect("a4", a4, boxWidth, boxHeight)
         val layer = ContinuousPageGeometry.layerRect("a4", a4, boxWidth, boxHeight)
 
-        // A stroke in the left margin of the page (5% of the box).
-        val x = 0.05f
+        // A stroke in the left margin of the page: the margin is outside
+        // the box now (the page fills the screen), so the stroke sits at a
+        // negative position in the box.
+        val x = -0.5f
         val y = 0.5f
         assertFalse("the stroke is not on the page", page.contains(x, y))
         assertTrue("the stroke is on the layer", layer.contains(x, y))
 
         // Its place in the layer's pixels: inside the layer, and left of the
-        // page (the page starts a quarter of its width further right).
+        // page (the page starts a third of the layer further right).
         val size = ContinuousPageGeometry.layerSize("a4", a4)
         val point = ContinuousPageGeometry.layerPoint(layer, x, y, size.width, size.height)
-        assertTrue("x ${point.x}", point.x > 0f && point.x < size.width)
+        assertTrue(
+            "x ${point.x} (layer=$layer page=$page size=$size)",
+            point.x > 0f && point.x < size.width
+        )
         assertTrue("y ${point.y}", point.y > 0f && point.y < size.height)
-        val pageLeft = size.width / 6f
+        val pageLeft = size.width / 3f
         assertTrue("the stroke is left of the page", point.x < pageLeft)
     }
 

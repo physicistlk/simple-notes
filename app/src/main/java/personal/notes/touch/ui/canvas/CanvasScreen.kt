@@ -419,6 +419,13 @@ fun CanvasScreen(
     /** The width chip the slider popup belongs to (only that one shows it). */
     var widthPopupChipHoriz by remember { mutableIntStateOf(-1) }
     var showColorPopupHoriz by remember { mutableStateOf(false) }
+    /**
+     * The colours of the dock's colour chips.
+     *
+     * The chips are the user's palette: a colour that is picked in the
+     * palette of a chip stays with that chip.
+     */
+    var dockColors by remember { mutableStateOf(TouchNotesDockColors.toList()) }
     /** The swatch the colour popup belongs to (only that one shows it). */
     var colorPopupChipHoriz by remember { mutableIntStateOf(-1) }
     var showWidthPopupVert by remember { mutableStateOf(false) }
@@ -563,54 +570,6 @@ fun CanvasScreen(
      * In the reader the page map is known (page pixels -> root pixels); in
      * single-page mode the canvas engine maps its own view space to the page.
      */
-    val glassBackdropAt: (GlassOrigin) -> GlassBackdrop? = { origin ->
-        val view = canvasViewRef
-        if (isContinuous) {
-            // The reader scrolls in a Lazy list; its offset is the signal
-            // that the page under the dock moved.
-            @Suppress("UNUSED_EXPRESSION")
-            if (uiState.doublePageMode || isHorizontal) {
-                continuousRowState.firstVisibleItemIndex
-                continuousRowState.firstVisibleItemScrollOffset
-            } else {
-                continuousColState.firstVisibleItemIndex
-                continuousColState.firstVisibleItemScrollOffset
-            }
-            // The image map: the bitmap the glass samples is the page image,
-            // and it is rendered at the display resolution - the ink space
-            // (the map above) has different pixels.
-            val map = continuousPageMap.imageMap
-            val bmp = glassReaderBitmap
-            if (map == null || bmp == null || map.scale <= 0f ||
-                map.pageIndex != glassReaderBitmapPage
-            ) {
-                null
-            } else {
-                GlassBackdrop(
-                    bitmap = bmp,
-                    pageOriginX = (origin.x - map.offsetX) / map.scale,
-                    pageOriginY = (origin.y - map.offsetY) / map.scale,
-                    invScale = 1f / map.scale
-                )
-            }
-        } else {
-            // Read inside the draw: the draw phase watches the tick and
-            // redraws the glass when the page was panned or zoomed.
-            @Suppress("UNUSED_EXPRESSION")
-            glassViewportTick
-            val bmp = view?.getBackingBitmap()
-            if (view == null || bmp == null) {
-                null
-            } else {
-                val lx = origin.x - canvasOriginInRoot.x
-                val ly = origin.y - canvasOriginInRoot.y
-                val p0 = view.viewPointToPage(lx, ly)
-                val p1 = view.viewPointToPage(lx + 1f, ly)
-                val sx = p1[0] - p0[0]
-                if (sx <= 0.0001f) null else GlassBackdrop(bmp, p0[0], p0[1], 1f / sx)
-            }
-        }
-    }
 
     /** Top-left of the live text field's typing area, in root coordinates. */
     var liveTextAnchorInRoot by remember { mutableStateOf(androidx.compose.ui.geometry.Offset.Zero) }
@@ -683,6 +642,68 @@ fun CanvasScreen(
                 viewModel.updateUndoRedo(canUndo, canRedo)
             }
         )
+    }
+
+    val glassBackdropAt: (GlassOrigin) -> GlassBackdrop? = { origin ->
+        val view = canvasViewRef
+        if (isContinuous) {
+            // The reader scrolls in a Lazy list; its offset is the signal
+            // that the page under the dock moved.
+            @Suppress("UNUSED_EXPRESSION")
+            if (uiState.doublePageMode || isHorizontal) {
+                continuousRowState.firstVisibleItemIndex
+                continuousRowState.firstVisibleItemScrollOffset
+            } else {
+                continuousColState.firstVisibleItemIndex
+                continuousColState.firstVisibleItemScrollOffset
+            }
+            // The glass samples the **annotation layer** of the page: the
+            // layer holds the writing, the page image does not - so with the
+            // page image the strokes never dispersed through the lens.
+            val panX = if (isHorizontal) 0f else continuousPanX
+            val panY = if (isHorizontal) continuousPanY else 0f
+            val mapping = inkController.layerScreenMapping(currentPageIndex, panX, panY)
+            if (mapping != null) {
+                GlassBackdrop(
+                    bitmap = mapping.bitmap,
+                    pageOriginX = origin.x - mapping.originX,
+                    pageOriginY = origin.y - mapping.originY,
+                    invScale = mapping.scale
+                )
+            } else {
+                // No layer (yet): the page image is the next best thing.
+                val map = continuousPageMap.imageMap
+                val bmp = glassReaderBitmap
+                if (map == null || bmp == null || map.scale <= 0f ||
+                    map.pageIndex != glassReaderBitmapPage
+                ) {
+                    null
+                } else {
+                    GlassBackdrop(
+                        bitmap = bmp,
+                        pageOriginX = (origin.x - map.offsetX) / map.scale,
+                        pageOriginY = (origin.y - map.offsetY) / map.scale,
+                        invScale = 1f / map.scale
+                    )
+                }
+            }
+        } else {
+            // Read inside the draw: the draw phase watches the tick and
+            // redraws the glass when the page was panned or zoomed.
+            @Suppress("UNUSED_EXPRESSION")
+            glassViewportTick
+            val bmp = view?.getBackingBitmap()
+            if (view == null || bmp == null) {
+                null
+            } else {
+                val lx = origin.x - canvasOriginInRoot.x
+                val ly = origin.y - canvasOriginInRoot.y
+                val p0 = view.viewPointToPage(lx, ly)
+                val p1 = view.viewPointToPage(lx + 1f, ly)
+                val sx = p1[0] - p0[0]
+                if (sx <= 0.0001f) null else GlassBackdrop(bmp, p0[0], p0[1], 1f / sx)
+            }
+        }
     }
     DisposableEffect(inkController) {
         onDispose {
@@ -1790,6 +1811,11 @@ fun CanvasScreen(
                                 } else {
                                     canvasViewRef?.resetTransform()
                                 }
+                                android.widget.Toast.makeText(
+                                    context,
+                                    "Zoom reset",
+                                    android.widget.Toast.LENGTH_SHORT
+                                ).show()
                             }) {
                                 Icon(
                                     imageVector = Icons.Default.Refresh,
@@ -2132,24 +2158,20 @@ fun CanvasScreen(
                                 .coerceIn(MIN_CONTINUOUS_SCALE, MAX_CONTINUOUS_SCALE)
                         }
                         val factor = newScale / oldScale
+                        // The page can be pulled aside at **every** zoom
+                        // level - at the original size too (the page is then
+                        // moved out of the way to write in the margin of a
+                        // PDF, and the endless canvas is moved around).
                         if (isHorizontal) {
                             val scrollDelta = (centroid.x * (factor - 1f)) - pan.x
                             continuousRowState.dispatchRawDelta(scrollDelta)
-                            if (newScale > 1f) {
-                                val maxPanY = (screenHeightPx * (newScale - 1f)) / 2f
-                                continuousPanY = (centroid.y - (centroid.y - continuousPanY) * factor + pan.y).coerceIn(-maxPanY, maxPanY)
-                            } else {
-                                continuousPanY = 0f
-                            }
+                            val maxPanY = (screenHeightPx * (newScale - 1f)) / 2f + screenHeightPx
+                            continuousPanY = (centroid.y - (centroid.y - continuousPanY) * factor + pan.y).coerceIn(-maxPanY, maxPanY)
                         } else {
                             val scrollDelta = (centroid.y * (factor - 1f)) - pan.y
                             continuousColState.dispatchRawDelta(scrollDelta)
-                            if (newScale > 1f) {
-                                val maxPanX = (screenWidthPx * (newScale - 1f)) / 2f
-                                continuousPanX = (centroid.x - (centroid.x - continuousPanX) * factor + pan.x).coerceIn(-maxPanX, maxPanX)
-                            } else {
-                                continuousPanX = 0f
-                            }
+                            val maxPanX = (screenWidthPx * (newScale - 1f)) / 2f + screenWidthPx
+                            continuousPanX = (centroid.x - (centroid.x - continuousPanX) * factor + pan.x).coerceIn(-maxPanX, maxPanX)
                         }
                         continuousScale = newScale
                     }
@@ -2365,10 +2387,11 @@ fun CanvasScreen(
                     },
                     update = { view ->
                         view.pageType = note?.pageType ?: "infinite"
-                        // The margin ink (the strokes outside the paper) is
-                        // kept for every page type: on a PDF the notes in the
-                        // margin are the most useful ones.
-                        view.beyondPaper = !uiState.fixPreviewPage
+                        // The margin ink (the strokes outside the paper)
+                        // belongs to the reader, where the page has a layer
+                        // that reaches past it. In the single page editor the
+                        // ink stays on the page.
+                        view.beyondPaper = (note?.pageType == "infinite") && !uiState.fixPreviewPage
                         view.currentTool = uiState.selectedTool
                         view.strokeColor = uiState.selectedColor.toArgb()
                         view.strokeWidthPx = uiState.strokeWidth
@@ -2508,6 +2531,8 @@ fun CanvasScreen(
                                                 savedGeneration = savedPageGenerations[idx] ?: 0,
                                                 isCurrentPage = idx == currentPageIndex,
                                                 isInfinite = isInfiniteNote,
+                                                panOffsetX = if (isHorizontal) 0f else continuousPanX,
+                                                panOffsetY = if (isHorizontal) continuousPanY else 0f,
                                                 pageType = note?.pageType ?: "infinite",
                                                 modifier = androidx.compose.ui.Modifier.then(
                                                     if (isInfiniteNote) {
@@ -2575,6 +2600,8 @@ fun CanvasScreen(
                                                         savedGeneration = savedPageGenerations[idx] ?: 0,
                                                         isCurrentPage = idx == currentPageIndex,
                                                         isInfinite = isInfiniteNote,
+                                                        panOffsetX = if (isHorizontal) 0f else continuousPanX,
+                                                        panOffsetY = if (isHorizontal) continuousPanY else 0f,
                                                         pageType = note?.pageType ?: "infinite",
                                                         modifier = androidx.compose.ui.Modifier.then(
                                                             if (isInfiniteNote) {
@@ -2642,6 +2669,8 @@ fun CanvasScreen(
                                                 savedGeneration = savedPageGenerations[idx] ?: 0,
                                                 isCurrentPage = idx == currentPageIndex,
                                                 isInfinite = isInfiniteNote,
+                                                panOffsetX = if (isHorizontal) 0f else continuousPanX,
+                                                panOffsetY = if (isHorizontal) continuousPanY else 0f,
                                                 pageType = note?.pageType ?: "infinite",
                                                 modifier = androidx.compose.ui.Modifier.then(
                                                     if (isInfiniteNote) {
@@ -3691,7 +3720,13 @@ fun CanvasScreen(
                                 val activeWidth = uiState.activeStrokeWidth()
                                 val isEraserTool = uiState.selectedTool == CanvasTool.ERASER
                                 widthPresets.forEachIndexed { wIdx, (widthPx, _) ->
-                                    val isSelected = activeWidth == widthPx
+                                    // The chip that is in use is the closest
+                                    // one: a thickness that was set with the
+                                    // slider belongs to no preset, and the
+                                    // user has to see which one is in use.
+                                    val isSelected = widthPresets.minByOrNull {
+                                        kotlin.math.abs(it.first - activeWidth)
+                                    }?.first == widthPx
                                     val barHeight = when (wIdx) {
                                         0 -> 2.dp
                                         1 -> 4.dp
@@ -3758,7 +3793,7 @@ fun CanvasScreen(
 
                                 // 3 Rounded-Square Color Swatches with checkmark
                                 // Short tap picks the colour, long press opens the full palette.
-                                TouchNotesDockColors.forEachIndexed { cIdx, c ->
+                                dockColors.forEachIndexed { cIdx, c ->
                                     val isSelected = uiState.selectedColor == c
                                     Box(
                                         modifier = Modifier
@@ -3799,9 +3834,16 @@ fun CanvasScreen(
                                                 showColorPopupHoriz = false
                                                 colorPopupChipHoriz = -1
                                             },
-                                            selectedColor = uiState.selectedColor,
+                                            selectedColor = dockColors.getOrElse(cIdx) { uiState.selectedColor },
                                             preferRight = false,
-                                            onColorSelected = { viewModel.selectColor(it) },
+                                            onColorSelected = { colour ->
+                                                // The chip the palette was
+                                                // opened from keeps the
+                                                // colour that was picked.
+                                                dockColors = dockColors.toMutableList()
+                                                    .also { list -> list[cIdx] = colour }
+                                                viewModel.selectColor(colour)
+                                            },
                                             onCustomColor = { showCustomColorDialog = true }
                                         )
                                     }
@@ -4103,7 +4145,7 @@ fun CanvasScreen(
 
                                 // 3 Rounded-Square Color Swatches with checkmark
                                 // Short tap picks the colour, long press opens the full palette.
-                                TouchNotesDockColors.forEachIndexed { cIdx, c ->
+                                dockColors.forEachIndexed { cIdx, c ->
                                     val isSelected = uiState.selectedColor == c
                                     Box(
                                         modifier = Modifier
@@ -4144,9 +4186,13 @@ fun CanvasScreen(
                                                 showColorPopupVert = false
                                                 colorPopupChipVert = -1
                                             },
-                                            selectedColor = uiState.selectedColor,
+                                            selectedColor = dockColors.getOrElse(cIdx) { uiState.selectedColor },
                                             preferRight = true,
-                                            onColorSelected = { viewModel.selectColor(it) },
+                                            onColorSelected = { colour ->
+                                                dockColors = dockColors.toMutableList()
+                                                    .also { list -> list[cIdx] = colour }
+                                                viewModel.selectColor(colour)
+                                            },
                                             onCustomColor = { showCustomColorDialog = true }
                                         )
                                     }
@@ -5355,6 +5401,10 @@ fun CanvasScreen(
                                                     checked = uiState.penBoxEnabled,
                                                     onCheckedChange = { viewModel.togglePenBox(it) }
                                                 )
+                                                // An infinite canvas has no page
+                                                // edges: the continuous reader
+                                                // would cut it into sheets, so
+                                                // the option is not offered.
                                                 // 5. Reading Mode
                                                 SettingsCheckboxRow(
                                                     title = "Reading Mode",
@@ -5462,7 +5512,11 @@ fun CanvasScreen(
                                                                 .weight(1f)
                                                                 .fillMaxHeight()
                                                                 .background(if (isContinuousMode) OrangePrimary else Color.White)
-                                                                .clickable {
+                                                                // An infinite canvas has no page
+                                                                // edges: the continuous reader
+                                                                // would cut it into sheets, so
+                                                                // the option is greyed out.
+                                                                .clickable(enabled = !isInfiniteNote) {
                                                                     if (!isContinuousMode) {
                                                                         scope.launch {
                                                                             canvasViewRef?.getBackingBitmap()?.let { bmp ->
@@ -5483,7 +5537,11 @@ fun CanvasScreen(
                                                                 text = "Continuous",
                                                                 fontSize = 12.sp,
                                                                 fontWeight = if (isContinuousMode) FontWeight.Bold else FontWeight.Normal,
-                                                                color = if (isContinuousMode) Color.White else OrangePrimary
+                                                                color = when {
+                                                                    isContinuousMode -> Color.White
+                                                                    isInfiniteNote -> Color(0xFFBBBBBB)
+                                                                    else -> OrangePrimary
+                                                                }
                                                             )
                                                         }
                                                         // Single button (right half)
@@ -6208,6 +6266,13 @@ fun ContinuousPageView(
     isCurrentPage: Boolean = false,
     /** An infinite canvas has no page edge: no frame, no desk. */
     isInfinite: Boolean = false,
+    /**
+     * How far the page was pulled aside by the two finger pan (in pixels).
+     * The writing is read in the page's own space, so a stroke lands where
+     * the page is - not where it was.
+     */
+    panOffsetX: Float = 0f,
+    panOffsetY: Float = 0f,
     /** The type of the note's pages ("infinite", "a4", "pdf"). */
     pageType: String = if (isInfinite) "infinite" else "a4",
     modifier: Modifier = Modifier,
@@ -6832,11 +6897,17 @@ fun ContinuousPageView(
                         down.consume()
                         val boxW = size.width.toFloat()
                         val boxH = size.height.toFloat()
+                        // The page can be pulled aside (the two finger pan),
+                        // so the touch has to be read in the page's own space:
+                        // otherwise a stroke would land where the page used
+                        // to be.
+                        val panX = panOffsetX
+                        val panY = panOffsetY
                         ink.beginStroke(
                             page = page,
                             pageIndex = pageIndex,
-                            x = down.position.x / boxW,
-                            y = down.position.y / boxH,
+                            x = (down.position.x - panX) / boxW,
+                            y = (down.position.y - panY) / boxH,
                             pressure = down.pressure,
                             boxWidth = boxW,
                             boxHeight = boxH,

@@ -767,8 +767,13 @@ class ContinuousInkController(
         pressure: Float,
         settings: InkToolSettings
     ) {
-        val cx = x.coerceIn(0f, 1f)
-        val cy = y.coerceIn(0f, 1f)
+        // The points are NOT clamped to the page: the annotation layer
+        // reaches past the page (the margin), and a stroke that lands there
+        // has to stay where it was drawn. Clamping pulled the stroke back
+        // into the page, so a big stroke was squashed at the edge and the
+        // eraser had nothing to wipe.
+        val cx = x.coerceIn(-64f, 64f)
+        val cy = y.coerceIn(-64f, 64f)
         val w = if (stroke.tool == CanvasTool.FOUNTAIN_PEN) {
             fountainWidth(pressure, stroke.baseWidthNorm, settings, stroke.points.lastOrNull()?.w)
         } else {
@@ -1930,6 +1935,45 @@ class ContinuousInkController(
      *
      * The base layer (layer 1) is always there; the user can add two more.
      */
+    /**
+     * Where the annotation layer of a page sits on the screen.
+     *
+     * The glass of the floating dock samples it: the layer holds the writing,
+     * so the strokes disperse through the lens - the page image alone has no
+     * ink in it.
+     */
+    data class LayerScreenMapping(
+        val bitmap: Bitmap,
+        /** The screen position of the layer's top-left corner. */
+        val originX: Float,
+        val originY: Float,
+        /** The layer's pixels per screen pixel. */
+        val scale: Float
+    )
+
+    /**
+     * The screen mapping of the annotation layer of a page, or null when the
+     * page has no layer (or the layer is masked).
+     */
+    fun layerScreenMapping(
+        pageIndex: Int,
+        panX: Float,
+        panY: Float
+    ): LayerScreenMapping? {
+        val s = getSession(pageIndex) ?: return null
+        val layer = s.stack.current ?: return null
+        if (!layer.visible) return null
+        val bitmap = s.layerInk[layer]?.firstOrNull() ?: return null
+        if (bitmap.isRecycled) return null
+        val rect = s.layerRectInBox
+        if (rect.empty || s.boxWidth <= 0f || s.boxHeight <= 0f) return null
+        val originX = panX + rect.left * s.boxWidth
+        val originY = panY + rect.top * s.boxHeight
+        val scale = bitmap.width / (rect.width * s.boxWidth)
+        if (!scale.isFinite() || scale <= 0f) return null
+        return LayerScreenMapping(bitmap, originX, originY, scale)
+    }
+
     fun layerStack(pageIndex: Int): PageLayerStack {
         val s = getSession(pageIndex)
         // A session that is still loading has no layers yet: the stack of the
