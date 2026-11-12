@@ -261,9 +261,15 @@ val TouchNotesEraserPresets = listOf(
     56f to "X-Thick"
 )
 
-/** Continuous reader zoom limits: below 1 the pages are smaller than fit. */
-private const val MIN_CONTINUOUS_SCALE = 0.4f
-private const val MAX_CONTINUOUS_SCALE = 4f
+/**
+ * The widest a page is rendered for the screen, in pixels.
+ *
+ * The reader draws the page as big as the zoom asks for, so a pinch that
+ * goes in reveals detail instead of a blurry enlargement. A page rendered
+ * at eight times the width of the screen would need more than a gigabyte of
+ * memory, so the render stops here and the rest is enlarged.
+ */
+private const val MAX_PAGE_RENDER_WIDTH_PX = 4800
 
 /**
  * Liquid glass, in two layers, the way a real glass panel behaves.
@@ -1808,7 +1814,16 @@ fun CanvasScreen(
                             // brings the canvas back to its origin.
                             IconButton(onClick = {
                                 if (isContinuous) {
-                                    continuousScale = 1f
+                                    val reset = ReaderTransform.resetZoom(
+                                        ReaderTransform.State(
+                                            continuousScale,
+                                            continuousPanX,
+                                            continuousPanY
+                                        )
+                                    )
+                                    continuousScale = reset.scale
+                                    continuousPanX = reset.panX
+                                    continuousPanY = reset.panY
                                 } else {
                                     canvasViewRef?.resetZoom()
                                 }
@@ -1826,8 +1841,16 @@ fun CanvasScreen(
                             }
                             IconButton(onClick = {
                                 if (isContinuous) {
-                                    continuousPanX = 0f
-                                    continuousPanY = 0f
+                                    val centred = ReaderTransform.centre(
+                                        ReaderTransform.State(
+                                            continuousScale,
+                                            continuousPanX,
+                                            continuousPanY
+                                        )
+                                    )
+                                    continuousScale = centred.scale
+                                    continuousPanX = centred.panX
+                                    continuousPanY = centred.panY
                                 } else {
                                     canvasViewRef?.resetPan()
                                 }
@@ -2163,47 +2186,74 @@ fun CanvasScreen(
                 }
         ) {
                 /**
-                 * Zoom / pan of the reader. Shared by the gesture detector on
-                 * the backdrop and by the two-finger pinch inside a page, so
-                 * both do the same thing.
+                 * Zoom / pan of the reader.
+                 *
+                 * The gesture is one event of the pinch: the middle of the
+                 * fingers, how far they moved and how much they spread. The
+                 * maths is in [ReaderTransform] - the page under the fingers
+                 * stays under the fingers, and the list is told how far it
+                 * has to scroll.
+                 *
+                 * The page can be pulled aside at **every** zoom level - at
+                 * the original size too (the page is then moved out of the
+                 * way to write in the margin of a PDF, and the endless canvas
+                 * is moved around).
                  */
                 val handleReaderTransform: (androidx.compose.ui.geometry.Offset, androidx.compose.ui.geometry.Offset, Float) -> Unit =
                     { centroid, pan, zoom ->
-                        val oldScale = continuousScale
-                        // With the zoom locked the pinch only moves the page.
-                        val newScale = if (uiState.zoomLocked) {
-                            oldScale
-                        } else {
-                            (continuousScale * zoom)
-                                .coerceIn(MIN_CONTINUOUS_SCALE, MAX_CONTINUOUS_SCALE)
+                        val listState = if (isHorizontal) continuousRowState else continuousColState
+                        val layout = readerLayout(
+                            listState = listState,
+                            centroid = centroid,
+                            horizontal = isHorizontal,
+                            doublePage = uiState.doublePageMode,
+                            scale = continuousScale,
+                            screenWidthPx = screenWidthPx,
+                            screenHeightPx = screenHeightPx,
+                            pageSpacingPx = with(density) { 16.dp.toPx() },
+                            crossPan = if (isHorizontal) continuousPanY else continuousPanX
+                        )
+                        val state = ReaderTransform.State(
+                            scale = continuousScale,
+                            panX = continuousPanX,
+                            panY = continuousPanY
+                        )
+                        val gesture = ReaderTransform.Gesture(
+                            centroidX = centroid.x,
+                            centroidY = centroid.y,
+                            panX = pan.x,
+                            panY = pan.y,
+                            zoom = zoom
+                        )
+                        val result = ReaderTransform.apply(
+                            state = state,
+                            gesture = gesture,
+                            layout = layout,
+                            zoomLocked = uiState.zoomLocked
+                        )
+                        // The list scrolls first: the pages have to move
+                        // before they are measured bigger.
+                        if (result.scrollDelta != 0f) {
+                            listState.dispatchRawDelta(result.scrollDelta)
                         }
-                        val factor = newScale / oldScale
-                        // The page can be pulled aside at **every** zoom
-                        // level - at the original size too (the page is then
-                        // moved out of the way to write in the margin of a
-                        // PDF, and the endless canvas is moved around).
-                        if (isHorizontal) {
-                            val scrollDelta = (centroid.x * (factor - 1f)) - pan.x
-                            continuousRowState.dispatchRawDelta(scrollDelta)
-                            val maxPanY = (screenHeightPx * (newScale - 1f)) / 2f + screenHeightPx
-                            continuousPanY = (centroid.y - (centroid.y - continuousPanY) * factor + pan.y).coerceIn(-maxPanY, maxPanY)
-                        } else {
-                            val scrollDelta = (centroid.y * (factor - 1f)) - pan.y
-                            continuousColState.dispatchRawDelta(scrollDelta)
-                            val maxPanX = (screenWidthPx * (newScale - 1f)) / 2f + screenWidthPx
-                            continuousPanX = (centroid.x - (centroid.x - continuousPanX) * factor + pan.x).coerceIn(-maxPanX, maxPanX)
-                        }
-                        continuousScale = newScale
+                        continuousScale = result.state.scale
+                        continuousPanX = result.state.panX
+                        continuousPanY = result.state.panY
                     }
 
                 // Rendering key for the page bitmaps. Quantising the zoom keeps
                 // a pinch gesture from launching a PDF render per frame while
                 // still upgrading resolution as the user zooms in (P1 audit).
+                // The buckets reach past the old limit of four times, because
+                // the reader zooms in that far now (the render itself stops
+                // at MAX_PAGE_RENDER_WIDTH_PX, so the memory stays the same).
                 val continuousZoomBucket = when {
                     continuousScale < 1.25f -> 1f
                     continuousScale < 1.75f -> 1.5f
                     continuousScale < 2.5f -> 2f
-                    else -> 3f
+                    continuousScale < 3.5f -> 3f
+                    continuousScale < 5f -> 4f
+                    else -> 6f
                 }
 
                 // When entering continuous mode — or flipping the reading
@@ -2700,7 +2750,6 @@ fun CanvasScreen(
                                                     }
                                                 ),
                                                 onStylusDetected = { viewModel.onStylusDetected() },
-                                        onPinch = { centroid, pan, zoom -> handleReaderTransform(centroid, pan, zoom) },
                                                 onPageBitmap = { idx, bmp ->
                                                     if (idx == currentPageIndex) {
                                                         glassReaderBitmap = bmp
@@ -2839,9 +2888,18 @@ fun CanvasScreen(
                                             fontSize = 12.sp,
                                             fontWeight = FontWeight.Medium,
                                             modifier = Modifier.clickable {
-                                                continuousScale = 1f
-                                                continuousPanX = 0f
-                                                continuousPanY = 0f
+                                                val reset = ReaderTransform.centre(
+                                                    ReaderTransform.resetZoom(
+                                                        ReaderTransform.State(
+                                                            continuousScale,
+                                                            continuousPanX,
+                                                            continuousPanY
+                                                        )
+                                                    )
+                                                )
+                                                continuousScale = reset.scale
+                                                continuousPanX = reset.panX
+                                                continuousPanY = reset.panY
                                             }
                                         )
                                     }
@@ -6111,57 +6169,6 @@ private suspend fun DrawingCanvasView.reloadLayersFromDisk(
 }
 
 /**
- * Two-finger pinch inside a page of the continuous reader.
- *
- * The list's own scroll takes the gesture away from a detector that sits
- * behind it, so the pinch is handled here — inside the page, where this
- * node runs before the list. It only reacts once a second pointer is down:
- * one finger keeps scrolling the reader and drawing.
- */
-private suspend fun androidx.compose.ui.input.pointer.PointerInputScope.detectPagePinch(
-    onPinch: (androidx.compose.ui.geometry.Offset, androidx.compose.ui.geometry.Offset, Float) -> Unit
-) {
-    val touchSlop = viewConfiguration.touchSlop
-    awaitPointerEventScope {
-        var pastSlop = false
-        var zoom = 1f
-        var pan = androidx.compose.ui.geometry.Offset.Zero
-        var prevCentroid = androidx.compose.ui.geometry.Offset.Zero
-        var prevDistance = 0f
-        while (true) {
-            val event = awaitPointerEvent()
-            val pressed = event.changes.filter { it.pressed }
-            if (pressed.size < 2) {
-                // The pinch is over: give the list back the gesture.
-                if (pressed.isEmpty() || pastSlop) return@awaitPointerEventScope
-                continue
-            }
-            val sumX = pressed.sumOf { it.position.x.toDouble() }.toFloat()
-            val sumY = pressed.sumOf { it.position.y.toDouble() }.toFloat()
-            val centroid = androidx.compose.ui.geometry.Offset(sumX / pressed.size, sumY / pressed.size)
-            val distance = (pressed[0].position - pressed[1].position).getDistance()
-            val zoomChange = if (prevDistance > 0f) distance / prevDistance else 1f
-            val panChange = centroid - prevCentroid
-            if (!pastSlop) {
-                zoom *= zoomChange
-                pan += panChange
-                val zoomMotion = kotlin.math.abs(1f - zoom) * centroid.getDistance()
-                if (zoomMotion > touchSlop || pan.getDistance() > touchSlop) pastSlop = true
-            }
-            if (pastSlop) {
-                // Take the gesture from the list.
-                event.changes.forEach { if (it.positionChanged()) it.consume() }
-                if (zoomChange != 1f || panChange != androidx.compose.ui.geometry.Offset.Zero) {
-                    onPinch(centroid, panChange, zoomChange)
-                }
-            }
-            prevCentroid = centroid
-            prevDistance = distance
-        }
-    }
-}
-
-/**
  * Maps the reader page's pixel space onto the screen (root coordinates):
  * `root = pagePx * scale + offset`. Published by [ContinuousPageView] for the
  * page the user is on, so screen gestures (the live text box) can be turned
@@ -6269,6 +6276,81 @@ private fun publishPageMap(
     )
 }
 
+/**
+ * What a pinch needs to know about the reader's layout: the page under the
+ * fingers, where it is and how big it is.
+ *
+ * The pages are measured at the zoom (`pageWidthDp = screenWidth *
+ * continuousScale`), so the page under the fingers is as big as the zoom
+ * says. Its place in the window comes from the list: the list lays the
+ * pages out one after the other and centres them across the window, so the
+ * page under the fingers is centred too - and the two finger pan moves it
+ * away from there.
+ *
+ * The list knows where the pages are: [androidx.compose.foundation.lazy.LazyListLayoutInfo]
+ * holds the visible pages with their place in the window.
+ */
+private fun readerLayout(
+    listState: androidx.compose.foundation.lazy.LazyListState,
+    centroid: androidx.compose.ui.geometry.Offset,
+    horizontal: Boolean,
+    doublePage: Boolean,
+    scale: Float,
+    screenWidthPx: Float,
+    screenHeightPx: Float,
+    pageSpacingPx: Float,
+    crossPan: Float
+): ReaderTransform.Layout {
+    val info = listState.layoutInfo
+    val viewport = info.viewportSize
+    val items = info.visibleItemsInfo
+    val main = if (horizontal) centroid.x else centroid.y
+    val item = items.firstOrNull { main >= it.offset && main < it.offset + it.size }
+    val firstIndex = items.firstOrNull()?.index ?: 0
+    // The page under the fingers: as wide as the screen in a column, as tall
+    // as the screen in a row - and as long as the list measured it on the
+    // other axis.
+    val pageWidth = if (horizontal) {
+        (item?.size ?: 0).toFloat()
+    } else {
+        screenWidthPx * scale
+    }
+    val pageHeight = if (horizontal) {
+        screenHeightPx * scale
+    } else {
+        (item?.size ?: 0).toFloat()
+    }
+    // The page is centred in the window and pulled aside by the pan.
+    val crossCentre = if (horizontal) viewport.height / 2f else viewport.width / 2f
+    var crossSize = if (horizontal) pageHeight else pageWidth
+    var crossOrigin = crossCentre - crossSize / 2f + crossPan
+    if (doublePage && !horizontal) {
+        // Two pages share one row: the page under the fingers is one of the
+        // two halves of it, so the row is not the page.
+        val rowWidth = screenWidthPx * scale
+        val halfWidth = (rowWidth - pageSpacingPx) / 2f
+        val rowLeft = crossCentre - rowWidth / 2f + crossPan
+        val column = if (centroid.x < rowLeft + halfWidth + pageSpacingPx / 2f) 0 else 1
+        crossSize = halfWidth
+        crossOrigin = rowLeft + column * (halfWidth + pageSpacingPx)
+    }
+    // The list scrolls along the other axis: the place of the page under the
+    // fingers is the place the list put it.
+    val scrollOrigin = (item?.offset ?: 0).toFloat()
+    return ReaderTransform.Layout(
+        viewportWidth = viewport.width.toFloat(),
+        viewportHeight = viewport.height.toFloat(),
+        horizontal = horizontal,
+        pageWidth = if (horizontal) pageWidth else crossSize,
+        pageHeight = if (horizontal) crossSize else pageHeight,
+        originX = if (horizontal) scrollOrigin else crossOrigin,
+        originY = if (horizontal) crossOrigin else scrollOrigin,
+        // The pages above the one under the fingers grow with the zoom and
+        // push it down.
+        pagesBefore = (item?.index ?: firstIndex) - firstIndex
+    )
+}
+
 @Composable
 fun ContinuousPageView(
     pageIndex: Int,
@@ -6300,7 +6382,6 @@ fun ContinuousPageView(
     onPageMapping: (ContinuousPageMap) -> Unit = {},
     onImageMapping: (ContinuousImageMap) -> Unit = {},
     onPageBitmap: (Int, android.graphics.Bitmap?) -> Unit = { _, _ -> },
-    onPinch: (androidx.compose.ui.geometry.Offset, androidx.compose.ui.geometry.Offset, Float) -> Unit = { _, _, _ -> },
     onClick: () -> Unit
 ) {
     val isVector = page.pdfSourcePath.isNotEmpty() && page.pdfPageIndex >= 0
@@ -6426,7 +6507,12 @@ fun ContinuousPageView(
         // upscaling a fixed low-resolution bitmap (P1 audit). The caller
         // quantises zoom, so this key changes a few times per gesture rather
         // than on every frame.
-        val desiredWidthPx = (displayWidthPx * zoom).roundToInt().coerceAtLeast(1)
+        //
+        // The render stops at MAX_PAGE_RENDER_WIDTH_PX: a page drawn at eight
+        // times the width of the screen would need more than a gigabyte of
+        // memory, so past that width the page is enlarged instead.
+        val desiredWidthPx = (displayWidthPx * zoom).roundToInt()
+            .coerceIn(1, MAX_PAGE_RENDER_WIDTH_PX)
 
         // Keep the previous bitmap on screen while a zoom bucket re-renders,
         // so pinching never flashes a placeholder.
@@ -6877,10 +6963,6 @@ fun ContinuousPageView(
         Box(
             modifier = Modifier
                 .matchParentSize()
-                .pointerInput(Unit) {
-                    // Two fingers zoom the reader; one finger still scrolls.
-                    detectPagePinch { centroid, pan, zoom -> onPinch(centroid, pan, zoom) }
-                }
                 .pointerInput(page.id, inkSettings) {
                     if (inkSettings.readingMode) return@pointerInput
                     try {
