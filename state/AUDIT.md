@@ -303,6 +303,22 @@ The user ticks a line here; only then does the row in the tables above become
 
 ## The builds
 
+The debug build of `ec95630` was **installed on the tablet on 2026-11-12** over
+USB (`230b89f8`, Xiaomi Pad 5 `21051182G`, Android 16) with
+`adb install -r`, so the notes of the app and the original TouchNotes
+(`com.newskyer.draw`, 7.0.3) were both left alone. The launch was clean: no
+exception in the logcat, the activity resumed in 1.8 s, the library showed the
+five notes of the user (`52_build_installed_launch.png`), and the footprint right
+after the start was 117 MB PSS.
+
+**On the permissions**: the *source* manifest has **no** `uses-permission` at
+all. The *merged* manifest carries one, `personal.notes.touch.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION`,
+which AndroidX adds by itself because the app registers a non-exported receiver
+(`ContextCompat.registerReceiver` in `MainActivity.kt`). It is an app-defined
+signature permission, it grants no device capability, and no
+`android.permission.*` entry exists in the APK. Removing the tag would break
+the receiver registration on Android 14 and later, so it stays.
+
 | Kind | Where |
 | :--- | :--- |
 | Debug APK | `app/build/outputs/apk/debug/app-debug.apk` (installed on the tablet) |
