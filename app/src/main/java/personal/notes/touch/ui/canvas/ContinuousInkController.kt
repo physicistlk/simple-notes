@@ -1091,6 +1091,7 @@ class ContinuousInkController(
                             null
                         }
                         if (ops != null) {
+                            android.util.Log.d("TouchNotes", "load: page=${s.pageIndex} layer=${layer.index} ops=${ops.size}")
                             for (op in ops) {
                                 when (op) {
                                     is InkOp.Stroke -> op.layer = layer
@@ -1098,6 +1099,8 @@ class ContinuousInkController(
                                 }
                             }
                             s.history.ops.addAll(ops)
+                        } else {
+                            android.util.Log.d("TouchNotes", "load: page=${s.pageIndex} layer=${layer.index} no ops file")
                         }
                     }
                     LoadedLayers(stack, stores, loadedHeight)
@@ -1955,6 +1958,7 @@ class ContinuousInkController(
             // Write the ops of the layer (the strokes and the erases as
             // vectors). Only the ops of this layer are written.
             val ops = s.history.ops.filter { it.layer === layer }
+            android.util.Log.d("TouchNotes", "persist: page=${s.pageIndex} layer=${layer.index} ops=${ops.size} dirty=${s.dirty}")
             val ok = withContext(Dispatchers.IO) {
                 repository.savePageLayerOps(noteId, s.pageIndex, layer.index, ops)
             }
