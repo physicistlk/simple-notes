@@ -1621,7 +1621,9 @@ class ContinuousInkController(
         s.saveJob = scope.launch {
             // Long enough that a page of writing is saved once, not after
             // every single stroke.
-            delay(1200)
+            // Long enough that a page of writing is saved once instead of
+            // after every stroke - each save encodes the whole layer.
+            delay(2500)
             persist(s)
         }
     }
@@ -1639,10 +1641,13 @@ class ContinuousInkController(
         // (the layers, their names and the current one) goes to the metadata
         // file of the page.
         for (layer in s.stack.layers) {
-            // The copy and the strokes drawn into it happen off the main
-            // thread: copying a 40 MB layer on the UI thread blocked the pen
-            // for tens of milliseconds after every stroke. The lock keeps a
-            // stroke that lands during the copy from tearing the snapshot.
+            // The layer is composed off the main thread. It is NOT copied
+            // first: a copy of the layer (the page plus a page width of
+            // margin on each side) is tens of megabytes of garbage per save,
+            // and the garbage is what made the pen lag and killed the eraser
+            // on a big drawing. The strokes are drawn into the layer as
+            // vectors, so the layer only changes when the eraser wipes
+            // something - the lock keeps that from tearing the file.
             val copy = try {
                 withContext(Dispatchers.IO) { composeLayer(s, layer) }
             } catch (e: OutOfMemoryError) {

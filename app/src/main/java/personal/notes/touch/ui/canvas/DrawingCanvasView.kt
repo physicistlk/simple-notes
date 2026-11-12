@@ -1155,6 +1155,21 @@ class DrawingCanvasView @JvmOverloads constructor(
         invalidate()
     }
 
+    /** The zoom goes back to 100 %; the page stays where it was. */
+    fun resetZoom() {
+        scale = 1f
+        updateViewMatrix()
+        invalidate()
+    }
+
+    /** The canvas goes back to its origin; the zoom stays as it is. */
+    fun resetPan() {
+        panX = 0f
+        panY = 0f
+        updateViewMatrix()
+        invalidate()
+    }
+
     fun resetTransform() {
         fitOrCenterPage()
     }

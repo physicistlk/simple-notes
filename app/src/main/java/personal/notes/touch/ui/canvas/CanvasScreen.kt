@@ -73,6 +73,7 @@ import androidx.compose.material.icons.filled.NoteAdd
 import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.CenterFocusStrong
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
@@ -1802,24 +1803,43 @@ fun CanvasScreen(
                                 )
                             }
 
-                            // Reset zoom/pan
+                            // The zoom and the pan are two actions: the
+                            // reset puts the zoom back to 100 %, the centre
+                            // brings the canvas back to its origin.
                             IconButton(onClick = {
                                 if (isContinuous) {
                                     continuousScale = 1f
-                                    continuousPanX = 0f
-                                    continuousPanY = 0f
                                 } else {
-                                    canvasViewRef?.resetTransform()
+                                    canvasViewRef?.resetZoom()
                                 }
                                 android.widget.Toast.makeText(
                                     context,
-                                    "Zoom reset",
+                                    "Zoom reset to 100%",
                                     android.widget.Toast.LENGTH_SHORT
                                 ).show()
                             }) {
                                 Icon(
                                     imageVector = Icons.Default.Refresh,
                                     contentDescription = "Reset zoom",
+                                    tint = Color(0xFF555555)
+                                )
+                            }
+                            IconButton(onClick = {
+                                if (isContinuous) {
+                                    continuousPanX = 0f
+                                    continuousPanY = 0f
+                                } else {
+                                    canvasViewRef?.resetPan()
+                                }
+                                android.widget.Toast.makeText(
+                                    context,
+                                    "Canvas centred",
+                                    android.widget.Toast.LENGTH_SHORT
+                                ).show()
+                            }) {
+                                Icon(
+                                    imageVector = Icons.Default.CenterFocusStrong,
+                                    contentDescription = "Centre canvas",
                                     tint = Color(0xFF555555)
                                 )
                             }
