@@ -668,6 +668,8 @@ class TextEditorViewModel(
 
     /** Cooldown for enter-split to reject key-bounce or leaked IME Enter events. */
     private var lastEnterSplitTime = 0L
+    private var lastSplitBlockId: String? = null
+    private var lastCreatedBlockId: String? = null
 
     /** Plain per-keystroke change of one block's text field; also detects Enter. */
     fun onBlockValueChange(id: String, newValue: TextFieldValue) {
@@ -689,22 +691,25 @@ class TextEditorViewModel(
 
         if (enteredNewline) {
             val now = System.currentTimeMillis()
-            if (now - lastEnterSplitTime < 250) {
+            if (now - lastEnterSplitTime < 600L && (id == lastSplitBlockId || id == lastCreatedBlockId)) {
                 // Drop duplicate / leaked newline event
                 val pre = newValue.text.replace("\n", "")
                 val updated = cur.copy(field = TextFieldValue(pre, TextRange(pre.length)))
                 val mutable = list.toMutableList()
                 mutable[idx] = updated
-                publishBlocks(mutable)
+                val nextTarget = lastCreatedBlockId?.let { FocusTarget(it) }
+                publishBlocks(mutable, nextTarget)
                 return
             }
             lastEnterSplitTime = now
+            lastSplitBlockId = id
             val caret = sel.start
             val pre = newValue.text.substring(0, caret - 1)
             val post = newValue.text.substring(caret)
             val atEnd = caret - 1 >= cur.field.text.length
             val newList = BlockOps.enterSplit(list, id, pre, post, atEnd)
             val nextId = newList.getOrNull(idx + 1)?.id
+            lastCreatedBlockId = nextId
             publishBlocks(newList, nextId?.let { FocusTarget(it) })
             return
         }
@@ -795,13 +800,14 @@ class TextEditorViewModel(
     /** Enter key handled through the key-event path (hardware / some IMEs). */
     fun onEnterPressed(id: String) {
         val now = System.currentTimeMillis()
-        if (now - lastEnterSplitTime < 250) return
-        lastEnterSplitTime = now
+        if (now - lastEnterSplitTime < 600L && (id == lastSplitBlockId || id == lastCreatedBlockId)) return
         val list = _blocks.value
         val idx = list.indexOfFirst { it.id == id }
         if (idx < 0) return
         val cur = list[idx]
         if (cur.type == BlockType.CODE || cur.type == BlockType.QUERY) return // one-line blocks
+        lastEnterSplitTime = now
+        lastSplitBlockId = id
         val f = cur.field
         if (f.selection.collapsed) {
             val caret = f.selection.start
@@ -818,6 +824,7 @@ class TextEditorViewModel(
         val atEnd = list[idx].field.selection.end >= list[idx].field.text.length
         val newList = BlockOps.enterSplit(list, blockId, pre, post, atEnd)
         val nextId = newList.getOrNull(idx + 1)?.id
+        lastCreatedBlockId = nextId
         publishBlocks(newList, nextId?.let { FocusTarget(it) })
     }
 
