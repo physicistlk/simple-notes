@@ -236,16 +236,13 @@ tablet; until then it stays **IMPLEMENTED**.
 
 ## The check list (tick these off on the tablet)
 
-The build that is on the tablet is the one of `7bcdc57` - it has the pinch of
-the reader (C45, C51) and everything that came before it.
+The build that is on the tablet is the one of `460e98a` (logging added to
+persist and load for debugging the data loss).
 
 **How to report it back:** tell me the numbers that pass (for example
 "T5, T6, T8, T13 ok"), or the number and what you saw. I tick **exactly**
 those rows in the tables above and nothing else. A ticked row becomes
 **FIXED**; a row that stays unticked stays **IMPLEMENTED**.
-
-**Three tests need your real fingers** - a two-finger gesture cannot be
-injected over adb, so **T6**, **T10** and **T13** are yours.
 
 ### Already confirmed - no need to redo them
 
@@ -258,102 +255,59 @@ injected over adb, so **T6**, **T10** and **T13** are yours.
 | **C40** | The layers panel: add a layer, the base layer is always there, the eye masks. |
 | **C43** | The eraser in the reader removes the ink and not the PDF text. |
 
-### 1 - The plain A4 sheets (C26)
+### Test results from the tablet (2026-11-12)
 
-| # | Do this | You must see |
+| # | Test | Result |
 | :--- | :--- | :--- |
-| **T5** | Open an A4 note in the reader | The page **fills the screen** (it was two thirds of it). |
-| **T6** | Two fingers, drag the page aside - once at 100 %, once zoomed out | The page **moves** both times. |
-| **T7** | Write in the margin that appears | The stroke is drawn there, and it is **still there after a restart**. |
-| **T8** | Press **the reset (zoom)**, then **the centre** | The reset puts the zoom back to **100 %** and leaves the page where it is; the centre brings the canvas back to its **origin** and leaves the zoom. Two different actions, each with its own toast. |
-
-### 2 - The imported PDF and its layers (C34)
-
-| # | Do this | You must see |
-| :--- | :--- | :--- |
-| **T9** | Open the imported PDF | The page **fills the screen**. |
-| **T10** | Two fingers, drag the PDF aside - at 100 % and zoomed out | The page **moves** both times. |
-| **T11** | Write in the margin | The stroke is drawn, it **survives a restart**, and it **reaches the export**. |
-| **T12** | The layers panel of the PDF | **+** adds a layer, the **eye** masks it, **...** merges or deletes it, and the **base layer cannot be deleted**. |
-
-### 3 - The endless canvas (C25)
-
-| # | Do this | You must see |
-| :--- | :--- | :--- |
-| **T2** | Open an infinite note in the reader | **No page frame and no grey desk** - the canvas runs to the edge of the screen. |
-| **T3** | Pinch **out**, pan 3-4 times to the side, then draw a **big** stroke | The stroke is drawn **whole**, and it does **not lag** behind the finger. |
-| **T4** | Right after T3, erase that new stroke with the eraser | The eraser **wipes it**. |
-
-### 4 - The glass (C24, C32)
-
-| # | Do this | You must see |
-| :--- | :--- | :--- |
-| **T1** | Draw a stroke **under the dock** | The ink is **displaced** where it crosses the rim, with a **magenta/cyan fringe**. |
-| **T14** | Scroll the page | The glass shows the **new** content under it, without a lag. |
-| **T15** | Drag the dock over the ink | The glass **follows the dock**. |
-
-### 5 - The palette and the thickness (C36, C37)
-
-| # | Do this | You must see |
-| :--- | :--- | :--- |
-| **T16** | Long press a colour chip | Every swatch is visible, **none on top of another**. |
-| **T17** | Pick a colour | **That chip** keeps the colour (not only the "+" chip). |
-| **T18** | Long press a thickness chip | The popup shows the **slider and a reset button**. |
-| **T19** | Press reset | The thickness goes back to the **default (6 px)** for the pen. |
-| **T20** | Set a thickness with the slider | The dock **shows which thickness is in use** (the closest chip is marked). |
-
-### 6 - The pinch and the zoom buttons (C45, C51, C41)
-
-These are the parts the pinch rework touched, so they are worth a look even
-if they look right.
-
-| # | Do this | You must see |
-| :--- | :--- | :--- |
-| **T13** | Pinch to zoom in the reader | The page grows **around the fingers** (not around its own centre), it goes **up to 8x**, and it must **not** run at double speed. |
-| **T21** | Pinch out as far as it goes | The **whole page** still fits on the screen. |
-| **T22** | Pinch in as far as it goes | The page is **sharp** enough to write small text on it (not a blurred enlargement). |
-| **T23** | Scroll with **one** finger | The reader still scrolls - the pinch must not have taken the one-finger scroll away. |
-| **T24** | Write with the stylus right after a pinch | The stroke lands **under the stylus**. |
-
-### 7 - The dock and the pen (C28, C31, C35)
-
-| # | Do this | You must see |
-| :--- | :--- | :--- |
-| **T25** | Draw on a PDF page with the stylus | The stroke follows the stylus, with no lag. |
-| **T26** | Draw a long stroke with the stylus | The preview follows the stylus **while the stroke is still going**. |
-| **T27** | Draw on the endless canvas | The pen does not lag behind the finger. |
+| **T28** | New infinite canvas naming | **PASS** - "canvas 1", "canvas 2"... |
+| **T29** | New A4 note naming | **PASS** - "note 1", "note 2"... |
+| **T30** | PDF import naming | **PASS** - takes the PDF's file name |
+| **T31** | A4 limited to A4 size | **FAIL** - still writes outside the A4 page (tested after zoom out, should clip the stroke) |
+| **T32** | PDF zoom-in | **FAIL** - PDF stays at 100%, only the top layer zooms in. Zoom out works for both. White page bed stays the same size. Pre-drawn strokes don't change size. |
+| **T3** | Big stroke on endless canvas | **PARTIAL** - the stroke starts from the page and can extend to zoomed-out area, but any stroke starting outside (after pan) does not work |
+| **T1** | Glass refraction | **FAIL** - acts as a simple transparency layer without refraction |
+| **T2** | Infinite canvas | **FAIL** - shows a bounding frame like a transparency layer when a stroke is put |
+| **T5** | A4 fills the screen | **PASS** but strokes can be put outside the A4 size (should clip) |
+| **T6** | A4 pan | **PARTIAL** - works horizontally but not vertically |
+| **T7** | Strokes survive tab close/reopen | **FAIL** - blank after reopen (both A4 and canvas) |
+| **T8** | Reset zoom vs centre | **PASS** |
+| **T9** | PDF fills the screen | **PASS** |
+| **T10** | PDF pan | **PASS** but stylus mode cannot be enabled |
+| **T11** | PDF margin strokes survive | **FAIL** - strokes do not survive closing the tab and reopening |
+| **T13** | Pinch zoom | **FAIL** - toast changes to 800 but nothing changes, PDF stays same size, pre-drawn strokes don't change size |
+| **T17** | Palette | **PASS** |
+| **T18** | Thickness | **FAIL** - set size to 21px on middle chip, draw some, select 3rd chip and back to 2nd chip: stroke resets to 6px (should stay 21px) |
+| **T16** | Palette swatches | **PASS** |
+| **T19** | Reset thickness | **PASS** |
+| **T20** | Thickness in use | **PASS** |
 
 ### Known limits - not tests, I know these
 
 | Row | The limit | What happens |
 | :--- | :--- | :--- |
-| **C50** | The annotation layer of a page is **one bitmap** (the page plus a page width of margin on each side, about 80 MB) and every save encodes all of it. | A very big drawing is still heavy. The layer has to become **tiles**, so only the written part is saved. That is the next piece of work. |
-| **C38** | The pinch of the reader is stepped, not continuous - the scale is Compose state, so every frame recomposes the reader. | Pinching feels like it jumps from step to step. |
-| **C27** | The layers of an **infinite** page are not confirmed yet. | The panel opens, but the layer actions on the endless canvas are unproven. |
-| **C26** | The **single page editor** keeps the ink on the page - the margin belongs to the reader. | By design: the margin is a reader feature. |
-| **C45** | Above about 3x the page is enlarged rather than drawn again (the render stops at 4800 px). | The page is sharp up to 3x and enlarged beyond it. A separate change would render it again. |
+| **C50** | The annotation layer is a grid of tiles, but the save/load/display path still needs work | T3 (big stroke lag), T4 (eraser death), T7 (strokes don't survive), T11 (PDF strokes don't survive) all still failing |
+| **C38** | The pinch of the reader is stepped, not continuous | Pinching feels like it jumps from step to step |
+| **C27** | The layers of an **infinite** page are not confirmed yet | The panel opens, but the layer actions on the endless canvas are unproven |
+| **C26** | The **single page editor** keeps the ink on the page | By design: the margin is a reader feature |
+| **C45** | Above about 3x the page is enlarged rather than drawn again | The page is sharp up to 3x and enlarged beyond it |
 
 ### The evidence behind the tests
 
 What the tablet showed so far, for the rows that are still unticked.
 
 **C24**
-  *The first version bent the page image, which has no ink in it, so the strokes never dispersed. The glass now samples the annotation layer, where the writing lives.*
   *Seen on the tablet: the yellow stroke under the dock is split into a magenta/cyan fringe at the rim (`30_glass_vertical_over_ink.png`). Waiting for the user's tick.*
 
 **C25**
   *T2 is confirmed. T3 and T4: the strokes were clamped to the page and the save copied the whole layer (80 MB of garbage per save) - both are fixed; the layer still has to become tiles.*
-  *Seen on the tablet (`30_glass_vertical_over_ink.png`, the canvas runs to the edge). Waiting for the user's tick.*
 
 **C32**
-  *The mapping was wrong (the image of the page instead of the layer); the glass now samples the layer and follows the pan.*
   *Verified on the tablet: the glass shows the PDF text under it, frosted and refracted (`37_glass_over_pdf_text.png`, `38_glass_over_pdf_text_closeup.png`), and 46 % of the dock's pixels change while the page scrolls. Waiting for the user's tick.*
 
 **C33**
   *Verified on the tablet: the annotation layer of an infinite page is now 3240 x 3019 px for a 1600 x 2236 px page image (the page plus a quarter of its width on both sides), and the layer holds only the new stroke - the page image stays clean. Writing next to the saved canvas is kept instead of being clipped. The zoom-out itself still needs a real pinch to be seen.*
 
 **C34**
-  *T9-T12 are implemented. T13 is implemented too (C45): the page grows around the fingers, the pinch is applied once and not twice, and the zoom reaches 8x. It needs a real pinch to be confirmed.*
   *Verified on the tablet: the PDF is drawn centred with a grey margin on both sides (like the original TouchNotes, see `40_reference_original_touchnotes_margin_writing.png`), a stroke in the margin is drawn, it lands in the page's annotation layer (`layers/page_<i>_annot_1.png`), it survives a restart, and the PDF text is untouched.*
 
 **C35**
@@ -370,6 +324,7 @@ What the tablet showed so far, for the rows that are still unticked.
 
 **C41**
   *The pan was clamped to zero at the original size and when zoomed out; it is free at every zoom level now.*
+  *Could not be verified with a synthetic gesture: the shell user may not write to the touch device (`/dev/input/event3`), so a two finger gesture cannot be injected over adb. This one needs real fingers.*
 
 **C51**
   *Could not be verified with a synthetic gesture: the shell user may not write to the touch device (`/dev/input/event3`), so a two finger gesture cannot be injected over adb. This one needs real fingers.*
