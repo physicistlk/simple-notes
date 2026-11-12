@@ -2,6 +2,7 @@ package personal.notes.touch.data.files
 
 import android.content.Context
 import android.net.Uri
+import personal.notes.touch.ui.canvas.LayerTileGrid
 import java.io.File
 
 class NoteFileStore(private val context: Context) {
@@ -122,7 +123,9 @@ class NoteFileStore(private val context: Context) {
             // same index would inherit them.
             if (f.name.startsWith("page_${pageIndex}_layer_") && f.name.endsWith(".png")) f.delete()
             // The annotation layers of the page (the writing of the user)
-            // and their metadata belong to it as well.
+            // and their metadata belong to it as well. The tile files of a
+            // layer (page_<i>_annot_<n>_t<tx>_<ty>.png) carry the same
+            // prefix, so they go with the page as well.
             if (f.name.startsWith("page_${pageIndex}_annot_") &&
                 (f.name.endsWith(".png") || f.name.endsWith(".json"))
             ) f.delete()
@@ -165,7 +168,9 @@ class NoteFileStore(private val context: Context) {
                 f.renameTo(target)
             }
             // The annotation layers of the page (the writing of the user)
-            // and their metadata move with the page.
+            // and their metadata move with the page. The tile files of a
+            // layer (page_<i>_annot_<n>_t<tx>_<ty>.png) carry the same
+            // prefix, so they move with it as well.
             if (f.name.startsWith("page_${oldIndex}_annot_") &&
                 (f.name.endsWith(".png") || f.name.endsWith(".json"))
             ) {
@@ -226,6 +231,29 @@ class NoteFileStore(private val context: Context) {
      */
     fun getAnnotationMetaFile(noteId: String, pageIndex: Int): File =
         File(getLayersDir(noteId), "page_${pageIndex}_annot.json")
+
+    /**
+     * The bitmap file of ONE tile of an annotation layer (C50).
+     *
+     * A layer that is cut into tiles has one PNG per tile:
+     * `page_<i>_annot_<n>_t<tx>_<ty>.png`. The name of the tile comes from
+     * the grid ([LayerTileGrid]), so the file store and the metadata always
+     * agree on it.
+     *
+     * The name keeps the prefix of the layer file (`page_<i>_annot_`), so
+     * the files of a page are found and moved with it.
+     */
+    fun getAnnotationLayerTileFile(
+        noteId: String,
+        pageIndex: Int,
+        layerIndex: Int,
+        tx: Int,
+        ty: Int
+    ): File =
+        File(
+            getLayersDir(noteId),
+            "page_${pageIndex}_annot_${layerIndex}_${LayerTileGrid.tileName(tx, ty)}.png"
+        )
 
     /** Workspace preferences (tab bar state, dock orientation) live beside the notes. */
     fun getUiPrefsFile(): File = File(context.filesDir, "ui_prefs.json")
