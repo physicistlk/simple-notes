@@ -142,6 +142,11 @@ class NoteRepository(
         noteDao.clearRecycled()
     }
 
+    /** Titles of live notes in [folderId] (null = unfiled). Used to mint default names. */
+    suspend fun existingTitlesInFolder(folderId: String?): List<String> = withContext(Dispatchers.IO) {
+        noteDao.getAllLive().filter { it.folderId == folderId }.map { it.title }
+    }
+
     suspend fun createNote(
         title: String = "Untitled Note",
         folderId: String? = null,

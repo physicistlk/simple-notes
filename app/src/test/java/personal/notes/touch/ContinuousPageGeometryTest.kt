@@ -110,7 +110,7 @@ class ContinuousPageGeometryTest {
         // width of margin on both sides - three times as wide as the page -
         // and as tall as the page.
         val size = ContinuousPageGeometry.layerSize(
-            "a4", ContinuousPageGeometry.DEFAULT_PAGE_RATIO
+            "pdf", ContinuousPageGeometry.DEFAULT_PAGE_RATIO
         )
         assertEquals(6480, size.width)
         assertEquals(3056, size.height)
@@ -149,8 +149,8 @@ class ContinuousPageGeometryTest {
         // page is pulled aside to write in it.
         val boxHeight = 1000f
         val boxWidth = boxHeight * a4
-        val page = ContinuousPageGeometry.pageRect("a4", a4, boxWidth, boxHeight)
-        val layer = ContinuousPageGeometry.layerRect("a4", a4, boxWidth, boxHeight)
+        val page = ContinuousPageGeometry.pageRect("pdf", a4, boxWidth, boxHeight)
+        val layer = ContinuousPageGeometry.layerRect("pdf", a4, boxWidth, boxHeight)
         assertTrue("the layer reaches past the page on the left", layer.left < page.left)
         assertTrue("the layer reaches past the page on the right", layer.right > page.right)
         // A whole page width on each side.
@@ -165,8 +165,8 @@ class ContinuousPageGeometryTest {
     fun aStrokeInTheMarginIsInsideTheLayerAndOutsideThePage() {
         val boxHeight = 1000f
         val boxWidth = boxHeight * a4
-        val page = ContinuousPageGeometry.pageRect("a4", a4, boxWidth, boxHeight)
-        val layer = ContinuousPageGeometry.layerRect("a4", a4, boxWidth, boxHeight)
+        val page = ContinuousPageGeometry.pageRect("pdf", a4, boxWidth, boxHeight)
+        val layer = ContinuousPageGeometry.layerRect("pdf", a4, boxWidth, boxHeight)
 
         // A stroke in the left margin of the page: the margin is outside
         // the box now (the page fills the screen), so the stroke sits at a
@@ -178,7 +178,7 @@ class ContinuousPageGeometryTest {
 
         // Its place in the layer's pixels: inside the layer, and left of the
         // page (the page starts a third of the layer further right).
-        val size = ContinuousPageGeometry.layerSize("a4", a4)
+        val size = ContinuousPageGeometry.layerSize("pdf", a4)
         val point = ContinuousPageGeometry.layerPoint(layer, x, y, size.width, size.height)
         assertTrue(
             "x ${point.x} (layer=$layer page=$page size=$size)",
@@ -193,8 +193,8 @@ class ContinuousPageGeometryTest {
     fun aStrokeOnThePageLandsOnThePageOfTheLayer() {
         val boxHeight = 1000f
         val boxWidth = boxHeight * a4 * 1.5f
-        val layer = ContinuousPageGeometry.layerRect("a4", a4, boxWidth, boxHeight)
-        val size = ContinuousPageGeometry.layerSize("a4", a4)
+        val layer = ContinuousPageGeometry.layerRect("pdf", a4, boxWidth, boxHeight)
+        val size = ContinuousPageGeometry.layerSize("pdf", a4)
         // The middle of the box is the middle of the page.
         val point = ContinuousPageGeometry.layerPoint(layer, 0.5f, 0.5f, size.width, size.height)
         assertEquals(size.width / 2f, point.x, 1f)
