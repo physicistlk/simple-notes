@@ -1766,7 +1766,10 @@ fun CanvasScreen(
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
                         // Left Action Group
-                        Row(verticalAlignment = Alignment.CenterVertically) {
+                        Row(
+                            modifier = Modifier.weight(1f),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
                             // Back
                             IconButton(onClick = saveAndExit) {
                                 Icon(
@@ -1822,64 +1825,54 @@ fun CanvasScreen(
                             // The zoom and the pan are two actions: the
                             // reset puts the zoom back to 100 %, the centre
                             // brings the canvas back to its origin.
-                            IconButton(onClick = {
-                                if (isContinuous) {
-                                    val reset = ReaderTransform.resetZoom(
-                                        ReaderTransform.State(
-                                            continuousScale,
-                                            continuousPanX,
-                                            continuousPanY
-                                        )
-                                    )
-                                    continuousScale = reset.scale
-                                    continuousPanX = reset.panX
-                                    continuousPanY = reset.panY
-                                } else {
+                            //
+                            // In the reader they live in the zoom pill (the
+                            // top bar was so full that the button of the
+                            // right panel was cut off the screen); the single
+                            // page mode has no pill, so they stay here.
+                            if (!isContinuous) {
+                                IconButton(onClick = {
                                     canvasViewRef?.resetZoom()
-                                }
-                                android.widget.Toast.makeText(
-                                    context,
-                                    "Zoom reset to 100%",
-                                    android.widget.Toast.LENGTH_SHORT
-                                ).show()
-                            }) {
-                                Icon(
-                                    imageVector = Icons.Default.Refresh,
-                                    contentDescription = "Reset zoom",
-                                    tint = Color(0xFF555555)
-                                )
-                            }
-                            IconButton(onClick = {
-                                if (isContinuous) {
-                                    val centred = ReaderTransform.centre(
-                                        ReaderTransform.State(
-                                            continuousScale,
-                                            continuousPanX,
-                                            continuousPanY
-                                        )
+                                    android.widget.Toast.makeText(
+                                        context,
+                                        "Zoom reset to 100%",
+                                        android.widget.Toast.LENGTH_SHORT
+                                    ).show()
+                                }) {
+                                    Icon(
+                                        imageVector = Icons.Default.Refresh,
+                                        contentDescription = "Reset zoom",
+                                        tint = Color(0xFF555555)
                                     )
-                                    continuousScale = centred.scale
-                                    continuousPanX = centred.panX
-                                    continuousPanY = centred.panY
-                                } else {
-                                    canvasViewRef?.resetPan()
                                 }
-                                android.widget.Toast.makeText(
-                                    context,
-                                    "Canvas centred",
-                                    android.widget.Toast.LENGTH_SHORT
-                                ).show()
-                            }) {
-                                Icon(
-                                    imageVector = Icons.Default.CenterFocusStrong,
-                                    contentDescription = "Centre canvas",
-                                    tint = Color(0xFF555555)
-                                )
+                                IconButton(onClick = {
+                                    canvasViewRef?.resetPan()
+                                    android.widget.Toast.makeText(
+                                        context,
+                                        "Canvas centred",
+                                        android.widget.Toast.LENGTH_SHORT
+                                    ).show()
+                                }) {
+                                    Icon(
+                                        imageVector = Icons.Default.CenterFocusStrong,
+                                        contentDescription = "Centre canvas",
+                                        tint = Color(0xFF555555)
+                                    )
+                                }
                             }
 
                             Spacer(modifier = Modifier.width(8.dp))
 
                             // Note Title Pill (Clickable -> Change note name)
+                            //
+                            // The pill may shrink: the row of the top bar
+                            // has more buttons than fit on a narrow screen,
+                            // and a long title must not push the button of
+                            // the right panel out of sight.
+                            Box(
+                                modifier = Modifier.weight(1f),
+                                contentAlignment = Alignment.CenterStart
+                            ) {
                             Surface(
                                 shape = RoundedCornerShape(16.dp),
                                 color = Color(0xFFF1F3F4),
@@ -1898,7 +1891,9 @@ fun CanvasScreen(
                                         text = note?.title?.ifBlank { "Untitled Note" } ?: "Untitled Note",
                                         fontSize = 14.sp,
                                         fontWeight = FontWeight.Medium,
-                                        color = Color(0xFF202124)
+                                        color = Color(0xFF202124),
+                                        maxLines = 1,
+                                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
                                     )
                                     Spacer(modifier = Modifier.width(6.dp))
                                     Icon(
@@ -1908,6 +1903,7 @@ fun CanvasScreen(
                                         modifier = Modifier.size(14.dp)
                                     )
                                 }
+                            }
                             }
 
                             // One-tap tabs collapse / expand toggle arrow (▲ / ▼)
@@ -2842,7 +2838,11 @@ fun CanvasScreen(
                                 }
                             }
 
-                            if (uiState.zoomLocked || kotlin.math.abs(continuousScale - 1f) > 0.05f) {
+                            if (uiState.zoomLocked ||
+                                kotlin.math.abs(continuousScale - 1f) > 0.05f ||
+                                continuousPanX != 0f ||
+                                continuousPanY != 0f
+                            ) {
                                 Surface(
                                     shape = RoundedCornerShape(16.dp),
                                     color = Color.Transparent,
@@ -2892,26 +2892,88 @@ fun CanvasScreen(
                                                 modifier = Modifier.size(13.dp)
                                             )
                                         }
+                                        // The zoom and the pan are two
+                                        // actions: the percentage puts the
+                                        // zoom back to 100 %, the button
+                                        // brings the canvas back to its
+                                        // origin.
                                         Text(
-                                            text = "${(continuousScale * 100).roundToInt()}% · Reset",
+                                            text = "${(continuousScale * 100).roundToInt()}%",
                                             color = Color.White,
                                             fontSize = 12.sp,
                                             fontWeight = FontWeight.Medium,
                                             modifier = Modifier.clickable {
-                                                val reset = ReaderTransform.centre(
-                                                    ReaderTransform.resetZoom(
-                                                        ReaderTransform.State(
-                                                            continuousScale,
-                                                            continuousPanX,
-                                                            continuousPanY
-                                                        )
+                                                val reset = ReaderTransform.resetZoom(
+                                                    ReaderTransform.State(
+                                                        continuousScale,
+                                                        continuousPanX,
+                                                        continuousPanY
                                                     )
                                                 )
                                                 continuousScale = reset.scale
                                                 continuousPanX = reset.panX
                                                 continuousPanY = reset.panY
+                                                android.widget.Toast.makeText(
+                                                    context,
+                                                    "Zoom reset to 100%",
+                                                    android.widget.Toast.LENGTH_SHORT
+                                                ).show()
                                             }
                                         )
+                                        IconButton(
+                                            onClick = {
+                                                val reset = ReaderTransform.resetZoom(
+                                                    ReaderTransform.State(
+                                                        continuousScale,
+                                                        continuousPanX,
+                                                        continuousPanY
+                                                    )
+                                                )
+                                                continuousScale = reset.scale
+                                                continuousPanX = reset.panX
+                                                continuousPanY = reset.panY
+                                                android.widget.Toast.makeText(
+                                                    context,
+                                                    "Zoom reset to 100%",
+                                                    android.widget.Toast.LENGTH_SHORT
+                                                ).show()
+                                            },
+                                            modifier = Modifier.size(32.dp)
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Refresh,
+                                                contentDescription = "Reset zoom to 100%",
+                                                tint = Color.White,
+                                                modifier = Modifier.size(13.dp)
+                                            )
+                                        }
+                                        IconButton(
+                                            onClick = {
+                                                val centred = ReaderTransform.centre(
+                                                    ReaderTransform.State(
+                                                        continuousScale,
+                                                        continuousPanX,
+                                                        continuousPanY
+                                                    )
+                                                )
+                                                continuousScale = centred.scale
+                                                continuousPanX = centred.panX
+                                                continuousPanY = centred.panY
+                                                android.widget.Toast.makeText(
+                                                    context,
+                                                    "Canvas centred",
+                                                    android.widget.Toast.LENGTH_SHORT
+                                                ).show()
+                                            },
+                                            modifier = Modifier.size(32.dp)
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.CenterFocusStrong,
+                                                contentDescription = "Centre the canvas",
+                                                tint = Color.White,
+                                                modifier = Modifier.size(13.dp)
+                                            )
+                                        }
                                     }
                                     }
                                 }
