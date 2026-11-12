@@ -38,7 +38,7 @@ Rules for a new finding:
 | `uses-permission` in the built APK | **0** (only the AndroidX self-permission) | `aapt2 dump permissions` |
 | `!!` in the sources | **0** | `grep -ro '!!'` |
 | Room schema | v12, exported schema in `app/schemas/…/12.json` | `DatabaseSchemaPolicyTest` |
-| Unit tests | **353 passing / 2 skipped / 0 failures** | `./gradlew testDebugUnitTest` |
+| Unit tests | **377 passing / 2 skipped / 0 failures** | `./gradlew testDebugUnitTest` |
 | Lint | 0 errors | `./gradlew lintDebug` |
 | Network | impossible (no permission, no cleartext) | manifest + `aapt2` |
 | Platform backup | **off** (`allowBackup=false` + `data_extraction_rules`) | manifest |
