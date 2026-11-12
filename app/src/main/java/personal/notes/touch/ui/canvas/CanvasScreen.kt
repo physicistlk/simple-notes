@@ -6604,8 +6604,8 @@ fun ContinuousPageView(
                 savedLayers = emptyMap()
                 return@LaunchedEffect
             }
-            savedLayers = loadPageLayersForDisplay(
-                repository.fileStore, noteId, pageIndex, displayWidthPx.roundToInt()
+            savedLayers = ink.composeDisplayLayers(
+                pageIndex, displayWidthPx.roundToInt()
             )
         }
 

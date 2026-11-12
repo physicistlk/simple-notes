@@ -1013,38 +1013,86 @@ class ContinuousInkController(
                     // it is cut into tiles here and the big bitmap is given
                     // back: the session holds the tiles, not the whole layer
                     // (audit C50).
+                    // Read the tile information of the layers from
+                    // the metadata.
+                    val tilesInfo = PageLayerMeta.decodeTiles(
+                        try {
+                            val f = repository.fileStore.getAnnotationMetaFile(noteId, s.pageIndex)
+                            if (f.exists()) f.readText() else ""
+                        } catch (e: Exception) {
+                            ""
+                        }
+                    )
                     val stores = LinkedHashMap<PageLayer, LayerTiles>()
                     var loadedHeight = 0
                     for (layer in stack.layers) {
-                        val file = repository.fileStore.getAnnotationLayerFile(
-                            noteId, s.pageIndex, layer.index
-                        )
-                        // The layer file is decoded as it is: the tiles are
-                        // mutable, so the big bitmap does not have to be
-                        // copied (a copy of it is 80 MB of memory).
-                        val stored = decodeLayerBitmap(file)
-                        if (stored == null) {
-                            // The file is there but could not be read: the
-                            // writing of the user is in it, so it must not be
-                            // overwritten by an empty layer.
-                            if (file.exists()) s.unreadableLayers.add(layer.index)
-                            continue
-                        }
-                        s.unreadableLayers.remove(layer.index)
-                        val bitmap = if (stored.width == s.inkWidth && stored.height == s.inkHeight) {
-                            stored
+                        val info = tilesInfo[layer.index]
+                        val store: LayerTiles?
+                        if (info != null && info.tiles.isNotEmpty()) {
+                            // Tiled layer: read the tile files.
+                            val grid = LayerTileGrid(info.width, info.height, info.tileSize)
+                            val t = LayerTiles(grid)
+                            val loaded = try {
+                                repository.loadPageLayerTiles(noteId, s.pageIndex, layer.index, info)
+                            } catch (e: Exception) {
+                                e.printStackTrace()
+                                emptyList()
+                            }
+                            for ((pos, bitmap) in loaded) {
+                                val (tx, ty) = pos
+                                if (tx < 0 || ty < 0 || tx >= grid.columns || ty >= grid.rows) continue
+                                if (bitmap.isRecycled) continue
+                                val tile = t.requireTile(tx, ty)
+                                val canvas = Canvas(tile)
+                                canvas.drawBitmap(bitmap, 0f, 0f, null)
+                                bitmap.recycle()
+                            }
+                            for (tx in 0 until grid.columns) {
+                                for (ty in 0 until grid.rows) {
+                                    t.releaseIfEmpty(tx, ty)
+                                }
+                            }
+                            store = t
+                            loadedHeight = max(loadedHeight, info.height)
+                            s.unreadableLayers.remove(layer.index)
                         } else {
-                            // The layer was written with another size (the
-                            // page changed): the page part of it lands on the
-                            // page part of the new layer, the margins are
-                            // added.
-                            fitLayer(stored, s.inkWidth, s.inkHeight)
+                            // Legacy layer: one full-size PNG. Decode it and
+                            // split it into tiles.
+                            val file = repository.fileStore.getAnnotationLayerFile(
+                                noteId, s.pageIndex, layer.index
+                            )
+                            val stored = decodeLayerBitmap(file)
+                            if (stored == null) {
+                                if (file.exists()) s.unreadableLayers.add(layer.index)
+                                continue
+                            }
+                            s.unreadableLayers.remove(layer.index)
+                            val bitmap = if (stored.width == s.inkWidth && stored.height == s.inkHeight) {
+                                stored
+                            } else {
+                                fitLayer(stored, s.inkWidth, s.inkHeight)
+                            }
+                            loadedHeight = max(loadedHeight, bitmap.height)
+                            store = tilesFromBitmap(s, bitmap)
+                            if (!bitmap.isRecycled) bitmap.recycle()
                         }
-                        loadedHeight = max(loadedHeight, bitmap.height)
-                        stores[layer] = tilesFromBitmap(s, bitmap)
-                        // The big bitmap is not needed any more: the tiles
-                        // hold the writing.
-                        if (!bitmap.isRecycled) bitmap.recycle()
+                        stores[layer] = store
+                        // Read the ops of the layer (the strokes and the erases
+                        // as vectors). They are drawn on top of the tiles.
+                        val ops = try {
+                            repository.loadPageLayerOps(noteId, s.pageIndex, layer.index)
+                        } catch (e: Exception) {
+                            null
+                        }
+                        if (ops != null) {
+                            for (op in ops) {
+                                when (op) {
+                                    is InkOp.Stroke -> op.layer = layer
+                                    is InkOp.Erase -> op.layer = layer
+                                }
+                            }
+                            s.history.ops.addAll(ops)
+                        }
                     }
                     LoadedLayers(stack, stores, loadedHeight)
                 }
@@ -1847,9 +1895,10 @@ class ContinuousInkController(
         // The page is only "clean" when the write actually succeeded: a
         // failed write must stay dirty so the next save tries again.
         s.dirty = false
-        // Every layer of the page is written to its own file, and the stack
-        // (the layers, their names and the current one) goes to the metadata
-        // file of the page.
+        // Every layer of the page is written to its own files: the tiles
+        // (one PNG per tile, only the ones that changed) and the ops (the
+        // strokes and the erases as vectors). The stack (the layers, their
+        // names and the current one) goes to the metadata file of the page.
         for (layer in s.stack.layers) {
             if (s.unreadableLayers.contains(layer.index)) {
                 // The file of this layer could not be read: writing it now
@@ -1862,45 +1911,81 @@ class ContinuousInkController(
                 )
                 continue
             }
-            // The layer is composed off the main thread. It is NOT copied
-            // first: a copy of the layer (the page plus a page width of
-            // margin on each side) is tens of megabytes of garbage per save,
-            // and the garbage is what made the pen lag and killed the eraser
-            // on a big drawing. The strokes are drawn into the layer as
-            // vectors, so the layer only changes when the eraser wipes
-            // something - the lock keeps that from tearing the file.
-            val copy = try {
-                withContext(Dispatchers.IO) { composeLayer(s, layer) }
-            } catch (e: OutOfMemoryError) {
-                e.printStackTrace()
-                s.dirty = true
-                return
-            }
-            if (copy == null) {
-                // The layer is empty: the file of an earlier life of it
-                // goes away, or the layer would come back with the writing
-                // it had before.
-                withContext(Dispatchers.IO) {
-                    repository.fileStore.getAnnotationLayerFile(
-                        noteId, s.pageIndex, layer.index
-                    ).delete()
+            val store = s.layerTiles[layer]
+            // Write the tiles that changed: each tile is already a small
+            // bitmap in memory, so this is cheap (no 80 MB allocation, no
+            // full-size PNG encode).
+            if (store != null) {
+                for (index in store.dirtyTiles()) {
+                    val tx = store.grid.tileColumn(index)
+                    val ty = store.grid.tileRow(index)
+                    if (tx < 0 || ty < 0) continue
+                    val bitmap = store.tile(tx, ty)
+                    if (bitmap != null && !bitmap.isRecycled) {
+                        val ok = withContext(Dispatchers.IO) {
+                            repository.savePageLayerTile(
+                                noteId, s.pageIndex, layer.index, tx, ty, bitmap
+                            )
+                        }
+                        if (!ok) {
+                            s.dirty = true
+                            android.util.Log.w(
+                                "TouchNotes",
+                                "Could not save tile $tx,$ty of layer ${layer.index}"
+                            )
+                        }
+                    } else {
+                        // The tile was released (the eraser emptied it): its
+                        // file must go, or the old writing would come back.
+                        withContext(Dispatchers.IO) {
+                            repository.fileStore.getAnnotationLayerTileFile(
+                                noteId, s.pageIndex, layer.index, tx, ty
+                            ).delete()
+                        }
+                    }
                 }
-                continue
+                store.markClean()
             }
+            // Write the ops of the layer (the strokes and the erases as
+            // vectors). Only the ops of this layer are written.
+            val ops = s.history.ops.filter { it.layer === layer }
             val ok = withContext(Dispatchers.IO) {
-                repository.savePageLayer(noteId, s.pageIndex, layer.index, copy)
+                repository.savePageLayerOps(noteId, s.pageIndex, layer.index, ops)
             }
-            copy.recycle()
             if (!ok) {
-                // The write failed: keep the session dirty so the next
-                // autosave or the flush on exit tries again.
                 s.dirty = true
-                android.util.Log.w("TouchNotes", "Could not save page ${s.pageIndex}")
-                return
+                android.util.Log.w("TouchNotes", "Could not save ops of layer ${layer.index}")
+            }
+            // The migration: a legacy layer (one full-size PNG) is now
+            // stored as tiles + ops. The legacy PNG goes away, but only
+            // after the new files are written.
+            withContext(Dispatchers.IO) {
+                val legacyFile = repository.fileStore.getAnnotationLayerFile(
+                    noteId, s.pageIndex, layer.index
+                )
+                if (legacyFile.exists() && store != null && store.existingTiles().isNotEmpty()) {
+                    // The tiles are already on the disk (written above); the
+                    // legacy PNG is no longer needed.
+                    legacyFile.delete()
+                }
             }
         }
+        // The metadata of the page: the stack and the tile information of
+        // every layer.
+        val tilesInfo = s.stack.layers.associate { layer ->
+            val store = s.layerTiles[layer]
+            val grid = store?.grid ?: LayerTileGrid(s.inkWidth, s.inkHeight)
+            layer.index to PageLayerMeta.LayerTilesInfo(
+                s.inkWidth, s.inkHeight, grid.tileSize,
+                store?.existingTiles()?.map { index ->
+                    grid.tileName(grid.tileColumn(index), grid.tileRow(index))
+                } ?: emptyList()
+            )
+        }
         withContext(Dispatchers.IO) {
-            repository.savePageLayerMeta(noteId, s.pageIndex, PageLayerMeta.encode(s.stack))
+            repository.savePageLayerMeta(
+                noteId, s.pageIndex, PageLayerMeta.encode(s.stack, tilesInfo)
+            )
             deleteStaleLayerFiles(s)
         }
         storedStacks[s.pageIndex] = s.stack
@@ -2556,6 +2641,131 @@ class ContinuousInkController(
     internal fun layerOps(pageIndex: Int, layer: PageLayer): List<InkOp> {
         val s = getSession(pageIndex) ?: return emptyList()
         return s.history.ops.filter { it.layer === layer }
+    }
+
+    /**
+     * Composes the display bitmap of a layer from the files on the disk.
+     *
+     * The tiles are composed into a downsampled bitmap (one tile at a
+     * time, so no 80 MB allocation), and the ops of the layer are drawn
+     * on top of them. Used by the reader when there is no session (the
+     * user only reads).
+     */
+    suspend fun composeDisplayLayer(
+        pageIndex: Int,
+        layer: PageLayer,
+        displayWidthPx: Int
+    ): Bitmap? = withContext(Dispatchers.IO) {
+        val metaText = try {
+            val f = repository.fileStore.getAnnotationMetaFile(noteId, pageIndex)
+            if (f.exists()) f.readText() else null
+        } catch (e: Exception) {
+            null
+        }
+        val tilesInfo = metaText?.let { PageLayerMeta.decodeTiles(it)[layer.index] }
+        val layerWidth: Int
+        val layerHeight: Int
+        val tiles: List<Pair<Pair<Int, Int>, Bitmap>> = if (tilesInfo != null && tilesInfo.tiles.isNotEmpty()) {
+            layerWidth = tilesInfo.width
+            layerHeight = tilesInfo.height
+            repository.loadPageLayerTiles(noteId, pageIndex, layer.index, tilesInfo)
+        } else {
+            // Legacy layer: read the PNG and treat it as one tile.
+            val file = repository.fileStore.getAnnotationLayerFile(noteId, pageIndex, layer.index)
+            if (!file.exists()) return@withContext null
+            val bitmap = decodeLayerBitmap(file) ?: return@withContext null
+            layerWidth = bitmap.width
+            layerHeight = bitmap.height
+            listOf(Pair(Pair(0, 0), bitmap))
+        }
+        if (layerWidth <= 0 || layerHeight <= 0) return@withContext null
+        val displayHeight = (displayWidthPx * layerHeight / layerWidth).coerceAtLeast(1)
+        val out = try {
+            Bitmap.createBitmap(displayWidthPx, displayHeight, Bitmap.Config.ARGB_8888)
+        } catch (e: OutOfMemoryError) {
+            e.printStackTrace()
+            null
+        } ?: return@withContext null
+        val canvas = Canvas(out)
+        val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
+        // Draw the tiles.
+        for ((pos, bitmap) in tiles) {
+            if (bitmap.isRecycled) continue
+            val (tx, ty) = pos
+            val tileSize = tilesInfo?.tileSize ?: layerWidth
+            val left = tx * tileSize
+            val top = ty * tileSize
+            val srcRect = Rect(0, 0, bitmap.width, bitmap.height)
+            val dstRect = RectF(
+                left.toFloat() / layerWidth * displayWidthPx,
+                top.toFloat() / layerHeight * displayHeight,
+                (left + bitmap.width).toFloat() / layerWidth * displayWidthPx,
+                (top + bitmap.height).toFloat() / layerHeight * displayHeight
+            )
+            canvas.drawBitmap(bitmap, srcRect, dstRect, paint)
+            bitmap.recycle()
+        }
+        // Draw the ops (the strokes and the erases as vectors).
+        val ops = repository.loadPageLayerOps(noteId, pageIndex, layer.index)
+        if (ops != null) {
+            for (op in ops) {
+                when (op) {
+                    is InkOp.Stroke -> {
+                        val stroke = op.stroke
+                        val w = displayWidthPx.toFloat()
+                        val h = displayHeight.toFloat()
+                        val paint2 = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                            style = Paint.Style.STROKE
+                            strokeCap = Paint.Cap.ROUND
+                            strokeJoin = Paint.Join.ROUND
+                            color = stroke.color
+                            strokeWidth = stroke.baseWidthNorm * w
+                        }
+                        // Auto-shape is re-derived on the load; for the
+                        // display path we draw the raw points (the same
+                        // look as the live preview).
+                        val path = Path()
+                        val points = stroke.points
+                        if (points.isNotEmpty()) {
+                            path.moveTo(points[0].x * w, points[0].y * h)
+                            for (i in 1 until points.size) {
+                                path.lineTo(points[i].x * w, points[i].y * h)
+                            }
+                        }
+                        canvas.drawPath(path, paint2)
+                    }
+                    is InkOp.Erase -> {
+                        // The eraser clears pixels: in the display bitmap we
+                        // just skip it (the tiles already have the hole).
+                    }
+                }
+            }
+        }
+        return@withContext out
+    }
+
+    /**
+     * Composes the display bitmaps of all the layers of a page from the
+     * files on the disk. Used by the reader when there is no session (the
+     * user only reads).
+     */
+    suspend fun composeDisplayLayers(
+        pageIndex: Int,
+        displayWidthPx: Int
+    ): Map<Int, Bitmap?> {
+        val result = LinkedHashMap<Int, Bitmap?>()
+        try {
+            val metaFile = repository.fileStore.getAnnotationMetaFile(noteId, pageIndex)
+            val text = if (metaFile.exists()) metaFile.readText() else null
+            val stack = text?.let { PageLayerMeta.decode(it) } ?: PageLayerStack.base()
+            for (layer in stack.layers) {
+                if (!layer.visible) continue
+                result[layer.index] = composeDisplayLayer(pageIndex, layer, displayWidthPx)
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        return result
     }
 
     /**

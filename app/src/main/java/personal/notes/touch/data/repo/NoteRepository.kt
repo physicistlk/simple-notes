@@ -808,6 +808,42 @@ class NoteRepository(
         out
     }
 
+    internal suspend fun savePageLayerOps(
+        noteId: String,
+        pageIndex: Int,
+        layerIndex: Int,
+        ops: List<personal.notes.touch.ui.canvas.InkOp>
+    ): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val file = fileStore.getAnnotationLayerOpsFile(noteId, pageIndex, layerIndex)
+            file.parentFile?.mkdirs()
+            file.writeText(personal.notes.touch.ui.canvas.ContinuousOpCodec.encode(ops))
+            true
+        } catch (e: Exception) {
+            e.printStackTrace()
+            false
+        }
+    }
+
+    internal suspend fun loadPageLayerOps(
+        noteId: String,
+        pageIndex: Int,
+        layerIndex: Int
+    ): List<personal.notes.touch.ui.canvas.InkOp>? = withContext(Dispatchers.IO) {
+        val file = fileStore.getAnnotationLayerOpsFile(noteId, pageIndex, layerIndex)
+        if (!file.exists()) return@withContext null
+        personal.notes.touch.ui.canvas.ContinuousOpCodec.decode(file.readText())
+    }
+
+    internal suspend fun deletePageLayerOps(noteId: String, pageIndex: Int, layerIndex: Int): Boolean =
+        withContext(Dispatchers.IO) {
+            try {
+                fileStore.getAnnotationLayerOpsFile(noteId, pageIndex, layerIndex).delete()
+            } catch (e: Exception) {
+                false
+            }
+        }
+
     /**
      * Deletes the tile files of a layer (C50).
      *

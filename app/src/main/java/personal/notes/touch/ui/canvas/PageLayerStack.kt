@@ -347,7 +347,7 @@ object PageLayerMeta {
  * strings, numbers, booleans and null) and nothing else - it is not a
  * general purpose parser, it is a small one that a unit test can check.
  */
-private object MiniJson {
+internal object MiniJson {
 
     /** Parses a JSON text; null when the text is broken. */
     fun parse(text: String): Any? {

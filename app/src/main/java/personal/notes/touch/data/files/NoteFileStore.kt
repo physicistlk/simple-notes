@@ -247,6 +247,9 @@ class NoteFileStore(private val context: Context) {
     fun getAnnotationMetaFile(noteId: String, pageIndex: Int): File =
         File(getLayersDir(noteId), "page_${pageIndex}_annot.json")
 
+    fun getAnnotationLayerOpsFile(noteId: String, pageIndex: Int, layerIndex: Int): File =
+        File(getLayersDir(noteId), "page_${pageIndex}_annot_${layerIndex}_ops.json")
+
     /**
      * The bitmap file of ONE tile of an annotation layer (C50).
      *
