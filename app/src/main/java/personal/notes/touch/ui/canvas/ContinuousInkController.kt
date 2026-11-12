@@ -828,13 +828,19 @@ class ContinuousInkController(
         pressure: Float,
         settings: InkToolSettings
     ) {
-        // The points are NOT clamped to the page: the annotation layer
-        // reaches past the page (the margin), and a stroke that lands there
-        // has to stay where it was drawn. Clamping pulled the stroke back
-        // into the page, so a big stroke was squashed at the edge and the
-        // eraser had nothing to wipe.
-        val cx = x.coerceIn(-64f, 64f)
-        val cy = y.coerceIn(-64f, 64f)
+        // An A4 page is limited to its own size: the writing cannot
+        // reach past it. PDF and infinite pages keep the margin, so a
+        // stroke can land outside the page.
+        val cx = if (session?.pageType == "a4") {
+            x.coerceIn(0f, 1f)
+        } else {
+            x.coerceIn(-64f, 64f)
+        }
+        val cy = if (session?.pageType == "a4") {
+            y.coerceIn(0f, 1f)
+        } else {
+            y.coerceIn(-64f, 64f)
+        }
         val w = if (stroke.tool == CanvasTool.FOUNTAIN_PEN) {
             fountainWidth(pressure, stroke.baseWidthNorm, settings, stroke.points.lastOrNull()?.w)
         } else {

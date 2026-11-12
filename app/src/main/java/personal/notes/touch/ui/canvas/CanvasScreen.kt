@@ -3893,7 +3893,7 @@ fun CanvasScreen(
                                                 shape = CircleShape
                                             )
                                             .combinedClickable(
-                                                onClick = { viewModel.setStrokeWidth(widthPx) },
+                                                onClick = { /* short tap is a no-op */ },
                                                 onLongClick = {
                                                     // Only the chip that was
                                                     // held down opens the
@@ -4251,7 +4251,7 @@ fun CanvasScreen(
                                                 shape = CircleShape
                                             )
                                             .combinedClickable(
-                                                onClick = { viewModel.setStrokeWidth(widthPx) },
+                                                onClick = { /* short tap is a no-op */ },
                                                 onLongClick = {
                                                     widthPopupChipVert = vIdx
                                                     showWidthPopupVert = true
