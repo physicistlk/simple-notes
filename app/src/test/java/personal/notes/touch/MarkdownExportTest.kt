@@ -129,6 +129,14 @@ class MarkdownExportTest {
     }
 
     @Test
+    fun remoteImagesAreNotAutoFetched() {
+        val html = MarkdownExport.htmlBody("![photo](https://example.com/photo.jpg)")
+        assertTrue(!html.contains("<img"))
+        assertTrue(html.contains("class=\"remote-image\""))
+        assertTrue(html.contains("https://example.com/photo.jpg"))
+    }
+
+    @Test
     fun documentIsSelfContainedAndTitled() {
         val doc = MarkdownExport.htmlDocument("My <Note>", "# Hi")
         assertTrue(doc.startsWith("<!DOCTYPE html>"))

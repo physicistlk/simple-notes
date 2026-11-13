@@ -1,6 +1,7 @@
 package personal.notes.touch
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Test
 import personal.notes.touch.util.PdfPageGeometry
@@ -74,9 +75,11 @@ class PdfPageGeometryTest {
                 floatArrayOf(5f, 60f, 80f, 70f)
             )
         )
-        assertEquals(5f, union!![0], 1e-4f)
-        assertEquals(20f, union[1], 1e-4f)
-        assertEquals(80f, union[2], 1e-4f)
-        assertEquals(70f, union[3], 1e-4f)
+        assertNotNull(union)
+        val u = requireNotNull(union)
+        assertEquals(5f, u[0], 1e-4f)
+        assertEquals(20f, u[1], 1e-4f)
+        assertEquals(80f, u[2], 1e-4f)
+        assertEquals(70f, u[3], 1e-4f)
     }
 }

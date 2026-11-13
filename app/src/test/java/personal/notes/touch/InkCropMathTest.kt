@@ -34,7 +34,7 @@ class InkCropMathTest {
             extra = 6f
         )
         assertNotNull(box)
-        val b = box!!
+        val b = requireNotNull(box)
         // The nib (20 px) plus the cap margin (6 px) surrounds the stroke.
         assertTrue("left ${b.left}", b.left <= 100 - 16)
         assertTrue("top ${b.top}", b.top <= 50 - 16)
@@ -44,31 +44,50 @@ class InkCropMathTest {
 
     @Test
     fun aWiderNibGrowsTheBox() {
-        val thin = InkCropMath.strokeBounds(floatArrayOf(10f), floatArrayOf(10f), 2f)!!
-        val thick = InkCropMath.strokeBounds(floatArrayOf(10f), floatArrayOf(10f), 40f)!!
+        val thin = requireNotNull(InkCropMath.strokeBounds(floatArrayOf(10f), floatArrayOf(10f), 2f))
+        val thick = requireNotNull(InkCropMath.strokeBounds(floatArrayOf(10f), floatArrayOf(10f), 40f))
         assertTrue(thick.width > thin.width)
         assertTrue(thick.height > thin.height)
     }
 
     @Test
     fun theHighlighterBandNeedsMoreRoom() {
-        val pen = InkCropMath.strokeBounds(floatArrayOf(10f), floatArrayOf(10f), 10f, 0.5f, 6f)!!
-        val highlighter = InkCropMath.strokeBounds(floatArrayOf(10f), floatArrayOf(10f), 10f, 1.7f, 6f)!!
+        val pen = requireNotNull(InkCropMath.strokeBounds(floatArrayOf(10f), floatArrayOf(10f), 10f, 0.5f, 6f))
+        val highlighter = requireNotNull(InkCropMath.strokeBounds(floatArrayOf(10f), floatArrayOf(10f), 10f, 1.7f, 6f))
         assertTrue(highlighter.width > pen.width)
     }
 
     @Test
+    fun eraserBoundsIncludeHalfWidthRoundCapRadius() {
+        val eraserWidth = 30f
+        val box = requireNotNull(
+            InkCropMath.strokeBounds(
+                floatArrayOf(100f),
+                floatArrayOf(100f),
+                widest = eraserWidth,
+                padFactor = 0.5f,
+                extra = 6f
+            )
+        )
+        // 30 * 0.5 + 6 = 21 px padding on each side
+        assertEquals(79, box.left)
+        assertEquals(79, box.top)
+        assertEquals(121, box.right)
+        assertEquals(121, box.bottom)
+    }
+
+    @Test
     fun aStrokeOnThePaperIsOnPaper() {
-        val box = InkCropMath.strokeBounds(floatArrayOf(100f, 400f), floatArrayOf(100f, 400f), 10f)!!
+        val box = requireNotNull(InkCropMath.strokeBounds(floatArrayOf(100f, 400f), floatArrayOf(100f, 400f), 10f))
         assertTrue(InkCropMath.isOnPaper(box, 2160, 3056))
         assertFalse(InkCropMath.isOffPaper(box, 2160, 3056))
     }
 
     @Test
     fun aStrokePastTheEdgeIsOffPaper() {
-        val box = InkCropMath.strokeBounds(floatArrayOf(2100f, 2200f), floatArrayOf(100f, 200f), 10f)!!
+        val box = requireNotNull(InkCropMath.strokeBounds(floatArrayOf(2100f, 2200f), floatArrayOf(100f, 200f), 10f))
         assertTrue(InkCropMath.isOffPaper(box, 2160, 3056))
-        val left = InkCropMath.strokeBounds(floatArrayOf(-40f, 100f), floatArrayOf(10f, 20f), 10f)!!
+        val left = requireNotNull(InkCropMath.strokeBounds(floatArrayOf(-40f, 100f), floatArrayOf(10f, 20f), 10f))
         assertTrue(InkCropMath.isOffPaper(left, 2160, 3056))
     }
 

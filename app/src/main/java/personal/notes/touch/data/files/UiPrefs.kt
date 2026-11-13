@@ -50,6 +50,19 @@ class UiPrefs(private val file: File) {
         }
     }
 
+    fun getString(key: String, default: String): String = synchronized(lock) {
+        val s = read().optString(key, "")
+        if (s.isEmpty()) default else s
+    }
+
+    fun putString(key: String, value: String) {
+        synchronized(lock) {
+            val json = read()
+            json.put(key, value)
+            write(json)
+        }
+    }
+
     /** Writes the file atomically: a temp file plus a rename. */
     private fun write(json: JSONObject) {
         try {

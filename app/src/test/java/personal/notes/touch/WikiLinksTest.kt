@@ -1,6 +1,7 @@
 package personal.notes.touch
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -64,11 +65,20 @@ class WikiLinksTest {
     @Test
     fun pendingQueryIsNullWhenTheLinkIsClosedOrAliased() {
         assertNull(WikiLinks.pendingAt("[[Pro]]", 7))
+        assertNull(WikiLinks.pendingAt("[[Pro]]", 4))
         assertNull(WikiLinks.pendingAt("[[Pro|alias", 12))
         assertNull(WikiLinks.pendingAt("line one\n[[Pro", 16))
         assertNull(WikiLinks.pendingAt("no brackets", 4))
         // Caret before the opening brackets.
         assertNull(WikiLinks.pendingAt("[[Pro", 1))
+    }
+
+    @Test
+    fun pendingQueryWorksWithAnotherClosedLinkLaterOnTheLine() {
+        val text = "See [[Pro and also [[Other]]"
+        val pending = WikiLinks.pendingAt(text, 9)
+        assertNotNull(pending)
+        assertEquals("Pro", pending?.query)
     }
 
     @Test

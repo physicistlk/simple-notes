@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -71,7 +72,18 @@ class NoteListViewModel(
     val settingsRepository: SettingsRepository? = null
 ) : ViewModel() {
 
-    private val _uiState = MutableStateFlow(NoteListUiState())
+    private val KEY_SORT_ORDER = "library_sort_order"
+    private val uiPrefs = repository.fileStore.uiPrefs()
+
+    private val _uiState = MutableStateFlow(
+        NoteListUiState(
+            sortOrder = try {
+                NoteSortOrder.valueOf(uiPrefs.getString(KEY_SORT_ORDER, NoteSortOrder.UPDATED_DESC.name))
+            } catch (e: Exception) {
+                NoteSortOrder.UPDATED_DESC
+            }
+        )
+    )
     val uiState: StateFlow<NoteListUiState> = _uiState.asStateFlow()
 
     val folders: StateFlow<List<FolderEntity>> = repository.getAllFolders()
@@ -402,6 +414,9 @@ class NoteListViewModel(
 
     fun setSortOrder(order: NoteSortOrder) {
         _uiState.value = _uiState.value.copy(sortOrder = order)
+        viewModelScope.launch(Dispatchers.IO) {
+            uiPrefs.putString(KEY_SORT_ORDER, order.name)
+        }
     }
 
     class Factory(

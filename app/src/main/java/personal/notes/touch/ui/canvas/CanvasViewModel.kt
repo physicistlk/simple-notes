@@ -770,11 +770,13 @@ class CanvasViewModel(
      * loses the whole page's ink.
      */
     private suspend fun saveContentLayer(index: Int, bitmap: Bitmap) {
-        val copy = try {
-            bitmap.copy(Bitmap.Config.ARGB_8888, false)
-        } catch (e: OutOfMemoryError) {
-            e.printStackTrace()
-            null
+        val copy = withContext(Dispatchers.IO) {
+            try {
+                bitmap.copy(Bitmap.Config.ARGB_8888, false)
+            } catch (e: OutOfMemoryError) {
+                e.printStackTrace()
+                null
+            }
         } ?: return
         saveContentLayerDirect(index, copy)
         copy.recycle()
@@ -888,11 +890,13 @@ class CanvasViewModel(
         if (!pageLoadedFromDisk && guardFile.exists()) return
         // The encoder runs off the main thread while the canvas keeps drawing
         // into the same bitmap: encode a copy so the file can never be torn.
-        val copy = try {
-            bitmap.copy(Bitmap.Config.ARGB_8888, false)
-        } catch (e: OutOfMemoryError) {
-            e.printStackTrace()
-            null
+        val copy = withContext(Dispatchers.IO) {
+            try {
+                bitmap.copy(Bitmap.Config.ARGB_8888, false)
+            } catch (e: OutOfMemoryError) {
+                e.printStackTrace()
+                null
+            }
         } ?: return
         // The copy is already made here; do not copy a second time.
         saveContentLayerDirect(pageIdx, copy)

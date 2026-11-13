@@ -249,7 +249,8 @@ object MarkdownExport {
     private fun renderImage(block: Block): String {
         val alt = escape(InlineMarkdown.plain(block.text).ifBlank { "image" })
         return if (block.url.startsWith("http://") || block.url.startsWith("https://")) {
-            "<figure><img src=\"${escapeAttr(block.url)}\" alt=\"$alt\"><figcaption>$alt</figcaption></figure>\n"
+            // Remote images must not fetch automatically over the network (breaks offline guarantee and leaks reader's IP)
+            "<figure class=\"remote-image\"><figcaption>&#128247; $alt (<a href=\"${escapeAttr(block.url)}\">${escape(block.url)}</a>)</figcaption></figure>\n"
         } else {
             // Local attachments live in app-private storage and are not part of
             // the export, so the page names the image instead of a broken <img>.

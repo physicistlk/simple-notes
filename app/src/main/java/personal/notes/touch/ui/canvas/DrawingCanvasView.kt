@@ -3046,6 +3046,45 @@ class DrawingCanvasView @JvmOverloads constructor(
                 } else {
                     bitmapCanvas?.let { drawStroke(it) }
                 }
+
+                // If this stroke was an eraser, also clear intersecting pixels in
+                // margin crops and image layer ink crops (C5).
+                if (currentTool == CanvasTool.ERASER && marks != null) {
+                    val marksF = RectF(marks)
+                    var erasedCrop = false
+                    for (crop in beyondPageInk) {
+                        if (!crop.bitmap.isRecycled) {
+                            val cropRect = RectF(crop.x, crop.y, crop.x + crop.bitmap.width, crop.y + crop.bitmap.height)
+                            if (RectF.intersects(cropRect, marksF)) {
+                                val c = android.graphics.Canvas(crop.bitmap)
+                                c.save()
+                                c.translate(-crop.x, -crop.y)
+                                drawStroke(c)
+                                c.restore()
+                                erasedCrop = true
+                            }
+                        }
+                    }
+                    for (layer in imageLayers) {
+                        for (crop in layer.ink) {
+                            if (!crop.bitmap.isRecycled) {
+                                val cropRect = RectF(crop.x, crop.y, crop.x + crop.bitmap.width, crop.y + crop.bitmap.height)
+                                if (RectF.intersects(cropRect, marksF)) {
+                                    val c = android.graphics.Canvas(crop.bitmap)
+                                    c.save()
+                                    c.translate(-crop.x, -crop.y)
+                                    drawStroke(c)
+                                    c.restore()
+                                    erasedCrop = true
+                                }
+                            }
+                        }
+                    }
+                    if (erasedCrop) {
+                        layersDirty = true
+                        onLayersChanged?.invoke()
+                    }
+                }
                 currentStrokePoints.clear()
                 currentPath.reset()
                 sampledPoints.clear()
@@ -3082,7 +3121,7 @@ class DrawingCanvasView @JvmOverloads constructor(
         val ys = FloatArray(pts.size) { pts[it].second }
         val padFactor = when (currentTool) {
             CanvasTool.HIGHLIGHTER -> 1.7f
-            CanvasTool.ERASER -> 0f
+            CanvasTool.ERASER -> 0.5f
             else -> 0.5f
         }
         val widestForPad = if (currentTool == CanvasTool.ERASER) eraserWidthPx else widest

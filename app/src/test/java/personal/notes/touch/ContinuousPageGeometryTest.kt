@@ -213,7 +213,7 @@ class ContinuousPageGeometryTest {
             extraPx = 4f
         )
         assertNotNull(bounds)
-        val b = bounds!!
+        val b = requireNotNull(bounds)
         // The nib is 2% of the box width (20 px): 60% of it around the
         // stroke, plus 4 px for the round cap.
         assertTrue("left ${b.left}", b.left <= 0.5f - 0.016f)

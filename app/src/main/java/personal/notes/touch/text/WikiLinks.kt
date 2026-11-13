@@ -53,9 +53,14 @@ object WikiLinks {
         if (caret < 2 || caret > text.length) return null
         val start = text.lastIndexOf("[[", caret - 2)
         if (start < 0) return null
-        // The token may already be closed before the caret (the caret sits
-        // inside "[[Beta]]"): completing it again would mangle the link.
-        if (text.indexOf("]]", start + 2).let { it >= 0 && it < caret }) return null
+        // The token may already be closed (the caret sits inside "[[Beta]]"
+        // or on an already-closed link on the line): completing it again would mangle the link.
+        val nextOpen = text.indexOf("[[", start + 2)
+        val closeIndex = text.indexOf("]]", start + 2)
+        val newlineIndex = text.indexOf('\n', start + 2)
+        if (closeIndex >= 0 && (nextOpen < 0 || closeIndex < nextOpen) && (newlineIndex < 0 || closeIndex < newlineIndex)) {
+            return null
+        }
         val between = text.substring(start + 2, caret)
         if (between.contains("]]") || between.contains('|') || between.contains('\n')) return null
         if (between.length > MAX_TARGET) return null

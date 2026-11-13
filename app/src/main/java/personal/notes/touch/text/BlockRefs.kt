@@ -97,6 +97,12 @@ object BlockRefs {
         if (caret < 2 || caret > text.length) return null
         val start = text.lastIndexOf("((", caret - 2)
         if (start < 0) return null
+        val nextOpen = text.indexOf("((", start + 2)
+        val closeIndex = text.indexOf("))", start + 2)
+        val newlineIndex = text.indexOf('\n', start + 2)
+        if (closeIndex >= 0 && (nextOpen < 0 || closeIndex < nextOpen) && (newlineIndex < 0 || closeIndex < newlineIndex)) {
+            return null
+        }
         val between = text.substring(start + 2, caret)
         if (between.contains("))") || between.contains('|') || between.contains('\n')) return null
         if (between.length > MAX_PENDING_QUERY) return null

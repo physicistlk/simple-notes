@@ -1,11 +1,15 @@
 package personal.notes.touch.data.repo
 
+import androidx.room.withTransaction
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import personal.notes.touch.data.db.AppDatabase
 import personal.notes.touch.data.db.dao.BlockBacklink
 import personal.notes.touch.data.db.dao.BlockCandidate
 import personal.notes.touch.data.db.dao.BlockRefDao
@@ -49,8 +53,10 @@ class NoteRepository(
     private val pageDao: PageDao,
     private val templateDao: TemplateDao,
     private val blockRefDao: BlockRefDao,
-    val fileStore: NoteFileStore
+    val fileStore: NoteFileStore,
+    private val database: AppDatabase? = null
 ) {
+    private val saveMutex = Mutex()
     /** Emitted after a cross-document block move/copy has reached both notes. */
     private val _blockTransfers = MutableSharedFlow<BlockTransferCompleted>(
         extraBufferCapacity = 32
@@ -194,10 +200,45 @@ class NoteRepository(
     }
 
     suspend fun updateNoteContent(id: String, title: String, content: String) = withContext(Dispatchers.IO) {
-        val existing = noteDao.getById(id)
-        if (existing != null) {
-            noteDao.updateContentRow(id, title, content, System.currentTimeMillis())
-            syncIndex(id, content)
+        saveMutex.withLock {
+            val action: suspend () -> Unit = {
+                val existing = noteDao.getById(id)
+                if (existing != null) {
+                    noteDao.updateContentRow(id, title, content, System.currentTimeMillis())
+                    syncIndex(id, content)
+                }
+            }
+            if (database != null) {
+                database.withTransaction { action() }
+            } else {
+                action()
+            }
+        }
+    }
+
+    suspend fun updateNoteContentAndBlocks(
+        id: String,
+        title: String,
+        content: String,
+        blocks: List<NoteBlockEntity>?
+    ) = withContext(Dispatchers.IO) {
+        saveMutex.withLock {
+            val action: suspend () -> Unit = {
+                val existing = noteDao.getById(id)
+                if (existing != null) {
+                    noteDao.updateContentRow(id, title, content, System.currentTimeMillis())
+                    syncIndex(id, content)
+                    if (blocks != null) {
+                        noteBlockDao.replaceBlocks(id, blocks)
+                        syncBlockRefs(id, blocks)
+                    }
+                }
+            }
+            if (database != null) {
+                database.withTransaction { action() }
+            } else {
+                action()
+            }
         }
     }
 
@@ -338,50 +379,69 @@ class NoteRepository(
             return@withContext 0
         }
 
-        val sourceNote = noteDao.getById(sourceNoteId) ?: return@withContext 0
-        val targetNote = noteDao.getById(targetNoteId) ?: return@withContext 0
-        if (sourceNote.pageType != "text" || targetNote.pageType != "text") {
-            return@withContext 0
-        }
+        saveMutex.withLock {
+            val sourceNote = noteDao.getById(sourceNoteId) ?: return@withLock 0
+            val targetNote = noteDao.getById(targetNoteId) ?: return@withLock 0
+            if (sourceNote.pageType != "text" || targetNote.pageType != "text") {
+                return@withLock 0
+            }
 
-        val incoming = BlockTransfer.selection(
-            rows = noteBlockDao.getBlocksForNote(sourceNoteId),
-            ids = blockIds
-        )
-        if (incoming.isEmpty()) return@withContext 0
-
-        val nextTarget = BlockTransfer.append(
-            target = noteBlockDao.getBlocksForNote(targetNoteId),
-            incoming = incoming,
-            targetNoteId = targetNoteId,
-            copyIds = !move
-        )
-        noteBlockDao.replaceBlocks(targetNoteId, nextTarget)
-        syncBlockRefs(targetNoteId, nextTarget)
-        updateNoteContent(
-            targetNoteId,
-            targetNote.title.ifBlank { "Untitled Note" },
-            BlockPersistence.serializeRows(nextTarget)
-        )
-
-        if (move) {
-            val nextSource = BlockTransfer.remove(
+            val incoming = BlockTransfer.selection(
                 rows = noteBlockDao.getBlocksForNote(sourceNoteId),
-                ids = incoming.map { it.id }.toSet()
+                ids = blockIds
             )
-            noteBlockDao.replaceBlocks(sourceNoteId, nextSource)
-            syncBlockRefs(sourceNoteId, nextSource)
-            updateNoteContent(
-                sourceNoteId,
-                sourceNote.title.ifBlank { "Untitled Note" },
-                BlockPersistence.serializeRows(nextSource)
-            )
-        }
+            if (incoming.isEmpty()) return@withLock 0
 
-        _blockTransfers.tryEmit(
-            BlockTransferCompleted(sourceNoteId, targetNoteId, move, incoming.size)
-        )
-        incoming.size
+            val action: suspend () -> Int = {
+                val nextTarget = BlockTransfer.append(
+                    target = noteBlockDao.getBlocksForNote(targetNoteId),
+                    incoming = incoming,
+                    targetNoteId = targetNoteId,
+                    copyIds = !move
+                )
+                noteBlockDao.replaceBlocks(targetNoteId, nextTarget)
+                syncBlockRefs(targetNoteId, nextTarget)
+                val targetContent = BlockPersistence.serializeRows(nextTarget)
+                noteDao.updateContentRow(
+                    targetNoteId,
+                    targetNote.title.ifBlank { "Untitled Note" },
+                    targetContent,
+                    System.currentTimeMillis()
+                )
+                syncIndex(targetNoteId, targetContent)
+
+                if (move) {
+                    val nextSource = BlockTransfer.remove(
+                        rows = noteBlockDao.getBlocksForNote(sourceNoteId),
+                        ids = incoming.map { it.id }.toSet()
+                    )
+                    noteBlockDao.replaceBlocks(sourceNoteId, nextSource)
+                    syncBlockRefs(sourceNoteId, nextSource)
+                    val sourceContent = BlockPersistence.serializeRows(nextSource)
+                    noteDao.updateContentRow(
+                        sourceNoteId,
+                        sourceNote.title.ifBlank { "Untitled Note" },
+                        sourceContent,
+                        System.currentTimeMillis()
+                    )
+                    syncIndex(sourceNoteId, sourceContent)
+                }
+                incoming.size
+            }
+
+            val count = if (database != null) {
+                database.withTransaction { action() }
+            } else {
+                action()
+            }
+
+            if (count > 0) {
+                _blockTransfers.tryEmit(
+                    BlockTransferCompleted(sourceNoteId, targetNoteId, move, count)
+                )
+            }
+            count
+        }
     }
 
     // ---- block references (schema 11) --------------------------------------

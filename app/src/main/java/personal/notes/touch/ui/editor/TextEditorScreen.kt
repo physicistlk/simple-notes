@@ -704,11 +704,11 @@ private fun FormattingToolbar(
             if (blockCommandsActive) viewModel.applyBlockCommand(BlockCommand.DIVIDER) else viewModel.insertDivider()
         })
         ToolbarButton(text = "⊞ Table", onClick = {
-            viewModel.applyBlockCommand(BlockCommand.TABLE)
+            if (blockCommandsActive) viewModel.applyBlockCommand(BlockCommand.TABLE) else viewModel.insertTable()
         })
         ToolbarButton(text = "🖼 Image", onClick = onPickImage)
         ToolbarButton(text = "# Tag", onClick = {
-            viewModel.applyBlockCommand(BlockCommand.TAG)
+            if (blockCommandsActive) viewModel.applyBlockCommand(BlockCommand.TAG) else viewModel.insertTag()
         })
         ToolbarButton(text = "🙂 Emoji", onClick = {
             viewModel.setShowEmojiSheet(true)

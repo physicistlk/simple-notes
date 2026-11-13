@@ -2,6 +2,7 @@ package personal.notes.touch
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -89,13 +90,22 @@ class BlockRefsTest {
     fun pendingIsNullForAliasedOrClosedReferences() {
         assertNull(BlockRefs.pendingAt("((dead|alias", 11))
         assertNull(BlockRefs.pendingAt("((dead))", 8))
+        assertNull(BlockRefs.pendingAt("((dead))", 5))
         assertNull(BlockRefs.pendingAt("plain text", 10))
+    }
+
+    @Test
+    fun pendingQueryWorksWithAnotherClosedLinkLaterOnTheLine() {
+        val text = "See ((dead and also ((other))"
+        val pending = BlockRefs.pendingAt(text, 10)
+        assertNotNull(pending)
+        assertEquals("dead", pending?.query)
     }
 
     @Test
     fun completionWritesTheShortKeyAndLabel() {
         val text = "See ((dead"
-        val pending = BlockRefs.pendingAt(text, text.length)!!
+        val pending = requireNotNull(BlockRefs.pendingAt(text, text.length))
         val (completed, caret) = BlockRefs.complete(
             text,
             pending,
@@ -109,7 +119,7 @@ class BlockRefsTest {
     @Test
     fun completionWithoutALabelWritesABareKey() {
         val text = "(("
-        val pending = BlockRefs.pendingAt(text, 2)!!
+        val pending = requireNotNull(BlockRefs.pendingAt(text, 2))
         val (completed, _) = BlockRefs.complete(text, pending, "deadbeef-1", "   ")
         assertEquals("((deadbeef))", completed)
     }

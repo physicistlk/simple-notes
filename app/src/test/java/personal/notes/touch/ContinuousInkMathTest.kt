@@ -32,7 +32,7 @@ class ContinuousInkMathTest {
         val points = listOf(InkPoint(0.25f, 0.25f, 0.01f), InkPoint(0.75f, 0.75f, 0.01f))
         val bounds = ContinuousInkMath.strokeBounds(points, 0.01f, 1000, 1400)
         assertNotNull(bounds)
-        val b = bounds!!
+        val b = requireNotNull(bounds)
         assertTrue("left ${b.left}", b.left in 0 until 250)
         assertTrue("top ${b.top}", b.top in 0 until 350)
         assertTrue("right ${b.right}", b.right in 750..1000)
@@ -41,17 +41,21 @@ class ContinuousInkMathTest {
 
     @Test
     fun edgeStrokesAreClampedNotWrapped() {
-        val topLeft = ContinuousInkMath.strokeBounds(
-            listOf(InkPoint(0f, 0f, 0.01f)), 0.01f, 2160, 3056
-        )!!
+        val topLeft = requireNotNull(
+            ContinuousInkMath.strokeBounds(
+                listOf(InkPoint(0f, 0f, 0.01f)), 0.01f, 2160, 3056
+            )
+        )
         assertEquals(0, topLeft.left)
         assertEquals(0, topLeft.top)
         assertTrue(topLeft.width > 0)
         assertTrue(topLeft.height > 0)
 
-        val bottomRight = ContinuousInkMath.strokeBounds(
-            listOf(InkPoint(1f, 1f, 0.01f)), 0.01f, 2160, 3056
-        )!!
+        val bottomRight = requireNotNull(
+            ContinuousInkMath.strokeBounds(
+                listOf(InkPoint(1f, 1f, 0.01f)), 0.01f, 2160, 3056
+            )
+        )
         assertEquals(2160, bottomRight.right)
         assertEquals(3056, bottomRight.bottom)
         assertTrue(bottomRight.left < 2160)
@@ -61,9 +65,9 @@ class ContinuousInkMathTest {
     @Test
     fun aWideNibGrowsThePatch() {
         val points = listOf(InkPoint(0.5f, 0.5f, 0.01f))
-        val thin = ContinuousInkMath.strokeBounds(points, 0.01f, 2160, 3056)!!
+        val thin = requireNotNull(ContinuousInkMath.strokeBounds(points, 0.01f, 2160, 3056))
         val widePoints = listOf(InkPoint(0.5f, 0.5f, 0.05f))
-        val thick = ContinuousInkMath.strokeBounds(widePoints, 0.05f, 2160, 3056)!!
+        val thick = requireNotNull(ContinuousInkMath.strokeBounds(widePoints, 0.05f, 2160, 3056))
         assertTrue(thick.width > thin.width)
         assertTrue(thick.height > thin.height)
     }
@@ -108,8 +112,8 @@ class ContinuousInkMathTest {
     @Test
     fun highlighterStrokeBoundsAreLargerThanPen() {
         val points = listOf(InkPoint(0.5f, 0.5f, 0.01f), InkPoint(0.6f, 0.6f, 0.01f))
-        val penBounds = ContinuousInkMath.strokeBounds(points, 0.01f, 2160, 3056, padFactor = 0.6f)!!
-        val highlighterBounds = ContinuousInkMath.strokeBounds(points, 0.01f * 3.2f, 2160, 3056, padFactor = 0.85f)!!
+        val penBounds = requireNotNull(ContinuousInkMath.strokeBounds(points, 0.01f, 2160, 3056, padFactor = 0.6f))
+        val highlighterBounds = requireNotNull(ContinuousInkMath.strokeBounds(points, 0.01f * 3.2f, 2160, 3056, padFactor = 0.85f))
         assertTrue(highlighterBounds.width > penBounds.width)
         assertTrue(highlighterBounds.height > penBounds.height)
         assertTrue(highlighterBounds.left <= penBounds.left)

@@ -189,4 +189,26 @@ class ContinuousInkHistoryTest {
         assertEquals(1, history.ops.size)
         assertTrue(history.ops[0].layer === second)
     }
+
+    @Test
+    fun historyOperationsTrackLayerStrokesForGlassBackdrop() {
+        val stack = PageLayerStack.base()
+        val history = InkHistory(stack)
+        val base = stack.layers[0]
+
+        val stroke1 = InkOp.Stroke(stroke(), null, base)
+        val stroke2 = InkOp.Stroke(stroke(CanvasTool.FOUNTAIN_PEN), null, base)
+        history.commit(stroke1)
+        history.commit(stroke2)
+
+        val baseOps = history.ops.filter { it.layer.index == base.index }
+        assertEquals(2, baseOps.size)
+        assertTrue(baseOps[0] === stroke1)
+        assertTrue(baseOps[1] === stroke2)
+
+        history.undo({ _, _ -> }, { _, _ -> })
+        val remainingOps = history.ops.filter { it.layer.index == base.index }
+        assertEquals(1, remainingOps.size)
+        assertTrue(remainingOps[0] === stroke1)
+    }
 }

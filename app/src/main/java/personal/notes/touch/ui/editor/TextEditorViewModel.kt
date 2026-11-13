@@ -79,6 +79,7 @@ class TextEditorViewModel(
 
     private val _title = MutableStateFlow("")
     val title: StateFlow<String> = _title.asStateFlow()
+    private var autoSaveDebounceMs: Long = 1000L
 
     /**
      * Serialized markdown of the whole note — the single source of truth.
@@ -517,14 +518,22 @@ class TextEditorViewModel(
             }
             .launchIn(viewModelScope)
 
-        // Setup debounced autosave (M2 spec: debounce 1s) — unchanged persistence
+        settingsRepository?.getSettings()
+            ?.onEach { s ->
+                if (s != null) {
+                    autoSaveDebounceMs = s.autoSaveIntervalMs.toLong().coerceAtLeast(100L)
+                }
+            }
+            ?.launchIn(viewModelScope)
+
+        // Setup debounced autosave (follows Settings autoSaveIntervalMs) — unchanged persistence
         // path. Block edits funnel into _contentValue, so this still covers them;
         // TextEditorScreen additionally calls saveNow() on ON_PAUSE / back /
         // check so notes survive an app kill.
         combine(_title, _contentValue) { t, c -> t to c.text }
             .drop(1)
             .filter { isInitialized }
-            .debounce(1000)
+            .debounce { autoSaveDebounceMs }
             .onEach { (t, c) ->
                 performSave(t, c)
             }
@@ -562,18 +571,29 @@ class TextEditorViewModel(
     private suspend fun performSave(titleText: String, contentText: String) {
         _isSaving.value = true
         try {
-            repository.updateNoteContent(
+            val blocks = _blocks.value
+            val blockEntities = when {
+                contentText.isBlank() -> emptyList()
+                blocks.isNotEmpty() && BlockModel.serializeBlocks(blocks) == BlockModel.serializeBlocks(BlockModel.parseBlocks(contentText)) -> {
+                    BlockPersistence.toEntities(noteId, blocks)
+                }
+                else -> null
+            }
+
+            repository.updateNoteContentAndBlocks(
                 id = noteId,
                 title = titleText.ifBlank { "Untitled Note" },
-                content = contentText
+                content = contentText,
+                blocks = blockEntities
             )
-            persistBlocks(contentText)
             lastSavedContent = contentText
             // A reload that was postponed (because the user was typing) can
-            // happen now.
+            // happen now only if the user hasn't typed further in the meantime.
             if (reloadPending) {
-                reloadPending = false
-                reloadFromStorage()
+                if (_contentValue.value.text == contentText) {
+                    reloadPending = false
+                    reloadFromStorage()
+                }
             }
         } finally {
             _isSaving.value = false
@@ -599,20 +619,6 @@ class TextEditorViewModel(
         _title.value = latest.title
         _contentValue.value = TextFieldValue(md)
         _activeBlockId.value = null
-    }
-
-    /**
-     * Writes the note's block rows for the content being saved. Skipped when
-     * the block list does not describe [contentText] (e.g. a save fired before
-     * the first derivation) or is empty — the next open then falls back to the
-     * markdown and reconciles ids instead of persisting a wrong shape.
-     */
-    private suspend fun persistBlocks(contentText: String) {
-        val blocks = _blocks.value
-        if (blocks.isEmpty()) return
-        val expected = BlockModel.serializeBlocks(BlockModel.parseBlocks(contentText))
-        if (BlockModel.serializeBlocks(blocks) != expected) return
-        repository.saveNoteBlocks(noteId, BlockPersistence.toEntities(noteId, blocks))
     }
 
     // ---------------------------------------------------------------------
@@ -1346,6 +1352,26 @@ class TextEditorViewModel(
         val newText = text.substring(0, cursor) + insert + text.substring(cursor)
         val newCursor = cursor + 5
         onContentChange(TextFieldValue(newText, TextRange(newCursor, newCursor + 4)))
+    }
+
+    fun insertTable() {
+        val current = _contentValue.value
+        val text = current.text
+        val cursor = current.selection.start.coerceIn(0, text.length)
+        val insert = "\n| Column 1 | Column 2 |\n| --- | --- |\n| Cell 1 | Cell 2 |\n"
+        val newText = text.substring(0, cursor) + insert + text.substring(cursor)
+        val newCursor = cursor + insert.length
+        onContentChange(TextFieldValue(newText, TextRange(newCursor)))
+    }
+
+    fun insertTag() {
+        val current = _contentValue.value
+        val text = current.text
+        val cursor = current.selection.start.coerceIn(0, text.length)
+        val insert = "#"
+        val newText = text.substring(0, cursor) + insert + text.substring(cursor)
+        val newCursor = cursor + insert.length
+        onContentChange(TextFieldValue(newText, TextRange(newCursor)))
     }
 
     fun toggleChecklist(lineIndex: Int, isChecked: Boolean) {

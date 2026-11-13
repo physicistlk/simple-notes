@@ -527,6 +527,9 @@ class ContinuousInkSession internal constructor(
     /** The layer the copy that is being built belongs to. */
     internal var glassPendingLayer: PageLayer? = null
 
+    /** The vector operations revision for the glass copy. */
+    internal var opRevision: Int = 0
+
     internal var background: Bitmap? = null
     internal var backgroundWidth: Int = 0
     internal var ready: Boolean = false
@@ -779,6 +782,9 @@ class ContinuousInkController(
         if (!settings.isWritingTool) return false
         if (boxWidth <= 0f || boxHeight <= 0f) return false
         val s = ensureSession(page, pageIndex, boxWidth, boxHeight, renderWidthPx)
+        if (s.pageType == "a4" && (x !in 0f..1f || y !in 0f..1f)) {
+            return false
+        }
         val widthNorm = if (settings.tool == CanvasTool.ERASER) {
             settings.eraserWidthPx / boxWidth
         } else {
@@ -889,6 +895,14 @@ class ContinuousInkController(
         }
         if (existing != null) {
             flushNow(existing)
+        }
+        val closing = closingSessions.remove(pageIndex)
+        if (closing != null) {
+            closing.boxWidth = boxWidth
+            closing.boxHeight = boxHeight
+            session = closing
+            onUndoRedoChanged(closing.history.canUndo, closing.history.canRedo)
+            return closing
         }
         val isVector = page.pdfSourcePath.isNotEmpty() && page.pdfPageIndex >= 0
         // The annotation layer lives in the box's pixel space, not in the
@@ -1354,6 +1368,8 @@ class ContinuousInkController(
         s.history.commit(op)
         trimUndo(s)
         s.dirty = true
+        s.opRevision++
+        scheduleGlassCopy(s)
     }
 
     /**
@@ -1435,6 +1451,7 @@ class ContinuousInkController(
         trimUndo(s)
         s.dirty = true
         s.tilesRevision++
+        s.opRevision++
         scheduleGlassCopy(s)
         // The erase changed the tiles, so the reader has to redraw them:
         // without this the wiped stroke stayed on the screen until something
@@ -1526,6 +1543,8 @@ class ContinuousInkController(
         )
         if (!undone) return false
         s.dirty = true
+        s.opRevision++
+        scheduleGlassCopy(s)
         scheduleSave(s)
         revision++
         layersRevision++
@@ -1543,6 +1562,8 @@ class ContinuousInkController(
         )
         if (!redone) return false
         s.dirty = true
+        s.opRevision++
+        scheduleGlassCopy(s)
         scheduleSave(s)
         revision++
         layersRevision++
@@ -1764,6 +1785,7 @@ class ContinuousInkController(
         trimUndo(s)
         s.dirty = true
         s.tilesRevision++
+        s.opRevision++
         scheduleGlassCopy(s)
         scheduleSave(s)
         revision++
@@ -2115,13 +2137,17 @@ class ContinuousInkController(
                     kotlinx.coroutines.delay(120)
                     withContext(Dispatchers.Main) {
                         closingSessions.remove(s.pageIndex)
-                        releaseBitmaps(s)
+                        if (session !== s) {
+                            releaseBitmaps(s)
+                        }
                         revision++
                         onSaved(s.pageIndex)
                     }
                 }
             } else {
-                releaseBitmaps(s)
+                if (session !== s) {
+                    releaseBitmaps(s)
+                }
             }
             return
         }
@@ -2138,7 +2164,9 @@ class ContinuousInkController(
             }
             withContext(Dispatchers.Main) {
                 closingSessions.remove(s.pageIndex)
-                releaseBitmaps(s)
+                if (session !== s) {
+                    releaseBitmaps(s)
+                }
                 revision++
                 onSaved(s.pageIndex)
             }
@@ -2257,6 +2285,7 @@ class ContinuousInkController(
         s.glassBitmap = null
         s.glassRevision = -1
         s.glassLayer = null
+        s.opRevision = 0
         s.background = null
         // The strokes are on disk now: the reader reloads the page from the
         // file, so the committed list must not draw them a second time.
@@ -2332,56 +2361,59 @@ class ContinuousInkController(
     /**
      * The small copy of the layer the glass samples.
      *
-     * The layer is a grid of tiles, so there is no single bitmap of it any
-     * more. The glass wants the writing of the layer under the dock, so the
-     * tiles are composed into one small bitmap - a quarter of the size of
-     * the layer, because the glass reads the page at that resolution anyway
-     * (it samples a quarter size copy of the backdrop).
+     * The layer is a grid of tiles and vector operations. The glass wants the
+     * writing of the layer under the dock, so the tiles and strokes are
+     * composed into one small bitmap - a quarter of the size of the layer,
+     * because the glass reads the page at that resolution anyway (it samples
+     * a quarter size copy of the backdrop).
      *
-     * The copy is built in the background when the tiles change: building it
+     * The copy is built in the background when the content changes: building it
      * on the draw thread would cost tens of milliseconds.
      */
     private fun glassCopy(s: ContinuousInkSession, layer: PageLayer): Bitmap? {
-        val store = s.layerTiles[layer] ?: return null
-        if (store.existingTiles().isEmpty()) return null
+        val targetRev = s.tilesRevision + s.opRevision
         val cached = s.glassBitmap
-        if (cached != null && s.glassRevision == s.tilesRevision && s.glassLayer === layer) {
+        if (cached != null && !cached.isRecycled && s.glassRevision == targetRev && s.glassLayer === layer) {
             return cached
         }
-        if (s.glassPending && s.glassPendingLayer === layer) {
+        if (s.glassPending && s.glassPendingLayer === layer && cached != null && !cached.isRecycled) {
             // A new copy of this layer is on its way: the old one is used
             // until it is there.
             return cached
         }
-        return buildGlassCopy(s, layer, store)
+        val store = s.layerTiles[layer]
+        return buildGlassCopy(s, layer, store, targetRev)
     }
 
     /**
-     * Builds the small copy of a layer out of its tiles.
+     * Builds the small copy of a layer out of its tiles and vector operations.
      */
     private fun buildGlassCopy(
         s: ContinuousInkSession,
         layer: PageLayer,
-        store: LayerTiles
+        store: LayerTiles?,
+        targetRev: Int
     ): Bitmap? {
         val copy = composeGlassCopy(s, store) ?: return null
         s.glassBitmap = copy
-        s.glassRevision = s.tilesRevision
+        s.glassRevision = targetRev
         s.glassLayer = layer
         return copy
     }
 
     /**
-     * Composes the tiles of a layer into one small bitmap.
+     * Composes the tiles and vector operations of a layer into one small bitmap.
      *
      * The copy is a quarter of the size of the layer: the glass samples the
      * page at that resolution anyway, so nothing is lost.
      */
-    private fun composeGlassCopy(s: ContinuousInkSession, store: LayerTiles): Bitmap? {
-        val grid = store.grid
-        if (grid.width <= 0 || grid.height <= 0) return null
-        val width = (grid.width / GLASS_COPY_SCALE).toInt().coerceAtLeast(1)
-        val height = (grid.height / GLASS_COPY_SCALE).toInt().coerceAtLeast(1)
+    private fun composeGlassCopy(s: ContinuousInkSession, store: LayerTiles?): Bitmap? {
+        val layer = s.glassPendingLayer ?: s.stack.current ?: return null
+        val layerWidth = if (store != null && store.grid.width > 0) store.grid.width else s.inkWidth
+        val layerHeight = if (store != null && store.grid.height > 0) store.grid.height else s.inkHeight
+        if (layerWidth <= 0 || layerHeight <= 0) return null
+        val width = (layerWidth / GLASS_COPY_SCALE).toInt().coerceAtLeast(1)
+        val height = (layerHeight / GLASS_COPY_SCALE).toInt().coerceAtLeast(1)
         val out = try {
             Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         } catch (e: OutOfMemoryError) {
@@ -2389,33 +2421,99 @@ class ContinuousInkController(
             null
         } ?: return null
         val canvas = Canvas(out)
-        val paint = Paint(Paint.FILTER_BITMAP_FLAG)
-        synchronized(s.inkLock) {
-            for (index in store.existingTiles()) {
-                val tx = grid.tileColumn(index)
-                val ty = grid.tileRow(index)
-                if (tx < 0 || ty < 0) continue
-                val bitmap = store.tile(tx, ty) ?: continue
-                if (bitmap.isRecycled) continue
-                val left = grid.tileLeft(tx)
-                val top = grid.tileTop(ty)
-                val right = left + grid.tileWidth(tx)
-                val bottom = top + grid.tileHeight(ty)
-                canvas.drawBitmap(
-                    bitmap,
-                    // The source is the tile itself (its own pixels), the
-                    // destination is its place in the small picture.
-                    Rect(0, 0, grid.tileWidth(tx), grid.tileHeight(ty)),
-                    RectF(
-                        left / grid.width.toFloat() * width,
-                        top / grid.height.toFloat() * height,
-                        right / grid.width.toFloat() * width,
-                        bottom / grid.height.toFloat() * height
-                    ),
-                    paint
-                )
+        val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
+
+        // 1. Draw vector PDF background if present
+        if (s.isVector) {
+            val bg = s.background
+            if (bg != null && !bg.isRecycled) {
+                val ratio = s.pageRatio
+                val page = ContinuousPageGeometry.pageRect(s.pageType, ratio, 1f, 1f)
+                val layerR = ContinuousPageGeometry.layerRect(s.pageType, ratio, 1f, 1f)
+                if (!layerR.empty && !page.empty) {
+                    val destLeft = (page.left - layerR.left) / layerR.width * width
+                    val destTop = (page.top - layerR.top) / layerR.height * height
+                    val destWidth = page.width / layerR.width * width
+                    val destHeight = page.height / layerR.height * height
+                    canvas.drawBitmap(
+                        bg,
+                        null,
+                        RectF(destLeft, destTop, destLeft + destWidth, destTop + destHeight),
+                        paint
+                    )
+                }
             }
         }
+
+        // 2. Draw existing tiles (if any)
+        if (store != null) {
+            val grid = store.grid
+            synchronized(s.inkLock) {
+                for (index in store.existingTiles()) {
+                    val tx = grid.tileColumn(index)
+                    val ty = grid.tileRow(index)
+                    if (tx < 0 || ty < 0) continue
+                    val bitmap = store.tile(tx, ty) ?: continue
+                    if (bitmap.isRecycled) continue
+                    val left = grid.tileLeft(tx)
+                    val top = grid.tileTop(ty)
+                    val right = left + grid.tileWidth(tx)
+                    val bottom = top + grid.tileHeight(ty)
+                    canvas.drawBitmap(
+                        bitmap,
+                        // The source is the tile itself (its own pixels), the
+                        // destination is its place in the small picture.
+                        Rect(0, 0, grid.tileWidth(tx), grid.tileHeight(ty)),
+                        RectF(
+                            left / grid.width.toFloat() * width,
+                            top / grid.height.toFloat() * height,
+                            right / grid.width.toFloat() * width,
+                            bottom / grid.height.toFloat() * height
+                        ),
+                        paint
+                    )
+                }
+            }
+        }
+
+        // 3. Draw committed ops for this layer
+        val ops = s.history.ops.filter { it.layer.index == layer.index }
+        if (ops.isNotEmpty()) {
+            val ratio = s.pageRatio
+            val rect = ContinuousPageGeometry.layerRect(s.pageType, ratio, 1f, 1f)
+            if (!rect.empty) {
+                val sx = width.toFloat() / rect.width
+                val sy = height.toFloat() / rect.height
+                for (op in ops) {
+                    when (op) {
+                        is InkOp.Stroke -> {
+                            val shape = op.shape
+                            if (shape == null) {
+                                val save = canvas.save()
+                                canvas.scale(sx, sy)
+                                canvas.translate(-rect.left, -rect.top)
+                                drawStroke(canvas, op.stroke, 1f, 1f, preview = false)
+                                canvas.restoreToCount(save)
+                            } else {
+                                val paint2 = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                                    style = Paint.Style.STROKE
+                                    strokeCap = Paint.Cap.ROUND
+                                    strokeJoin = Paint.Join.ROUND
+                                    color = op.stroke.color
+                                    strokeWidth = op.stroke.baseWidthNorm * width / rect.width
+                                }
+                                val save = canvas.save()
+                                canvas.scale(width.toFloat() / layerWidth, height.toFloat() / layerHeight)
+                                canvas.drawPath(shape, paint2)
+                                canvas.restoreToCount(save)
+                            }
+                        }
+                        is InkOp.Erase -> {}
+                    }
+                }
+            }
+        }
+
         return out
     }
 
@@ -2427,8 +2525,8 @@ class ContinuousInkController(
      */
     private fun scheduleGlassCopy(s: ContinuousInkSession) {
         val layer = s.stack.current ?: return
-        val store = s.layerTiles[layer] ?: return
-        if (store.existingTiles().isEmpty()) return
+        val store = s.layerTiles[layer]
+        val targetRev = s.tilesRevision + s.opRevision
         if (s.glassPending && s.glassPendingLayer === layer) return
         s.glassPending = true
         s.glassPendingLayer = layer
@@ -2438,7 +2536,7 @@ class ContinuousInkController(
             s.glassPendingLayer = null
             if (session === s || closingSessions.containsValue(s)) {
                 s.glassBitmap = copy
-                s.glassRevision = s.tilesRevision
+                s.glassRevision = targetRev
                 s.glassLayer = layer
                 revision++
             }
