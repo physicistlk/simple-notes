@@ -264,6 +264,7 @@ object MarkdownExport {
         if (run.highlight) html = "<mark>$html</mark>"
         if (run.bold) html = "<strong>$html</strong>"
         if (run.italic) html = "<em>$html</em>"
+        if (run.underline) html = "<u>$html</u>"
         if (run.strike) html = "<del>$html</del>"
         when {
             run.wiki -> html =

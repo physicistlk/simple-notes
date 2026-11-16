@@ -41,12 +41,14 @@ data class InkToolSettings(
     val pressureSizeEnabled: Boolean,
     val stylusOnly: Boolean = false,
     val readingMode: Boolean = false,
-    val autoShapeEnabled: Boolean = false
+    val autoShapeEnabled: Boolean = false,
+    val opacity: Float = 1.0f
 ) {
     /** Tools that write; lasso/image/text keep opening the page instead. */
     val isWritingTool: Boolean
         get() = when (tool) {
-            CanvasTool.FOUNTAIN_PEN, CanvasTool.PEN, CanvasTool.HIGHLIGHTER,
+            CanvasTool.FOUNTAIN_PEN, CanvasTool.PEN, CanvasTool.PENCIL,
+            CanvasTool.SHAPE_FILL, CanvasTool.HIGHLIGHTER,
             CanvasTool.ERASER, CanvasTool.SHAPE_RECT,
             CanvasTool.SHAPE_CIRCLE, CanvasTool.SHAPE_LINE -> true
             else -> false
@@ -58,7 +60,7 @@ data class InkToolSettings(
 }
 
 /** One sampled point of a stroke, in normalised page coordinates. */
-class InkPoint(val x: Float, val y: Float, val w: Float)
+class InkPoint(val x: Float, val y: Float, val w: Float, val tilt: Float = 0f)
 
 /**
  * A stroke in normalised page space: [InkPoint.x] / [InkPoint.y] are 0..1
@@ -78,6 +80,41 @@ class ContinuousStroke(
     val startY: Float get() = points.first().y
     val endX: Float get() = points.last().x
     val endY: Float get() = points.last().y
+
+    @Transient var cachedW: Float = -1f
+    @Transient var cachedH: Float = -1f
+    @Transient var cachedCount: Int = -1
+    @Transient var cachedPath1: Path? = null
+    @Transient var cachedPath2: Path? = null
+    @Transient var cachedPath3: Path? = null
+    @Transient var cachedAvgTilt: Float = 0f
+    @Transient var boundsCount: Int = -1
+    @Transient var minX: Float = 0f
+    @Transient var minY: Float = 0f
+    @Transient var maxX: Float = 0f
+    @Transient var maxY: Float = 0f
+
+    fun ensureBounds() {
+        val count = points.size
+        if (count == 0 || boundsCount == count) return
+        var lx = Float.MAX_VALUE
+        var ly = Float.MAX_VALUE
+        var rx = -Float.MAX_VALUE
+        var by = -Float.MAX_VALUE
+        val pad = (baseWidthNorm * 2.5f).coerceAtLeast(0.015f)
+        for (i in 0 until count) {
+            val p = points[i]
+            if (p.x - pad < lx) lx = p.x - pad
+            if (p.y - pad < ly) ly = p.y - pad
+            if (p.x + pad > rx) rx = p.x + pad
+            if (p.y + pad > by) by = p.y + pad
+        }
+        minX = lx
+        minY = ly
+        maxX = rx
+        maxY = by
+        boundsCount = count
+    }
 }
 
 /**
@@ -530,6 +567,11 @@ class ContinuousInkSession internal constructor(
     /** The vector operations revision for the glass copy. */
     internal var opRevision: Int = 0
 
+    /** World-space origin and scale of [glassBitmap] when [pageType] == "infinite". */
+    internal var glassWorldLeft: Float = -0.25f
+    internal var glassWorldTop: Float = -0.10f
+    internal var glassPxPerUnit: Float = 540f
+
     internal var background: Bitmap? = null
     internal var backgroundWidth: Int = 0
     internal var ready: Boolean = false
@@ -777,7 +819,8 @@ class ContinuousInkController(
         boxWidth: Float,
         boxHeight: Float,
         renderWidthPx: Int,
-        settings: InkToolSettings
+        settings: InkToolSettings,
+        tilt: Float = 0f
     ): Boolean {
         if (!settings.isWritingTool) return false
         if (boxWidth <= 0f || boxHeight <= 0f) return false
@@ -790,8 +833,15 @@ class ContinuousInkController(
         } else {
             settings.strokeWidthPx / boxWidth
         }
-        val stroke = ContinuousStroke(settings.tool, settings.color, widthNorm, settings.autoShapeEnabled)
-        addPoint(stroke, x, y, pressure, settings)
+        val effectiveColor = if (settings.tool != CanvasTool.ERASER && settings.tool != CanvasTool.HIGHLIGHTER && settings.opacity < 1f) {
+            val baseAlpha = android.graphics.Color.alpha(settings.color)
+            val newAlpha = (baseAlpha * settings.opacity.coerceIn(0.05f, 1f)).roundToInt().coerceIn(1, 255)
+            (settings.color and 0x00FFFFFF) or (newAlpha shl 24)
+        } else {
+            settings.color
+        }
+        val stroke = ContinuousStroke(settings.tool, effectiveColor, widthNorm, settings.autoShapeEnabled)
+        addPoint(stroke, x, y, pressure, settings, tilt)
         s.live = stroke
         isDrawing = true
         livePageIndex = pageIndex
@@ -800,19 +850,19 @@ class ContinuousInkController(
     }
 
     /** Adds a point to the stroke in progress (page-normalised). */
-    fun extendStroke(x: Float, y: Float, pressure: Float, settings: InkToolSettings) {
+    fun extendStroke(x: Float, y: Float, pressure: Float, settings: InkToolSettings, tilt: Float = 0f) {
         val stroke = session?.live ?: return
-        addPoint(stroke, x, y, pressure, settings)
+        addPoint(stroke, x, y, pressure, settings, tilt)
         previewRevision++
     }
 
     /** Lifts the pen: the stroke joins the page's ink layer and is saved. */
-    fun endStroke(x: Float, y: Float, pressure: Float, settings: InkToolSettings) {
+    fun endStroke(x: Float, y: Float, pressure: Float, settings: InkToolSettings, tilt: Float = 0f) {
         val s = session ?: return
         isDrawing = false
         livePageIndex = -1
         val stroke = s.live ?: return
-        addPoint(stroke, x, y, pressure, settings)
+        addPoint(stroke, x, y, pressure, settings, tilt)
         s.live = null
         finishStroke(s, stroke, settings.autoShapeEnabled)
         revision++
@@ -832,7 +882,8 @@ class ContinuousInkController(
         x: Float,
         y: Float,
         pressure: Float,
-        settings: InkToolSettings
+        settings: InkToolSettings,
+        tilt: Float = 0f
     ) {
         // An A4 page is limited to its own size: the writing cannot
         // reach past it. PDF and infinite pages keep the margin, so a
@@ -840,27 +891,51 @@ class ContinuousInkController(
         val cx = if (session?.pageType == "a4") {
             x.coerceIn(0f, 1f)
         } else {
-            x.coerceIn(-64f, 64f)
+            x.coerceIn(-1000f, 1000f)
         }
         val cy = if (session?.pageType == "a4") {
             y.coerceIn(0f, 1f)
         } else {
-            y.coerceIn(-64f, 64f)
+            y.coerceIn(-1000f, 1000f)
         }
-        val w = if (stroke.tool == CanvasTool.FOUNTAIN_PEN) {
-            fountainWidth(pressure, stroke.baseWidthNorm, settings, stroke.points.lastOrNull()?.w)
-        } else {
-            stroke.baseWidthNorm
-        }
+        val tiltNorm = ((tilt - 0.16f) / 0.90f).coerceIn(0f, 1f)
         val last = stroke.points.lastOrNull()
+        var fx = cx
+        var fy = cy
         if (last != null) {
             val dx = cx - last.x
             val dy = cy - last.y
-            // ~2 px on a 2160 px page: dense enough to look smooth, sparse
+            val distSq = dx * dx + dy * dy
+            // ~1.5 px on a 2160 px page: dense enough to look smooth, sparse
             // enough to keep the path small while the pen moves quickly.
-            if (dx * dx + dy * dy < 0.0000012f) return
+            if (distSq < 0.0000006f) return
+            // Velocity-adaptive micro-jitter stabilizer for freehand tools:
+            // smooths glass tremor on slow strokes while keeping fast curves responsive.
+            if (stroke.tool == CanvasTool.PEN || stroke.tool == CanvasTool.FOUNTAIN_PEN || stroke.tool == CanvasTool.PENCIL) {
+                val dist = kotlin.math.sqrt(distSq.toDouble()).toFloat()
+                val alpha = (0.58f + (dist / 0.012f) * 0.34f).coerceIn(0.58f, 0.92f)
+                fx = last.x + (cx - last.x) * alpha
+                fy = last.y + (cy - last.y) * alpha
+            }
         }
-        stroke.points.add(InkPoint(cx, cy, w))
+        val w = when (stroke.tool) {
+            CanvasTool.FOUNTAIN_PEN ->
+                fountainWidth(pressure, stroke.baseWidthNorm, settings, last?.w)
+            CanvasTool.PEN -> {
+                val target = PencilGrainShader.calculatePenWidth(
+                    stroke.baseWidthNorm, pressure, settings.pressureSizeEnabled
+                )
+                last?.w?.let { ContinuousInkMath.smooth(it, target) } ?: target
+            }
+            CanvasTool.PENCIL -> {
+                val target = PencilGrainShader.calculatePencilWidth(
+                    stroke.baseWidthNorm, pressure, tilt, settings.pressureSizeEnabled
+                )
+                last?.w?.let { ContinuousInkMath.smooth(it, target) } ?: target
+            }
+            else -> stroke.baseWidthNorm
+        }
+        stroke.points.add(InkPoint(fx, fy, w, tiltNorm))
     }
 
     /** Same pressure curve the single-page fountain pen uses. */
@@ -1355,14 +1430,21 @@ class ContinuousInkController(
             return
         }
         var shape: Path? = null
-        val rect = s.layerRectInBox
-        if (autoShapeEnabled && (stroke.tool == CanvasTool.PEN || stroke.tool == CanvasTool.FOUNTAIN_PEN) && !rect.empty) {
-            // The auto-shape works on points in pixels: the stroke is
-            // normalised to the box, the path lives in the layer's pixels.
-            val sx = s.inkWidth / rect.width
-            val sy = s.inkHeight / rect.height
-            val pts = stroke.points.map { ((it.x - rect.left) * sx) to ((it.y - rect.top) * sy) }
-            shape = autoShape(pts)
+        if (autoShapeEnabled && (stroke.tool == CanvasTool.PEN || stroke.tool == CanvasTool.FOUNTAIN_PEN)) {
+            if (s.pageType == "infinite") {
+                val pts = stroke.points.map { (it.x * 2160f) to (it.y * 2160f) }
+                shape = autoShape(pts)
+            } else {
+                val rect = s.layerRectInBox
+                if (!rect.empty) {
+                    // The auto-shape works on points in pixels: the stroke is
+                    // normalised to the box, the path lives in the layer's pixels.
+                    val sx = s.inkWidth / rect.width
+                    val sy = s.inkHeight / rect.height
+                    val pts = stroke.points.map { ((it.x - rect.left) * sx) to ((it.y - rect.top) * sy) }
+                    shape = autoShape(pts)
+                }
+            }
         }
         val op = InkOp.Stroke(stroke, shape, layer)
         s.history.commit(op)
@@ -1410,40 +1492,43 @@ class ContinuousInkController(
      */
     private fun commitErase(s: ContinuousInkSession, stroke: ContinuousStroke) {
         val layer = s.stack.current ?: return
-        val bounds = strokeBoundsInInk(stroke, s) ?: return
         val patches = mutableListOf<InkPatch>()
-        for (placement in s.tilesOf(layer)) {
-            val store = placement.tiles
-            val grid = placement.grid
-            val touched = grid.tilesForRect(bounds.left, bounds.top, bounds.right, bounds.bottom)
-            for (index in touched) {
-                val tx = grid.tileColumn(index)
-                val ty = grid.tileRow(index)
-                if (tx < 0 || ty < 0) continue
-                // Nothing to wipe in a tile that does not exist: it is not
-                // created just to be emptied again.
-                val tile = store.tile(tx, ty) ?: continue
-                if (tile.isRecycled) continue
-                val rect = LayerTilePatch.rectInTile(
-                    grid, tx, ty, bounds.left, bounds.top, bounds.right, bounds.bottom
-                ) ?: continue
-                val before = capture(tile, Rect(rect[0], rect[1], rect[2], rect[3])) ?: continue
-                val after: IntArray?
-                synchronized(s.inkLock) {
-                    val canvas = Canvas(tile)
-                    drawEraseInTile(canvas, s, stroke, grid, tx, ty)
-                    after = capture(tile, Rect(rect[0], rect[1], rect[2], rect[3]))
-                }
-                patches.add(
-                    InkPatch(
-                        tx, ty,
-                        rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1],
-                        before, after, store
+        val bounds = strokeBoundsInInk(stroke, s)
+        if (s.pageType != "infinite") {
+            if (bounds == null) return
+            for (placement in s.tilesOf(layer)) {
+                val store = placement.tiles
+                val grid = placement.grid
+                val touched = grid.tilesForRect(bounds.left, bounds.top, bounds.right, bounds.bottom)
+                for (index in touched) {
+                    val tx = grid.tileColumn(index)
+                    val ty = grid.tileRow(index)
+                    if (tx < 0 || ty < 0) continue
+                    // Nothing to wipe in a tile that does not exist: it is not
+                    // created just to be emptied again.
+                    val tile = store.tile(tx, ty) ?: continue
+                    if (tile.isRecycled) continue
+                    val rect = LayerTilePatch.rectInTile(
+                        grid, tx, ty, bounds.left, bounds.top, bounds.right, bounds.bottom
+                    ) ?: continue
+                    val before = capture(tile, Rect(rect[0], rect[1], rect[2], rect[3])) ?: continue
+                    val after: IntArray?
+                    synchronized(s.inkLock) {
+                        val canvas = Canvas(tile)
+                        drawEraseInTile(canvas, s, stroke, grid, tx, ty)
+                        after = capture(tile, Rect(rect[0], rect[1], rect[2], rect[3]))
+                    }
+                    patches.add(
+                        InkPatch(
+                            tx, ty,
+                            rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1],
+                            before, after, store
+                        )
                     )
-                )
-                // A tile without ink costs nothing: it goes back to the
-                // system right away.
-                store.releaseIfEmpty(tx, ty)
+                    // A tile without ink costs nothing: it goes back to the
+                    // system right away.
+                    store.releaseIfEmpty(tx, ty)
+                }
             }
         }
         val op = InkOp.Erase(stroke, patches, layer)
@@ -1479,12 +1564,9 @@ class ContinuousInkController(
         val sx = s.inkWidth / rect.width
         val sy = s.inkHeight / rect.height
         val save = canvas.save()
-        // The order matters: the tile's origin first (in layer pixels), then
-        // the box -> layer mapping.
-        canvas.translate(-grid.tileLeft(tx).toFloat(), -grid.tileTop(ty).toFloat())
-        canvas.scale(sx, sy)
-        canvas.translate(-rect.left, -rect.top)
-        drawStroke(canvas, stroke, 1f, 1f, preview = false)
+        // Translate in layer pixels and draw directly at pixel dimensions (sx, sy).
+        canvas.translate(-grid.tileLeft(tx).toFloat() - rect.left * sx, -grid.tileTop(ty).toFloat() - rect.top * sy)
+        drawStroke(canvas, stroke, sx, sy, preview = false)
         canvas.restoreToCount(save)
     }
 
@@ -2021,16 +2103,104 @@ class ContinuousInkController(
                 } ?: emptyList()
             )
         }
+        val previewOpsSnapshot = if (s.pageIndex == 0 && s.pageType == "infinite") {
+            s.history.ops.toList()
+        } else {
+            emptyList()
+        }
+        val previewStackSnapshot = if (s.pageIndex == 0 && s.pageType == "infinite") {
+            s.stack
+        } else {
+            null
+        }
         withContext(Dispatchers.IO) {
             repository.savePageLayerMeta(
                 noteId, s.pageIndex, PageLayerMeta.encode(s.stack, tilesInfo)
             )
             deleteStaleLayerFiles(s)
+            if (s.pageIndex == 0 && s.pageType == "infinite" && previewStackSnapshot != null) {
+                generateAndSavePagePreview(previewOpsSnapshot, previewStackSnapshot)
+            }
         }
         storedStacks.remove(s.pageIndex)
         storedStacks[s.pageIndex] = s.stack
         s.savedWhileActive = true
         onSaved(s.pageIndex)
+    }
+
+    private fun generateAndSavePagePreview(ops: List<InkOp>, stack: PageLayerStack) {
+        try {
+            val pageFile = repository.fileStore.getPageFile(noteId, 0)
+            val thumbW = 360
+            val thumbH = 500
+            val bitmap = Bitmap.createBitmap(thumbW, thumbH, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(bitmap)
+            canvas.drawColor(android.graphics.Color.WHITE)
+
+            var minX = Float.MAX_VALUE
+            var minY = Float.MAX_VALUE
+            var maxX = -Float.MAX_VALUE
+            var maxY = -Float.MAX_VALUE
+            var count = 0
+            for (op in ops) {
+                if (op is InkOp.Stroke) {
+                    for (p in op.stroke.points) {
+                        val px = p.x * 2160f
+                        val py = p.y * 2160f
+                        if (px < minX) minX = px
+                        if (px > maxX) maxX = px
+                        if (py < minY) minY = py
+                        if (py > maxY) maxY = py
+                        count++
+                    }
+                }
+            }
+            if (count > 0 && minX <= maxX && minY <= maxY) {
+                val strokeW = (maxX - minX).coerceAtLeast(100f)
+                val strokeH = (maxY - minY).coerceAtLeast(100f)
+                val padding = 40f
+                val scale = kotlin.math.min(
+                    (thumbW - padding * 2f) / strokeW,
+                    (thumbH - padding * 2f) / strokeH
+                )
+                val save = canvas.save()
+                canvas.translate(
+                    thumbW / 2f - (minX + maxX) / 2f * scale,
+                    thumbH / 2f - (minY + maxY) / 2f * scale
+                )
+                canvas.scale(scale, scale)
+                for (layer in stack.layers) {
+                    if (!layer.visible) continue
+                    val layerOps = ops.filter { it.layer.index == layer.index }
+                    if (layerOps.isEmpty()) continue
+                    val hasErase = layerOps.any { it is InkOp.Erase }
+                    val layerSave = if (hasErase) {
+                        canvas.saveLayer(minX - 200f, minY - 200f, maxX + 200f, maxY + 200f, null)
+                    } else {
+                        -1
+                    }
+                    for (op in layerOps) {
+                        when (op) {
+                            is InkOp.Stroke -> drawInfiniteOpStroke(canvas, op)
+                            is InkOp.Erase -> drawStroke(canvas, op.stroke, 2160f, 2160f, preview = false)
+                        }
+                    }
+                    if (layerSave >= 0) {
+                        canvas.restoreToCount(layerSave)
+                    }
+                }
+                canvas.restoreToCount(save)
+            }
+            pageFile.parentFile?.mkdirs()
+            val tempFile = java.io.File(pageFile.parentFile, "${pageFile.name}.tmp")
+            java.io.FileOutputStream(tempFile).use { out ->
+                bitmap.compress(Bitmap.CompressFormat.PNG, 90, out)
+            }
+            tempFile.renameTo(pageFile)
+            bitmap.recycle()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
     }
 
     /**
@@ -2334,19 +2504,43 @@ class ContinuousInkController(
     )
 
     /**
+     * Optional callback used by the infinite canvas to render placed items
+     * (imported PDF pages and images) into the glass copy before strokes.
+     * Receives `(canvas, worldLeft, worldTop, pxPerUnit)`.
+     */
+    var infiniteBackdropDrawer: ((Canvas, Float, Float, Float) -> Unit)? = null
+    var infiniteWorldBounds: (() -> FloatArray?)? = null
+
+    /** Triggers an immediate rebuild of the active session's glass backdrop copy. */
+    fun refreshGlassCopy() {
+        val s = session ?: return
+        s.opRevision++
+        scheduleGlassCopy(s)
+    }
+
+    /**
      * The screen mapping of the annotation layer of a page, or null when the
      * page has no layer (or the layer is masked).
      */
     fun layerScreenMapping(
         pageIndex: Int,
         panX: Float,
-        panY: Float
+        panY: Float,
+        infiniteScale: Float = 1f
     ): LayerScreenMapping? {
         val s = getSession(pageIndex) ?: return null
         val layer = s.stack.current ?: return null
         if (!layer.visible) return null
         val bitmap = glassCopy(s, layer) ?: return null
         if (bitmap.isRecycled) return null
+        if (s.pageType == "infinite") {
+            val effScale = infiniteScale.coerceAtLeast(0.1f)
+            val originX = panX + s.glassWorldLeft * 2160f * effScale
+            val originY = panY + s.glassWorldTop * 2160f * effScale
+            val scale = s.glassPxPerUnit / (2160f * effScale)
+            if (!scale.isFinite() || scale <= 0f) return null
+            return LayerScreenMapping(bitmap, originX, originY, scale)
+        }
         val rect = s.layerRectInBox
         if (rect.empty || s.boxWidth <= 0f || s.boxHeight <= 0f) return null
         val originX = panX + rect.left * s.boxWidth
@@ -2381,6 +2575,12 @@ class ContinuousInkController(
             // until it is there.
             return cached
         }
+        // Never block the UI draw thread building the glass backdrop for infinite canvas
+        // or when a previous cached copy is already available; schedule it asynchronously.
+        if (s.pageType == "infinite" || (cached != null && !cached.isRecycled)) {
+            scheduleGlassCopy(s)
+            return cached?.takeIf { !it.isRecycled }
+        }
         val store = s.layerTiles[layer]
         return buildGlassCopy(s, layer, store, targetRev)
     }
@@ -2409,6 +2609,86 @@ class ContinuousInkController(
      */
     private fun composeGlassCopy(s: ContinuousInkSession, store: LayerTiles?): Bitmap? {
         val layer = s.glassPendingLayer ?: s.stack.current ?: return null
+        if (s.pageType == "infinite") {
+            val pxPerUnit = 2160f / GLASS_COPY_SCALE // 540f isotropic pixels per 2160f world unit
+            var minX = -0.15f
+            var minY = -0.10f
+            var maxX = 1.35f
+            var maxY = 1.35f
+            val itemBounds = infiniteWorldBounds?.invoke()
+            if (itemBounds != null && itemBounds.size >= 4) {
+                if (itemBounds[0] < minX) minX = itemBounds[0]
+                if (itemBounds[1] < minY) minY = itemBounds[1]
+                if (itemBounds[2] > maxX) maxX = itemBounds[2]
+                if (itemBounds[3] > maxY) maxY = itemBounds[3]
+            }
+            for (op in s.history.ops) {
+                val stroke = when (op) {
+                    is InkOp.Stroke -> op.stroke
+                    is InkOp.Erase -> op.stroke
+                }
+                for (pt in stroke.points) {
+                    if (pt.x - 0.08f < minX) minX = pt.x - 0.08f
+                    if (pt.y - 0.08f < minY) minY = pt.y - 0.08f
+                    if (pt.x + 0.08f > maxX) maxX = pt.x + 0.08f
+                    if (pt.y + 0.08f > maxY) maxY = pt.y + 0.08f
+                }
+            }
+            val spanX = (maxX - minX).coerceIn(1.0f, 3.2f)
+            val spanY = (maxY - minY).coerceIn(1.0f, 3.2f)
+            val width = (spanX * pxPerUnit).roundToInt().coerceAtLeast(1)
+            val height = (spanY * pxPerUnit).roundToInt().coerceAtLeast(1)
+            val out = try {
+                Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            } catch (e: OutOfMemoryError) {
+                e.printStackTrace()
+                null
+            } ?: return null
+            s.glassWorldLeft = minX
+            s.glassWorldTop = minY
+            s.glassPxPerUnit = pxPerUnit
+            val canvas = Canvas(out)
+            infiniteBackdropDrawer?.invoke(canvas, minX, minY, pxPerUnit)
+            for (visLayer in s.stack.layers) {
+                if (!visLayer.visible) continue
+                val layerOps = s.history.ops.filter { it.layer.index == visLayer.index }
+                if (layerOps.isEmpty()) continue
+                val hasErase = layerOps.any { it is InkOp.Erase }
+                val layerSave = if (hasErase) {
+                    canvas.saveLayer(0f, 0f, width.toFloat(), height.toFloat(), null)
+                } else -1
+                val save = canvas.save()
+                canvas.translate(-minX * pxPerUnit, -minY * pxPerUnit)
+                for (op in layerOps) {
+                    when (op) {
+                        is InkOp.Stroke -> {
+                            val shape = op.shape
+                            if (shape == null) {
+                                drawStroke(canvas, op.stroke, pxPerUnit, pxPerUnit, preview = false)
+                            } else {
+                                val paint2 = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                                    style = Paint.Style.STROKE
+                                    strokeCap = Paint.Cap.ROUND
+                                    strokeJoin = Paint.Join.ROUND
+                                    color = op.stroke.color
+                                    strokeWidth = op.stroke.baseWidthNorm * pxPerUnit
+                                }
+                                val sSave = canvas.save()
+                                canvas.scale(pxPerUnit / 2160f, pxPerUnit / 2160f)
+                                canvas.drawPath(shape, paint2)
+                                canvas.restoreToCount(sSave)
+                            }
+                        }
+                        is InkOp.Erase -> {
+                            drawStroke(canvas, op.stroke, pxPerUnit, pxPerUnit, preview = false)
+                        }
+                    }
+                }
+                canvas.restoreToCount(save)
+                if (layerSave >= 0) canvas.restoreToCount(layerSave)
+            }
+            return out
+        }
         val layerWidth = if (store != null && store.grid.width > 0) store.grid.width else s.inkWidth
         val layerHeight = if (store != null && store.grid.height > 0) store.grid.height else s.inkHeight
         if (layerWidth <= 0 || layerHeight <= 0) return null
@@ -2490,9 +2770,8 @@ class ContinuousInkController(
                             val shape = op.shape
                             if (shape == null) {
                                 val save = canvas.save()
-                                canvas.scale(sx, sy)
-                                canvas.translate(-rect.left, -rect.top)
-                                drawStroke(canvas, op.stroke, 1f, 1f, preview = false)
+                                canvas.translate(-rect.left * sx, -rect.top * sy)
+                                drawStroke(canvas, op.stroke, sx, sy, preview = false)
                                 canvas.restoreToCount(save)
                             } else {
                                 val paint2 = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -2535,10 +2814,15 @@ class ContinuousInkController(
             s.glassPending = false
             s.glassPendingLayer = null
             if (session === s || closingSessions.containsValue(s)) {
-                s.glassBitmap = copy
-                s.glassRevision = targetRev
-                s.glassLayer = layer
-                revision++
+                if (copy != null) {
+                    s.glassBitmap = copy
+                    s.glassRevision = targetRev
+                    s.glassLayer = layer
+                    revision++
+                }
+                if (s.tilesRevision + s.opRevision != targetRev) {
+                    scheduleGlassCopy(s)
+                }
             }
         }
     }
@@ -2727,6 +3011,120 @@ class ContinuousInkController(
 
     // ---- drawing -------------------------------------------------------
 
+    private fun drawInfiniteOpStroke(canvas: Canvas, op: InkOp.Stroke) {
+        val shape = op.shape
+        if (shape == null) {
+            drawStroke(canvas, op.stroke, 2160f, 2160f, preview = false)
+            return
+        }
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+            color = op.stroke.color
+            strokeWidth = op.stroke.baseWidthNorm * 2160f
+        }
+        canvas.drawPath(shape, paint)
+    }
+
+    /**
+     * Returns the bounding-box center (x, y) in infinite-world coordinates (2160f scale)
+     * of all committed strokes on [pageIndex], or null if there are no strokes.
+     */
+    fun computeArtworkCenter(pageIndex: Int): Pair<Float, Float>? {
+        val s = getSession(pageIndex) ?: return null
+        var minX = Float.MAX_VALUE
+        var minY = Float.MAX_VALUE
+        var maxX = -Float.MAX_VALUE
+        var maxY = -Float.MAX_VALUE
+        var count = 0
+        for (op in s.history.ops) {
+            if (op is InkOp.Stroke) {
+                for (p in op.stroke.points) {
+                    val px = p.x * 2160f
+                    val py = p.y * 2160f
+                    if (px < minX) minX = px
+                    if (px > maxX) maxX = px
+                    if (py < minY) minY = py
+                    if (py > maxY) maxY = py
+                    count++
+                }
+            }
+        }
+        if (count == 0) return null
+        return Pair((minX + maxX) / 2f, (minY + maxY) / 2f)
+    }
+
+    /**
+     * Draws all committed operations of a layer into an unconstrained infinite canvas,
+     * optionally culling strokes outside the visible world bounds `[minWorldX..maxWorldX, minWorldY..maxWorldY]`.
+     */
+    fun drawOpsInfinite(
+        canvas: Canvas,
+        pageIndex: Int,
+        layer: PageLayer,
+        minWorldX: Float = -Float.MAX_VALUE,
+        minWorldY: Float = -Float.MAX_VALUE,
+        maxWorldX: Float = Float.MAX_VALUE,
+        maxWorldY: Float = Float.MAX_VALUE
+    ) {
+        val s = getSession(pageIndex) ?: return
+        val hasBounds = minWorldX < maxWorldX && minWorldY < maxWorldY
+        for (op in s.history.ops) {
+            if (op.layer.index != layer.index) continue
+            when (op) {
+                is InkOp.Stroke -> {
+                    if (hasBounds && op.shape == null) {
+                        val st = op.stroke
+                        st.ensureBounds()
+                        if (st.maxX < minWorldX || st.minX > maxWorldX ||
+                            st.maxY < minWorldY || st.minY > maxWorldY
+                        ) {
+                            continue
+                        }
+                    }
+                    drawInfiniteOpStroke(canvas, op)
+                }
+                is InkOp.Erase -> drawStroke(canvas, op.stroke, 2160f, 2160f, preview = false)
+            }
+        }
+    }
+
+    /**
+     * Draws the live uncommitted preview stroke on the infinite canvas.
+     */
+    fun drawPreviewInfinite(canvas: Canvas, pageIndex: Int, scale: Float = 1f) {
+        if (laserPageIndex == pageIndex) {
+            val comp = if (scale > 0f) 1f / scale else 1f
+            drawLaser(canvas, 2160f, 2160f, comp)
+        }
+        val s = session ?: return
+        if (s.pageIndex != pageIndex) return
+        val stroke = s.live ?: return
+        drawStroke(canvas, stroke, 2160f, 2160f, preview = true)
+    }
+
+    /**
+     * Clears all strokes on the current layer of the given page, with undo support.
+     * Implements Quick Clear from Concepts analysis §2.9.
+     */
+    fun clearCurrentLayer(pageIndex: Int): Boolean {
+        val s = getSession(pageIndex) ?: return false
+        val layer = s.stack.current ?: return false
+        val removed = mutableListOf<OpEntry>()
+        s.history.ops.forEachIndexed { idx, op ->
+            if (op.layer.index == layer.index) removed.add(OpEntry(idx, op))
+        }
+        if (removed.isEmpty()) return false
+        s.history.commitClear(emptyList(), removed)
+        s.dirty = true
+        s.opRevision++
+        scheduleSave(s)
+        revision++
+        onUndoRedoChanged(s.canUndo, s.canRedo)
+        return true
+    }
+
     /**
      * Draws the committed strokes of one layer of a page into the page box.
      *
@@ -2855,37 +3253,73 @@ class ContinuousInkController(
         }
         // Draw the ops (the strokes and the erases as vectors).
         if (!ops.isNullOrEmpty()) {
-            val ratio = rasterPageRatio(pageIndex)
-            val rect = ContinuousPageGeometry.layerRect(pageType, ratio, 1f, 1f)
-            if (!rect.empty) {
-                val sx = displayWidthPx.toFloat() / rect.width
-                val sy = displayHeight.toFloat() / rect.height
+            if (ContinuousPageGeometry.isInfinite(pageType)) {
+                val hasErase = ops.any { it is InkOp.Erase }
+                val save = if (hasErase) {
+                    canvas.saveLayer(0f, 0f, displayWidthPx.toFloat(), displayHeight.toFloat(), null)
+                } else {
+                    -1
+                }
                 for (op in ops) {
                     when (op) {
                         is InkOp.Stroke -> {
                             val shape = op.shape
                             if (shape == null) {
-                                val save = canvas.save()
-                                canvas.scale(sx, sy)
-                                canvas.translate(-rect.left, -rect.top)
-                                drawStroke(canvas, op.stroke, 1f, 1f, preview = false)
-                                canvas.restoreToCount(save)
+                                drawStroke(canvas, op.stroke, displayWidthPx.toFloat(), displayHeight.toFloat(), preview = false)
                             } else {
                                 val paint2 = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                                     style = Paint.Style.STROKE
                                     strokeCap = Paint.Cap.ROUND
                                     strokeJoin = Paint.Join.ROUND
                                     color = op.stroke.color
-                                    strokeWidth = op.stroke.baseWidthNorm * displayWidthPx / rect.width
+                                    strokeWidth = op.stroke.baseWidthNorm * displayWidthPx
                                 }
-                                val save = canvas.save()
-                                canvas.scale(displayWidthPx.toFloat() / layerWidth, displayHeight.toFloat() / layerHeight)
+                                val sSave = canvas.save()
+                                canvas.scale(displayWidthPx.toFloat() / 2160f, displayHeight.toFloat() / 2160f)
                                 canvas.drawPath(shape, paint2)
-                                canvas.restoreToCount(save)
+                                canvas.restoreToCount(sSave)
                             }
                         }
                         is InkOp.Erase -> {
-                            // Eraser clears pixels
+                            drawStroke(canvas, op.stroke, displayWidthPx.toFloat(), displayHeight.toFloat(), preview = false)
+                        }
+                    }
+                }
+                if (save >= 0) {
+                    canvas.restoreToCount(save)
+                }
+            } else {
+                val ratio = rasterPageRatio(pageIndex)
+                val rect = ContinuousPageGeometry.layerRect(pageType, ratio, 1f, 1f)
+                if (!rect.empty) {
+                    val sx = displayWidthPx.toFloat() / rect.width
+                    val sy = displayHeight.toFloat() / rect.height
+                    for (op in ops) {
+                        when (op) {
+                            is InkOp.Stroke -> {
+                                val shape = op.shape
+                                if (shape == null) {
+                                    val save = canvas.save()
+                                    canvas.translate(-rect.left * sx, -rect.top * sy)
+                                    drawStroke(canvas, op.stroke, sx, sy, preview = false)
+                                    canvas.restoreToCount(save)
+                                } else {
+                                    val paint2 = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                                        style = Paint.Style.STROKE
+                                        strokeCap = Paint.Cap.ROUND
+                                        strokeJoin = Paint.Join.ROUND
+                                        color = op.stroke.color
+                                        strokeWidth = op.stroke.baseWidthNorm * displayWidthPx / rect.width
+                                    }
+                                    val save = canvas.save()
+                                    canvas.scale(displayWidthPx.toFloat() / layerWidth, displayHeight.toFloat() / layerHeight)
+                                    canvas.drawPath(shape, paint2)
+                                    canvas.restoreToCount(save)
+                                }
+                            }
+                            is InkOp.Erase -> {
+                                // Eraser clears pixels
+                            }
                         }
                     }
                 }
@@ -2982,9 +3416,8 @@ class ContinuousInkController(
                     val shape = op.shape
                     if (shape == null) {
                         val save = canvas.save()
-                        canvas.scale(sx, sy)
-                        canvas.translate(-rect.left, -rect.top)
-                        drawStroke(canvas, op.stroke, 1f, 1f, preview = false)
+                        canvas.translate(-rect.left * sx, -rect.top * sy)
+                        drawStroke(canvas, op.stroke, sx, sy, preview = false)
                         canvas.restoreToCount(save)
                     } else {
                         // The auto-shape path already lives in the page's
@@ -3001,9 +3434,8 @@ class ContinuousInkController(
                 }
                 is InkOp.Erase -> {
                     val save = canvas.save()
-                    canvas.scale(sx, sy)
-                    canvas.translate(-rect.left, -rect.top)
-                    drawStroke(canvas, op.stroke, 1f, 1f, preview = false)
+                    canvas.translate(-rect.left * sx, -rect.top * sy)
+                    drawStroke(canvas, op.stroke, sx, sy, preview = false)
                     canvas.restoreToCount(save)
                 }
             }
@@ -3025,40 +3457,84 @@ class ContinuousInkController(
         drawStroke(canvas, stroke, viewWidth, viewHeight, preview = true)
     }
 
-    /** The red laser dot with its short tail. */
-    private fun drawLaser(canvas: Canvas, viewWidth: Float, viewHeight: Float) {
+    /** The red laser dot with a smooth fading gradient tail. */
+    private fun drawLaser(
+        canvas: Canvas,
+        viewWidth: Float,
+        viewHeight: Float,
+        scaleCompensation: Float = 1f
+    ) {
         if (!laserActive || laserTrail.isEmpty()) return
-        // The tail fades out, like the single-page laser.
         val now = System.currentTimeMillis()
         while (laserTrail.isNotEmpty() && now - laserTrail.first().time > LASER_TRAIL_MS) {
             laserTrail.removeAt(0)
         }
         if (laserTrail.isEmpty()) return
-        val glow = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE
-            strokeCap = Paint.Cap.ROUND
-            color = 0xFFFF3B30.toInt()
-            alpha = 120
-            strokeWidth = 6f * (viewWidth / 1600f).coerceAtLeast(0.6f)
+        val unitScale = (viewWidth / 1600f).coerceAtLeast(0.6f) * scaleCompensation
+        val strokeW = 6.5f * unitScale
+        if (laserTrail.size >= 2) {
+            val path = Path()
+            val p0 = laserTrail[0]
+            val p0x = p0.x * viewWidth
+            val p0y = p0.y * viewHeight
+            path.moveTo(p0x, p0y)
+            if (laserTrail.size == 2) {
+                val p1 = laserTrail[1]
+                path.lineTo(p1.x * viewWidth, p1.y * viewHeight)
+            } else {
+                for (i in 1 until laserTrail.size - 1) {
+                    val cur = laserTrail[i]
+                    val next = laserTrail[i + 1]
+                    val cx = cur.x * viewWidth
+                    val cy = cur.y * viewHeight
+                    val mx = (cur.x + next.x) * 0.5f * viewWidth
+                    val my = (cur.y + next.y) * 0.5f * viewHeight
+                    path.quadTo(cx, cy, mx, my)
+                }
+                val last = laserTrail.last()
+                path.lineTo(last.x * viewWidth, last.y * viewHeight)
+            }
+            val tail = laserTrail.first()
+            val head = laserTrail.last()
+            val tx = tail.x * viewWidth
+            val ty = tail.y * viewHeight
+            val hx = head.x * viewWidth
+            val hy = head.y * viewHeight
+            val tailAge = (now - tail.time).toFloat().coerceAtMost(LASER_TRAIL_MS.toFloat())
+            val tailAlpha = ((1f - tailAge / LASER_TRAIL_MS) * 60f).toInt().coerceIn(0, 60)
+            val tailColor = (tailAlpha shl 24) or 0x00FF3B30
+            val headColor = 0xC8FF3B30.toInt()
+            val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                style = Paint.Style.STROKE
+                strokeCap = Paint.Cap.ROUND
+                strokeJoin = Paint.Join.ROUND
+                strokeWidth = strokeW
+                if (kotlin.math.hypot((hx - tx).toDouble(), (hy - ty).toDouble()) > 1.0) {
+                    shader = android.graphics.LinearGradient(
+                        tx, ty, hx, hy,
+                        tailColor, headColor,
+                        android.graphics.Shader.TileMode.CLAMP
+                    )
+                } else {
+                    color = headColor
+                }
+            }
+            canvas.drawPath(path, glowPaint)
+        }
+        val head = laserTrail.last()
+        val hx = head.x * viewWidth
+        val hy = head.y * viewHeight
+        val radius = 7.5f * unitScale
+        val halo = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+            color = 0x44FF3B30
         }
         val dot = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.FILL
             color = 0xFFFF3B30.toInt()
         }
-        for (i in 1 until laserTrail.size) {
-            val a = laserTrail[i - 1]
-            val b = laserTrail[i]
-            val age = (now - b.time).toFloat().coerceAtMost(LASER_TRAIL_MS.toFloat())
-            glow.alpha = (120f * (1f - age / LASER_TRAIL_MS)).toInt().coerceIn(20, 120)
-            canvas.drawLine(
-                a.x * viewWidth, a.y * viewHeight,
-                b.x * viewWidth, b.y * viewHeight,
-                glow
-            )
-        }
-        val head = laserTrail.last()
-        val radius = 7f * (viewWidth / 1600f).coerceAtLeast(0.6f)
-        canvas.drawCircle(head.x * viewWidth, head.y * viewHeight, radius, dot)
+        canvas.drawCircle(hx, hy, radius * 1.9f, halo)
+        canvas.drawCircle(hx, hy, radius, dot)
     }
 
     private fun drawStroke(
@@ -3126,19 +3602,116 @@ class ContinuousInkController(
                     canvas.drawPath(smoothPath(stroke, w, h), paint)
                 }
             }
-            CanvasTool.FOUNTAIN_PEN -> {
-                // Piecewise width, round caps: the dense sampling makes the
-                // joins invisible, and the pressure taper stays.
-                paint.strokeWidth = widthPx
-                var previous = stroke.points.first()
-                for (i in 1 until stroke.points.size) {
-                    val p = stroke.points[i]
-                    paint.strokeWidth = ((previous.w + p.w) / 2f) * w
-                    canvas.drawLine(
-                        previous.x * w, previous.y * h,
-                        p.x * w, p.y * h, paint
+            CanvasTool.FOUNTAIN_PEN, CanvasTool.PEN -> {
+                val pts = stroke.points
+                val count = pts.size
+                paint.style = Paint.Style.FILL
+                val cached1 = stroke.cachedPath1
+                val canUseCache = !preview &&
+                    stroke.cachedCount == count &&
+                    stroke.cachedW == w &&
+                    stroke.cachedH == h &&
+                    cached1 != null
+                val ribbon = if (canUseCache && cached1 != null) {
+                    cached1
+                } else {
+                    val xs = FloatArray(count) { pts[it].x * w }
+                    val ys = FloatArray(count) { pts[it].y * h }
+                    val ws = FloatArray(count) { (pts[it].w * w).coerceAtLeast(1f) }
+                    val built = PencilGrainShader.buildVariableWidthRibbon(
+                        xs, ys, ws, count, widthMultiplier = 1f, taperEnds = true
                     )
-                    previous = p
+                    if (!preview) {
+                        stroke.cachedW = w
+                        stroke.cachedH = h
+                        stroke.cachedCount = count
+                        stroke.cachedPath1 = built
+                    }
+                    built
+                }
+                canvas.drawPath(ribbon, paint)
+            }
+            CanvasTool.PENCIL -> {
+                // Concepts-style 3-layer concentric variable-width graphite ribbon:
+                // zero vertex beading, fibrous stippled edges, and tilt-modulated core.
+                val pts = stroke.points
+                val count = pts.size
+                val cached1 = stroke.cachedPath1
+                val cached2 = stroke.cachedPath2
+                val canUseCache = !preview &&
+                    stroke.cachedCount == count &&
+                    stroke.cachedW == w &&
+                    stroke.cachedH == h &&
+                    cached1 != null &&
+                    cached2 != null
+                val avgTilt: Float
+                val pathEdge: Path
+                val pathMid: Path
+                val pathCore: Path?
+                if (canUseCache && cached1 != null && cached2 != null) {
+                    avgTilt = stroke.cachedAvgTilt
+                    pathEdge = cached1
+                    pathMid = cached2
+                    pathCore = stroke.cachedPath3
+                } else {
+                    val xs = FloatArray(count) { pts[it].x * w }
+                    val ys = FloatArray(count) { pts[it].y * h }
+                    val ws = FloatArray(count) { (pts[it].w * w).coerceAtLeast(1.2f) }
+                    var tiltSum = 0f
+                    for (i in 0 until count) tiltSum += pts[i].tilt
+                    avgTilt = (tiltSum / count.coerceAtLeast(1)).coerceIn(0f, 1f)
+                    pathEdge = PencilGrainShader.buildVariableWidthRibbon(
+                        xs, ys, ws, count, widthMultiplier = 1.14f, taperEnds = false
+                    )
+                    pathMid = PencilGrainShader.buildVariableWidthRibbon(
+                        xs, ys, ws, count, widthMultiplier = 0.80f, taperEnds = true
+                    )
+                    pathCore = PencilGrainShader.buildVariableWidthRibbon(
+                        xs, ys, ws, count, widthMultiplier = 0.45f * (1f - 0.30f * avgTilt), taperEnds = true
+                    )
+                    if (!preview) {
+                        stroke.cachedW = w
+                        stroke.cachedH = h
+                        stroke.cachedCount = count
+                        stroke.cachedAvgTilt = avgTilt
+                        stroke.cachedPath1 = pathEdge
+                        stroke.cachedPath2 = pathMid
+                        stroke.cachedPath3 = pathCore
+                    }
+                }
+
+                val baseAlpha = android.graphics.Color.alpha(stroke.color).coerceIn(24, 255)
+                paint.style = Paint.Style.FILL
+
+                // 1. Outer fibrous paper-tooth halo (catches high paper peaks at edges)
+                paint.shader = PencilGrainShader.shaderEdge
+                paint.alpha = (baseAlpha * (0.28f + 0.16f * avgTilt)).roundToInt().coerceIn(10, 255)
+                canvas.drawPath(pathEdge, paint)
+
+                // 2. Mid graphite body (textured tooth with transparent valleys)
+                paint.shader = PencilGrainShader.shaderMid
+                paint.alpha = (baseAlpha * (0.58f - 0.18f * avgTilt)).roundToInt().coerceIn(18, 255)
+                canvas.drawPath(pathMid, paint)
+
+                // 3. Inner graphite core (crisp when upright, dissolves into soft wash when tilted)
+                val coreAlpha = (baseAlpha * (0.78f - 0.52f * avgTilt)).roundToInt()
+                if (coreAlpha >= 14 && pathCore != null) {
+                    paint.shader = PencilGrainShader.shaderCore
+                    paint.alpha = coreAlpha.coerceIn(14, 255)
+                    canvas.drawPath(pathCore, paint)
+                }
+            }
+            CanvasTool.SHAPE_FILL -> {
+                // Concepts-style Draw + Fill: dynamically closes from current endpoint to start point
+                if (stroke.points.size < 3) {
+                    paint.style = Paint.Style.FILL
+                    val pt = stroke.points.first()
+                    canvas.drawCircle(pt.x * w, pt.y * h, (widthPx * 0.5f).coerceAtLeast(2f), paint)
+                } else {
+                    paint.style = Paint.Style.FILL
+                    val path = smoothPath(stroke, w, h)
+                    path.close()
+                    canvas.drawPath(path, paint)
                 }
             }
             else -> {

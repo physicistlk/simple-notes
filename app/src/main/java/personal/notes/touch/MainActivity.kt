@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.os.Build
 import android.os.Bundle
+import android.view.MotionEvent
 import android.view.WindowManager
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
@@ -143,6 +144,11 @@ class MainActivity : AppCompatActivity() {
         super.onPause()
     }
 
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        StylusTiltTracker.update(ev)
+        return super.dispatchTouchEvent(ev)
+    }
+
     override fun onDestroy() {
         if (BuildConfig.DEBUG) {
             // Mirror of the onCreate debug hook registration; runCatching only
@@ -151,5 +157,26 @@ class MainActivity : AppCompatActivity() {
             runCatching { unregisterReceiver(DebugGestureInjector.receiver) }
         }
         super.onDestroy()
+    }
+}
+
+/**
+ * Tracks the latest hardware stylus tilt angle (radians, 0 = perpendicular)
+ * from [MotionEvent.AXIS_TILT] so Compose canvases can shade with pencil tilt.
+ */
+object StylusTiltTracker {
+    @Volatile
+    var currentTiltRad: Float = 0f
+        private set
+
+    fun update(ev: MotionEvent) {
+        if (ev.pointerCount <= 0) return
+        val toolType = ev.getToolType(0)
+        if (toolType == MotionEvent.TOOL_TYPE_STYLUS || toolType == MotionEvent.TOOL_TYPE_ERASER) {
+            val tilt = ev.getAxisValue(MotionEvent.AXIS_TILT, 0)
+            currentTiltRad = if (tilt.isFinite() && tilt >= 0f) tilt.coerceIn(0f, 1.45f) else 0f
+        } else {
+            currentTiltRad = 0f
+        }
     }
 }

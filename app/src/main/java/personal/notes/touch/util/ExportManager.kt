@@ -1,7 +1,9 @@
 package personal.notes.touch.util
 
+import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
+import android.widget.Toast
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
@@ -146,7 +148,7 @@ object ExportManager {
             val bitmap = if (pageIdx == currentPageIndex && currentEditingBitmap != null) {
                 flattenBitmap(currentEditingBitmap, currentEditingBackground, currentEditingImageLayers)
             } else {
-                loadFlattenedPageBitmap(fileStore, note.id, pageIdx)
+                loadFlattenedPageBitmap(fileStore, note.id, pageIdx, pageType = note.pageType)
             }
 
             val pageInfo = PdfDocument.PageInfo.Builder(pdfPageWidth, pdfPageHeight, pdfPageNumber++).create()
@@ -268,7 +270,11 @@ object ExportManager {
         val chooser = Intent.createChooser(shareIntent, chooserTitle).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
-        context.startActivity(chooser)
+        try {
+            context.startActivity(chooser)
+        } catch (e: ActivityNotFoundException) {
+            Toast.makeText(context, "No app available to share this file", Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun renderTextContentToCanvas(
@@ -435,8 +441,12 @@ object ExportManager {
         noteId: String,
         pageIndex: Int,
         // The layers are page scoped, so every page has its own.
-        includeLayers: Boolean = true
+        includeLayers: Boolean = true,
+        pageType: String = "a4"
     ): Bitmap? {
+        if (pageType == "infinite") {
+            return loadInfiniteExportBitmap(fileStore, noteId, pageIndex)
+        }
         val pageFile = fileStore.getPageFile(noteId, pageIndex)
         val strokesFile = fileStore.getStrokesFile(noteId, pageIndex)
         val layers = if (includeLayers) readDiskImageLayers(fileStore, noteId, pageIndex) else emptyList()
@@ -500,6 +510,173 @@ object ExportManager {
      * part of them. A hidden layer is not part of the export: it is not
      * drawn on the page either.
      */
+    private suspend fun loadInfiniteExportBitmap(
+        fileStore: personal.notes.touch.data.files.NoteFileStore,
+        noteId: String,
+        pageIndex: Int
+    ): Bitmap {
+        val outSize = 2160
+        val out = Bitmap.createBitmap(outSize, outSize, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(out)
+        canvas.drawColor(Color.WHITE)
+
+        val placedItems = personal.notes.touch.ui.canvas.InfiniteItemsStore.load(fileStore, noteId)
+        val stack = readAnnotationStack(fileStore, noteId, pageIndex)
+        val layerOpsList = mutableListOf<List<personal.notes.touch.ui.canvas.InkOp>>()
+        var minX = Float.MAX_VALUE
+        var minY = Float.MAX_VALUE
+        var maxX = -Float.MAX_VALUE
+        var maxY = -Float.MAX_VALUE
+        var count = 0
+
+        for (item in placedItems) {
+            val hw = item.width / 2f
+            val hh = item.height / 2f
+            minX = minOf(minX, item.centerX - hw)
+            maxX = maxOf(maxX, item.centerX + hw)
+            minY = minOf(minY, item.centerY - hh)
+            maxY = maxOf(maxY, item.centerY + hh)
+            count++
+        }
+
+        for (layer in stack.layers) {
+            if (!layer.visible) {
+                layerOpsList.add(emptyList())
+                continue
+            }
+            val opsFile = fileStore.getAnnotationLayerOpsFile(noteId, pageIndex, layer.index)
+            val ops = try {
+                if (opsFile.exists()) {
+                    personal.notes.touch.ui.canvas.ContinuousOpCodec.decode(opsFile.readText()) ?: emptyList()
+                } else {
+                    emptyList()
+                }
+            } catch (_: Exception) {
+                emptyList()
+            }
+            layerOpsList.add(ops)
+            for (op in ops) {
+                if (op is personal.notes.touch.ui.canvas.InkOp.Stroke) {
+                    for (p in op.stroke.points) {
+                        val px = p.x * 2160f
+                        val py = p.y * 2160f
+                        if (px < minX) minX = px
+                        if (px > maxX) maxX = px
+                        if (py < minY) minY = py
+                        if (py > maxY) maxY = py
+                        count++
+                    }
+                }
+            }
+        }
+
+        if (count > 0 && minX <= maxX && minY <= maxY) {
+            val contentW = (maxX - minX).coerceAtLeast(100f)
+            val contentH = (maxY - minY).coerceAtLeast(100f)
+            val padding = 120f
+            val scale = kotlin.math.min(
+                (outSize - padding * 2f) / contentW,
+                (outSize - padding * 2f) / contentH
+            )
+            val save = canvas.save()
+            canvas.translate(
+                outSize / 2f - (minX + maxX) / 2f * scale,
+                outSize / 2f - (minY + maxY) / 2f * scale
+            )
+            canvas.scale(scale, scale)
+
+            val itemPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
+            val pdfDocs = HashMap<String, PdfiumDocument>()
+            try {
+                for (item in placedItems) {
+                    val bmp: Bitmap? = when (item) {
+                        is personal.notes.touch.ui.canvas.InfiniteCanvasItem.ImageItem -> {
+                            fileStore.getNoteAsset(noteId, item.fileName)?.let { BitmapUtils.loadBitmapFromFile(it) }
+                        }
+                        is personal.notes.touch.ui.canvas.InfiniteCanvasItem.PdfPageItem -> {
+                            val doc = pdfDocs[item.pdfFileName] ?: run {
+                                val f = fileStore.getNoteAsset(noteId, item.pdfFileName)
+                                val d = if (f != null) PdfiumDocument.open(f) else null
+                                if (d != null) pdfDocs[item.pdfFileName] = d
+                                d
+                            }
+                            doc?.renderPage(item.pdfPageIndex, 2048, 2048)
+                        }
+                    }
+                    if (bmp != null && !bmp.isRecycled) {
+                        val itemSave = canvas.save()
+                        canvas.translate(item.centerX, item.centerY)
+                        if (item.rotationDeg != 0f) canvas.rotate(item.rotationDeg)
+                        val dst = android.graphics.RectF(-item.width / 2f, -item.height / 2f, item.width / 2f, item.height / 2f)
+                        canvas.drawBitmap(bmp, null, dst, itemPaint)
+                        canvas.restoreToCount(itemSave)
+                        bmp.recycle()
+                    }
+                }
+            } finally {
+                pdfDocs.values.forEach { it.close() }
+            }
+
+            for (ops in layerOpsList) {
+                if (ops.isEmpty()) continue
+                val hasErase = ops.any { it is personal.notes.touch.ui.canvas.InkOp.Erase }
+                val layerSave = if (hasErase) {
+                    canvas.saveLayer(minX - 200f, minY - 200f, maxX + 200f, maxY + 200f, null)
+                } else {
+                    -1
+                }
+                for (op in ops) {
+                    when (op) {
+                        is personal.notes.touch.ui.canvas.InkOp.Stroke -> {
+                            val shape = op.shape
+                            val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                                style = Paint.Style.STROKE
+                                strokeCap = Paint.Cap.ROUND
+                                strokeJoin = Paint.Join.ROUND
+                                color = op.stroke.color
+                                strokeWidth = op.stroke.baseWidthNorm * 2160f
+                            }
+                            if (shape != null) {
+                                canvas.drawPath(shape, paint)
+                            } else if (op.stroke.points.isNotEmpty()) {
+                                val path = Path()
+                                val pts = op.stroke.points
+                                path.moveTo(pts[0].x * 2160f, pts[0].y * 2160f)
+                                for (i in 1 until pts.size) {
+                                    path.lineTo(pts[i].x * 2160f, pts[i].y * 2160f)
+                                }
+                                canvas.drawPath(path, paint)
+                            }
+                        }
+                        is personal.notes.touch.ui.canvas.InkOp.Erase -> {
+                            if (op.stroke.points.isNotEmpty()) {
+                                val erasePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                                    style = Paint.Style.STROKE
+                                    strokeCap = Paint.Cap.ROUND
+                                    strokeJoin = Paint.Join.ROUND
+                                    xfermode = android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.CLEAR)
+                                    strokeWidth = op.stroke.baseWidthNorm * 2160f
+                                }
+                                val path = Path()
+                                val pts = op.stroke.points
+                                path.moveTo(pts[0].x * 2160f, pts[0].y * 2160f)
+                                for (i in 1 until pts.size) {
+                                    path.lineTo(pts[i].x * 2160f, pts[i].y * 2160f)
+                                }
+                                canvas.drawPath(path, erasePaint)
+                            }
+                        }
+                    }
+                }
+                if (layerSave >= 0) {
+                    canvas.restoreToCount(layerSave)
+                }
+            }
+            canvas.restoreToCount(save)
+        }
+        return out
+    }
+
     private suspend fun loadAnnotationLayer(
         fileStore: personal.notes.touch.data.files.NoteFileStore,
         noteId: String,

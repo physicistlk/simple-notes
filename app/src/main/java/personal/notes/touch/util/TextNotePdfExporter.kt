@@ -354,6 +354,9 @@ object TextNotePdfExporter {
             if (run.strike) {
                 builder.setSpan(StrikethroughSpan(), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
             }
+            if (run.underline) {
+                builder.setSpan(UnderlineSpan(), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            }
             if (run.highlight) {
                 builder.setSpan(
                     BackgroundColorSpan(0xFFFFF176.toInt()), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE

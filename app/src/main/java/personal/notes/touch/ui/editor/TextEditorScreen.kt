@@ -54,7 +54,10 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.VerticalSplit
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material3.DropdownMenu
@@ -336,6 +339,14 @@ fun TextEditorScreen(
 
                         Spacer(modifier = Modifier.width(6.dp))
 
+                        IconButton(onClick = { viewModel.toggleFindBar() }) {
+                            Icon(
+                                imageVector = Icons.Default.Search,
+                                contentDescription = "Find and replace",
+                                tint = Color.White
+                            )
+                        }
+
                         IconButton(onClick = { viewModel.toggleReadOnly() }) {
                             Icon(
                                 imageVector = if (isReadOnly) Icons.Default.Lock else Icons.Default.LockOpen,
@@ -399,6 +410,93 @@ fun TextEditorScreen(
                 .fillMaxSize()
                 .padding(innerPadding)
         ) {
+            val isFindBarOpen by viewModel.isFindBarOpen.collectAsState()
+            if (isFindBarOpen) {
+                val findQuery by viewModel.findQuery.collectAsState()
+                val replaceQuery by viewModel.replaceQuery.collectAsState()
+                val caseSensitive by viewModel.findCaseSensitive.collectAsState()
+                val findMatches by viewModel.findMatches.collectAsState()
+                val activeMatchIndex by viewModel.activeMatchIndex.collectAsState()
+
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f),
+                    tonalElevation = 2.dp,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            OutlinedTextField(
+                                value = findQuery,
+                                onValueChange = { viewModel.onFindQueryChange(it) },
+                                placeholder = { Text("Find in note...", fontSize = 13.sp) },
+                                singleLine = true,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Text(
+                                text = if (findMatches.isEmpty()) "0/0" else "${activeMatchIndex + 1}/${findMatches.size}",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            androidx.compose.material3.TextButton(
+                                onClick = { viewModel.toggleFindCaseSensitive() }
+                            ) {
+                                Text(
+                                    text = "Aa",
+                                    fontWeight = if (caseSensitive) FontWeight.Bold else FontWeight.Normal,
+                                    color = if (caseSensitive) themeColor else MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            IconButton(onClick = { viewModel.findPrevious() }) {
+                                Icon(Icons.Default.KeyboardArrowUp, contentDescription = "Previous match")
+                            }
+                            IconButton(onClick = { viewModel.findNext() }) {
+                                Icon(Icons.Default.KeyboardArrowDown, contentDescription = "Next match")
+                            }
+                            IconButton(onClick = { viewModel.toggleFindBar(false) }) {
+                                Icon(Icons.Default.Close, contentDescription = "Close find bar")
+                            }
+                        }
+                        if (!isReadOnly) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                OutlinedTextField(
+                                    value = replaceQuery,
+                                    onValueChange = { viewModel.onReplaceQueryChange(it) },
+                                    placeholder = { Text("Replace with...", fontSize = 13.sp) },
+                                    singleLine = true,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                androidx.compose.material3.TextButton(
+                                    onClick = { viewModel.replaceCurrent() },
+                                    enabled = findMatches.isNotEmpty()
+                                ) {
+                                    Text("Replace")
+                                }
+                                androidx.compose.material3.TextButton(
+                                    onClick = { viewModel.replaceAll() },
+                                    enabled = findMatches.isNotEmpty()
+                                ) {
+                                    Text("All")
+                                }
+                            }
+                        }
+                    }
+                }
+                HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f))
+            }
+
             // Formatting Toolbar (Visible in EDIT and SPLIT modes when not read-only)
             if (editorMode != EditorMode.PREVIEW && !isReadOnly) {
                 // In the block editor the toolbar transforms the ACTIVE block;

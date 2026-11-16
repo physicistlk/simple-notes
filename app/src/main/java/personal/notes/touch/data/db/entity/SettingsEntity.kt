@@ -27,6 +27,8 @@ data class SettingsEntity(
     val penSlot2Width: Float = 3f,
     /** Page turning direction: 0=vertical (scroll), 1=horizontal (swipe). */
     val pageTurningDirection: Int = 0,
-    /** Page turning mode: 0=continuous (scroll all), 1=single (one at a time). */
-    val pageTurningMode: Int = 0
+    /** Page turning mode for A4/standard notes: 0=continuous (scroll all), 1=single (one at a time). */
+    val pageTurningMode: Int = 0,
+    /** Page turning mode for PDF notes, decoupled from A4 notes: 0=continuous, 1=single. */
+    val pdfPageTurningMode: Int = 0
 )

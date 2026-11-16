@@ -59,13 +59,21 @@ data class GlassBackdrop(
     val pageOriginX: Float,
     val pageOriginY: Float,
     val invScale: Float,
-    val sampleScale: Float = SAMPLE_SCALE
+    val sampleScale: Float = SAMPLE_SCALE,
+    /** Screen-space grid spacing in pixels (0 when no procedural grid is active). */
+    val gridStepPx: Float = 0f,
+    /** Screen-space pan X for procedural grid refraction. */
+    val gridOriginX: Float = 0f,
+    /** Screen-space pan Y for procedural grid refraction. */
+    val gridOriginY: Float = 0f,
+    /** 0 = none, 1 = lined, 2 = graph, 3 = dots/isometric. */
+    val gridMode: Int = 0
 )
 
 /** Where a floating element sits on the screen (root pixels). */
 class GlassOrigin {
-    var x = 0f
-    var y = 0f
+    var x by androidx.compose.runtime.mutableFloatStateOf(0f)
+    var y by androidx.compose.runtime.mutableFloatStateOf(0f)
 }
 
 /**
@@ -89,26 +97,26 @@ class GlassOrigin {
 data class LiquidGlassStyle(
     val tint: Color,
     val fallback: Color,
-    val refract: Dp = 10.dp,
-    val bezel: Dp = 12.dp,
-    val blur: Dp = 3.dp,
-    val dispersion: Dp = 1.1.dp,
-    val highlight: Float = 0.55f,
+    val refract: Dp = 6.dp,
+    val bezel: Dp = 14.dp,
+    val blur: Dp = 3.8.dp,
+    val dispersion: Dp = 1.6.dp,
+    val highlight: Float = 0.78f,
     val paper: Color = Color.White,
     val outside: Color = Color(0xFFEFEFEF)
 ) {
     companion object {
         val Light = LiquidGlassStyle(
-            tint = Color(0xFFF4F6FA).copy(alpha = 0.30f),
-            fallback = Color(0xFFF4F6FA).copy(alpha = 0.74f)
+            tint = Color(0xFFEAF0FA).copy(alpha = 0.34f),
+            fallback = Color(0xFFEEF3FA).copy(alpha = 0.82f)
         )
         val Dark = LiquidGlassStyle(
-            tint = Color(0xFF16161A).copy(alpha = 0.50f),
-            fallback = Color(0xFF16161A).copy(alpha = 0.78f),
-            refract = 6.dp,
-            bezel = 9.dp,
-            blur = 2.dp,
-            highlight = 0.35f
+            tint = Color(0xFF14161E).copy(alpha = 0.56f),
+            fallback = Color(0xFF14161E).copy(alpha = 0.82f),
+            refract = 8.dp,
+            bezel = 10.dp,
+            blur = 2.5.dp,
+            highlight = 0.48f
         )
     }
 }
@@ -137,6 +145,7 @@ uniform float  uRadius;
 uniform float2 uPageOrigin;
 uniform float  uInvScale;
 uniform float2 uBitmapSize;
+uniform float  uHasBitmap;
 uniform float  uBezel;
 uniform float  uRefract;
 uniform float  uBlur;
@@ -145,31 +154,54 @@ uniform float  uHighlight;
 uniform half3  uPaper;
 uniform half3  uOutside;
 uniform half4  uTint;
+uniform float  uGridStep;
+uniform float2 uGridOrigin;
+uniform float  uGridMode;
 
-half3 pageAt(float2 p) {
-    if (p.x < 0.0 || p.y < 0.0 || p.x >= uBitmapSize.x || p.y >= uBitmapSize.y) {
-        return uOutside;
+half3 synthGrid(float2 screenPt, half3 baseCol) {
+    if (uGridMode < 0.5 || uGridStep < 8.0) return baseCol;
+    float gx = mod(mod(screenPt.x - uGridOrigin.x, uGridStep) + uGridStep, uGridStep);
+    float gy = mod(mod(screenPt.y - uGridOrigin.y, uGridStep) + uGridStep, uGridStep);
+    float dx = min(gx, uGridStep - gx);
+    float dy = min(gy, uGridStep - gy);
+    half3 gridTint = half3(0.835, 0.855, 0.890);
+    if (uGridMode < 1.5) {
+        // Lined
+        float lineY = 1.0 - smoothstep(0.4, 1.4, dy);
+        return mix(baseCol, gridTint, half(lineY * 0.65));
+    } else if (uGridMode < 2.5) {
+        // Graph
+        float line = max(1.0 - smoothstep(0.4, 1.4, dx), 1.0 - smoothstep(0.4, 1.4, dy));
+        return mix(baseCol, gridTint, half(line * 0.65));
+    } else {
+        // Dots / Isometric
+        float dist = length(float2(dx, dy));
+        float dotMask = 1.0 - smoothstep(1.0, 2.4, dist);
+        return mix(baseCol, gridTint, half(dotMask * 0.75));
     }
-    half4 c = backdrop.eval(p);
-    return c.rgb + uPaper * (1.0 - c.a);
 }
 
-// Nine taps on two rings: thin ink strokes blur into a haze instead of
-// turning into a row of ghost copies.
-//
-// The tap count is the whole performance story: the dock is redrawn with
-// every stroke (the window repaints), and the glass is 130 000 pixels wide.
-// Nine taps are enough to read as frost; the old 17 taps, evaluated three
-// times for the colour split, cost 51 samples per pixel and made the pen
-// lag behind the finger.
-half3 frost(float2 p, float r) {
-    half3 s = pageAt(p);
+half3 pageAt(float2 p, float2 screenPt) {
+    half3 base = uPaper;
+    if (uHasBitmap > 0.5) {
+        if (p.x < 0.0 || p.y < 0.0 || p.x >= uBitmapSize.x || p.y >= uBitmapSize.y) {
+            base = uOutside;
+        } else {
+            half4 c = backdrop.eval(p);
+            base = c.rgb + uPaper * (1.0 - c.a);
+        }
+    }
+    return synthGrid(screenPt, base);
+}
+
+half3 frost(float2 p, float2 screenPt, float r, float screenR) {
+    half3 s = pageAt(p, screenPt);
     for (int i = 0; i < 4; i++) {
         float a = float(i) * 1.570796;
         float2 o1 = float2(cos(a), sin(a));
         float2 o2 = float2(cos(a + 0.785398), sin(a + 0.785398));
-        s += pageAt(p + o1 * r * 0.5);
-        s += pageAt(p + o2 * r);
+        s += pageAt(p + o1 * r * 0.5, screenPt + o1 * screenR * 0.5);
+        s += pageAt(p + o2 * r, screenPt + o2 * screenR);
     }
     return s / 9.0;
 }
@@ -185,12 +217,16 @@ half4 main(float2 fragCoord) {
 
     // t = 1 on the very rim, 0 at the inner edge of the bezel and in the core.
     float depth = clamp(-d, 0.0, uBezel);
-    float t = 1.0 - depth / uBezel;
+    float tLinear = 1.0 - depth / max(uBezel, 1.0);
+    // Smooth meniscus lens profile
+    float t = tLinear * tLinear * (3.0 - 2.0 * tLinear);
 
-    // Outward normal of the rim.
+    // Smooth outward normal of the rounded-rect rim.
+    float2 cornerVec = max(q, float2(0.0));
+    float cornerLen = length(cornerVec);
     float2 n;
-    if (q.x > 0.0 && q.y > 0.0) {
-        n = normalize(q);
+    if (cornerLen > 0.001) {
+        n = cornerVec / cornerLen;
     } else if (q.x > q.y) {
         n = float2(1.0, 0.0);
     } else {
@@ -198,35 +234,77 @@ half4 main(float2 fragCoord) {
     }
     n *= sign(p);
 
-    // Refraction: only the bezel bends the page.
-    float bend = t * t;
-    float2 src = fragCoord - n * bend * uRefract;
-    float2 base = uPageOrigin + src * uInvScale;
+    // Snell's-law meniscus refraction: flat core (0px shift across the main body
+    // so strokes align 1:1 with the canvas), bending only on the curved outer rim.
+    float rimT = clamp(1.0 - (-d) / max(uBezel * 0.34, 1.0), 0.0, 1.0);
+    float bend = rimT * rimT * rimT;
+    float2 refractOffset = -n * bend * uRefract;
+    float2 srcScreen = fragCoord + refractOffset;
+    float2 base = uPageOrigin + srcScreen * uInvScale;
 
-    // Clear rim, frosted core.
-    float rad = mix(uBlur * 0.35, uBlur, 1.0 - t) * uInvScale;
-    float2 dv = n * (uDisp * t) * uInvScale;
+    // Clear refractive rim, silky frosted core.
+    float screenRad = mix(uBlur * 0.30, uBlur, 1.0 - t);
+    float rad = screenRad * uInvScale;
+    float2 dvScreen = n * (uDisp * (0.35 + 0.65 * t));
+    float2 dv = dvScreen * uInvScale;
 
-    // One frosted pass for the body; the colour split takes two cheap single
-    // samples instead of two more full frosts.
-    half3 col = frost(base, rad);
-    if (t >= 0.02) {
-        col = half3(pageAt(base + dv).r, col.g, pageAt(base - dv).b);
+    // Frosted body + chromatic dispersion split across R/G/B channels.
+    half3 col = frost(base, srcScreen, rad, screenRad);
+    if (tLinear >= 0.015) {
+        half rCh = pageAt(base + dv, srcScreen + dvScreen).r;
+        half bCh = pageAt(base - dv, srcScreen - dvScreen).b;
+        col = half3(mix(col.r, rCh, half(0.82)), col.g, mix(col.b, bCh, half(0.82)));
     }
 
-    // Material: tint, a little vibrance.
-    col = mix(col, uTint.rgb, uTint.a);
-    half luma = dot(col, half3(0.299, 0.587, 0.114));
-    col = mix(half3(luma), col, 1.12);
+    // Apple Liquid Glass optical body depth:
+    // Give light glass a cool quartz-silver body density so pure-white (1.0)
+    // specular glints and inner caustics have real headroom over white paper.
+    float isDarkGlass = step(0.5, 1.0 - float(uTint.r));
+    float minorAxis = (hs.x < hs.y) ? (fragCoord.x / max(uSize.x, 1.0)) : (fragCoord.y / max(uSize.y, 1.0));
+    float cylCurve = sin(clamp(minorAxis, 0.0, 1.0) * 3.14159265);
+    if (isDarkGlass < 0.5) {
+        // Light Liquid Glass: cool silver-sky quartz body + cylindrical sheen
+        half3 quartzTop = half3(0.915, 0.942, 0.982);
+        half3 quartzBot = half3(0.845, 0.885, 0.948);
+        half3 quartzBody = mix(quartzTop, quartzBot, half(clamp(minorAxis, 0.0, 1.0)));
+        col = mix(col, quartzBody, half(0.42));
+        col = mix(col, uTint.rgb, uTint.a * half(0.65));
+        // Soft bright crown along the upper-center cylinder
+        float crown = smoothstep(0.55, 0.12, minorAxis) * (1.0 - tLinear * 0.6);
+        col += half3(0.055, 0.062, 0.072) * half(crown);
+    } else {
+        col = mix(col, uTint.rgb, uTint.a);
+    }
 
-    // Light: the rim is shaded (thickness), then a glint on the lit
-    // top-left edge and a weaker bounce on the opposite one.
-    float2 L = normalize(float2(-0.55, -0.83));
+    // Boost chroma/vibrance of anything refracted underneath
+    half luma = dot(col, half3(0.299, 0.587, 0.114));
+    col = mix(half3(luma), col, half(1.22));
+
+    // 1. Outer Fresnel thickness shadow right inside the boundary (defines edge on white paper)
+    float outerEdge = pow(clamp(1.0 - (-d) / max(uBezel * 0.24, 1.0), 0.0, 1.0), 2.0);
+    col *= half(1.0 - 0.15 * outerEdge);
+
+    // 2. Inner Caustic Meniscus Ring (signature Apple Liquid Glass inner luminous ridge)
+    float causticBand = exp(-pow((tLinear - 0.36) / 0.16, 2.0));
+    col += half3(0.065, 0.082, 0.105) * half(causticBand * (0.65 + 0.35 * cylCurve));
+
+    // 3. Subtle iridescent prism tint along curved corners
+    float cornerFactor = clamp(cornerLen / max(r, 1.0), 0.0, 1.0) * tLinear;
+    half3 prismTint = mix(
+        half3(0.74, 0.91, 1.00),
+        half3(0.96, 0.82, 1.00),
+        half(0.5 + 0.5 * n.x * n.y)
+    );
+    col = mix(col, prismTint, half(cornerFactor * 0.14));
+
+    // 4. Directional anisotropic specular glint (top-left primary + bottom-right sky bounce)
+    float2 L = normalize(float2(-0.52, -0.85));
     float facing = dot(n, L);
-    float rim = pow(t, 3.0);
-    col *= 1.0 - 0.08 * rim;
-    float spec = rim * (max(facing, 0.0) + 0.35 * max(-facing, 0.0));
-    col += half3(uHighlight * spec + 0.04 * t * t);
+    float rimSpec = pow(tLinear, 2.6);
+    float topGlint = rimSpec * pow(max(facing, 0.0), 1.45);
+    float botBounce = rimSpec * 0.48 * pow(max(-facing, 0.0), 1.75);
+    col += half3(1.0, 1.0, 1.0) * half(uHighlight * topGlint);
+    col += half3(0.82, 0.91, 1.0) * half(uHighlight * botBounce);
 
     return half4(clamp(col, 0.0, 1.0), 1.0);
 }
@@ -260,6 +338,9 @@ class LiquidGlassShader {
     private var samplePendingScale: Float = SAMPLE_SCALE
 
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val emptyBackdropBitmap: Bitmap by lazy {
+        Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888)
+    }
 
     /** The paint that draws the refracted backdrop. */
     val shaderPaint: Paint get() = paint
@@ -325,24 +406,35 @@ class LiquidGlassShader {
         density: Float
     ): Shader? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return null
-        val bmp = backdrop?.bitmap ?: return null
-        if (width <= 0f || height <= 0f || backdrop.invScale <= 0f) return null
-        // The sample is a scaled copy of the page, so every page coordinate
-        // is scaled with it.
-        val k = backdrop.sampleScale
-        val sample = sampleFor(bmp, k) ?: return null
+        if (width <= 0f || height <= 0f) return null
+        val k = (backdrop?.sampleScale ?: 1f).coerceAtLeast(0.01f)
+        val rawInvScale = backdrop?.invScale ?: 1f
+        val invScale = if (rawInvScale > 0f && rawInvScale.isFinite()) rawInvScale else 1f
+        val bmp = backdrop?.bitmap
+        val sample = if (bmp != null && !bmp.isRecycled) sampleFor(bmp, k) else null
+        val activeBitmap = sample?.bitmap ?: emptyBackdropBitmap
+        val hasBitmap = if (sample != null) 1f else 0f
         return try {
-            if (inputBitmap !== sample.bitmap) {
-                input = BitmapShader(sample.bitmap, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
-                inputBitmap = sample.bitmap
+            if (inputBitmap !== activeBitmap) {
+                input = BitmapShader(activeBitmap, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
+                inputBitmap = activeBitmap
             }
             val shaderIn = input ?: return null
             val rs = runtime ?: RuntimeShader(LIQUID_GLASS_AGSL).also { runtime = it }
             rs.setFloatUniform("uSize", width, height)
             rs.setFloatUniform("uRadius", radiusPx)
-            rs.setFloatUniform("uPageOrigin", backdrop.pageOriginX * k, backdrop.pageOriginY * k)
-            rs.setFloatUniform("uInvScale", backdrop.invScale * k)
-            rs.setFloatUniform("uBitmapSize", sample.bitmap.width.toFloat(), sample.bitmap.height.toFloat())
+            rs.setFloatUniform(
+                "uPageOrigin",
+                (backdrop?.pageOriginX ?: 0f) * k,
+                (backdrop?.pageOriginY ?: 0f) * k
+            )
+            rs.setFloatUniform("uInvScale", invScale * k)
+            rs.setFloatUniform(
+                "uBitmapSize",
+                activeBitmap.width.toFloat(),
+                activeBitmap.height.toFloat()
+            )
+            rs.setFloatUniform("uHasBitmap", hasBitmap)
             rs.setFloatUniform("uBezel", style.bezel.value * density)
             rs.setFloatUniform("uRefract", style.refract.value * density)
             rs.setFloatUniform("uBlur", style.blur.value * density)
@@ -355,6 +447,13 @@ class LiquidGlassShader {
             rs.setFloatUniform(
                 "uTint", style.tint.red, style.tint.green, style.tint.blue, style.tint.alpha
             )
+            rs.setFloatUniform("uGridStep", backdrop?.gridStepPx ?: 0f)
+            rs.setFloatUniform(
+                "uGridOrigin",
+                backdrop?.gridOriginX ?: 0f,
+                backdrop?.gridOriginY ?: 0f
+            )
+            rs.setFloatUniform("uGridMode", (backdrop?.gridMode ?: 0).toFloat())
             rs.setInputShader("backdrop", shaderIn)
             rs
         } catch (e: Exception) {
@@ -424,17 +523,48 @@ fun Modifier.liquidGlassBackdrop(
 
 private val GlassRimBrush = Brush.linearGradient(
     colorStops = arrayOf(
-        0.00f to Color.White.copy(alpha = 0.95f), // glint on the lit corner
-        0.30f to Color.White.copy(alpha = 0.18f),
-        0.55f to Color.Black.copy(alpha = 0.10f), // gives the edge a line over white paper
-        1.00f to Color.White.copy(alpha = 0.70f)  // bounce on the far corner
+        0.00f to Color.White.copy(alpha = 0.98f), // crisp specular glint on top-left corner
+        0.22f to Color(0xFFD8ECFF).copy(alpha = 0.65f), // cool prism rim
+        0.52f to Color(0xFF1E293B).copy(alpha = 0.18f), // subtle glass edge definition over white paper
+        0.78f to Color(0xFFE8D8FF).copy(alpha = 0.52f), // subtle lavender-sky transition
+        1.00f to Color.White.copy(alpha = 0.88f)  // bright bounce on bottom-right corner
     )
 )
 
-/** A thin specular outline. (cornerRadius is kept so old call sites compile.) */
-@Suppress("UNUSED_PARAMETER")
+private val GlassInnerMeniscusBrush = Brush.linearGradient(
+    colorStops = arrayOf(
+        0.00f to Color.White.copy(alpha = 0.72f),
+        0.35f to Color.White.copy(alpha = 0.16f),
+        0.70f to Color(0xFFB8DCFF).copy(alpha = 0.20f),
+        1.00f to Color.White.copy(alpha = 0.50f)
+    )
+)
+
+/**
+ * Dual-ring Apple Liquid Glass specular outline:
+ * - Outer 1.2dp directional specular + prism rim
+ * - Inner inset meniscus highlight ring that gives the capsule 3D lens thickness
+ */
 fun Modifier.liquidGlassRim(cornerRadius: Dp, shape: Shape): Modifier =
-    this.border(width = 1.dp, brush = GlassRimBrush, shape = shape)
+    this
+        .border(width = 1.2.dp, brush = GlassRimBrush, shape = shape)
+        .drawWithContent {
+            drawContent()
+            val inset = 2.2.dp.toPx()
+            val innerR = (cornerRadius.toPx() - inset).coerceAtLeast(2f)
+            if (size.width > inset * 2f && size.height > inset * 2f) {
+                drawRoundRect(
+                    brush = GlassInnerMeniscusBrush,
+                    topLeft = Offset(inset, inset),
+                    size = androidx.compose.ui.geometry.Size(
+                        size.width - inset * 2f,
+                        size.height - inset * 2f
+                    ),
+                    cornerRadius = CornerRadius(innerR, innerR),
+                    style = androidx.compose.ui.graphics.drawscope.Stroke(width = 1.dp.toPx())
+                )
+            }
+        }
 
 /**
  * A soft "liquid light" bloom that follows a hovering stylus (or mouse) over

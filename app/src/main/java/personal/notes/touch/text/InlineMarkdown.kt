@@ -19,6 +19,7 @@ data class InlineRun(
     val bold: Boolean = false,
     val italic: Boolean = false,
     val strike: Boolean = false,
+    val underline: Boolean = false,
     val code: Boolean = false,
     val highlight: Boolean = false,
     /** External link target (`http(s)`, `mailto`, bare host) or wiki title. */
@@ -55,7 +56,7 @@ object InlineMarkdown {
 
     private fun sameStyle(a: InlineRun, b: InlineRun): Boolean =
         a.bold == b.bold && a.italic == b.italic && a.strike == b.strike &&
-            a.code == b.code && a.highlight == b.highlight &&
+            a.underline == b.underline && a.code == b.code && a.highlight == b.highlight &&
             a.link == b.link && a.wiki == b.wiki
 
     private fun parseInto(src: String, style: InlineRun, out: MutableList<InlineRun>) {
@@ -155,6 +156,20 @@ object InlineMarkdown {
                 buffer.append(c)
                 i++
                 continue
+            }
+
+            // <u>underline</u>
+            if (c == '<' && src.startsWith("<u>", i, ignoreCase = true)) {
+                val end = src.indexOf("</u>", i + 3, ignoreCase = true)
+                if (end > i + 3) {
+                    val inner = src.substring(i + 3, end)
+                    flush()
+                    val nested = ArrayList<InlineRun>()
+                    parseInto(inner, style.copy(underline = true), nested)
+                    out.addAll(nested)
+                    i = end + 4
+                    continue
+                }
             }
 
             // ~~strike~~

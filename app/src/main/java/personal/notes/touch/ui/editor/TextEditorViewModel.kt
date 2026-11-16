@@ -60,6 +60,8 @@ data class OutlineEntry(val blockIndex: Int, val level: Int, val text: String)
 
 data class WordStats(val wordCount: Int, val charCount: Int)
 
+data class FindMatch(val blockIndex: Int, val blockId: String, val start: Int, val end: Int)
+
 @OptIn(FlowPreview::class)
 class TextEditorViewModel(
     val noteId: String,
@@ -98,6 +100,188 @@ class TextEditorViewModel(
 
     private val _pendingFocus = MutableStateFlow<FocusTarget?>(null)
     val pendingFocus: StateFlow<FocusTarget?> = _pendingFocus.asStateFlow()
+
+    private val _isFindBarOpen = MutableStateFlow(false)
+    val isFindBarOpen: StateFlow<Boolean> = _isFindBarOpen.asStateFlow()
+
+    private val _findQuery = MutableStateFlow("")
+    val findQuery: StateFlow<String> = _findQuery.asStateFlow()
+
+    private val _replaceQuery = MutableStateFlow("")
+    val replaceQuery: StateFlow<String> = _replaceQuery.asStateFlow()
+
+    private val _findCaseSensitive = MutableStateFlow(false)
+    val findCaseSensitive: StateFlow<Boolean> = _findCaseSensitive.asStateFlow()
+
+    private val _activeMatchIndex = MutableStateFlow(-1)
+    val activeMatchIndex: StateFlow<Int> = _activeMatchIndex.asStateFlow()
+
+    val findMatches: StateFlow<List<FindMatch>> = combine(
+        _blocks,
+        _findQuery,
+        _findCaseSensitive
+    ) { blocks, query, caseSensitive ->
+        computeFindMatches(blocks, query, caseSensitive)
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    private fun computeFindMatches(
+        blocks: List<EditableBlock>,
+        query: String,
+        caseSensitive: Boolean
+    ): List<FindMatch> {
+        if (query.isEmpty()) return emptyList()
+        val matches = mutableListOf<FindMatch>()
+        blocks.forEachIndexed { idx, block ->
+            if (block.type == BlockType.DIVIDER || block.type == BlockType.IMAGE || block.type == BlockType.QUERY) {
+                return@forEachIndexed
+            }
+            val text = block.field.text
+            var pos = 0
+            while (pos <= text.length - query.length) {
+                val found = text.indexOf(query, startIndex = pos, ignoreCase = !caseSensitive)
+                if (found < 0) break
+                matches.add(FindMatch(idx, block.id, found, found + query.length))
+                pos = found + query.length.coerceAtLeast(1)
+            }
+        }
+        return matches
+    }
+
+    fun toggleFindBar(open: Boolean? = null) {
+        val next = open ?: !_isFindBarOpen.value
+        _isFindBarOpen.value = next
+        if (!next) {
+            _activeMatchIndex.value = -1
+        }
+    }
+
+    fun onFindQueryChange(query: String) {
+        _findQuery.value = query
+        val matches = computeFindMatches(_blocks.value, query, _findCaseSensitive.value)
+        _activeMatchIndex.value = if (matches.isEmpty()) -1 else 0
+        if (matches.isNotEmpty()) {
+            focusMatch(matches[0])
+        }
+    }
+
+    fun onReplaceQueryChange(replace: String) {
+        _replaceQuery.value = replace
+    }
+
+    fun toggleFindCaseSensitive() {
+        val next = !_findCaseSensitive.value
+        _findCaseSensitive.value = next
+        val matches = computeFindMatches(_blocks.value, _findQuery.value, next)
+        _activeMatchIndex.value = if (matches.isEmpty()) -1 else 0
+        if (matches.isNotEmpty()) {
+            focusMatch(matches[0])
+        }
+    }
+
+    fun findNext() {
+        val matches = computeFindMatches(_blocks.value, _findQuery.value, _findCaseSensitive.value)
+        if (matches.isEmpty()) {
+            _activeMatchIndex.value = -1
+            return
+        }
+        val nextIdx = (_activeMatchIndex.value + 1) % matches.size
+        _activeMatchIndex.value = nextIdx
+        focusMatch(matches[nextIdx])
+    }
+
+    fun findPrevious() {
+        val matches = computeFindMatches(_blocks.value, _findQuery.value, _findCaseSensitive.value)
+        if (matches.isEmpty()) {
+            _activeMatchIndex.value = -1
+            return
+        }
+        val cur = _activeMatchIndex.value
+        val prevIdx = if (cur <= 0) matches.lastIndex else cur - 1
+        _activeMatchIndex.value = prevIdx
+        focusMatch(matches[prevIdx])
+    }
+
+    private fun focusMatch(match: FindMatch) {
+        val list = _blocks.value.toMutableList()
+        val block = list.getOrNull(match.blockIndex) ?: return
+        val start = match.start.coerceIn(0, block.field.text.length)
+        val end = match.end.coerceIn(start, block.field.text.length)
+        list[match.blockIndex] = block.copy(
+            field = block.field.copy(selection = TextRange(start, end))
+        )
+        _blocks.value = list
+        _activeBlockId.value = block.id
+        _pendingFocus.value = FocusTarget(block.id)
+    }
+
+    fun replaceCurrent() {
+        if (_isReadOnly.value) return
+        val matches = computeFindMatches(_blocks.value, _findQuery.value, _findCaseSensitive.value)
+        if (matches.isEmpty()) return
+        val idx = _activeMatchIndex.value.coerceIn(0, matches.lastIndex)
+        val match = matches[idx]
+        val list = _blocks.value.toMutableList()
+        val block = list.getOrNull(match.blockIndex) ?: return
+        val text = block.field.text
+        if (match.start < 0 || match.end > text.length) return
+        val replacement = _replaceQuery.value
+        val newText = text.substring(0, match.start) + replacement + text.substring(match.end)
+        val newCaret = match.start + replacement.length
+        list[match.blockIndex] = block.copy(
+            field = TextFieldValue(newText, TextRange(newCaret))
+        )
+        publishBlocks(list, FocusTarget(block.id))
+        val after = computeFindMatches(list, _findQuery.value, _findCaseSensitive.value)
+        if (after.isEmpty()) {
+            _activeMatchIndex.value = -1
+        } else {
+            val nextIdx = idx.coerceAtMost(after.lastIndex)
+            _activeMatchIndex.value = nextIdx
+            focusMatch(after[nextIdx])
+        }
+    }
+
+    fun replaceAll(): Int {
+        if (_isReadOnly.value) return 0
+        val query = _findQuery.value
+        if (query.isEmpty()) return 0
+        val replacement = _replaceQuery.value
+        val caseSensitive = _findCaseSensitive.value
+        var count = 0
+        val updated = _blocks.value.map { block ->
+            if (block.type == BlockType.DIVIDER || block.type == BlockType.IMAGE || block.type == BlockType.QUERY) {
+                block
+            } else {
+                val text = block.field.text
+                var pos = 0
+                val sb = StringBuilder()
+                var changed = false
+                while (pos < text.length) {
+                    val found = text.indexOf(query, startIndex = pos, ignoreCase = !caseSensitive)
+                    if (found < 0) {
+                        sb.append(text, pos, text.length)
+                        break
+                    }
+                    sb.append(text, pos, found)
+                    sb.append(replacement)
+                    pos = found + query.length
+                    count++
+                    changed = true
+                }
+                if (changed) {
+                    val str = sb.toString()
+                    block.copy(field = TextFieldValue(str, TextRange(str.length)))
+                } else {
+                    block
+                }
+            }
+        }
+        if (count > 0) {
+            publishBlocks(updated)
+            _activeMatchIndex.value = -1
+        }
+        return count
+    }
 
     /** Outline of headings 1–6 in current blocks (SiYuan document outline). */
     val outline: StateFlow<List<OutlineEntry>> = _blocks

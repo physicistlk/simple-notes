@@ -156,10 +156,16 @@ object BlockOps {
             )
         }
 
-        // Sensible no-ops per spec: divider or empty heading before → just stay.
-        if (prev.type == BlockType.DIVIDER ||
-            (prev.type == BlockType.HEADING && prev.field.text.isEmpty())
-        ) {
+        // Sensible no-ops per spec: divider, empty heading, or structured block before.
+        val prevIsStructured = prev.type == BlockType.DIVIDER ||
+            prev.type == BlockType.TABLE ||
+            prev.type == BlockType.IMAGE ||
+            prev.type == BlockType.CODE ||
+            prev.type == BlockType.QUERY
+        if (prevIsStructured || (prev.type == BlockType.HEADING && prev.field.text.isEmpty())) {
+            if (cur.type != BlockType.PARAGRAPH) {
+                return BackspaceResult(demote(), cur.id)
+            }
             return BackspaceResult(blocks, null)
         }
 

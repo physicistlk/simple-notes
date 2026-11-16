@@ -108,7 +108,7 @@ fun ExportDialog(
             if (currentBitmap != null && !currentBitmap.isRecycled) {
                 ExportManager.flattenBitmap(currentBitmap, backgroundBitmap, imageLayers)
             } else {
-                ExportManager.loadFlattenedPageBitmap(fileStore, note.id, currentPageIndex, includeLayers = true)
+                ExportManager.loadFlattenedPageBitmap(fileStore, note.id, currentPageIndex, includeLayers = true, pageType = note.pageType)
             }
         }
         value = loaded

@@ -974,6 +974,7 @@ class NoteRepository(
         val file = fileStore.getPageFile(noteId, pageIndex)
         val ok = personal.notes.touch.util.BitmapUtils.saveBitmapToPng(bitmap, file)
         if (ok) {
+            personal.notes.touch.util.BitmapUtils.invalidateImageCache(file)
             try {
                 // A narrow touch: the whole row must not be written back,
                 // or the page the user is on would be lost.

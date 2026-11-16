@@ -43,7 +43,262 @@ enum class CanvasTool {
     SHAPE_LINE,
     LASSO,
     /** Shows a red dot with a short tail where the pen is; writes nothing. */
-    LASER_POINTER
+    LASER_POINTER,
+    /** Graphite pencil with paper-tooth abrasion texture and stylus tilt shading. */
+    PENCIL,
+    /** Concepts-style draw + fill: closes and fills the curve between endpoints while drawing. */
+    SHAPE_FILL
+}
+
+/**
+ * Shared seamless 128x128 multi-scale paper-tooth ALPHA_8 grain shaders and
+ * variable-width smooth ribbon path builder for Pen, Fountain Pen, and
+ * Concepts-style Graphite Pencil.
+ */
+internal object PencilGrainShader {
+    private const val TEX_SIZE = 128
+
+    /** Fine + medium paper-tooth grain for the inner graphite core. */
+    val shaderCore: android.graphics.BitmapShader by lazy { createGrainShader(0x51A7F3C9, minAlpha = 35, contrast = 1.15f) }
+
+    /** Mid-body paper-tooth grain with transparent valleys so paper breathes through. */
+    val shaderMid: android.graphics.BitmapShader by lazy { createGrainShader(0x2C91B4E7, minAlpha = 0, contrast = 1.45f) }
+
+    /** Sparse high-peak paper tooth for fibrous outer pencil edge abrasion. */
+    val shaderEdge: android.graphics.BitmapShader by lazy { createGrainShader(0x7E3A9D13, minAlpha = 0, contrast = 2.10f) }
+
+    val shader: android.graphics.BitmapShader get() = shaderMid
+
+    private fun createGrainShader(seedInit: Int, minAlpha: Int, contrast: Float): android.graphics.BitmapShader {
+        val bmp = android.graphics.Bitmap.createBitmap(TEX_SIZE, TEX_SIZE, android.graphics.Bitmap.Config.ALPHA_8)
+        val fine = IntArray(TEX_SIZE * TEX_SIZE)
+        var seed = seedInit
+        for (i in fine.indices) {
+            seed = seed * 1664525 + 1013904223
+            val n1 = (seed ushr 24) and 0xFF
+            seed = seed * 1664525 + 1013904223
+            val n2 = (seed ushr 24) and 0xFF
+            fine[i] = (n1 + n2) ushr 1
+        }
+        val pixels = ByteArray(TEX_SIZE * TEX_SIZE)
+        for (y in 0 until TEX_SIZE) {
+            val yUp = (y - 1) and (TEX_SIZE - 1)
+            val yDn = (y + 1) and (TEX_SIZE - 1)
+            for (x in 0 until TEX_SIZE) {
+                val xLt = (x - 1) and (TEX_SIZE - 1)
+                val xRt = (x + 1) and (TEX_SIZE - 1)
+                val c = fine[y * TEX_SIZE + x]
+                // 3x3 paper-fiber cluster average blended with high-frequency tooth
+                val neighbors = (
+                    fine[yUp * TEX_SIZE + x] + fine[yDn * TEX_SIZE + x] +
+                    fine[y * TEX_SIZE + xLt] + fine[y * TEX_SIZE + xRt]
+                ) ushr 2
+                val blended = (c * 3 + neighbors * 2) / 5
+                val centered = ((blended - 118) * contrast + 128f).toInt()
+                val alpha = if (centered <= minAlpha) minAlpha else centered.coerceIn(minAlpha, 255)
+                pixels[y * TEX_SIZE + x] = alpha.toByte()
+            }
+        }
+        bmp.copyPixelsFromBuffer(java.nio.ByteBuffer.wrap(pixels))
+        return android.graphics.BitmapShader(
+            bmp,
+            android.graphics.Shader.TileMode.REPEAT,
+            android.graphics.Shader.TileMode.REPEAT
+        )
+    }
+
+    fun calculatePencilWidth(baseWidth: Float, pressure: Float, tiltRad: Float, pressureEnabled: Boolean): Float {
+        val tiltNorm = ((tiltRad - 0.16f) / 0.90f).coerceIn(0f, 1f)
+        val p = if (pressureEnabled) pressure.coerceIn(0.15f, 1.0f) else 0.72f
+        return baseWidth * (0.72f + 0.58f * p) * (1f + tiltNorm * 3.1f)
+    }
+
+    fun calculatePenWidth(baseWidth: Float, pressure: Float, pressureEnabled: Boolean): Float {
+        if (!pressureEnabled) return baseWidth
+        val p = pressure.coerceIn(0.10f, 1.0f)
+        // Crisp fineliner/gel-pen curve: responsive without wild swings
+        val curved = kotlin.math.sqrt(p.toDouble()).toFloat()
+        return baseWidth * (0.76f + 0.38f * curved)
+    }
+
+    /**
+     * Builds a single closed variable-width ribbon [Path] from screen-space
+     * `(x, y, width)` samples using quadratic midpoint interpolation.
+     *
+     * Because the entire ribbon is one closed path drawn with [Paint.Style.FILL],
+     * semi-transparent strokes and textured pencil shaders never double-blend at
+     * segment joints.
+     */
+    fun buildVariableWidthRibbon(
+        xs: FloatArray,
+        ys: FloatArray,
+        ws: FloatArray,
+        count: Int,
+        widthMultiplier: Float = 1f,
+        taperEnds: Boolean = true
+    ): Path {
+        val path = Path()
+        if (count <= 0) return path
+        if (count == 1) {
+            val r = (ws[0] * widthMultiplier * 0.5f).coerceAtLeast(0.8f)
+            path.addCircle(xs[0], ys[0], r, Path.Direction.CW)
+            return path
+        }
+
+        // 1. Subdivide along quadratic midpoint spline into smooth samples
+        val maxSamples = count * 5 + 8
+        val sx = FloatArray(maxSamples)
+        val sy = FloatArray(maxSamples)
+        val sr = FloatArray(maxSamples)
+        var sCount = 0
+
+        fun pushSample(px: Float, py: Float, pw: Float) {
+            val r = (pw * widthMultiplier * 0.5f).coerceAtLeast(0.6f)
+            if (sCount > 0) {
+                val dx = px - sx[sCount - 1]
+                val dy = py - sy[sCount - 1]
+                if (dx * dx + dy * dy < 0.6f) return
+            }
+            if (sCount < maxSamples) {
+                sx[sCount] = px
+                sy[sCount] = py
+                sr[sCount] = r
+                sCount++
+            }
+        }
+
+        pushSample(xs[0], ys[0], ws[0])
+        if (count == 2) {
+            pushSample(xs[1], ys[1], ws[1])
+        } else {
+            val m0x = (xs[0] + xs[1]) * 0.5f
+            val m0y = (ys[0] + ys[1]) * 0.5f
+            val m0w = (ws[0] + ws[1]) * 0.5f
+            pushSample(m0x, m0y, m0w)
+            var prevMx = m0x
+            var prevMy = m0y
+            var prevMw = m0w
+            for (i in 1 until count - 1) {
+                val cx = xs[i]
+                val cy = ys[i]
+                val cw = ws[i]
+                val nextMx = (cx + xs[i + 1]) * 0.5f
+                val nextMy = (cy + ys[i + 1]) * 0.5f
+                val nextMw = (cw + ws[i + 1]) * 0.5f
+                val chord = kotlin.math.hypot((nextMx - prevMx).toDouble(), (nextMy - prevMy).toDouble()).toFloat()
+                val steps = (chord / 3.5f).toInt().coerceIn(1, 4)
+                for (s in 1..steps) {
+                    val t = s.toFloat() / steps
+                    val inv = 1f - t
+                    val qx = inv * inv * prevMx + 2f * inv * t * cx + t * t * nextMx
+                    val qy = inv * inv * prevMy + 2f * inv * t * cy + t * t * nextMy
+                    val qw = prevMw + (nextMw - prevMw) * t
+                    pushSample(qx, qy, qw)
+                }
+                prevMx = nextMx
+                prevMy = nextMy
+                prevMw = nextMw
+            }
+            pushSample(xs[count - 1], ys[count - 1], ws[count - 1])
+        }
+
+        if (sCount == 1) {
+            path.addCircle(sx[0], sy[0], sr[0], Path.Direction.CW)
+            return path
+        }
+
+        // Apply subtle start/end nib taper
+        if (taperEnds && sCount >= 4) {
+            val taperLen = minOf(4, sCount / 3)
+            for (i in 0 until taperLen) {
+                val f = 0.58f + 0.42f * (i.toFloat() / taperLen)
+                sr[i] *= f
+            }
+            for (i in 0 until taperLen) {
+                val idx = sCount - 1 - i
+                val f = 0.52f + 0.48f * (i.toFloat() / taperLen)
+                sr[idx] *= f
+            }
+        }
+
+        val leftX = FloatArray(sCount)
+        val leftY = FloatArray(sCount)
+        val rightX = FloatArray(sCount)
+        val rightY = FloatArray(sCount)
+
+        for (i in 0 until sCount) {
+            val tx: Float
+            val ty: Float
+            when (i) {
+                0 -> {
+                    tx = sx[1] - sx[0]
+                    ty = sy[1] - sy[0]
+                }
+                sCount - 1 -> {
+                    tx = sx[i] - sx[i - 1]
+                    ty = sy[i] - sy[i - 1]
+                }
+                else -> {
+                    tx = sx[i + 1] - sx[i - 1]
+                    ty = sy[i + 1] - sy[i - 1]
+                }
+            }
+            val len = kotlin.math.hypot(tx.toDouble(), ty.toDouble()).toFloat().coerceAtLeast(0.001f)
+            val nx = -ty / len
+            val ny = tx / len
+            val r = sr[i]
+            leftX[i] = sx[i] + nx * r
+            leftY[i] = sy[i] + ny * r
+            rightX[i] = sx[i] - nx * r
+            rightY[i] = sy[i] - ny * r
+        }
+
+        path.moveTo(leftX[0], leftY[0])
+        for (i in 1 until sCount - 1) {
+            val mx = (leftX[i] + leftX[i + 1]) * 0.5f
+            val my = (leftY[i] + leftY[i + 1]) * 0.5f
+            path.quadTo(leftX[i], leftY[i], mx, my)
+        }
+        path.lineTo(leftX[sCount - 1], leftY[sCount - 1])
+
+        // Round end cap at tail
+        val endIdx = sCount - 1
+        val endTx = sx[endIdx] - sx[endIdx - 1]
+        val endTy = sy[endIdx] - sy[endIdx - 1]
+        val endLen = kotlin.math.hypot(endTx.toDouble(), endTy.toDouble()).toFloat().coerceAtLeast(0.001f)
+        val endUx = endTx / endLen
+        val endUy = endTy / endLen
+        val endR = sr[endIdx]
+        path.quadTo(
+            sx[endIdx] + endUx * endR * 1.15f,
+            sy[endIdx] + endUy * endR * 1.15f,
+            rightX[endIdx],
+            rightY[endIdx]
+        )
+
+        for (i in sCount - 2 downTo 1) {
+            val mx = (rightX[i] + rightX[i - 1]) * 0.5f
+            val my = (rightY[i] + rightY[i - 1]) * 0.5f
+            path.quadTo(rightX[i], rightY[i], mx, my)
+        }
+        path.lineTo(rightX[0], rightY[0])
+
+        // Round start cap at head
+        val startTx = sx[1] - sx[0]
+        val startTy = sy[1] - sy[0]
+        val startLen = kotlin.math.hypot(startTx.toDouble(), startTy.toDouble()).toFloat().coerceAtLeast(0.001f)
+        val startUx = startTx / startLen
+        val startUy = startTy / startLen
+        val startR = sr[0]
+        path.quadTo(
+            sx[0] - startUx * startR * 1.15f,
+            sy[0] - startUy * startR * 1.15f,
+            leftX[0],
+            leftY[0]
+        )
+        path.close()
+        return path
+    }
 }
 
 enum class PaperPattern {
@@ -687,6 +942,7 @@ class DrawingCanvasView @JvmOverloads constructor(
             invalidate()
         }
     var pageType: String = "infinite"
+    private var a4OutOfBoundsStroke = false
     var minZoom: Float = 0.20f
     var horizontalResistance: Float = 0.4f
     private val paperBedPaint = Paint().apply { style = Paint.Style.FILL }
@@ -1071,6 +1327,8 @@ class DrawingCanvasView @JvmOverloads constructor(
         when (currentTool) {
             CanvasTool.FOUNTAIN_PEN -> {
                 strokePaint.xfermode = null
+                strokePaint.shader = null
+                strokePaint.style = Paint.Style.STROKE
                 strokePaint.color = strokeColor
                 strokePaint.strokeWidth = strokeWidthPx
                 strokePaint.strokeCap = Paint.Cap.ROUND
@@ -1079,6 +1337,28 @@ class DrawingCanvasView @JvmOverloads constructor(
             }
             CanvasTool.PEN -> {
                 strokePaint.xfermode = null
+                strokePaint.shader = null
+                strokePaint.style = Paint.Style.STROKE
+                strokePaint.color = strokeColor
+                strokePaint.strokeWidth = strokeWidthPx
+                strokePaint.strokeCap = Paint.Cap.ROUND
+                strokePaint.strokeJoin = Paint.Join.ROUND
+                strokePaint.alpha = 255
+            }
+            CanvasTool.PENCIL -> {
+                strokePaint.xfermode = null
+                strokePaint.shader = PencilGrainShader.shader
+                strokePaint.style = Paint.Style.STROKE
+                strokePaint.color = strokeColor
+                strokePaint.strokeWidth = strokeWidthPx
+                strokePaint.strokeCap = Paint.Cap.ROUND
+                strokePaint.strokeJoin = Paint.Join.ROUND
+                strokePaint.alpha = 215
+            }
+            CanvasTool.SHAPE_FILL -> {
+                strokePaint.xfermode = null
+                strokePaint.shader = null
+                strokePaint.style = Paint.Style.FILL
                 strokePaint.color = strokeColor
                 strokePaint.strokeWidth = strokeWidthPx
                 strokePaint.strokeCap = Paint.Cap.ROUND
@@ -1273,8 +1553,13 @@ class DrawingCanvasView @JvmOverloads constructor(
         super.onSizeChanged(w, h, oldw, oldh)
         if (w > 0 && h > 0) {
             if (backingBitmap == null) {
-                initBackingBitmap(w, h)
-            } else if (oldw == 0 || oldh == 0) {
+                val initW = if (pageType == "a4" || pageType == "pdf") 2160 else w
+                val initH = if (pageType == "a4" || pageType == "pdf") 3056 else h
+                initBackingBitmap(initW, initH)
+                if (pageType == "a4" || pageType == "pdf") {
+                    fitOrCenterPage()
+                }
+            } else if (oldw != w || oldh != h) {
                 fitOrCenterPage()
             }
         }
@@ -2083,13 +2368,15 @@ class DrawingCanvasView @JvmOverloads constructor(
         // 2. Draw paper pattern
         drawPaperPattern(canvas)
 
+        val clipToA4 = pageType == "a4"
+        if (clipToA4) {
+            canvas.save()
+            canvas.clipRect(0f, 0f, pageW, pageH)
+        }
+
         // 3. Draw committed bitmap
         backingBitmap?.let { bmp ->
             canvas.drawBitmap(bmp, 0f, 0f, bitmapPaint)
-        }
-
-        if (isPageBounded) {
-            canvas.drawRect(0f, 0f, pageW, pageH, pageBorderPaint)
         }
 
         // 3a. F-10: PDF text selection highlight (cached rects, no native call
@@ -2105,9 +2392,11 @@ class DrawingCanvasView @JvmOverloads constructor(
 
         // 3c. Ink written outside the paper: page-level crops painted over the
         // canvas surround, so a PDF page can be annotated in its margins.
-        for (crop in beyondPageInk) {
-            if (crop.bitmap.isRecycled) continue
-            canvas.drawBitmap(crop.bitmap, crop.x, crop.y, bitmapPaint)
+        if (!clipToA4) {
+            for (crop in beyondPageInk) {
+                if (crop.bitmap.isRecycled) continue
+                canvas.drawBitmap(crop.bitmap, crop.x, crop.y, bitmapPaint)
+            }
         }
 
         // 4. Draw current in-progress stroke or shape preview
@@ -2136,10 +2425,21 @@ class DrawingCanvasView @JvmOverloads constructor(
                 }
                 else -> {}
             }
-        } else if (currentTool == CanvasTool.FOUNTAIN_PEN && currentStrokePoints.isNotEmpty()) {
+        } else if ((currentTool == CanvasTool.FOUNTAIN_PEN || currentTool == CanvasTool.PENCIL) && currentStrokePoints.isNotEmpty()) {
             drawFountainPenStroke(canvas, currentStrokePoints, strokePaint)
+        } else if (currentTool == CanvasTool.SHAPE_FILL && !currentPath.isEmpty) {
+            val closed = Path(currentPath)
+            closed.close()
+            canvas.drawPath(closed, strokePaint)
         } else if (!currentPath.isEmpty) {
             canvas.drawPath(currentPath, strokePaint)
+        }
+
+        if (clipToA4) {
+            canvas.restore()
+        }
+        if (isPageBounded) {
+            canvas.drawRect(0f, 0f, pageW, pageH, pageBorderPaint)
         }
 
         // 5. Draw Lasso selection overlay (content)
@@ -2688,22 +2988,44 @@ class DrawingCanvasView @JvmOverloads constructor(
         // Image layer interaction (tap/drag/pinch)
         if (handleImageLayerTouchEvent(event, x, y)) return true
 
+        // A4 pages are strictly bounded to the paper; unlike PDFs, strokes cannot
+        // start or spill outside the page into the surrounding desk.
+        val pageW = (backingBitmap?.width?.toFloat() ?: pdfPageRectWidth()).takeIf { it > 0f } ?: 2160f
+        val pageH = (backingBitmap?.height?.toFloat() ?: pdfPageRectHeight()).takeIf { it > 0f } ?: 3056f
+        val isA4 = pageType == "a4"
+        if (isA4) {
+            if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+                if (x < 0f || x > pageW || y < 0f || y > pageH) {
+                    a4OutOfBoundsStroke = true
+                    return true
+                }
+                a4OutOfBoundsStroke = false
+            } else if (a4OutOfBoundsStroke) {
+                if (event.actionMasked == MotionEvent.ACTION_UP || event.actionMasked == MotionEvent.ACTION_CANCEL) {
+                    a4OutOfBoundsStroke = false
+                }
+                return true
+            }
+        }
+        val bx = if (isA4) x.coerceIn(0f, pageW) else x
+        val by = if (isA4) y.coerceIn(0f, pageH) else y
+
         // Geometric shape tools
         if (currentTool in listOf(CanvasTool.SHAPE_RECT, CanvasTool.SHAPE_CIRCLE, CanvasTool.SHAPE_LINE)) {
             when (event.action) {
                 MotionEvent.ACTION_DOWN -> {
                     saveUndoState()
-                    startTouchX = x
-                    startTouchY = y
-                    currentTouchX = x
-                    currentTouchY = y
+                    startTouchX = bx
+                    startTouchY = by
+                    currentTouchX = bx
+                    currentTouchY = by
                     isDrawingShape = true
                     invalidate()
                     return true
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    currentTouchX = x
-                    currentTouchY = y
+                    currentTouchX = bx
+                    currentTouchY = by
                     invalidate()
                     return true
                 }
@@ -2716,8 +3038,8 @@ class DrawingCanvasView @JvmOverloads constructor(
                         invalidate()
                         return true
                     }
-                    currentTouchX = x
-                    currentTouchY = y
+                    currentTouchX = bx
+                    currentTouchY = by
                     isDrawingShape = false
                     // Commit shape to bitmap
                     val c = bitmapCanvas
@@ -2899,16 +3221,25 @@ class DrawingCanvasView @JvmOverloads constructor(
                 // when the finger lifts, and only the rectangle it touches
                 // has to be remembered (see saveUndoStateForRect).
                 currentPath.reset()
-                currentPath.moveTo(x, y)
-                lastTouchX = x
-                lastTouchY = y
+                currentPath.moveTo(bx, by)
+                lastTouchX = bx
+                lastTouchY = by
                 sampledPoints.clear()
-                sampledPoints.add(x to y)
+                sampledPoints.add(bx to by)
                 currentStrokePoints.clear()
                 lastSmoothedWidth = -1f
-                if (currentTool == CanvasTool.FOUNTAIN_PEN) {
-                    val initialWidth = calculateFountainPenWidth(event.pressure)
-                    currentStrokePoints.add(StrokePoint(x, y, initialWidth))
+                if (currentTool == CanvasTool.FOUNTAIN_PEN || currentTool == CanvasTool.PENCIL) {
+                    val initialWidth = if (currentTool == CanvasTool.PENCIL) {
+                        PencilGrainShader.calculatePencilWidth(
+                            strokeWidthPx,
+                            event.pressure,
+                            event.getAxisValue(MotionEvent.AXIS_TILT),
+                            pressureSizeEnabled
+                        )
+                    } else {
+                        calculateFountainPenWidth(event.pressure)
+                    }
+                    currentStrokePoints.add(StrokePoint(bx, by, initialWidth))
                 }
                 invalidate()
                 return true
@@ -2920,41 +3251,50 @@ class DrawingCanvasView @JvmOverloads constructor(
                     invalidate()
                     return true
                 }
-                if (currentTool == CanvasTool.FOUNTAIN_PEN) {
+                if (currentTool == CanvasTool.FOUNTAIN_PEN || currentTool == CanvasTool.PENCIL) {
+                    val tiltRad = event.getAxisValue(MotionEvent.AXIS_TILT)
                     for (h in 0 until event.historySize) {
                         val hPts = floatArrayOf(event.getHistoricalX(h), event.getHistoricalY(h))
                         pageInverseMatrix.mapPoints(hPts)
-                        val hx = hPts[0]
-                        val hy = hPts[1]
+                        val hx = if (isA4) hPts[0].coerceIn(0f, pageW) else hPts[0]
+                        val hy = if (isA4) hPts[1].coerceIn(0f, pageH) else hPts[1]
                         val last = currentStrokePoints.lastOrNull()
                         val distSq = if (last != null) {
                             (hx - last.x) * (hx - last.x) + (hy - last.y) * (hy - last.y)
                         } else 999f
                         if (distSq >= 4f) {
-                            val hw = calculateFountainPenWidth(event.getHistoricalPressure(h))
+                            val hw = if (currentTool == CanvasTool.PENCIL) {
+                                PencilGrainShader.calculatePencilWidth(strokeWidthPx, event.getHistoricalPressure(h), tiltRad, pressureSizeEnabled)
+                            } else {
+                                calculateFountainPenWidth(event.getHistoricalPressure(h))
+                            }
                             currentStrokePoints.add(StrokePoint(hx, hy, hw))
                             sampledPoints.add(hx to hy)
                         }
                     }
                     val last = currentStrokePoints.lastOrNull()
                     val distSq = if (last != null) {
-                        (x - last.x) * (x - last.x) + (y - last.y) * (y - last.y)
+                        (bx - last.x) * (bx - last.x) + (by - last.y) * (by - last.y)
                     } else 999f
                     if (distSq >= 4f) {
-                        val w = calculateFountainPenWidth(event.pressure)
-                        currentStrokePoints.add(StrokePoint(x, y, w))
-                        sampledPoints.add(x to y)
+                        val w = if (currentTool == CanvasTool.PENCIL) {
+                            PencilGrainShader.calculatePencilWidth(strokeWidthPx, event.pressure, tiltRad, pressureSizeEnabled)
+                        } else {
+                            calculateFountainPenWidth(event.pressure)
+                        }
+                        currentStrokePoints.add(StrokePoint(bx, by, w))
+                        sampledPoints.add(bx to by)
                     }
                     invalidate()
                     return true
                 }
-                val dx = Math.abs(x - lastTouchX)
-                val dy = Math.abs(y - lastTouchY)
+                val dx = Math.abs(bx - lastTouchX)
+                val dy = Math.abs(by - lastTouchY)
                 if (dx >= 2 || dy >= 2) {
-                    currentPath.quadTo(lastTouchX, lastTouchY, (x + lastTouchX) / 2, (y + lastTouchY) / 2)
-                    lastTouchX = x
-                    lastTouchY = y
-                    sampledPoints.add(x to y)
+                    currentPath.quadTo(lastTouchX, lastTouchY, (bx + lastTouchX) / 2, (by + lastTouchY) / 2)
+                    lastTouchX = bx
+                    lastTouchY = by
+                    sampledPoints.add(bx to by)
                 }
                 invalidate()
                 return true
@@ -2971,18 +3311,21 @@ class DrawingCanvasView @JvmOverloads constructor(
                     invalidate()
                     return true
                 }
-                val fountain = currentTool == CanvasTool.FOUNTAIN_PEN && currentStrokePoints.isNotEmpty()
+                val fountain = (currentTool == CanvasTool.FOUNTAIN_PEN || currentTool == CanvasTool.PENCIL) && currentStrokePoints.isNotEmpty()
                 if (fountain) {
                     val last = currentStrokePoints.last()
-                    val distSq = (x - last.x) * (x - last.x) + (y - last.y) * (y - last.y)
+                    val distSq = (bx - last.x) * (bx - last.x) + (by - last.y) * (by - last.y)
                     if (distSq > 1f) {
                         val finalWidth = if (lastSmoothedWidth > 0f) lastSmoothedWidth * 0.85f else strokeWidthPx
-                        currentStrokePoints.add(StrokePoint(x, y, finalWidth))
-                        sampledPoints.add(x to y)
+                        currentStrokePoints.add(StrokePoint(bx, by, finalWidth))
+                        sampledPoints.add(bx to by)
                     }
                 } else {
-                    currentPath.lineTo(x, y)
-                    sampledPoints.add(x to y)
+                    currentPath.lineTo(bx, by)
+                    if (currentTool == CanvasTool.SHAPE_FILL) {
+                        currentPath.close()
+                    }
+                    sampledPoints.add(bx to by)
                 }
 
                 // Where the marks of this stroke belong:
@@ -2993,7 +3336,7 @@ class DrawingCanvasView @JvmOverloads constructor(
                 //  - otherwise   -> straight into the page ink, as before.
                 val marks = strokeInkBounds()
                 val onLayer = currentLayerOwnsInk()
-                val offPaper = marks != null && !paperRect().contains(marks)
+                val offPaper = !isA4 && marks != null && !paperRect().contains(marks)
                 val drawStroke: (android.graphics.Canvas) -> Unit = { c ->
                     if (fountain) {
                         if (autoShapeEnabled) {
@@ -3110,7 +3453,7 @@ class DrawingCanvasView @JvmOverloads constructor(
      * the nib so round caps and the wide highlighter stay inside the box.
      */
     private fun strokeInkBounds(): Rect? {
-        val fountain = currentTool == CanvasTool.FOUNTAIN_PEN && currentStrokePoints.isNotEmpty()
+        val fountain = (currentTool == CanvasTool.FOUNTAIN_PEN || currentTool == CanvasTool.PENCIL) && currentStrokePoints.isNotEmpty()
         val pts: List<Pair<Float, Float>> =
             if (fountain) currentStrokePoints.map { it.x to it.y } else sampledPoints
         if (pts.isEmpty()) return null
@@ -3162,9 +3505,14 @@ class DrawingCanvasView @JvmOverloads constructor(
                 onCanvasTouchStart?.invoke()
             }
             MotionEvent.ACTION_MOVE -> {
+                for (hIdx in 0 until event.historySize) {
+                    val hPts = floatArrayOf(event.getHistoricalX(hIdx), event.getHistoricalY(hIdx))
+                    pageInverseMatrix.mapPoints(hPts)
+                    laserTrail.add(LaserPoint(hPts[0], hPts[1], event.getHistoricalEventTime(hIdx)))
+                }
                 laserTrail.add(LaserPoint(pts[0], pts[1], now))
                 // Keep the tail short.
-                while (laserTrail.size > 48) laserTrail.removeAt(0)
+                while (laserTrail.size > 96) laserTrail.removeAt(0)
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 // The dot stays for a moment and fades out on its own.
@@ -3173,7 +3521,7 @@ class DrawingCanvasView @JvmOverloads constructor(
         invalidate()
     }
 
-    /** Draws the laser dot and its tail (page coordinates). */
+    /** Draws the laser dot and a smooth quadratic gradient tail (page coordinates). */
     private fun drawLaserPointer(canvas: Canvas) {
         if (laserTrail.isEmpty()) return
         val now = System.currentTimeMillis()
@@ -3182,12 +3530,41 @@ class DrawingCanvasView @JvmOverloads constructor(
             laserTrail.clear()
             return
         }
-        for (i in 1 until points.size) {
-            val a = points[i - 1]
-            val b = points[i]
-            val age = (now - b.time).toFloat().coerceAtMost(LASER_TRAIL_MS.toFloat())
-            laserGlowPaint.alpha = (90f * (1f - age / LASER_TRAIL_MS)).toInt().coerceIn(0, 255)
-            canvas.drawLine(a.x, a.y, b.x, b.y, laserGlowPaint)
+        if (points.size >= 2) {
+            val path = Path()
+            path.moveTo(points[0].x, points[0].y)
+            if (points.size == 2) {
+                path.lineTo(points[1].x, points[1].y)
+            } else {
+                for (i in 1 until points.size - 1) {
+                    val cur = points[i]
+                    val next = points[i + 1]
+                    path.quadTo(cur.x, cur.y, (cur.x + next.x) * 0.5f, (cur.y + next.y) * 0.5f)
+                }
+                path.lineTo(points.last().x, points.last().y)
+            }
+            val tail = points.first()
+            val head = points.last()
+            val tailAge = (now - tail.time).toFloat().coerceAtMost(LASER_TRAIL_MS.toFloat())
+            val tailAlpha = ((1f - tailAge / LASER_TRAIL_MS) * 60f).toInt().coerceIn(0, 60)
+            val tailColor = (tailAlpha shl 24) or 0x00FF3B30
+            val headColor = 0xC8FF3B30.toInt()
+            val smoothPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                style = Paint.Style.STROKE
+                strokeCap = Paint.Cap.ROUND
+                strokeJoin = Paint.Join.ROUND
+                strokeWidth = laserGlowPaint.strokeWidth
+                if (kotlin.math.hypot((head.x - tail.x).toDouble(), (head.y - tail.y).toDouble()) > 1.0) {
+                    shader = android.graphics.LinearGradient(
+                        tail.x, tail.y, head.x, head.y,
+                        tailColor, headColor,
+                        android.graphics.Shader.TileMode.CLAMP
+                    )
+                } else {
+                    color = headColor
+                }
+            }
+            canvas.drawPath(path, smoothPaint)
         }
         val head = points.last()
         laserGlowPaint.alpha = 70
@@ -3490,58 +3867,50 @@ class DrawingCanvasView @JvmOverloads constructor(
 
     private fun drawFountainPenStroke(canvas: Canvas, points: List<StrokePoint>, basePaint: Paint) {
         if (points.isEmpty()) return
-        fountainPenPaint.color = basePaint.color
-        fountainPenPaint.alpha = basePaint.alpha
-        fountainPenPaint.xfermode = basePaint.xfermode
+        val count = points.size
+        val xs = FloatArray(count) { points[it].x }
+        val ys = FloatArray(count) { points[it].y }
+        val ws = FloatArray(count) { points[it].width }
 
-        if (points.size == 1) {
-            val p0 = points[0]
-            fountainPenPaint.strokeWidth = p0.width
-            canvas.drawPoint(p0.x, p0.y, fountainPenPaint)
-            return
-        }
-
-        if (points.size == 2) {
-            val p0 = points[0]
-            val p1 = points[1]
-            drawTaperedLine(canvas, p0.x, p0.y, p0.width, p1.x, p1.y, p1.width, fountainPenPaint)
-            return
-        }
-
-        // Draw from first point to first midpoint
-        val p0 = points[0]
-        val p1 = points[1]
-        val m0X = (p0.x + p1.x) / 2f
-        val m0Y = (p0.y + p1.y) / 2f
-        val m0W = (p0.width + p1.width) / 2f
-        drawTaperedLine(canvas, p0.x, p0.y, p0.width, m0X, m0Y, m0W, fountainPenPaint)
-
-        // Draw intermediate quadratic beziers between midpoints
-        var prevMX = m0X
-        var prevMY = m0Y
-        var prevMW = m0W
-
-        for (i in 1 until points.size - 1) {
-            val curr = points[i]
-            val next = points[i + 1]
-            val nextMX = (curr.x + next.x) / 2f
-            val nextMY = (curr.y + next.y) / 2f
-            val nextMW = (curr.width + next.width) / 2f
-            drawTaperedQuad(
-                canvas,
-                prevMX, prevMY, prevMW,
-                curr.x, curr.y,
-                nextMX, nextMY, nextMW,
-                fountainPenPaint
+        if (currentTool == CanvasTool.PENCIL) {
+            val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                style = Paint.Style.FILL
+                color = basePaint.color
+            }
+            val baseAlpha = basePaint.alpha.coerceIn(24, 255)
+            // 1. Outer fibrous paper-tooth halo
+            fillPaint.shader = PencilGrainShader.shaderEdge
+            fillPaint.alpha = (baseAlpha * 0.32f).roundToInt().coerceIn(12, 255)
+            canvas.drawPath(
+                PencilGrainShader.buildVariableWidthRibbon(xs, ys, ws, count, widthMultiplier = 1.12f, taperEnds = false),
+                fillPaint
             )
-            prevMX = nextMX
-            prevMY = nextMY
-            prevMW = nextMW
+            // 2. Mid graphite body
+            fillPaint.shader = PencilGrainShader.shaderMid
+            fillPaint.alpha = (baseAlpha * 0.62f).roundToInt().coerceIn(20, 255)
+            canvas.drawPath(
+                PencilGrainShader.buildVariableWidthRibbon(xs, ys, ws, count, widthMultiplier = 0.80f, taperEnds = true),
+                fillPaint
+            )
+            // 3. Inner dense core
+            fillPaint.shader = PencilGrainShader.shaderCore
+            fillPaint.alpha = (baseAlpha * 0.78f).roundToInt().coerceIn(28, 255)
+            canvas.drawPath(
+                PencilGrainShader.buildVariableWidthRibbon(xs, ys, ws, count, widthMultiplier = 0.46f, taperEnds = true),
+                fillPaint
+            )
+            return
         }
 
-        // Draw from last midpoint to last point
-        val pLast = points.last()
-        drawTaperedLine(canvas, prevMX, prevMY, prevMW, pLast.x, pLast.y, pLast.width, fountainPenPaint)
+        val ribbonPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+            color = basePaint.color
+            alpha = basePaint.alpha
+            xfermode = basePaint.xfermode
+            shader = basePaint.shader
+        }
+        val ribbon = PencilGrainShader.buildVariableWidthRibbon(xs, ys, ws, count, widthMultiplier = 1f, taperEnds = true)
+        canvas.drawPath(ribbon, ribbonPaint)
     }
 
     private fun drawTaperedLine(

@@ -111,6 +111,16 @@ object BitmapUtils {
     fun getCachedImage(path: String, lastModified: Long): Bitmap? =
         imageCache["$path:$lastModified"]
 
+    fun invalidateImageCache(file: File) {
+        val prefix = "${file.absolutePath}:"
+        synchronized(imageCache) {
+            val keys = imageCache.keys.filter { it.startsWith(prefix) }
+            for (k in keys) {
+                imageCache.remove(k)
+            }
+        }
+    }
+
     /**
      * Decodes an image block attachment downsampled so its longest side is at
      * most [maxDimension] px (RGB_565). Small bounded cache: editor rows are

@@ -26,7 +26,7 @@ object TableModel {
             if (!line.startsWith("|")) continue
             val cells = line.removePrefix("|").removeSuffix("|")
                 .split('|')
-                .map { it.trim() }
+                .map { it.trim().replace("<br>", "\n", ignoreCase = true) }
             if (cells.all { SEPARATOR.matches(it) }) continue
             if (cells.isEmpty()) continue
             rows.add(cells)
@@ -41,7 +41,12 @@ object TableModel {
         if (rows.isEmpty()) return ""
         val width = rows.maxOf { it.size }
         fun line(cells: List<String>): String =
-            "| " + (0 until width).joinToString(" | ") { cells.getOrElse(it) { "" } } + " |"
+            "| " + (0 until width).joinToString(" | ") { idx ->
+                cells.getOrElse(idx) { "" }
+                    .replace("\r\n", "<br>")
+                    .replace("\n", "<br>")
+                    .replace("\r", "<br>")
+            } + " |"
         val out = ArrayList<String>(rows.size + 1)
         out.add(line(rows.first()))
         out.add("| " + (0 until width).joinToString(" | ") { "---" } + " |")

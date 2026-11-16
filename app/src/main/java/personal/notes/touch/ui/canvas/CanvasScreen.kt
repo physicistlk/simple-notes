@@ -67,6 +67,7 @@ import androidx.compose.material.icons.filled.CropSquare
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.FormatColorFill
 import androidx.compose.material.icons.filled.FormatShapes
 import androidx.compose.material.icons.filled.GridOn
 import androidx.compose.material.icons.filled.History
@@ -130,6 +131,7 @@ import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -390,6 +392,9 @@ fun CanvasScreen(
     var showDeleteNoteDialog by remember { mutableStateOf(false) }
     var showPdfPagePicker by remember { mutableStateOf(false) }
     var pendingPdfUri by remember { mutableStateOf<Uri?>(null) }
+    var showInfinitePdfColumnPicker by remember { mutableStateOf(false) }
+    var pendingInfinitePdfUri by remember { mutableStateOf<Uri?>(null) }
+    var selectedInfinitePdfColumns by remember { mutableIntStateOf(2) }
     /** True while the next PDF is picked as a page background, not imported. */
     var pdfImportAsBackground by remember { mutableStateOf(false) }
     var pendingPdfPageCount by remember { mutableStateOf(0) }
@@ -447,14 +452,23 @@ fun CanvasScreen(
     var colorPopupChipVert by remember { mutableIntStateOf(-1) }
 
     val isInfinite = (note?.pageType ?: "infinite") == "infinite"
-    val isContinuous = uiState.pageTurningMode == 0
     /** An infinite canvas is endless: no page frame, no desk, no edge. */
     val isInfiniteNote = note?.pageType == "infinite"
+    val isContinuous = uiState.pageTurningMode == 0 || isInfiniteNote
     val isHorizontal = uiState.pageTurningDirection == 1
 
     var continuousScale by remember { mutableFloatStateOf(1f) }
     var continuousPanX by remember { mutableFloatStateOf(0f) }
     var continuousPanY by remember { mutableFloatStateOf(0f) }
+    var singlePageScale by remember { mutableFloatStateOf(1f) }
+    var showZoomHud by remember { mutableStateOf(false) }
+    var zoomHudActivityTick by remember { mutableIntStateOf(0) }
+    LaunchedEffect(zoomHudActivityTick, showZoomHud) {
+        if (showZoomHud) {
+            kotlinx.coroutines.delay(2000L)
+            showZoomHud = false
+        }
+    }
 
     val showTabsState = uiState.showTabs
     val fixPreviewPageState = uiState.fixPreviewPage
@@ -465,6 +479,26 @@ fun CanvasScreen(
     val density = LocalDensity.current
     val screenWidthPx = with(density) { configuration.screenWidthDp.dp.toPx() }
     val screenHeightPx = with(density) { configuration.screenHeightDp.dp.toPx() }
+
+    var infiniteItems by remember(viewModel.noteId) {
+        mutableStateOf<List<InfiniteCanvasItem>>(emptyList())
+    }
+    var selectedInfiniteItemId by remember(viewModel.noteId) {
+        mutableStateOf<String?>(null)
+    }
+    val infiniteBitmapCache = remember(viewModel.noteId) {
+        InfiniteItemBitmapCache(viewModel.fileStore, viewModel.noteId, scope)
+    }
+    DisposableEffect(infiniteBitmapCache) {
+        onDispose { infiniteBitmapCache.close() }
+    }
+    LaunchedEffect(viewModel.noteId, isInfiniteNote) {
+        if (isInfiniteNote) {
+            infiniteItems = withContext(Dispatchers.IO) {
+                InfiniteItemsStore.load(viewModel.fileStore, viewModel.noteId)
+            }
+        }
+    }
 
     // F-10 PDF text selection: whether the current vector page has extractable
     // text, whether the Text tool is in selection mode, and the live selection.
@@ -655,9 +689,100 @@ fun CanvasScreen(
         )
     }
 
+    if (isInfiniteNote) {
+        inkController.infiniteWorldBounds = {
+            val snapshot = infiniteItems
+            if (snapshot.isEmpty()) {
+                null
+            } else {
+                var minX = Float.MAX_VALUE
+                var minY = Float.MAX_VALUE
+                var maxX = -Float.MAX_VALUE
+                var maxY = -Float.MAX_VALUE
+                for (item in snapshot) {
+                    val l = (item.centerX - item.width * 0.6f) / 2160f
+                    val t = (item.centerY - item.height * 0.6f) / 2160f
+                    val r = (item.centerX + item.width * 0.6f) / 2160f
+                    val b = (item.centerY + item.height * 0.6f) / 2160f
+                    if (l < minX) minX = l
+                    if (t < minY) minY = t
+                    if (r > maxX) maxX = r
+                    if (b > maxY) maxY = b
+                }
+                floatArrayOf(minX, minY, maxX, maxY)
+            }
+        }
+        inkController.infiniteBackdropDrawer = { canvas, worldLeft, worldTop, pxPerUnit ->
+            val snapshot = infiniteItems
+            if (snapshot.isNotEmpty()) {
+                val itemScale = pxPerUnit / 2160f
+                val worldRight = worldLeft + canvas.width.toFloat() / pxPerUnit
+                val worldBottom = worldTop + canvas.height.toFloat() / pxPerUnit
+                val minWx = worldLeft * 2160f
+                val minWy = worldTop * 2160f
+                val maxWx = worldRight * 2160f
+                val maxWy = worldBottom * 2160f
+                val save = canvas.save()
+                canvas.translate(-worldLeft * pxPerUnit, -worldTop * pxPerUnit)
+                canvas.scale(itemScale, itemScale)
+                val itemPaint = android.graphics.Paint(
+                    android.graphics.Paint.FILTER_BITMAP_FLAG or android.graphics.Paint.ANTI_ALIAS_FLAG
+                )
+                val paperFill = android.graphics.Paint().apply {
+                    color = android.graphics.Color.WHITE
+                    style = android.graphics.Paint.Style.FILL
+                }
+                val dst = android.graphics.RectF()
+                for (item in snapshot) {
+                    val halfSpan = maxOf(item.width, item.height) * 0.72f
+                    if (item.centerX + halfSpan < minWx || item.centerX - halfSpan > maxWx ||
+                        item.centerY + halfSpan < minWy || item.centerY - halfSpan > maxWy
+                    ) {
+                        continue
+                    }
+                    val bmp = infiniteBitmapCache.getExistingBitmapForBackdrop(item)
+                    val itemSave = canvas.save()
+                    canvas.translate(item.centerX, item.centerY)
+                    if (item.rotationDeg != 0f) {
+                        canvas.rotate(item.rotationDeg)
+                    }
+                    dst.set(
+                        -item.width / 2f,
+                        -item.height / 2f,
+                        item.width / 2f,
+                        item.height / 2f
+                    )
+                    if (item is InfiniteCanvasItem.PdfPageItem) {
+                        canvas.drawRect(dst, paperFill)
+                    }
+                    if (bmp != null && !bmp.isRecycled) {
+                        canvas.drawBitmap(bmp, null, dst, itemPaint)
+                    }
+                    canvas.restoreToCount(itemSave)
+                }
+                canvas.restoreToCount(save)
+            }
+        }
+    } else {
+        inkController.infiniteWorldBounds = null
+        inkController.infiniteBackdropDrawer = null
+    }
+    LaunchedEffect(isInfiniteNote, infiniteItems, infiniteBitmapCache.renderTick) {
+        if (isInfiniteNote) {
+            kotlinx.coroutines.delay(180)
+            inkController.refreshGlassCopy()
+        }
+    }
+
     val glassBackdropAt: (GlassOrigin) -> GlassBackdrop? = { origin ->
         val view = canvasViewRef
         if (isContinuous) {
+            // Observe ink revision and infinite item render ticks so the glass
+            // redraws immediately when background copies finish building.
+            @Suppress("UNUSED_EXPRESSION")
+            inkController.revision
+            @Suppress("UNUSED_EXPRESSION")
+            infiniteBitmapCache.renderTick
             // The reader scrolls in a Lazy list; its offset is the signal
             // that the page under the dock moved.
             @Suppress("UNUSED_EXPRESSION")
@@ -677,19 +802,65 @@ fun CanvasScreen(
             // reads the page at). The origin of the copy is the top-left
             // corner of the layer, so the glass still looks at the writing
             // that lies under it.
-            val panX = if (isHorizontal) 0f else continuousPanX
-            val panY = if (isHorizontal) continuousPanY else 0f
-            val mapping = inkController.layerScreenMapping(currentPageIndex, panX, panY)
+            val localOriginX = origin.x - canvasOriginInRoot.x
+            val localOriginY = origin.y - canvasOriginInRoot.y
+            val panX = if (isInfiniteNote) continuousPanX else if (isHorizontal) 0f else continuousPanX
+            val panY = if (isInfiniteNote) continuousPanY else if (isHorizontal) continuousPanY else 0f
+            val gridStepPx = if (isInfiniteNote) {
+                uiState.backgroundDensity.coerceIn(20, 80).toFloat() * 2f * continuousScale
+            } else 0f
+            val gridMode = if (isInfiniteNote) {
+                when (uiState.infiniteGridPreset) {
+                    InfiniteGridPreset.BLANK -> 0
+                    InfiniteGridPreset.LINED -> 1
+                    InfiniteGridPreset.GRAPH, InfiniteGridPreset.TRIANGLE -> 2
+                    InfiniteGridPreset.DOTS, InfiniteGridPreset.ISOMETRIC -> 3
+                }
+            } else 0
+            val gridOrigX = panX - localOriginX
+            val gridOrigY = panY - localOriginY
+            val mapping = inkController.layerScreenMapping(currentPageIndex, panX, panY, continuousScale)
             if (mapping != null) {
+                val pBox = continuousPageMap.pageBox?.takeIf { !isInfiniteNote && it.valid && it.pageIndex == currentPageIndex }
+                val pageOriginX: Float
+                val pageOriginY: Float
+                val invScale: Float
+                if (pBox != null) {
+                    val lRect = inkController.layerRectFor(
+                        currentPageIndex, pBox.width.toFloat(), pBox.height.toFloat()
+                    )
+                    val layerRootX = pBox.originX + lRect.left * pBox.width
+                    val layerRootY = pBox.originY + lRect.top * pBox.height
+                    val layerScreenW = (lRect.width * pBox.width).coerceAtLeast(1f)
+                    invScale = mapping.bitmap.width.toFloat() / layerScreenW
+                    pageOriginX = (origin.x - layerRootX) * invScale
+                    pageOriginY = (origin.y - layerRootY) * invScale
+                } else {
+                    val effOriginX = if (isInfiniteNote) localOriginX else {
+                        val pm = continuousPageMap.map
+                        if (pm != null && pm.pageIndex == currentPageIndex) origin.x - pm.offsetX + panX else localOriginX
+                    }
+                    val effOriginY = if (isInfiniteNote) localOriginY else {
+                        val pm = continuousPageMap.map
+                        if (pm != null && pm.pageIndex == currentPageIndex) origin.y - pm.offsetY + panY else localOriginY
+                    }
+                    invScale = mapping.scale
+                    pageOriginX = (effOriginX - mapping.originX) * invScale
+                    pageOriginY = (effOriginY - mapping.originY) * invScale
+                }
                 GlassBackdrop(
                     bitmap = mapping.bitmap,
                     // The origin of the glass in the pixels of the copy.
-                    pageOriginX = (origin.x - mapping.originX) * mapping.scale,
-                    pageOriginY = (origin.y - mapping.originY) * mapping.scale,
-                    invScale = mapping.scale,
+                    pageOriginX = pageOriginX,
+                    pageOriginY = pageOriginY,
+                    invScale = invScale,
                     // The copy is already as small as the glass reads the
                     // page: it is sampled as it is.
-                    sampleScale = 1f
+                    sampleScale = 1f,
+                    gridStepPx = gridStepPx,
+                    gridOriginX = gridOrigX,
+                    gridOriginY = gridOrigY,
+                    gridMode = gridMode
                 )
             } else {
                 // No layer (yet): the page image is the next best thing.
@@ -698,13 +869,27 @@ fun CanvasScreen(
                 if (map == null || bmp == null || map.scale <= 0f ||
                     map.pageIndex != glassReaderBitmapPage
                 ) {
-                    null
+                    GlassBackdrop(
+                        bitmap = null,
+                        pageOriginX = localOriginX - panX,
+                        pageOriginY = localOriginY - panY,
+                        invScale = 1f / continuousScale.coerceAtLeast(0.1f),
+                        sampleScale = 1f,
+                        gridStepPx = gridStepPx,
+                        gridOriginX = gridOrigX,
+                        gridOriginY = gridOrigY,
+                        gridMode = gridMode
+                    )
                 } else {
                     GlassBackdrop(
                         bitmap = bmp,
                         pageOriginX = (origin.x - map.offsetX) / map.scale,
                         pageOriginY = (origin.y - map.offsetY) / map.scale,
-                        invScale = 1f / map.scale
+                        invScale = 1f / map.scale,
+                        gridStepPx = gridStepPx,
+                        gridOriginX = gridOrigX,
+                        gridOriginY = gridOrigY,
+                        gridMode = gridMode
                     )
                 }
             }
@@ -722,7 +907,7 @@ fun CanvasScreen(
                 val p0 = view.viewPointToPage(lx, ly)
                 val p1 = view.viewPointToPage(lx + 1f, ly)
                 val sx = p1[0] - p0[0]
-                if (sx <= 0.0001f) null else GlassBackdrop(bmp, p0[0], p0[1], 1f / sx)
+                if (sx <= 0.0001f) null else GlassBackdrop(bmp, p0[0], p0[1], sx)
             }
         }
     }
@@ -1058,6 +1243,45 @@ fun CanvasScreen(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         uri?.let {
+            if (isInfiniteNote) {
+                scope.launch {
+                    val placed = withContext(Dispatchers.IO) {
+                        val fileName = viewModel.fileStore.saveNoteImage(viewModel.noteId, it) ?: return@withContext null
+                        val file = viewModel.fileStore.getNoteAsset(viewModel.noteId, fileName) ?: return@withContext null
+                        val opts = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                        android.graphics.BitmapFactory.decodeFile(file.absolutePath, opts)
+                        val rawW = opts.outWidth.coerceAtLeast(1).toFloat()
+                        val rawH = opts.outHeight.coerceAtLeast(1).toFloat()
+                        val maxWorld = 1200f
+                        val ratio = maxWorld / maxOf(rawW, rawH)
+                        val w = rawW * ratio
+                        val h = rawH * ratio
+                        val cx = (-continuousPanX + screenWidthPx / 2f) / continuousScale.coerceAtLeast(0.1f)
+                        val cy = (-continuousPanY + screenHeightPx / 2f) / continuousScale.coerceAtLeast(0.1f)
+                        InfiniteCanvasItem.ImageItem(
+                            id = java.util.UUID.randomUUID().toString(),
+                            fileName = fileName,
+                            centerX = cx,
+                            centerY = cy,
+                            width = w,
+                            height = h
+                        )
+                    }
+                    if (placed != null) {
+                        val updated = infiniteItems + placed
+                        infiniteItems = updated
+                        selectedInfiniteItemId = placed.id
+                        withContext(Dispatchers.IO) {
+                            InfiniteItemsStore.save(viewModel.fileStore, viewModel.noteId, updated)
+                        }
+                    } else {
+                        android.widget.Toast.makeText(
+                            context, "Could not load image", android.widget.Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
+                return@let
+            }
             scope.launch {
                 try {
                     // Decode off the main thread (same pattern as
@@ -1086,6 +1310,79 @@ fun CanvasScreen(
         }
     }
 
+    val importPdfToInfiniteCanvas: (Uri, Int) -> Unit = { sourceUri, requestedCols ->
+        scope.launch {
+            val newPages = withContext(Dispatchers.IO) {
+                val pdfFileName = InfiniteItemsStore.copyPdfToNoteDir(
+                    context, viewModel.fileStore, viewModel.noteId, sourceUri
+                ) ?: return@withContext emptyList<InfiniteCanvasItem.PdfPageItem>()
+                val pdfFile = viewModel.fileStore.getNoteAsset(viewModel.noteId, pdfFileName)
+                    ?: return@withContext emptyList<InfiniteCanvasItem.PdfPageItem>()
+                val doc = personal.notes.touch.util.PdfiumDocument.open(pdfFile)
+                    ?: return@withContext emptyList<InfiniteCanvasItem.PdfPageItem>()
+                try {
+                    val count = doc.pageCount
+                    if (count <= 0) return@withContext emptyList<InfiniteCanvasItem.PdfPageItem>()
+                    val cols = minOf(count, requestedCols.coerceIn(1, 4)).coerceAtLeast(1)
+                    val cellW = 1440f
+                    val gap = 96f
+                    val originX = (-continuousPanX + screenWidthPx / 2f) / continuousScale.coerceAtLeast(0.1f)
+                    val originY = (-continuousPanY + screenHeightPx / 2f) / continuousScale.coerceAtLeast(0.1f)
+                    val startX = originX - ((cols - 1) * (cellW + gap)) / 2f
+                    var rowY = originY
+                    var rowMaxH = 0f
+                    val list = mutableListOf<InfiniteCanvasItem.PdfPageItem>()
+                    for (p in 0 until count) {
+                        val sz = doc.pageSize(p)
+                        val ptsW = if (sz[0] > 0f) sz[0] else 595f
+                        val ptsH = if (sz[1] > 0f) sz[1] else 842f
+                        val w = cellW
+                        val h = (cellW * (ptsH / ptsW)).coerceIn(360f, 4500f)
+                        val col = p % cols
+                        if (col == 0 && p > 0) {
+                            rowY += rowMaxH + gap
+                            rowMaxH = 0f
+                        }
+                        if (h > rowMaxH) rowMaxH = h
+                        val cx = startX + col * (cellW + gap)
+                        val cy = rowY
+                        list.add(
+                            InfiniteCanvasItem.PdfPageItem(
+                                id = java.util.UUID.randomUUID().toString(),
+                                pdfFileName = pdfFileName,
+                                pdfPageIndex = p,
+                                centerX = cx,
+                                centerY = cy,
+                                width = w,
+                                height = h
+                            )
+                        )
+                    }
+                    list
+                } finally {
+                    doc.close()
+                }
+            }
+            if (newPages.isNotEmpty()) {
+                val updated = infiniteItems + newPages
+                infiniteItems = updated
+                selectedInfiniteItemId = newPages.first().id
+                withContext(Dispatchers.IO) {
+                    InfiniteItemsStore.save(viewModel.fileStore, viewModel.noteId, updated)
+                }
+                android.widget.Toast.makeText(
+                    context,
+                    "Placed ${newPages.size} PDF pages in ${requestedCols.coerceIn(1, 4)} column(s)",
+                    android.widget.Toast.LENGTH_SHORT
+                ).show()
+            } else {
+                android.widget.Toast.makeText(
+                    context, "Could not open PDF", android.widget.Toast.LENGTH_SHORT
+                ).show()
+            }
+        }
+    }
+
     // PDF Picker Launcher — vector import (defect F-10): the source PDF is
     // kept with the note and pages are re-rendered from pdfium at any zoom
     // level (sharp text, no raster upscaling). The stroke layer is never
@@ -1094,6 +1391,12 @@ fun CanvasScreen(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
         uri?.let {
+            if (isInfiniteNote) {
+                pdfImportAsBackground = false
+                pendingInfinitePdfUri = it
+                showInfinitePdfColumnPicker = true
+                return@let
+            }
             if (pdfImportAsBackground) {
                 // "Set page background": the picked PDF is not imported, the
                 // user chooses one of its pages for the current page.
@@ -1477,6 +1780,88 @@ fun CanvasScreen(
         )
     }
 
+    // Dialog: Infinite Canvas PDF Column Arrangement Picker (1, 2, 3, or 4 columns)
+    if (showInfinitePdfColumnPicker && pendingInfinitePdfUri != null) {
+        AlertDialog(
+            onDismissRequest = {
+                showInfinitePdfColumnPicker = false
+                pendingInfinitePdfUri = null
+            },
+            title = { Text("Import PDF to Canvas") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(
+                        text = "Choose how many columns to arrange the PDF pages in:",
+                        fontSize = 14.sp,
+                        color = Color(0xFF475467)
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        for (colOption in 1..4) {
+                            val isSelected = selectedInfinitePdfColumns == colOption
+                            Surface(
+                                shape = RoundedCornerShape(10.dp),
+                                color = if (isSelected) OrangePrimary.copy(alpha = 0.12f) else Color(0xFFF2F4F7),
+                                border = BorderStroke(
+                                    width = if (isSelected) 1.5.dp else 1.dp,
+                                    color = if (isSelected) OrangePrimary else Color(0xFFD0D5DD)
+                                ),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clickable { selectedInfinitePdfColumns = colOption }
+                            ) {
+                                Column(
+                                    modifier = Modifier.padding(vertical = 12.dp, horizontal = 4.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Text(
+                                        text = "$colOption",
+                                        fontSize = 18.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = if (isSelected) OrangePrimary else Color(0xFF1D2939)
+                                    )
+                                    Text(
+                                        text = if (colOption == 1) "Column" else "Columns",
+                                        fontSize = 11.sp,
+                                        color = if (isSelected) OrangePrimary else Color(0xFF667085)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val targetUri = pendingInfinitePdfUri
+                        val cols = selectedInfinitePdfColumns.coerceIn(1, 4)
+                        showInfinitePdfColumnPicker = false
+                        pendingInfinitePdfUri = null
+                        if (targetUri != null) {
+                            importPdfToInfiniteCanvas(targetUri, cols)
+                        }
+                    }
+                ) {
+                    Text("Import", color = OrangePrimary, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        showInfinitePdfColumnPicker = false
+                        pendingInfinitePdfUri = null
+                    }
+                ) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
     // Dialog: PDF Page Picker
     if (showPdfPagePicker && pendingPdfUri != null) {
         AlertDialog(
@@ -1826,44 +2211,8 @@ fun CanvasScreen(
                                 )
                             }
 
-                            // The zoom and the pan are two actions: the
-                            // reset puts the zoom back to 100 %, the centre
-                            // brings the canvas back to its origin.
-                            //
-                            // In the reader they live in the zoom pill (the
-                            // top bar was so full that the button of the
-                            // right panel was cut off the screen); the single
-                            // page mode has no pill, so they stay here.
-                            if (!isContinuous) {
-                                IconButton(onClick = {
-                                    canvasViewRef?.resetZoom()
-                                    android.widget.Toast.makeText(
-                                        context,
-                                        "Zoom reset to 100%",
-                                        android.widget.Toast.LENGTH_SHORT
-                                    ).show()
-                                }) {
-                                    Icon(
-                                        imageVector = Icons.Default.Refresh,
-                                        contentDescription = "Reset zoom",
-                                        tint = Color(0xFF555555)
-                                    )
-                                }
-                                IconButton(onClick = {
-                                    canvasViewRef?.resetPan()
-                                    android.widget.Toast.makeText(
-                                        context,
-                                        "Canvas centred",
-                                        android.widget.Toast.LENGTH_SHORT
-                                    ).show()
-                                }) {
-                                    Icon(
-                                        imageVector = Icons.Default.CenterFocusStrong,
-                                        contentDescription = "Centre canvas",
-                                        tint = Color(0xFF555555)
-                                    )
-                                }
-                            }
+                            // Zoom / Reset / Center live in the auto-fading top-center
+                            // HUD pill across all note types and modes.
 
                             Spacer(modifier = Modifier.width(8.dp))
 
@@ -2211,55 +2560,80 @@ fun CanvasScreen(
                  */
                 val handleReaderTransform: (androidx.compose.ui.geometry.Offset, androidx.compose.ui.geometry.Offset, Float) -> Unit =
                     { centroid, pan, zoom ->
-                        val listState = if (isHorizontal) continuousRowState else continuousColState
-                        val layout = readerLayout(
-                            listState = listState,
-                            centroid = centroid,
-                            horizontal = isHorizontal,
-                            doublePage = uiState.doublePageMode,
-                            scale = continuousScale,
-                            screenWidthPx = screenWidthPx,
-                            screenHeightPx = screenHeightPx,
-                            pageSpacingPx = with(density) { 16.dp.toPx() },
-                            crossPan = if (isHorizontal) continuousPanY else continuousPanX
-                        )
-                        val state = ReaderTransform.State(
-                            scale = continuousScale,
-                            panX = continuousPanX,
-                            panY = continuousPanY
-                        )
-                        val gesture = ReaderTransform.Gesture(
-                            centroidX = centroid.x,
-                            centroidY = centroid.y,
-                            panX = pan.x,
-                            panY = pan.y,
-                            zoom = zoom
-                        )
-                        val result = ReaderTransform.apply(
-                            state = state,
-                            gesture = gesture,
-                            layout = layout,
-                            zoomLocked = uiState.zoomLocked
-                        )
-                        // The list scrolls first: the pages have to move
-                        // before they are measured bigger. Any scroll delta not
-                        // consumed by the list (e.g. single-page A4 notes or boundaries)
-                        // translates into pan offset so the page can be panned in both axes.
-                        val consumed = if (result.scrollDelta != 0f) {
-                            listState.dispatchRawDelta(result.scrollDelta)
-                        } else 0f
-                        val unconsumed = result.scrollDelta - consumed
-                        val pullLimit = ReaderTransform.pullLimit(
-                            if (isHorizontal) screenHeightPx else screenWidthPx,
-                            result.state.scale
-                        )
-                        continuousScale = result.state.scale
-                        if (isHorizontal) {
-                            continuousPanX = (result.state.panX - unconsumed).coerceIn(-pullLimit, pullLimit)
-                            continuousPanY = result.state.panY
+                        if (isInfiniteNote) {
+                            if (zoom.isFinite() && pan.x.isFinite() && pan.y.isFinite() &&
+                                centroid.x.isFinite() && centroid.y.isFinite()
+                            ) {
+                                val oldScale = continuousScale.coerceIn(0.1f, 10.0f)
+                                val newScale = if (uiState.zoomLocked) {
+                                    oldScale
+                                } else {
+                                    (oldScale * zoom).coerceIn(0.1f, 10.0f)
+                                }
+                                val factor = newScale / oldScale
+                                continuousScale = newScale
+                                continuousPanX = (centroid.x - (centroid.x - continuousPanX) * factor + pan.x)
+                                    .coerceIn(-1_000_000f, 1_000_000f)
+                                continuousPanY = (centroid.y - (centroid.y - continuousPanY) * factor + pan.y)
+                                    .coerceIn(-1_000_000f, 1_000_000f)
+                                if (kotlin.math.abs(zoom - 1f) > 0.0005f) {
+                                    showZoomHud = true
+                                    zoomHudActivityTick++
+                                }
+                            }
                         } else {
-                            continuousPanX = result.state.panX
-                            continuousPanY = (result.state.panY - unconsumed).coerceIn(-pullLimit, pullLimit)
+                            val listState = if (isHorizontal) continuousRowState else continuousColState
+                            val layout = readerLayout(
+                                listState = listState,
+                                centroid = centroid,
+                                horizontal = isHorizontal,
+                                doublePage = uiState.doublePageMode,
+                                scale = continuousScale,
+                                screenWidthPx = screenWidthPx,
+                                screenHeightPx = screenHeightPx,
+                                pageSpacingPx = with(density) { 16.dp.toPx() },
+                                crossPan = if (isHorizontal) continuousPanY else continuousPanX
+                            )
+                            val state = ReaderTransform.State(
+                                scale = continuousScale,
+                                panX = continuousPanX,
+                                panY = continuousPanY
+                            )
+                            val gesture = ReaderTransform.Gesture(
+                                centroidX = centroid.x,
+                                centroidY = centroid.y,
+                                panX = pan.x,
+                                panY = pan.y,
+                                zoom = zoom
+                            )
+                            val result = ReaderTransform.apply(
+                                state = state,
+                                gesture = gesture,
+                                layout = layout,
+                                zoomLocked = uiState.zoomLocked
+                            )
+                            // The list scrolls first: the pages have to move
+                            // before they are measured bigger. Any scroll delta not
+                            // consumed by the list (e.g. single-page A4 notes or boundaries)
+                            // translates into pan offset so the page can be panned in both axes.
+                            val consumed = if (result.scrollDelta != 0f) {
+                                listState.dispatchRawDelta(result.scrollDelta)
+                            } else 0f
+                            val unconsumed = result.scrollDelta - consumed
+                            val pullLimit = ReaderTransform.pullLimit(
+                                if (isHorizontal) screenHeightPx else screenWidthPx,
+                                result.state.scale
+                            )
+                            continuousScale = result.state.scale
+                            if (isHorizontal) {
+                                continuousPanX = (result.state.panX - unconsumed).coerceIn(-pullLimit, pullLimit)
+                                continuousPanY = result.state.panY
+                            } else {
+                                continuousPanX = result.state.panX
+                                continuousPanY = (result.state.panY - unconsumed).coerceIn(-pullLimit, pullLimit)
+                            }
+                            showZoomHud = true
+                            zoomHudActivityTick++
                         }
                     }
 
@@ -2292,7 +2666,8 @@ fun CanvasScreen(
                     pressureSizeEnabled = uiState.pressureSizeEnabled,
                     stylusOnly = uiState.stylusOnly,
                     readingMode = uiState.readingMode,
-                    autoShapeEnabled = uiState.autoShapeEnabled
+                    autoShapeEnabled = uiState.autoShapeEnabled,
+                    opacity = uiState.strokeOpacity
                 )
 
 
@@ -2363,6 +2738,7 @@ fun CanvasScreen(
                 }
 
                 // Drawing Canvas (always mounted in composition)
+                val currentIsContinuous by androidx.compose.runtime.rememberUpdatedState(isContinuous)
                 AndroidView(
                     factory = { ctx ->
                         DrawingCanvasView(ctx).apply {
@@ -2377,9 +2753,6 @@ fun CanvasScreen(
                             onThreeFingerTap = { handleClipboardPaste() }
                             // Any touch on the page closes the open menus.
                             onCanvasTouchStart = { dismissCanvasOverlays() }
-                            // The glass samples the page under the dock: it
-                            // has to redraw when the page moves.
-                            onViewportChanged = { glassViewportTick++ }
                             onImageSelectionChanged = {
                                 selectedImageIndex = it
                             }
@@ -2411,7 +2784,16 @@ fun CanvasScreen(
                             onUndoRedoListener = { canUndo, canRedo ->
                                 viewModel.updateUndoRedo(canUndo, canRedo)
                             }
+                            onViewportChanged = {
+                                if (!currentIsContinuous) {
+                                    singlePageScale = scale
+                                    showZoomHud = true
+                                    zoomHudActivityTick++
+                                    glassViewportTick++
+                                }
+                            }
                             onStrokeFinishedListener = {
+                                glassViewportTick++
                                 getBackingBitmap()?.let { bmp ->
                                     viewModel.scheduleDebouncedSave(bmp)
                                 }
@@ -2512,7 +2894,11 @@ fun CanvasScreen(
                     val pageWidthDp = with(density) { (screenWidthPx * continuousScale).toDp() }
                     val pageHeightDp = with(density) { (screenHeightPx * continuousScale).toDp() }
 
-                    Box(modifier = Modifier.fillMaxSize()) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .onGloballyPositioned { canvasOriginInRoot = it.positionInRoot() }
+                    ) {
                         Box(
                             modifier = Modifier
                                 .fillMaxSize()
@@ -2582,8 +2968,173 @@ fun CanvasScreen(
                                         }
                                     }
                                 }
+                                .pointerInput(note?.pageType, currentPageIndex, inkSettings, continuousZoomBucket, pages) {
+                                    if (isInfiniteNote || note?.pageType == "a4") return@pointerInput
+                                    if (inkSettings.readingMode) return@pointerInput
+                                    try {
+                                        awaitEachGesture {
+                                            val down = awaitFirstDown(requireUnconsumed = false)
+                                            if (down.isConsumed) return@awaitEachGesture
+                                            val isStylus = down.type == PointerType.Stylus || down.type == PointerType.Eraser
+                                            if (isStylus) viewModel.onStylusDetected()
+                                            val isAllowedPointer = isStylus || (!inkSettings.stylusOnly && down.type == PointerType.Touch)
+                                            if (!isAllowedPointer || !inkSettings.isWritingTool || inkSettings.isLaserPointer) {
+                                                return@awaitEachGesture
+                                            }
+                                            val box = continuousPageMap.pageBox ?: return@awaitEachGesture
+                                            if (box.width <= 0 || box.height <= 0) return@awaitEachGesture
+                                            val targetIndex = if (pages.getOrNull(box.pageIndex) != null) box.pageIndex else currentPageIndex
+                                            val targetPage = pages.getOrNull(targetIndex) ?: return@awaitEachGesture
+                                            val boxW = box.width.toFloat()
+                                            val boxH = box.height.toFloat()
+                                            fun toNorm(pos: androidx.compose.ui.geometry.Offset): Pair<Float, Float> {
+                                                val rx = canvasOriginInRoot.x + pos.x
+                                                val ry = canvasOriginInRoot.y + pos.y
+                                                return ((rx - box.originX) / boxW) to ((ry - box.originY) / boxH)
+                                            }
+                                            val (sx, sy) = toNorm(down.position)
+                                            down.consume()
+                                            val renderW = (boxW * continuousZoomBucket).roundToInt().coerceIn(1, MAX_PAGE_RENDER_WIDTH_PX)
+                                            inkController.beginStroke(
+                                                page = targetPage,
+                                                pageIndex = targetIndex,
+                                                x = sx,
+                                                y = sy,
+                                                pressure = down.pressure,
+                                                boxWidth = boxW,
+                                                boxHeight = boxH,
+                                                renderWidthPx = renderW,
+                                                settings = inkSettings,
+                                                tilt = personal.notes.touch.StylusTiltTracker.currentTiltRad
+                                            )
+                                            while (true) {
+                                                val event = awaitPointerEvent()
+                                                if (event.changes.count { it.pressed } > 1) {
+                                                    inkController.cancelStroke()
+                                                    break
+                                                }
+                                                val change = event.changes.firstOrNull { it.id == down.id }
+                                                if (change == null) {
+                                                    inkController.cancelStroke()
+                                                    break
+                                                }
+                                                val (cx, cy) = toNorm(change.position)
+                                                val tiltNow = personal.notes.touch.StylusTiltTracker.currentTiltRad
+                                                @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
+                                                fun processHistory(c: androidx.compose.ui.input.pointer.PointerInputChange) {
+                                                    for (hp in c.historical) {
+                                                        val (hx, hy) = toNorm(hp.position)
+                                                        inkController.extendStroke(hx, hy, c.pressure, inkSettings, tiltNow)
+                                                    }
+                                                }
+                                                processHistory(change)
+                                                if (change.changedToUpIgnoreConsumed()) {
+                                                    inkController.endStroke(cx, cy, change.pressure, inkSettings, tiltNow)
+                                                    change.consume()
+                                                    break
+                                                }
+                                                inkController.extendStroke(cx, cy, change.pressure, inkSettings, tiltNow)
+                                                change.consume()
+                                            }
+                                        }
+                                    } finally {
+                                        inkController.cancelStroke()
+                                    }
+                                }
                         ) {
-                            if (isHorizontal) {
+                            if (isInfiniteNote) {
+                                val page = pages.firstOrNull() ?: personal.notes.touch.data.db.entity.PageEntity(
+                                    id = java.util.UUID.randomUUID().toString(),
+                                    noteId = viewModel.noteId,
+                                    index = 0,
+                                    bitmapPath = "",
+                                    updatedAt = System.currentTimeMillis()
+                                )
+                                InfiniteCanvasView(
+                                    page = page,
+                                    pageIndex = 0,
+                                    noteId = viewModel.noteId,
+                                    ink = inkController,
+                                    inkSettings = inkSettings,
+                                    scale = continuousScale,
+                                    panX = continuousPanX,
+                                    panY = continuousPanY,
+                                    backgroundDensity = uiState.backgroundDensity,
+                                    gridPreset = uiState.infiniteGridPreset,
+                                    snapToGrid = uiState.gridSnapEnabled,
+                                    strokeOpacity = uiState.strokeOpacity,
+                                    items = infiniteItems,
+                                    selectedItemId = selectedInfiniteItemId,
+                                    bitmapCache = infiniteBitmapCache,
+                                    onSelectItem = { selectedInfiniteItemId = it },
+                                    onUpdateItem = { updated ->
+                                        infiniteItems = infiniteItems.map { if (it.id == updated.id) updated else it }
+                                    },
+                                    onCommitItems = {
+                                        val snapshot = infiniteItems
+                                        scope.launch(Dispatchers.IO) {
+                                            InfiniteItemsStore.save(viewModel.fileStore, viewModel.noteId, snapshot)
+                                        }
+                                    },
+                                    onDeleteItem = { itemId ->
+                                        val updated = infiniteItems.filterNot { it.id == itemId }
+                                        infiniteItems = updated
+                                        if (selectedInfiniteItemId == itemId) selectedInfiniteItemId = null
+                                        scope.launch(Dispatchers.IO) {
+                                            InfiniteItemsStore.save(viewModel.fileStore, viewModel.noteId, updated)
+                                        }
+                                    },
+                                    onResetTransform = {
+                                        val center = inkController.computeArtworkCenter(0)
+                                        continuousScale = 1.0f
+                                        if (center != null) {
+                                            continuousPanX = screenWidthPx / 2f - center.first
+                                            continuousPanY = screenHeightPx / 2f - center.second
+                                        } else {
+                                            continuousPanX = 0f
+                                            continuousPanY = 0f
+                                        }
+                                    },
+                                    onCycleGridPreset = {
+                                        viewModel.cycleInfiniteGridPreset()
+                                    },
+                                    onSnapToggle = {
+                                        viewModel.toggleGridSnap()
+                                    },
+                                    onOpacityChange = { newAlpha ->
+                                        viewModel.setStrokeOpacity(newAlpha)
+                                    },
+                                    onQuickClear = {
+                                        inkController.clearCurrentLayer(0)
+                                    },
+                                    onStylusDetected = { viewModel.onStylusDetected() },
+                                    onPanZoom = { dPanX, dPanY, dZoom, centroid ->
+                                        if (!dPanX.isFinite() || !dPanY.isFinite() || !dZoom.isFinite() ||
+                                            !centroid.x.isFinite() || !centroid.y.isFinite()
+                                        ) {
+                                            return@InfiniteCanvasView
+                                        }
+                                        val oldScale = continuousScale.coerceIn(0.1f, 10.0f)
+                                        val newScale = if (uiState.zoomLocked) {
+                                            oldScale
+                                        } else {
+                                            (oldScale * dZoom).coerceIn(0.1f, 10.0f)
+                                        }
+                                        val factor = newScale / oldScale
+                                        continuousScale = newScale
+                                        continuousPanX = (centroid.x - (centroid.x - continuousPanX) * factor + dPanX)
+                                            .coerceIn(-1_000_000f, 1_000_000f)
+                                        continuousPanY = (centroid.y - (centroid.y - continuousPanY) * factor + dPanY)
+                                            .coerceIn(-1_000_000f, 1_000_000f)
+                                        if (kotlin.math.abs(dZoom - 1f) > 0.0005f) {
+                                            showZoomHud = true
+                                            zoomHudActivityTick++
+                                        }
+                                    },
+                                    onDismissOverlays = { dismissCanvasOverlays() },
+                                    modifier = Modifier.fillMaxSize()
+                                )
+                            } else if (isHorizontal) {
                                 androidx.compose.foundation.lazy.LazyRow(
                                     state = continuousRowState,
                                     modifier = Modifier.fillMaxSize(),
@@ -2615,6 +3166,7 @@ fun CanvasScreen(
                                                 readerLayers = readerLayers,
                                                 onPageMapping = { continuousPageMap.map = it },
                                                 onImageMapping = { continuousPageMap.imageMap = it },
+                                                onPageBox = { continuousPageMap.pageBox = it },
                                                 zoom = continuousZoomBucket,
                                                 ink = inkController,
                                                 inkSettings = inkSettings,
@@ -2684,6 +3236,7 @@ fun CanvasScreen(
                                                         readerLayers = readerLayers,
                                                         onPageMapping = { continuousPageMap.map = it },
                                                         onImageMapping = { continuousPageMap.imageMap = it },
+                                                        onPageBox = { continuousPageMap.pageBox = it },
                                                         zoom = continuousZoomBucket,
                                                         ink = inkController,
                                                         inkSettings = inkSettings,
@@ -2753,6 +3306,7 @@ fun CanvasScreen(
                                                 readerLayers = readerLayers,
                                                 onPageMapping = { continuousPageMap.map = it },
                                                 onImageMapping = { continuousPageMap.imageMap = it },
+                                                onPageBox = { continuousPageMap.pageBox = it },
                                                 zoom = continuousZoomBucket,
                                                 ink = inkController,
                                                 inkSettings = inkSettings,
@@ -2789,216 +3343,158 @@ fun CanvasScreen(
                             }
                         }
 
-                        // Continuous Mode Floating HUD: Stylus/Finger Mode toggle and Zoom Reset pill
-                        // Placed outside graphicsLayer so it stays fixed at TopCenter at 1x scale
-                        Row(
+                    }
+                }
+
+                // Floating HUD: Zoom / Reset / Center pill (auto-hides after pan/zoom inactivity)
+                // Works across Infinite Canvas, A4 notes, and PDF notes in both continuous and single-page modes.
+                Row(
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = if (uiState.dockHorizontal) 74.dp else 10.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    val displayScale = if (isContinuous) continuousScale else singlePageScale
+                    AnimatedVisibility(
+                        visible = showZoomHud,
+                        enter = fadeIn(androidx.compose.animation.core.tween(150)),
+                        exit = fadeOut(androidx.compose.animation.core.tween(1000))
+                    ) {
+                        Surface(
+                            shape = RoundedCornerShape(16.dp),
+                            color = Color.Transparent,
                             modifier = Modifier
-                                .align(Alignment.TopCenter)
-                                // The horizontal dock sits at the top as
-                                // well: the pills move below it.
-                                .padding(top = if (uiState.dockHorizontal) 74.dp else 10.dp),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            if (uiState.stylusOnly || uiState.stylusDetected) {
-                                Surface(
+                                .shadow(
+                                    elevation = 12.dp,
                                     shape = RoundedCornerShape(16.dp),
-                                    color = Color.Transparent,
-                                    modifier = Modifier
-                                        .shadow(
-                                            elevation = 12.dp,
-                                            shape = RoundedCornerShape(16.dp),
-                                            ambientColor = Color(0x26000000),
-                                            spotColor = Color(0x40000000)
-                                        )
-                                        .clip(RoundedCornerShape(16.dp))
-                                        .onGloballyPositioned {
-                                            glassStylusOrigin.x = it.positionInRoot().x
-                                            glassStylusOrigin.y = it.positionInRoot().y
-                                        }
-                                        .clickable {
-                                            val togglingTo = !uiState.stylusOnly
-                                            viewModel.toggleStylusOnly(togglingTo)
-                                            val msg = if (togglingTo) {
-                                                "Stylus Mode ON: only pen writes"
-                                            } else {
-                                                "Finger Draw ON: 2 fingers to scroll"
-                                            }
-                                            android.widget.Toast.makeText(
-                                                context,
-                                                msg,
-                                                android.widget.Toast.LENGTH_SHORT
-                                            ).show()
-                                        }
+                                    ambientColor = Color(0x26000000),
+                                    spotColor = Color(0x40000000)
+                                )
+                                .clip(RoundedCornerShape(16.dp))
+                                .onGloballyPositioned {
+                                    glassZoomOrigin.x = it.positionInRoot().x
+                                    glassZoomOrigin.y = it.positionInRoot().y
+                                }
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .liquidGlassBackdrop(
+                                        glassShader, 16.dp, LiquidGlassStyle.Dark
+                                    ) { glassBackdropAt(glassZoomOrigin) }
+                                    .liquidGlassRim(16.dp, RoundedCornerShape(16.dp))
+                            ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(2.dp),
+                                modifier = Modifier.padding(start = 2.dp, end = 12.dp, top = 2.dp, bottom = 2.dp)
+                            ) {
+                                IconButton(
+                                    onClick = {
+                                        viewModel.setZoomLocked(!uiState.zoomLocked)
+                                        zoomHudActivityTick++
+                                    },
+                                    modifier = Modifier.size(32.dp)
                                 ) {
-                                    Box(
-                                        modifier = Modifier
-                                            .liquidGlassBackdrop(
-                                                glassShader, 16.dp, LiquidGlassStyle.Dark
-                                            ) { glassBackdropAt(glassStylusOrigin) }
-                                            .liquidGlassRim(16.dp, RoundedCornerShape(16.dp))
-                                    ) {
-                                    Row(
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
-                                        horizontalArrangement = Arrangement.spacedBy(4.dp)
-                                    ) {
-                                        Icon(
-                                            imageVector = Icons.Default.Edit,
-                                            contentDescription = null,
-                                            tint = Color.White,
-                                            modifier = Modifier.size(12.dp)
+                                    Icon(
+                                        imageVector = if (uiState.zoomLocked) {
+                                            Icons.Default.Lock
+                                        } else {
+                                            Icons.Outlined.LockOpen
+                                        },
+                                        contentDescription = if (uiState.zoomLocked) {
+                                            "Unlock pinch zoom"
+                                        } else {
+                                            "Lock pinch zoom"
+                                        },
+                                        tint = if (uiState.zoomLocked) OrangePrimary else Color.White,
+                                        modifier = Modifier.size(13.dp)
+                                    )
+                                }
+                                val doResetZoom = {
+                                    if (isContinuous) {
+                                        val reset = ReaderTransform.resetZoom(
+                                            ReaderTransform.State(
+                                                continuousScale,
+                                                continuousPanX,
+                                                continuousPanY
+                                            )
                                         )
-                                        Text(
-                                            text = if (uiState.stylusOnly) "Stylus Mode" else "Finger Draw",
-                                            color = Color.White,
-                                            fontSize = 11.sp,
-                                            fontWeight = FontWeight.Medium
-                                        )
+                                        continuousScale = reset.scale
+                                        continuousPanX = reset.panX
+                                        continuousPanY = reset.panY
+                                    } else {
+                                        canvasViewRef?.resetZoom()
+                                        singlePageScale = 1f
                                     }
-                                    }
+                                    zoomHudActivityTick++
+                                    android.widget.Toast.makeText(
+                                        context,
+                                        "Zoom reset to 100%",
+                                        android.widget.Toast.LENGTH_SHORT
+                                    ).show()
+                                }
+                                Text(
+                                    text = "${(displayScale * 100).roundToInt()}%",
+                                    color = Color.White,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    modifier = Modifier.clickable { doResetZoom() }
+                                )
+                                IconButton(
+                                    onClick = { doResetZoom() },
+                                    modifier = Modifier.size(32.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Refresh,
+                                        contentDescription = "Reset zoom to 100%",
+                                        tint = Color.White,
+                                        modifier = Modifier.size(13.dp)
+                                    )
+                                }
+                                IconButton(
+                                    onClick = {
+                                        if (!isContinuous) {
+                                            canvasViewRef?.resetPan()
+                                        } else if (isInfiniteNote) {
+                                            val center = inkController.computeArtworkCenter(0)
+                                            continuousScale = 1f
+                                            if (center != null) {
+                                                continuousPanX = screenWidthPx / 2f - center.first
+                                                continuousPanY = screenHeightPx / 2f - center.second
+                                            } else {
+                                                continuousPanX = 0f
+                                                continuousPanY = 0f
+                                            }
+                                        } else {
+                                            val centred = ReaderTransform.centre(
+                                                ReaderTransform.State(
+                                                    continuousScale,
+                                                    continuousPanX,
+                                                    continuousPanY
+                                                )
+                                            )
+                                            continuousScale = centred.scale
+                                            continuousPanX = centred.panX
+                                            continuousPanY = centred.panY
+                                        }
+                                        zoomHudActivityTick++
+                                        android.widget.Toast.makeText(
+                                            context,
+                                            "Canvas centred",
+                                            android.widget.Toast.LENGTH_SHORT
+                                        ).show()
+                                    },
+                                    modifier = Modifier.size(32.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.CenterFocusStrong,
+                                        contentDescription = "Centre the canvas",
+                                        tint = Color.White,
+                                        modifier = Modifier.size(13.dp)
+                                    )
                                 }
                             }
-
-                            if (uiState.zoomLocked ||
-                                kotlin.math.abs(continuousScale - 1f) > 0.05f ||
-                                continuousPanX != 0f ||
-                                continuousPanY != 0f
-                            ) {
-                                Surface(
-                                    shape = RoundedCornerShape(16.dp),
-                                    color = Color.Transparent,
-                                    modifier = Modifier
-                                        .shadow(
-                                            elevation = 12.dp,
-                                            shape = RoundedCornerShape(16.dp),
-                                            ambientColor = Color(0x26000000),
-                                            spotColor = Color(0x40000000)
-                                        )
-                                        .clip(RoundedCornerShape(16.dp))
-                                        .onGloballyPositioned {
-                                            glassZoomOrigin.x = it.positionInRoot().x
-                                            glassZoomOrigin.y = it.positionInRoot().y
-                                        }
-                                ) {
-                                    Box(
-                                        modifier = Modifier
-                                            .liquidGlassBackdrop(
-                                                glassShader, 16.dp, LiquidGlassStyle.Dark
-                                            ) { glassBackdropAt(glassZoomOrigin) }
-                                            .liquidGlassRim(16.dp, RoundedCornerShape(16.dp))
-                                    ) {
-                                    Row(
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.spacedBy(2.dp),
-                                        modifier = Modifier.padding(start = 2.dp, end = 12.dp, top = 2.dp, bottom = 2.dp)
-                                    ) {
-                                        // Lock the pinch: two fingers then only
-                                        // move the page around.
-                                        IconButton(
-                                            onClick = { viewModel.setZoomLocked(!uiState.zoomLocked) },
-                                            modifier = Modifier.size(32.dp)
-                                        ) {
-                                            Icon(
-                                                imageVector = if (uiState.zoomLocked) {
-                                                    Icons.Default.Lock
-                                                } else {
-                                                    Icons.Outlined.LockOpen
-                                                },
-                                                contentDescription = if (uiState.zoomLocked) {
-                                                    "Unlock pinch zoom"
-                                                } else {
-                                                    "Lock pinch zoom"
-                                                },
-                                                tint = if (uiState.zoomLocked) OrangePrimary else Color.White,
-                                                modifier = Modifier.size(13.dp)
-                                            )
-                                        }
-                                        // The zoom and the pan are two
-                                        // actions: the percentage puts the
-                                        // zoom back to 100 %, the button
-                                        // brings the canvas back to its
-                                        // origin.
-                                        Text(
-                                            text = "${(continuousScale * 100).roundToInt()}%",
-                                            color = Color.White,
-                                            fontSize = 12.sp,
-                                            fontWeight = FontWeight.Medium,
-                                            modifier = Modifier.clickable {
-                                                val reset = ReaderTransform.resetZoom(
-                                                    ReaderTransform.State(
-                                                        continuousScale,
-                                                        continuousPanX,
-                                                        continuousPanY
-                                                    )
-                                                )
-                                                continuousScale = reset.scale
-                                                continuousPanX = reset.panX
-                                                continuousPanY = reset.panY
-                                                android.widget.Toast.makeText(
-                                                    context,
-                                                    "Zoom reset to 100%",
-                                                    android.widget.Toast.LENGTH_SHORT
-                                                ).show()
-                                            }
-                                        )
-                                        IconButton(
-                                            onClick = {
-                                                val reset = ReaderTransform.resetZoom(
-                                                    ReaderTransform.State(
-                                                        continuousScale,
-                                                        continuousPanX,
-                                                        continuousPanY
-                                                    )
-                                                )
-                                                continuousScale = reset.scale
-                                                continuousPanX = reset.panX
-                                                continuousPanY = reset.panY
-                                                android.widget.Toast.makeText(
-                                                    context,
-                                                    "Zoom reset to 100%",
-                                                    android.widget.Toast.LENGTH_SHORT
-                                                ).show()
-                                            },
-                                            modifier = Modifier.size(32.dp)
-                                        ) {
-                                            Icon(
-                                                imageVector = Icons.Default.Refresh,
-                                                contentDescription = "Reset zoom to 100%",
-                                                tint = Color.White,
-                                                modifier = Modifier.size(13.dp)
-                                            )
-                                        }
-                                        IconButton(
-                                            onClick = {
-                                                val centred = ReaderTransform.centre(
-                                                    ReaderTransform.State(
-                                                        continuousScale,
-                                                        continuousPanX,
-                                                        continuousPanY
-                                                    )
-                                                )
-                                                continuousScale = centred.scale
-                                                continuousPanX = centred.panX
-                                                continuousPanY = centred.panY
-                                                android.widget.Toast.makeText(
-                                                    context,
-                                                    "Canvas centred",
-                                                    android.widget.Toast.LENGTH_SHORT
-                                                ).show()
-                                            },
-                                            modifier = Modifier.size(32.dp)
-                                        ) {
-                                            Icon(
-                                                imageVector = Icons.Default.CenterFocusStrong,
-                                                contentDescription = "Centre the canvas",
-                                                tint = Color.White,
-                                                modifier = Modifier.size(13.dp)
-                                            )
-                                        }
-                                    }
-                                    }
-                                }
                             }
                         }
                     }
@@ -3763,10 +4259,18 @@ fun CanvasScreen(
                                 ) {
                                     Box(
                                         modifier = Modifier
-                                            .height(20.dp)
-                                            .width(4.dp)
-                                            .clip(RoundedCornerShape(2.dp))
-                                            .background(Color(0x38000000))
+                                            .height(22.dp)
+                                            .width(5.dp)
+                                            .clip(RoundedCornerShape(2.5.dp))
+                                            .background(
+                                                Brush.horizontalGradient(
+                                                    colors = listOf(
+                                                        Color.White.copy(alpha = 0.78f),
+                                                        Color(0x331E293B)
+                                                    )
+                                                )
+                                            )
+                                            .border(0.6.dp, Color.White.copy(alpha = 0.85f), RoundedCornerShape(2.5.dp))
                                     )
                                 }
 
@@ -3785,6 +4289,24 @@ fun CanvasScreen(
                                     label = "Pen",
                                     isSelected = uiState.selectedTool == CanvasTool.PEN,
                                     onClick = { viewModel.selectTool(CanvasTool.PEN) }
+                                )
+
+                                // Graphite Pencil (abrasion + stylus tilt)
+                                PencaseToolIcon(
+                                    icon = Icons.Default.Edit,
+                                    label = "Pencil",
+                                    isSelected = uiState.selectedTool == CanvasTool.PENCIL,
+                                    selectedTint = Color(0xFF475569),
+                                    onClick = { viewModel.selectTool(CanvasTool.PENCIL) }
+                                )
+
+                                // Shape Draw + Fill (live closed curve fill)
+                                PencaseToolIcon(
+                                    icon = Icons.Default.FormatColorFill,
+                                    label = "Fill",
+                                    isSelected = uiState.selectedTool == CanvasTool.SHAPE_FILL,
+                                    selectedTint = OrangePrimary,
+                                    onClick = { viewModel.selectTool(CanvasTool.SHAPE_FILL) }
                                 )
 
                                 // Yellow Highlighter
@@ -3879,9 +4401,16 @@ fun CanvasScreen(
 
                                 Box(
                                     modifier = Modifier
-                                        .height(22.dp)
-                                        .width(1.dp)
-                                        .background(Color(0x1F000000))
+                                        .height(24.dp)
+                                        .width(1.5.dp)
+                                        .background(
+                                            Brush.horizontalGradient(
+                                                colors = listOf(
+                                                    Color(0x241E293B),
+                                                    Color.White.copy(alpha = 0.75f)
+                                                )
+                                            )
+                                        )
                                 )
 
                                 // 3 Stroke Width Presets (Horizontal bar line thickness)
@@ -3907,23 +4436,48 @@ fun CanvasScreen(
                                     }
                                     Box(
                                         modifier = Modifier
-                                            .size(26.dp)
+                                            .size(28.dp)
                                             .clip(CircleShape)
-                                            .background(if (isSelected) OrangePrimary.copy(alpha = 0.14f) else Color.Transparent)
+                                            .background(
+                                                if (isSelected) {
+                                                    Brush.verticalGradient(
+                                                        colors = listOf(
+                                                            Color.White.copy(alpha = 0.94f),
+                                                            Color.White.copy(alpha = 0.58f)
+                                                        )
+                                                    )
+                                                } else {
+                                                    Brush.verticalGradient(
+                                                        colors = listOf(
+                                                            Color.White.copy(alpha = 0.30f),
+                                                            Color.White.copy(alpha = 0.12f)
+                                                        )
+                                                    )
+                                                }
+                                            )
                                             .border(
-                                                width = if (isSelected) 1.5.dp else 0.dp,
-                                                color = if (isSelected) OrangePrimary else Color.Transparent,
+                                                width = if (isSelected) 1.4.dp else 0.7.dp,
+                                                brush = if (isSelected) {
+                                                    Brush.linearGradient(
+                                                        colors = listOf(
+                                                            Color.White,
+                                                            OrangePrimary.copy(alpha = 0.75f),
+                                                            Color.White.copy(alpha = 0.90f)
+                                                        )
+                                                    )
+                                                } else {
+                                                    Brush.linearGradient(
+                                                        colors = listOf(
+                                                            Color.White.copy(alpha = 0.65f),
+                                                            Color.White.copy(alpha = 0.18f)
+                                                        )
+                                                    )
+                                                },
                                                 shape = CircleShape
                                             )
                                             .combinedClickable(
                                                 onClick = { viewModel.setStrokeWidth(widthPx) },
                                                 onLongClick = {
-                                                    // Only the chip that was
-                                                    // held down opens the
-                                                    // slider: the popup used
-                                                    // to be built once per
-                                                    // chip, so three of them
-                                                    // opened at once.
                                                     widthPopupChipHoriz = wIdx
                                                     showWidthPopupHoriz = true
                                                 }
@@ -3966,9 +4520,16 @@ fun CanvasScreen(
 
                                 Box(
                                     modifier = Modifier
-                                        .height(22.dp)
-                                        .width(1.dp)
-                                        .background(Color(0x1F000000))
+                                        .height(24.dp)
+                                        .width(1.5.dp)
+                                        .background(
+                                            Brush.horizontalGradient(
+                                                colors = listOf(
+                                                    Color(0x241E293B),
+                                                    Color.White.copy(alpha = 0.75f)
+                                                )
+                                            )
+                                        )
                                 )
 
                                 // 3 Rounded-Square Color Swatches with checkmark
@@ -3977,13 +4538,37 @@ fun CanvasScreen(
                                     val isSelected = uiState.selectedColor == c
                                     Box(
                                         modifier = Modifier
-                                            .size(24.dp)
-                                            .clip(RoundedCornerShape(7.dp))
+                                            .size(25.dp)
+                                            .clip(RoundedCornerShape(8.dp))
                                             .background(c)
+                                            .drawWithContent {
+                                                drawContent()
+                                                // Liquid glass bead top-left specular gloss
+                                                drawRect(
+                                                    brush = Brush.linearGradient(
+                                                        colors = listOf(
+                                                            Color.White.copy(alpha = 0.46f),
+                                                            Color.Transparent,
+                                                            Color.Black.copy(alpha = 0.12f)
+                                                        )
+                                                    )
+                                                )
+                                            }
                                             .border(
-                                                width = if (isSelected) 2.dp else 0.8.dp,
-                                                color = if (isSelected) OrangePrimary else Color(0x28000000),
-                                                shape = RoundedCornerShape(7.dp)
+                                                width = if (isSelected) 2.dp else 1.dp,
+                                                brush = if (isSelected) {
+                                                    Brush.linearGradient(
+                                                        colors = listOf(Color.White, OrangePrimary, Color.White)
+                                                    )
+                                                } else {
+                                                    Brush.linearGradient(
+                                                        colors = listOf(
+                                                            Color.White.copy(alpha = 0.80f),
+                                                            Color(0x33000000)
+                                                        )
+                                                    )
+                                                },
+                                                shape = RoundedCornerShape(8.dp)
                                             )
                                             .combinedClickable(
                                                 onClick = { viewModel.selectColor(c) },
@@ -4135,10 +4720,18 @@ fun CanvasScreen(
                                 ) {
                                     Box(
                                         modifier = Modifier
-                                            .width(20.dp)
-                                            .height(4.dp)
-                                            .clip(RoundedCornerShape(2.dp))
-                                            .background(Color(0x38000000))
+                                            .width(22.dp)
+                                            .height(5.dp)
+                                            .clip(RoundedCornerShape(2.5.dp))
+                                            .background(
+                                                Brush.verticalGradient(
+                                                    colors = listOf(
+                                                        Color.White.copy(alpha = 0.78f),
+                                                        Color(0x331E293B)
+                                                    )
+                                                )
+                                            )
+                                            .border(0.6.dp, Color.White.copy(alpha = 0.85f), RoundedCornerShape(2.5.dp))
                                     )
                                 }
 
@@ -4157,6 +4750,24 @@ fun CanvasScreen(
                                     label = "Pen",
                                     isSelected = uiState.selectedTool == CanvasTool.PEN,
                                     onClick = { viewModel.selectTool(CanvasTool.PEN) }
+                                )
+
+                                // Graphite Pencil (abrasion + stylus tilt)
+                                PencaseToolIcon(
+                                    icon = Icons.Default.Edit,
+                                    label = "Pencil",
+                                    isSelected = uiState.selectedTool == CanvasTool.PENCIL,
+                                    selectedTint = Color(0xFF475569),
+                                    onClick = { viewModel.selectTool(CanvasTool.PENCIL) }
+                                )
+
+                                // Shape Draw + Fill (live closed curve fill)
+                                PencaseToolIcon(
+                                    icon = Icons.Default.FormatColorFill,
+                                    label = "Fill",
+                                    isSelected = uiState.selectedTool == CanvasTool.SHAPE_FILL,
+                                    selectedTint = OrangePrimary,
+                                    onClick = { viewModel.selectTool(CanvasTool.SHAPE_FILL) }
                                 )
 
                                 // Yellow Highlighter
@@ -4251,9 +4862,16 @@ fun CanvasScreen(
 
                                 Box(
                                     modifier = Modifier
-                                        .width(22.dp)
-                                        .height(1.dp)
-                                        .background(Color(0x1F000000))
+                                        .width(24.dp)
+                                        .height(1.5.dp)
+                                        .background(
+                                            Brush.verticalGradient(
+                                                colors = listOf(
+                                                    Color(0x241E293B),
+                                                    Color.White.copy(alpha = 0.75f)
+                                                )
+                                            )
+                                        )
                                 )
 
                                 // 3 Stroke Width Presets (vertical line thickness bars)
@@ -4275,12 +4893,43 @@ fun CanvasScreen(
                                     }
                                     Box(
                                         modifier = Modifier
-                                            .size(26.dp)
+                                            .size(28.dp)
                                             .clip(CircleShape)
-                                            .background(if (isSelected) OrangePrimary.copy(alpha = 0.14f) else Color.Transparent)
+                                            .background(
+                                                if (isSelected) {
+                                                    Brush.verticalGradient(
+                                                        colors = listOf(
+                                                            Color.White.copy(alpha = 0.94f),
+                                                            Color.White.copy(alpha = 0.58f)
+                                                        )
+                                                    )
+                                                } else {
+                                                    Brush.verticalGradient(
+                                                        colors = listOf(
+                                                            Color.White.copy(alpha = 0.30f),
+                                                            Color.White.copy(alpha = 0.12f)
+                                                        )
+                                                    )
+                                                }
+                                            )
                                             .border(
-                                                width = if (isSelected) 1.5.dp else 0.dp,
-                                                color = if (isSelected) OrangePrimary else Color.Transparent,
+                                                width = if (isSelected) 1.4.dp else 0.7.dp,
+                                                brush = if (isSelected) {
+                                                    Brush.linearGradient(
+                                                        colors = listOf(
+                                                            Color.White,
+                                                            OrangePrimary.copy(alpha = 0.75f),
+                                                            Color.White.copy(alpha = 0.90f)
+                                                        )
+                                                    )
+                                                } else {
+                                                    Brush.linearGradient(
+                                                        colors = listOf(
+                                                            Color.White.copy(alpha = 0.65f),
+                                                            Color.White.copy(alpha = 0.18f)
+                                                        )
+                                                    )
+                                                },
                                                 shape = CircleShape
                                             )
                                             .combinedClickable(
@@ -4328,9 +4977,16 @@ fun CanvasScreen(
 
                                 Box(
                                     modifier = Modifier
-                                        .width(22.dp)
-                                        .height(1.dp)
-                                        .background(Color(0x1F000000))
+                                        .width(24.dp)
+                                        .height(1.5.dp)
+                                        .background(
+                                            Brush.verticalGradient(
+                                                colors = listOf(
+                                                    Color(0x241E293B),
+                                                    Color.White.copy(alpha = 0.75f)
+                                                )
+                                            )
+                                        )
                                 )
 
                                 // 3 Rounded-Square Color Swatches with checkmark
@@ -4339,13 +4995,37 @@ fun CanvasScreen(
                                     val isSelected = uiState.selectedColor == c
                                     Box(
                                         modifier = Modifier
-                                            .size(24.dp)
-                                            .clip(RoundedCornerShape(7.dp))
+                                            .size(25.dp)
+                                            .clip(RoundedCornerShape(8.dp))
                                             .background(c)
+                                            .drawWithContent {
+                                                drawContent()
+                                                // Liquid glass bead top-left specular gloss
+                                                drawRect(
+                                                    brush = Brush.linearGradient(
+                                                        colors = listOf(
+                                                            Color.White.copy(alpha = 0.46f),
+                                                            Color.Transparent,
+                                                            Color.Black.copy(alpha = 0.12f)
+                                                        )
+                                                    )
+                                                )
+                                            }
                                             .border(
-                                                width = if (isSelected) 2.dp else 0.8.dp,
-                                                color = if (isSelected) OrangePrimary else Color(0x28000000),
-                                                shape = RoundedCornerShape(7.dp)
+                                                width = if (isSelected) 2.dp else 1.dp,
+                                                brush = if (isSelected) {
+                                                    Brush.linearGradient(
+                                                        colors = listOf(Color.White, OrangePrimary, Color.White)
+                                                    )
+                                                } else {
+                                                    Brush.linearGradient(
+                                                        colors = listOf(
+                                                            Color.White.copy(alpha = 0.80f),
+                                                            Color(0x33000000)
+                                                        )
+                                                    )
+                                                },
+                                                shape = RoundedCornerShape(8.dp)
                                             )
                                             .combinedClickable(
                                                 onClick = { viewModel.selectColor(c) },
@@ -5701,7 +6381,7 @@ fun CanvasScreen(
                                                             modifier = Modifier
                                                                 .weight(1f)
                                                                 .fillMaxHeight()
-                                                                .background(if (isContinuousMode) OrangePrimary else Color.White)
+                                                                .background(if (!isInfiniteNote && isContinuousMode) OrangePrimary else Color.White)
                                                                 // An infinite canvas has no page
                                                                 // edges: the continuous reader
                                                                 // would cut it into sheets, so
@@ -5726,10 +6406,10 @@ fun CanvasScreen(
                                                             Text(
                                                                 text = "Continuous",
                                                                 fontSize = 12.sp,
-                                                                fontWeight = if (isContinuousMode) FontWeight.Bold else FontWeight.Normal,
+                                                                fontWeight = if (!isInfiniteNote && isContinuousMode) FontWeight.Bold else FontWeight.Normal,
                                                                 color = when {
-                                                                    isContinuousMode -> Color.White
                                                                     isInfiniteNote -> Color(0xFFBBBBBB)
+                                                                    isContinuousMode -> Color.White
                                                                     else -> OrangePrimary
                                                                 }
                                                             )
@@ -5739,8 +6419,8 @@ fun CanvasScreen(
                                                             modifier = Modifier
                                                                 .weight(1f)
                                                                 .fillMaxHeight()
-                                                                .background(if (isSingleMode) OrangePrimary else Color.White)
-                                                                .clickable {
+                                                                .background(if (!isInfiniteNote && isSingleMode) OrangePrimary else Color.White)
+                                                                .clickable(enabled = !isInfiniteNote) {
                                                                     if (!isSingleMode) {
                                                                         val targetIdx = (if (uiState.pageTurningDirection == 1) {
                                                                             continuousRowState.firstVisibleItemIndex
@@ -5760,8 +6440,12 @@ fun CanvasScreen(
                                                             Text(
                                                                 text = "Single",
                                                                 fontSize = 12.sp,
-                                                                fontWeight = if (isSingleMode) FontWeight.Bold else FontWeight.Normal,
-                                                                color = if (isSingleMode) Color.White else OrangePrimary
+                                                                fontWeight = if (!isInfiniteNote && isSingleMode) FontWeight.Bold else FontWeight.Normal,
+                                                                color = when {
+                                                                    isInfiniteNote -> Color(0xFFBBBBBB)
+                                                                    isSingleMode -> Color.White
+                                                                    else -> OrangePrimary
+                                                                }
                                                             )
                                                         }
                                                     }
@@ -5860,29 +6544,86 @@ fun PencaseToolIcon(
     onClick: () -> Unit
 ) {
     val scale by androidx.compose.animation.core.animateFloatAsState(
-        targetValue = if (isSelected) 1.08f else 1.0f,
+        targetValue = if (isSelected) 1.10f else 1.0f,
         animationSpec = androidx.compose.animation.core.spring(
             dampingRatio = androidx.compose.animation.core.Spring.DampingRatioMediumBouncy,
             stiffness = androidx.compose.animation.core.Spring.StiffnessMedium
         ),
         label = "toolScale"
     )
+    val liftY by androidx.compose.animation.core.animateFloatAsState(
+        targetValue = if (isSelected) -2.5f else 0f,
+        animationSpec = androidx.compose.animation.core.spring(
+            dampingRatio = androidx.compose.animation.core.Spring.DampingRatioNoBouncy,
+            stiffness = androidx.compose.animation.core.Spring.StiffnessMedium
+        ),
+        label = "toolLift"
+    )
 
+    val slotShape = RoundedCornerShape(13.dp)
     Box(
         modifier = Modifier
             .size(36.dp)
             .graphicsLayer {
                 scaleX = scale
                 scaleY = scale
+                translationY = liftY
             }
-            .clip(RoundedCornerShape(11.dp))
+            .clip(slotShape)
             .background(
-                if (isSelected) selectedTint.copy(alpha = 0.16f) else Color.Transparent
+                if (isSelected) {
+                    Brush.verticalGradient(
+                        colors = listOf(
+                            Color.White.copy(alpha = 0.95f),
+                            Color.White.copy(alpha = 0.62f)
+                        )
+                    )
+                } else {
+                    Brush.verticalGradient(
+                        colors = listOf(
+                            Color.White.copy(alpha = 0.28f),
+                            Color.White.copy(alpha = 0.10f)
+                        )
+                    )
+                }
             )
+            .drawWithContent {
+                if (isSelected) {
+                    // Luminous inner color bloom under the active tool icon
+                    drawCircle(
+                        brush = Brush.radialGradient(
+                            colors = listOf(
+                                selectedTint.copy(alpha = 0.24f),
+                                Color.Transparent
+                            ),
+                            center = Offset(size.width * 0.5f, size.height * 0.55f),
+                            radius = size.minDimension * 0.58f
+                        ),
+                        radius = size.minDimension * 0.58f,
+                        center = Offset(size.width * 0.5f, size.height * 0.55f)
+                    )
+                }
+                drawContent()
+            }
             .border(
-                width = if (isSelected) 1.dp else 0.dp,
-                color = if (isSelected) selectedTint.copy(alpha = 0.40f) else Color.Transparent,
-                shape = RoundedCornerShape(11.dp)
+                width = if (isSelected) 1.25.dp else 0.7.dp,
+                brush = if (isSelected) {
+                    Brush.linearGradient(
+                        colors = listOf(
+                            Color.White,
+                            selectedTint.copy(alpha = 0.58f),
+                            Color.White.copy(alpha = 0.90f)
+                        )
+                    )
+                } else {
+                    Brush.linearGradient(
+                        colors = listOf(
+                            Color.White.copy(alpha = 0.62f),
+                            Color.White.copy(alpha = 0.14f)
+                        )
+                    )
+                },
+                shape = slotShape
             )
             .clickable(onClick = onClick),
         contentAlignment = Alignment.Center
@@ -5891,14 +6632,14 @@ fun PencaseToolIcon(
             Icon(
                 painter = painterResource(id = drawableRes),
                 contentDescription = label,
-                tint = if (isSelected) selectedTint else Color(0xFF374151),
+                tint = if (isSelected) selectedTint else Color(0xFF1E293B),
                 modifier = Modifier.size(20.dp)
             )
         } else if (icon != null) {
             Icon(
                 imageVector = icon,
                 contentDescription = label,
-                tint = if (isSelected) selectedTint else Color(0xFF374151),
+                tint = if (isSelected) selectedTint else Color(0xFF1E293B),
                 modifier = Modifier.size(20.dp)
             )
         }
@@ -6317,6 +7058,8 @@ class ContinuousPageMapHolder {
     var map: ContinuousPageMap? = null
     /** The same, for the page image the glass samples. */
     var imageMap: ContinuousImageMap? = null
+    /** Root-space bounding box of the current page item in the continuous reader. */
+    var pageBox: ReaderPageBox? = null
 }
 
 /**
@@ -6325,6 +7068,7 @@ class ContinuousPageMapHolder {
  * frame, and must not invalidate composition.
  */
 class ReaderPageBox {
+    var pageIndex = -1
     var originX = 0f
     var originY = 0f
     var width = 0
@@ -6463,6 +7207,984 @@ private fun readerLayout(
     )
 }
 
+private enum class PrecisionHudStage {
+    EXPANDED,
+    COLLAPSED,
+    MINI_COLLAPSED
+}
+
+@Composable
+private fun PrecisionDotsIcon(
+    tint: Color = Color(0xFF1F2937),
+    modifier: Modifier = Modifier.size(18.dp)
+) {
+    androidx.compose.foundation.Canvas(modifier = modifier) {
+        val r = size.minDimension * 0.10f
+        val step = size.minDimension * 0.30f
+        val cx = size.width / 2f
+        val cy = size.height / 2f
+        for (row in -1..1) {
+            for (col in -1..1) {
+                drawCircle(
+                    color = tint,
+                    radius = r,
+                    center = androidx.compose.ui.geometry.Offset(cx + col * step, cy + row * step)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun PrecisionOptionRow(
+    isChecked: Boolean,
+    label: String,
+    valueText: String,
+    accentColor: Color = Color(0xFF1F2937),
+    valueColor: Color = Color(0xFF4B5563),
+    onClick: () -> Unit
+) {
+    Surface(
+        shape = RoundedCornerShape(8.dp),
+        color = Color.White.copy(alpha = 0.96f),
+        shadowElevation = 2.dp,
+        border = BorderStroke(1.dp, Color(0xFFDCDFE6)),
+        modifier = Modifier.clickable { onClick() }
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(13.dp)
+                    .clip(RoundedCornerShape(3.dp))
+                    .background(if (isChecked) accentColor else Color.Transparent)
+                    .border(1.2.dp, accentColor, RoundedCornerShape(3.dp))
+            )
+            Text(
+                text = label,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = Color(0xFF1F2937)
+            )
+            Box(
+                modifier = Modifier
+                    .width(1.dp)
+                    .height(14.dp)
+                    .background(Color(0xFFE5E7EB))
+            )
+            Text(
+                text = valueText,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Normal,
+                color = valueColor
+            )
+        }
+    }
+}
+
+@Composable
+fun InfiniteCanvasHud(
+    scale: Float,
+    panX: Float,
+    panY: Float,
+    gridPreset: InfiniteGridPreset,
+    snapToGrid: Boolean,
+    strokeOpacity: Float,
+    onResetTransform: () -> Unit,
+    onCycleGridPreset: () -> Unit,
+    onToggleSnap: () -> Unit,
+    onOpacityChange: (Float) -> Unit,
+    onQuickClear: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    var stage by remember { mutableStateOf(PrecisionHudStage.COLLAPSED) }
+    var lastInteractionTick by remember { mutableIntStateOf(0) }
+    var showOpacitySlider by remember { mutableStateOf(false) }
+    var showClearConfirm by remember { mutableStateOf(false) }
+
+    LaunchedEffect(stage, lastInteractionTick) {
+        if (stage == PrecisionHudStage.COLLAPSED) {
+            kotlinx.coroutines.delay(1200L)
+            stage = PrecisionHudStage.MINI_COLLAPSED
+        }
+    }
+
+    Column(
+        modifier = modifier,
+        horizontalAlignment = Alignment.Start,
+        verticalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        when (stage) {
+            PrecisionHudStage.MINI_COLLAPSED -> {
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = Color.White.copy(alpha = 0.96f),
+                    shadowElevation = 3.dp,
+                    border = BorderStroke(1.dp, Color(0xFFDCDFE6)),
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clickable {
+                            stage = PrecisionHudStage.EXPANDED
+                            lastInteractionTick++
+                        }
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        PrecisionDotsIcon(modifier = Modifier.size(20.dp))
+                    }
+                }
+            }
+
+            PrecisionHudStage.COLLAPSED -> {
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = Color.White.copy(alpha = 0.96f),
+                    shadowElevation = 3.dp,
+                    border = BorderStroke(1.dp, Color(0xFFDCDFE6)),
+                    modifier = Modifier.clickable {
+                        stage = PrecisionHudStage.EXPANDED
+                        lastInteractionTick++
+                    }
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        PrecisionDotsIcon(modifier = Modifier.size(18.dp))
+                        Text(
+                            text = "Precision",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = Color(0xFF1F2937)
+                        )
+                    }
+                }
+            }
+
+            PrecisionHudStage.EXPANDED -> {
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = Color.White.copy(alpha = 0.96f),
+                    shadowElevation = 3.dp,
+                    border = BorderStroke(1.dp, Color(0xFFDCDFE6)),
+                    modifier = Modifier.clickable {
+                        showOpacitySlider = false
+                        stage = PrecisionHudStage.COLLAPSED
+                        lastInteractionTick++
+                    }
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        PrecisionDotsIcon(modifier = Modifier.size(18.dp))
+                        Text(
+                            text = "Precision",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = Color(0xFF1F2937)
+                        )
+                    }
+                }
+
+                PrecisionOptionRow(
+                    isChecked = gridPreset != InfiniteGridPreset.BLANK,
+                    label = "Grid",
+                    valueText = gridPreset.label,
+                    onClick = {
+                        lastInteractionTick++
+                        onCycleGridPreset()
+                    }
+                )
+
+                PrecisionOptionRow(
+                    isChecked = snapToGrid,
+                    label = "Snap",
+                    valueText = if (snapToGrid) "ON" else "OFF",
+                    accentColor = if (snapToGrid) OrangePrimary else Color(0xFF1F2937),
+                    onClick = {
+                        lastInteractionTick++
+                        onToggleSnap()
+                    }
+                )
+
+                PrecisionOptionRow(
+                    isChecked = strokeOpacity < 0.99f || showOpacitySlider,
+                    label = "Alpha",
+                    valueText = "${(strokeOpacity * 100).roundToInt()}%",
+                    accentColor = if (showOpacitySlider) OrangePrimary else Color(0xFF1F2937),
+                    onClick = {
+                        lastInteractionTick++
+                        showOpacitySlider = !showOpacitySlider
+                    }
+                )
+
+                if (showOpacitySlider) {
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = Color.White.copy(alpha = 0.96f),
+                        shadowElevation = 3.dp,
+                        border = BorderStroke(1.dp, Color(0xFFDCDFE6))
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .width(200.dp)
+                                .padding(horizontal = 10.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Slider(
+                                value = strokeOpacity,
+                                onValueChange = {
+                                    lastInteractionTick++
+                                    onOpacityChange(it)
+                                },
+                                valueRange = 0.05f..1.0f,
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                    }
+                }
+
+                PrecisionOptionRow(
+                    isChecked = false,
+                    label = "Clear",
+                    valueText = "Layer",
+                    accentColor = Color(0xFFDC2626),
+                    valueColor = Color(0xFFDC2626),
+                    onClick = {
+                        lastInteractionTick++
+                        showClearConfirm = true
+                    }
+                )
+            }
+        }
+    }
+
+    if (showClearConfirm) {
+        AlertDialog(
+            onDismissRequest = { showClearConfirm = false },
+            title = { Text("Clear Current Layer?") },
+            text = { Text("All strokes on the active layer will be cleared. You can undo this action.") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showClearConfirm = false
+                        onQuickClear()
+                    }
+                ) {
+                    Text("Clear", color = Color(0xFFDC2626))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showClearConfirm = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+}
+
+private val SNAP_AXES_LINED = arrayOf(1f to 0f)
+private val SNAP_AXES_ORTHO = arrayOf(1f to 0f, 0f to 1f)
+private val SNAP_AXES_TRIANGLE = arrayOf(
+    1f to 0f,
+    0.5f to 0.8660254f,
+    -0.5f to 0.8660254f
+)
+private val SNAP_AXES_ISOMETRIC = arrayOf(
+    1f to 0f,
+    0f to 1f,
+    0.5f to 0.8660254f,
+    -0.5f to 0.8660254f,
+    0.8660254f to 0.5f,
+    0.8660254f to -0.5f
+)
+
+private fun gridSnapAxes(preset: InfiniteGridPreset): Array<Pair<Float, Float>> = when (preset) {
+    InfiniteGridPreset.LINED -> SNAP_AXES_LINED
+    InfiniteGridPreset.GRAPH, InfiniteGridPreset.DOTS, InfiniteGridPreset.BLANK -> SNAP_AXES_ORTHO
+    InfiniteGridPreset.TRIANGLE -> SNAP_AXES_TRIANGLE
+    InfiniteGridPreset.ISOMETRIC -> SNAP_AXES_ISOMETRIC
+}
+
+private fun bestGridAxis(dx: Float, dy: Float, axes: Array<Pair<Float, Float>>): Pair<Float, Float> {
+    var best = axes[0]
+    var bestScore = -1f
+    for (axis in axes) {
+        val score = kotlin.math.abs(dx * axis.first + dy * axis.second)
+        if (score > bestScore) {
+            bestScore = score
+            best = axis
+        }
+    }
+    return best
+}
+
+private fun snapToInfiniteGrid(
+    x: Float,
+    y: Float,
+    step: Float,
+    panX: Float,
+    panY: Float,
+    preset: InfiniteGridPreset
+): Pair<Float, Float> {
+    if (step < 8f || preset == InfiniteGridPreset.BLANK) return Pair(x, y)
+    return when (preset) {
+        InfiniteGridPreset.LINED -> {
+            val sy = ((y - panY) / step).roundToInt() * step + panY
+            Pair(x, sy)
+        }
+        InfiniteGridPreset.GRAPH, InfiniteGridPreset.DOTS -> {
+            val sx = ((x - panX) / step).roundToInt() * step + panX
+            val sy = ((y - panY) / step).roundToInt() * step + panY
+            Pair(sx, sy)
+        }
+        InfiniteGridPreset.ISOMETRIC, InfiniteGridPreset.TRIANGLE -> {
+            val rowH = step * 0.8660254f
+            val row = ((y - panY) / rowH).roundToInt()
+            val sy = row * rowH + panY
+            val offsetX = if (row % 2 == 0) 0f else step * 0.5f
+            val sx = ((x - panX - offsetX) / step).roundToInt() * step + panX + offsetX
+            Pair(sx, sy)
+        }
+        InfiniteGridPreset.BLANK -> Pair(x, y)
+    }
+}
+
+@OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
+@Composable
+fun InfiniteCanvasView(
+    page: personal.notes.touch.data.db.entity.PageEntity,
+    pageIndex: Int,
+    noteId: String,
+    ink: ContinuousInkController,
+    inkSettings: InkToolSettings,
+    scale: Float,
+    panX: Float,
+    panY: Float,
+    backgroundDensity: Int,
+    gridPreset: InfiniteGridPreset,
+    snapToGrid: Boolean,
+    strokeOpacity: Float,
+    items: List<InfiniteCanvasItem>,
+    selectedItemId: String?,
+    bitmapCache: InfiniteItemBitmapCache,
+    onSelectItem: (String?) -> Unit,
+    onUpdateItem: (InfiniteCanvasItem) -> Unit,
+    onCommitItems: () -> Unit,
+    onDeleteItem: (String) -> Unit,
+    onResetTransform: () -> Unit,
+    onCycleGridPreset: () -> Unit,
+    onSnapToggle: () -> Unit,
+    onOpacityChange: (Float) -> Unit,
+    onQuickClear: () -> Unit,
+    onStylusDetected: () -> Unit,
+    onPanZoom: (Float, Float, Float, androidx.compose.ui.geometry.Offset) -> Unit,
+    onDismissOverlays: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val layerStack = ink.layerStack(pageIndex)
+
+    val currentScale by androidx.compose.runtime.rememberUpdatedState(scale)
+    val currentPanX by androidx.compose.runtime.rememberUpdatedState(panX)
+    val currentPanY by androidx.compose.runtime.rememberUpdatedState(panY)
+    val currentSnap by androidx.compose.runtime.rememberUpdatedState(snapToGrid)
+    val currentGridPreset by androidx.compose.runtime.rememberUpdatedState(gridPreset)
+    val currentDensity by androidx.compose.runtime.rememberUpdatedState(backgroundDensity)
+    val currentInkSettings by androidx.compose.runtime.rememberUpdatedState(inkSettings)
+    val currentItems by androidx.compose.runtime.rememberUpdatedState(items)
+    val currentSelectedItemId by androidx.compose.runtime.rememberUpdatedState(selectedItemId)
+
+    val itemPaint = remember {
+        android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG or android.graphics.Paint.ANTI_ALIAS_FLAG)
+    }
+    val paperFill = remember {
+        android.graphics.Paint().apply {
+            color = android.graphics.Color.WHITE
+            style = android.graphics.Paint.Style.FILL
+        }
+    }
+    val paperBorder = remember {
+        android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xFFD0D5DD.toInt()
+            style = android.graphics.Paint.Style.STROKE
+        }
+    }
+    val selStroke = remember {
+        android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xFFFB6443.toInt()
+            style = android.graphics.Paint.Style.STROKE
+        }
+    }
+    val handleFill = remember {
+        android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            color = android.graphics.Color.WHITE
+            style = android.graphics.Paint.Style.FILL
+        }
+    }
+    val deleteFill = remember {
+        android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xFFDC2626.toInt()
+            style = android.graphics.Paint.Style.FILL
+        }
+    }
+    val accentFill = remember {
+        android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xFFFB6443.toInt()
+            style = android.graphics.Paint.Style.FILL
+        }
+    }
+    val iconPaint = remember {
+        android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            color = android.graphics.Color.WHITE
+            textAlign = android.graphics.Paint.Align.CENTER
+            isFakeBoldText = true
+        }
+    }
+    val itemDstRect = remember { android.graphics.RectF() }
+
+    LaunchedEffect(page.id, noteId) {
+        ink.ensureSessionForPage(page, pageIndex)
+    }
+
+    Box(modifier = modifier) {
+        // 1. Base Canvas: Grid + Frustum-Culled Items + Frustum-Culled Committed Strokes.
+        // Does NOT observe previewRevision, so live tool strokes never redraw PDFs or committed ink.
+        androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
+            @Suppress("UNUSED_EXPRESSION")
+            ink.revision
+            @Suppress("UNUSED_EXPRESSION")
+            bitmapCache.renderTick
+
+            ink.updateGeometry(pageIndex, 2160f * scale, 2160f * scale)
+            drawRect(color = Color.White)
+
+            if (gridPreset != InfiniteGridPreset.BLANK) {
+                val density = backgroundDensity.coerceIn(20, 80).toFloat()
+                val step = density * 2f * scale
+                if (step >= 8f) {
+                    val gridColor = Color(0xFFE2E4E8)
+                    val startX = ((panX % step) + step) % step
+                    val startY = ((panY % step) + step) % step
+                    when (gridPreset) {
+                        InfiniteGridPreset.LINED -> {
+                            var y = startY
+                            while (y < size.height) {
+                                drawLine(
+                                    color = gridColor,
+                                    start = androidx.compose.ui.geometry.Offset(0f, y),
+                                    end = androidx.compose.ui.geometry.Offset(size.width, y),
+                                    strokeWidth = 1f
+                                )
+                                y += step
+                            }
+                        }
+                        InfiniteGridPreset.GRAPH -> {
+                            var x = startX
+                            while (x < size.width) {
+                                drawLine(
+                                    color = gridColor,
+                                    start = androidx.compose.ui.geometry.Offset(x, 0f),
+                                    end = androidx.compose.ui.geometry.Offset(x, size.height),
+                                    strokeWidth = 1f
+                                )
+                                x += step
+                            }
+                            var y = startY
+                            while (y < size.height) {
+                                drawLine(
+                                    color = gridColor,
+                                    start = androidx.compose.ui.geometry.Offset(0f, y),
+                                    end = androidx.compose.ui.geometry.Offset(size.width, y),
+                                    strokeWidth = 1f
+                                )
+                                y += step
+                            }
+                        }
+                        InfiniteGridPreset.DOTS -> {
+                            var x = startX
+                            while (x < size.width) {
+                                var y = startY
+                                while (y < size.height) {
+                                    drawCircle(
+                                        color = gridColor,
+                                        radius = 1.8f,
+                                        center = androidx.compose.ui.geometry.Offset(x, y)
+                                    )
+                                    y += step
+                                }
+                                x += step
+                            }
+                        }
+                        InfiniteGridPreset.ISOMETRIC -> {
+                            val rowH = step * 0.8660254f
+                            val startIsoY = ((panY % rowH) + rowH) % rowH
+                            var row = 0
+                            var y = startIsoY
+                            while (y < size.height) {
+                                val offsetX = if (row % 2 == 0) 0f else step * 0.5f
+                                var x = ((startX + offsetX) % step)
+                                while (x < size.width) {
+                                    drawCircle(
+                                        color = gridColor,
+                                        radius = 1.8f,
+                                        center = androidx.compose.ui.geometry.Offset(x, y)
+                                    )
+                                    x += step
+                                }
+                                y += rowH
+                                row++
+                            }
+                        }
+                        InfiniteGridPreset.TRIANGLE -> {
+                            val rowH = step * 0.8660254f
+                            val startTriY = ((panY % rowH) + rowH) % rowH
+                            var y = startTriY
+                            while (y < size.height) {
+                                drawLine(
+                                    color = gridColor,
+                                    start = androidx.compose.ui.geometry.Offset(0f, y),
+                                    end = androidx.compose.ui.geometry.Offset(size.width, y),
+                                    strokeWidth = 0.8f
+                                )
+                                y += rowH
+                            }
+                            val slopeDx = size.height / 1.7320508f
+                            var x = startX - slopeDx
+                            while (x < size.width + slopeDx) {
+                                drawLine(
+                                    color = gridColor,
+                                    start = androidx.compose.ui.geometry.Offset(x, 0f),
+                                    end = androidx.compose.ui.geometry.Offset(x + slopeDx, size.height),
+                                    strokeWidth = 0.8f
+                                )
+                                drawLine(
+                                    color = gridColor,
+                                    start = androidx.compose.ui.geometry.Offset(x, 0f),
+                                    end = androidx.compose.ui.geometry.Offset(x - slopeDx, size.height),
+                                    strokeWidth = 0.8f
+                                )
+                                x += step
+                            }
+                        }
+                        InfiniteGridPreset.BLANK -> {}
+                    }
+                }
+            }
+
+            drawIntoCanvas { canvas ->
+                val native = canvas.nativeCanvas
+                val safeScale = scale.coerceAtLeast(0.05f)
+                val viewLeft = -panX / safeScale
+                val viewTop = -panY / safeScale
+                val viewRight = (size.width - panX) / safeScale
+                val viewBottom = (size.height - panY) / safeScale
+                val count = native.save()
+                native.translate(panX, panY)
+                native.scale(scale, scale)
+
+                paperBorder.strokeWidth = (1.5f / safeScale).coerceAtLeast(0.5f)
+
+                for (item in items) {
+                    val halfSpan = if (item.rotationDeg == 0f) 0f else maxOf(item.width, item.height) * 0.72f
+                    val halfW = if (item.rotationDeg == 0f) item.width * 0.5f + 32f else halfSpan
+                    val halfH = if (item.rotationDeg == 0f) item.height * 0.5f + 32f else halfSpan
+                    if (item.centerX + halfW < viewLeft || item.centerX - halfW > viewRight ||
+                        item.centerY + halfH < viewTop || item.centerY - halfH > viewBottom
+                    ) {
+                        continue
+                    }
+
+                    val bmp = when (item) {
+                        is InfiniteCanvasItem.ImageItem -> bitmapCache.getImageBitmap(item.fileName)
+                        is InfiniteCanvasItem.PdfPageItem -> bitmapCache.getPdfPageBitmap(item, scale)
+                    }
+                    val itemSave = native.save()
+                    native.translate(item.centerX, item.centerY)
+                    if (item.rotationDeg != 0f) {
+                        native.rotate(item.rotationDeg)
+                    }
+                    itemDstRect.set(
+                        -item.width / 2f,
+                        -item.height / 2f,
+                        item.width / 2f,
+                        item.height / 2f
+                    )
+                    if (item is InfiniteCanvasItem.PdfPageItem) {
+                        native.drawRect(itemDstRect, paperFill)
+                    }
+                    if (bmp != null && !bmp.isRecycled) {
+                        native.drawBitmap(bmp, null, itemDstRect, itemPaint)
+                    }
+                    if (item is InfiniteCanvasItem.PdfPageItem) {
+                        native.drawRect(itemDstRect, paperBorder)
+                    }
+                    if (item.id == selectedItemId) {
+                        selStroke.strokeWidth = (2.5f / safeScale).coerceAtLeast(1f)
+                        native.drawRect(itemDstRect, selStroke)
+                        val r = 16f / safeScale.coerceAtLeast(0.1f)
+                        iconPaint.textSize = 18f / safeScale.coerceAtLeast(0.1f)
+                        // Top-left: Delete
+                        native.drawCircle(itemDstRect.left, itemDstRect.top, r, deleteFill)
+                        native.drawText("✕", itemDstRect.left, itemDstRect.top + r * 0.35f, iconPaint)
+                        // Top-right: Rotate
+                        native.drawCircle(itemDstRect.right, itemDstRect.top, r, accentFill)
+                        native.drawText("↻", itemDstRect.right, itemDstRect.top + r * 0.35f, iconPaint)
+                        // Bottom-right: Resize
+                        native.drawCircle(itemDstRect.right, itemDstRect.bottom, r, handleFill)
+                        native.drawCircle(itemDstRect.right, itemDstRect.bottom, r, selStroke)
+                    }
+                    native.restoreToCount(itemSave)
+                }
+
+                val normMinX = viewLeft / 2160f
+                val normMinY = viewTop / 2160f
+                val normMaxX = viewRight / 2160f
+                val normMaxY = viewBottom / 2160f
+
+                layerStack.layers.forEach { layer ->
+                    if (layer.visible) {
+                        val hasErase = ink.layerHasErase(pageIndex, layer)
+                        val layerSave = if (hasErase) {
+                            native.saveLayer(
+                                viewLeft,
+                                viewTop,
+                                viewRight,
+                                viewBottom,
+                                null
+                            )
+                        } else {
+                            -1
+                        }
+                        ink.drawOpsInfinite(
+                            native,
+                            pageIndex,
+                            layer,
+                            normMinX,
+                            normMinY,
+                            normMaxX,
+                            normMaxY
+                        )
+                        if (layerSave >= 0) {
+                            native.restoreToCount(layerSave)
+                        }
+                    }
+                }
+
+                native.restoreToCount(count)
+            }
+        }
+
+        // 2. Live Preview Overlay Canvas: only redraws the single active stroke in progress
+        // or the laser pointer dot, keeping stylus responsiveness at 120Hz regardless of zoom or PDFs.
+        androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
+            @Suppress("UNUSED_EXPRESSION")
+            ink.previewRevision
+            @Suppress("UNUSED_EXPRESSION")
+            ink.laserRevision
+            drawIntoCanvas { canvas ->
+                val native = canvas.nativeCanvas
+                val count = native.save()
+                native.translate(panX, panY)
+                native.scale(scale, scale)
+                ink.drawPreviewInfinite(native, pageIndex, scale)
+                native.restoreToCount(count)
+            }
+        }
+
+        Box(
+            modifier = Modifier
+                .matchParentSize()
+                .pointerInput(page.id) {
+                    try {
+                        awaitEachGesture {
+                            val settings = currentInkSettings
+                            if (settings.readingMode) return@awaitEachGesture
+                            val down = awaitFirstDown(requireUnconsumed = false)
+                            onDismissOverlays()
+                            val isStylus = down.type == PointerType.Stylus || down.type == PointerType.Eraser
+                            if (isStylus) onStylusDetected()
+                            val isAllowedPointer = isStylus || (!settings.stylusOnly && down.type == PointerType.Touch)
+
+                            val downWorldX = (down.position.x - currentPanX) / currentScale.coerceAtLeast(0.1f)
+                            val downWorldY = (down.position.y - currentPanY) / currentScale.coerceAtLeast(0.1f)
+                            val selItem = currentSelectedItemId?.let { id ->
+                                currentItems.firstOrNull { it.id == id }
+                            }
+                            var activeItem: InfiniteCanvasItem? = null
+                            var activeHandle = InfiniteItemHandle.NONE
+                            if (selItem != null) {
+                                val h = hitTestInfiniteItemHandle(downWorldX, downWorldY, selItem, currentScale)
+                                if (h != InfiniteItemHandle.NONE) {
+                                    activeItem = selItem
+                                    activeHandle = h
+                                }
+                            }
+                            if (activeHandle == InfiniteItemHandle.NONE && settings.tool == CanvasTool.LASSO) {
+                                val hit = hitTestInfiniteItems(downWorldX, downWorldY, currentItems)
+                                if (hit != null) {
+                                    onSelectItem(hit.id)
+                                    activeItem = hit
+                                    activeHandle = InfiniteItemHandle.MOVE
+                                } else {
+                                    onSelectItem(null)
+                                }
+                            }
+                            if (activeItem != null && activeHandle != InfiniteItemHandle.NONE) {
+                                down.consume()
+                                if (activeHandle == InfiniteItemHandle.DELETE) {
+                                    onDeleteItem(activeItem.id)
+                                    return@awaitEachGesture
+                                }
+                                val startItem = activeItem
+                                val startCx = startItem.centerX
+                                val startCy = startItem.centerY
+                                val startW = startItem.width
+                                val startH = startItem.height
+                                val startRot = startItem.rotationDeg
+                                val startDist = kotlin.math.hypot(
+                                    (downWorldX - startCx).toDouble(),
+                                    (downWorldY - startCy).toDouble()
+                                ).toFloat().coerceAtLeast(10f)
+                                val startAngle = Math.toDegrees(
+                                    kotlin.math.atan2((downWorldY - startCy).toDouble(), (downWorldX - startCx).toDouble())
+                                ).toFloat()
+                                while (true) {
+                                    val event = awaitPointerEvent()
+                                    if (event.changes.count { it.pressed } > 1) break
+                                    val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                    val curWx = (change.position.x - currentPanX) / currentScale.coerceAtLeast(0.1f)
+                                    val curWy = (change.position.y - currentPanY) / currentScale.coerceAtLeast(0.1f)
+                                    val updated = when (activeHandle) {
+                                        InfiniteItemHandle.MOVE -> startItem.withTransform(
+                                            centerX = startCx + (curWx - downWorldX),
+                                            centerY = startCy + (curWy - downWorldY)
+                                        )
+                                        InfiniteItemHandle.RESIZE -> {
+                                            val curDist = kotlin.math.hypot(
+                                                (curWx - startCx).toDouble(),
+                                                (curWy - startCy).toDouble()
+                                            ).toFloat().coerceAtLeast(10f)
+                                            val factor = (curDist / startDist).coerceIn(0.15f, 8.0f)
+                                            startItem.withTransform(
+                                                width = (startW * factor).coerceIn(80f, 8000f),
+                                                height = (startH * factor).coerceIn(80f, 8000f)
+                                            )
+                                        }
+                                        InfiniteItemHandle.ROTATE -> {
+                                            val curAngle = Math.toDegrees(
+                                                kotlin.math.atan2((curWy - startCy).toDouble(), (curWx - startCx).toDouble())
+                                            ).toFloat()
+                                            startItem.withTransform(rotationDeg = startRot + (curAngle - startAngle))
+                                        }
+                                        else -> startItem
+                                    }
+                                    onUpdateItem(updated)
+                                    change.consume()
+                                    if (change.changedToUpIgnoreConsumed()) break
+                                }
+                                onCommitItems()
+                                return@awaitEachGesture
+                            } else if (selItem != null && settings.isWritingTool) {
+                                onSelectItem(null)
+                            }
+
+                            if (settings.isLaserPointer) {
+                                val sScale = currentScale
+                                val sPanX = currentPanX
+                                val sPanY = currentPanY
+                                val baseW = 2160f
+                                val wx = (down.position.x - sPanX) / (sScale * baseW)
+                                val wy = (down.position.y - sPanY) / (sScale * baseW)
+                                ink.updateLaser(pageIndex, wx, wy)
+                                down.consume()
+                                while (true) {
+                                    val event = awaitPointerEvent()
+                                    val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                    for (hist in change.historical) {
+                                        val hwx = (hist.position.x - currentPanX) / (currentScale * baseW)
+                                        val hwy = (hist.position.y - currentPanY) / (currentScale * baseW)
+                                        ink.updateLaser(pageIndex, hwx, hwy)
+                                    }
+                                    val cwx = (change.position.x - currentPanX) / (currentScale * baseW)
+                                    val cwy = (change.position.y - currentPanY) / (currentScale * baseW)
+                                    ink.updateLaser(pageIndex, cwx, cwy)
+                                    change.consume()
+                                    if (change.changedToUpIgnoreConsumed()) break
+                                }
+                                ink.clearLaser()
+                                return@awaitEachGesture
+                            }
+
+                            if (!settings.isWritingTool || !isAllowedPointer) {
+                                down.consume()
+                                var lastPos = down.position
+                                while (true) {
+                                    val event = awaitPointerEvent()
+                                    if (event.changes.count { it.pressed } > 1) break
+                                    val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                    val delta = change.position - lastPos
+                                    lastPos = change.position
+                                    onPanZoom(delta.x, delta.y, 1f, down.position)
+                                    change.consume()
+                                    if (change.changedToUpIgnoreConsumed()) break
+                                }
+                                return@awaitEachGesture
+                            }
+
+                            down.consume()
+                            val sScale = currentScale
+                            val sPanX = currentPanX
+                            val sPanY = currentPanY
+                            val sSnap = currentSnap
+                            val sPreset = currentGridPreset
+                            val sStep = currentDensity.coerceIn(20, 80).toFloat() * 2f * sScale
+                            val baseW = 2160f
+                            val (sx, sy) = if (sSnap) {
+                                snapToInfiniteGrid(down.position.x, down.position.y, sStep, sPanX, sPanY, sPreset)
+                            } else {
+                                Pair(down.position.x, down.position.y)
+                            }
+                            var snapAnchorX = sx
+                            var snapAnchorY = sy
+                            val allowedAxes = gridSnapAxes(sPreset)
+                            var snapUx = allowedAxes[0].first
+                            var snapUy = allowedAxes[0].second
+                            var snapLocked = false
+                            val wx = (sx - sPanX) / (sScale * baseW)
+                            val wy = (sy - sPanY) / (sScale * baseW)
+
+                            ink.beginStroke(
+                                page = page,
+                                pageIndex = pageIndex,
+                                x = wx,
+                                y = wy,
+                                pressure = down.pressure,
+                                boxWidth = baseW,
+                                boxHeight = baseW,
+                                renderWidthPx = 2160,
+                                settings = settings,
+                                tilt = personal.notes.touch.StylusTiltTracker.currentTiltRad
+                            )
+
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                if (event.changes.count { it.pressed } > 1) {
+                                    ink.cancelStroke()
+                                    break
+                                }
+                                val change = event.changes.firstOrNull { it.id == down.id }
+                                if (change == null) {
+                                    ink.cancelStroke()
+                                    break
+                                }
+                                val isShapeSnapTool = settings.tool == CanvasTool.SHAPE_LINE ||
+                                    settings.tool == CanvasTool.SHAPE_RECT ||
+                                    settings.tool == CanvasTool.SHAPE_CIRCLE
+                                val (cx, cy) = if (sSnap && isShapeSnapTool) {
+                                    snapToInfiniteGrid(change.position.x, change.position.y, sStep, sPanX, sPanY, sPreset)
+                                } else if (sSnap) {
+                                    val rawX = change.position.x
+                                    val rawY = change.position.y
+                                    val dx = rawX - snapAnchorX
+                                    val dy = rawY - snapAnchorY
+                                    val dist = kotlin.math.hypot(dx.toDouble(), dy.toDouble()).toFloat()
+                                    if (!snapLocked) {
+                                        val chosen = bestGridAxis(dx, dy, allowedAxes)
+                                        snapUx = chosen.first
+                                        snapUy = chosen.second
+                                        if (dist >= 10f) {
+                                            snapLocked = true
+                                        }
+                                    } else {
+                                        val projNow = dx * snapUx + dy * snapUy
+                                        val perpNow = kotlin.math.abs(-dx * snapUy + dy * snapUx)
+                                        val turnThreshold = kotlin.math.max(26f, sStep * 0.45f)
+                                        if (sPreset != InfiniteGridPreset.LINED &&
+                                            perpNow > turnThreshold &&
+                                            kotlin.math.abs(projNow) > sStep * 0.35f
+                                        ) {
+                                            // Commit corner on grid and switch to the new grid line direction
+                                            val rawCornerX = snapAnchorX + projNow * snapUx
+                                            val rawCornerY = snapAnchorY + projNow * snapUy
+                                            val (cornerX, cornerY) = snapToInfiniteGrid(
+                                                rawCornerX, rawCornerY, sStep, sPanX, sPanY, sPreset
+                                            )
+                                            val cwx = (cornerX - sPanX) / (sScale * baseW)
+                                            val cwy = (cornerY - sPanY) / (sScale * baseW)
+                                            ink.extendStroke(
+                                                cwx, cwy, change.pressure, settings,
+                                                personal.notes.touch.StylusTiltTracker.currentTiltRad
+                                            )
+                                            snapAnchorX = cornerX
+                                            snapAnchorY = cornerY
+                                            val newAxis = bestGridAxis(rawX - snapAnchorX, rawY - snapAnchorY, allowedAxes)
+                                            snapUx = newAxis.first
+                                            snapUy = newAxis.second
+                                        }
+                                    }
+                                    val finalDx = rawX - snapAnchorX
+                                    val finalDy = rawY - snapAnchorY
+                                    val proj = finalDx * snapUx + finalDy * snapUy
+                                    Pair(snapAnchorX + proj * snapUx, snapAnchorY + proj * snapUy)
+                                } else {
+                                    Pair(change.position.x, change.position.y)
+                                }
+                                val curWx = (cx - sPanX) / (sScale * baseW)
+                                val curWy = (cy - sPanY) / (sScale * baseW)
+
+                                if (!isShapeSnapTool && !sSnap) {
+                                    @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
+                                    val hist = change.historical
+                                    val tiltNow = personal.notes.touch.StylusTiltTracker.currentTiltRad
+                                    for (hIdx in 0 until hist.size) {
+                                        val hp = hist[hIdx].position
+                                        val hwx = (hp.x - sPanX) / (sScale * baseW)
+                                        val hwy = (hp.y - sPanY) / (sScale * baseW)
+                                        ink.extendStroke(hwx, hwy, change.pressure, settings, tiltNow)
+                                    }
+                                }
+                                if (change.pressed) {
+                                    ink.extendStroke(curWx, curWy, change.pressure, settings, personal.notes.touch.StylusTiltTracker.currentTiltRad)
+                                    change.consume()
+                                } else {
+                                    ink.endStroke(curWx, curWy, change.pressure, settings, personal.notes.touch.StylusTiltTracker.currentTiltRad)
+                                    change.consume()
+                                    break
+                                }
+                            }
+                        }
+                    } catch (e: Exception) {
+                        ink.cancelStroke()
+                    }
+                }
+        )
+
+        InfiniteCanvasHud(
+            scale = scale,
+            panX = panX,
+            panY = panY,
+            gridPreset = gridPreset,
+            snapToGrid = snapToGrid,
+            strokeOpacity = strokeOpacity,
+            onResetTransform = onResetTransform,
+            onCycleGridPreset = onCycleGridPreset,
+            onToggleSnap = onSnapToggle,
+            onOpacityChange = onOpacityChange,
+            onQuickClear = onQuickClear,
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .padding(start = 16.dp, bottom = 16.dp)
+        )
+    }
+}
+
+@OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
 @Composable
 fun ContinuousPageView(
     pageIndex: Int,
@@ -6493,6 +8215,7 @@ fun ContinuousPageView(
     onStylusDetected: () -> Unit = {},
     onPageMapping: (ContinuousPageMap) -> Unit = {},
     onImageMapping: (ContinuousImageMap) -> Unit = {},
+    onPageBox: (ReaderPageBox) -> Unit = {},
     onPageBitmap: (Int, android.graphics.Bitmap?) -> Unit = { _, _ -> },
     onClick: () -> Unit
 ) {
@@ -6582,11 +8305,13 @@ fun ContinuousPageView(
                 }
             )
             .onGloballyPositioned { coords ->
+                pageBox.pageIndex = pageIndex
                 pageBox.originX = coords.positionInRoot().x
                 pageBox.originY = coords.positionInRoot().y
                 pageBox.width = coords.size.width
                 pageBox.height = coords.size.height
                 if (isCurrentPage) {
+                    onPageBox(pageBox)
                     // The page image sits inside the box (a fixed page has a
                     // margin, an infinite page is fitted into it), so the
                     // maps have to describe that rect and not the whole box.
@@ -7150,6 +8875,9 @@ fun ContinuousPageView(
                             while (true) {
                                 val event = awaitPointerEvent()
                                 val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                for (hist in change.historical) {
+                                    ink.updateLaser(pageIndex, hist.position.x / lBoxW, hist.position.y / lBoxH)
+                                }
                                 ink.updateLaser(pageIndex, change.position.x / lBoxW, change.position.y / lBoxH)
                                 change.consume()
                                 if (change.changedToUpIgnoreConsumed()) break
@@ -7178,7 +8906,8 @@ fun ContinuousPageView(
                             boxWidth = boxW,
                             boxHeight = boxH,
                             renderWidthPx = desiredWidthPx,
-                            settings = inkSettings
+                            settings = inkSettings,
+                            tilt = personal.notes.touch.StylusTiltTracker.currentTiltRad
                         )
                         while (true) {
                             val event = awaitPointerEvent()
@@ -7198,12 +8927,19 @@ fun ContinuousPageView(
                             }
                             val curX = change.position.x / boxW
                             val curY = change.position.y / boxH
+                            val tiltNow = personal.notes.touch.StylusTiltTracker.currentTiltRad
+                            @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
+                            val hist = change.historical
+                            for (hIdx in 0 until hist.size) {
+                                val hp = hist[hIdx].position
+                                ink.extendStroke(hp.x / boxW, hp.y / boxH, change.pressure, inkSettings, tiltNow)
+                            }
                             if (change.changedToUpIgnoreConsumed()) {
-                                ink.endStroke(curX, curY, change.pressure, inkSettings)
+                                ink.endStroke(curX, curY, change.pressure, inkSettings, tiltNow)
                                 change.consume()
                                 break
                             }
-                            ink.extendStroke(curX, curY, change.pressure, inkSettings)
+                            ink.extendStroke(curX, curY, change.pressure, inkSettings, tiltNow)
                             change.consume()
                         }
                     }

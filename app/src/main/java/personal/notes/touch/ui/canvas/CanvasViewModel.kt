@@ -10,13 +10,13 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filterNotNull
@@ -40,6 +40,15 @@ import java.io.File
  * it starts with and the size the reset button restores.
  */
 const val DEFAULT_ERASER_WIDTH = 36f
+
+enum class InfiniteGridPreset(val label: String) {
+    BLANK("Blank"),
+    GRAPH("Graph"),
+    LINED("Lined"),
+    DOTS("Dots"),
+    ISOMETRIC("Iso"),
+    TRIANGLE("Tri")
+}
 
 data class CanvasUiState(
     val selectedTool: CanvasTool = CanvasTool.PEN,
@@ -102,7 +111,10 @@ data class CanvasUiState(
     val horizontalResistance: Float = 0.4f,
     val minimalInfiniteZoom: Float = 0.20f,
     val autoCenter: Boolean = true,
-    val autoSaveIntervalMs: Int = 1000
+    val autoSaveIntervalMs: Int = 1000,
+    val gridSnapEnabled: Boolean = false,
+    val strokeOpacity: Float = 1.0f,
+    val infiniteGridPreset: InfiniteGridPreset = InfiniteGridPreset.GRAPH
 )
 
 /**
@@ -276,23 +288,15 @@ class CanvasViewModel(
      *
      * [onCleared] runs after `viewModelScope` is cancelled, so a page turned
      * less than [PAGE_SAVE_DEBOUNCE_MS] before leaving would be dropped. The
-     * write is launched on [finalPageSaveScope] (not the cancelled
-     * `viewModelScope`) and awaited for at most
-     * [FINAL_PAGE_SAVE_TIMEOUT_MS] so it normally lands before the process can
-     * die — the wait is hard-bounded so it can never hold the main thread long
-     * enough to matter. A timed-out write is left running on IO (the scope is
-     * not cancelled here), because cancelling would lose exactly the value
-     * this method exists to keep.
+     * write is dispatched asynchronously on [finalPageSaveScope] (not the cancelled
+     * `viewModelScope`) without blocking the main UI thread during navigation.
      */
     override fun onCleared() {
         if (lastPageRestored && !isNoteDeleted && note.value?.deleted != true) {
             val pageIndex = _currentPageIndex.value
             if (pageIndex >= 0) {
-                val write = finalPageSaveScope.launch {
+                finalPageSaveScope.launch {
                     repository.saveLastPage(noteId, pageIndex)
-                }
-                runBlocking {
-                    withTimeoutOrNull(FINAL_PAGE_SAVE_TIMEOUT_MS) { write.join() }
                 }
             }
         }
@@ -320,7 +324,9 @@ class CanvasViewModel(
         }
         if (settingsRepository != null) {
             viewModelScope.launch {
-                settingsRepository.getSettings().collect { nullableSettings ->
+                combine(settingsRepository.getSettings(), note) { nullableSettings, noteRow ->
+                    nullableSettings to noteRow
+                }.collect { (nullableSettings, noteRow) ->
                     val settings = nullableSettings ?: return@collect
                     val pattern = when (settings.defaultBackground) {
                         1 -> PaperPattern.GRID
@@ -360,7 +366,7 @@ class CanvasViewModel(
                         backgroundMode = settings.backgroundMode,
                         backgroundDensity = settings.backgroundDensity,
                         pageTurningDirection = settings.pageTurningDirection,
-                        pageTurningMode = settings.pageTurningMode,
+                        pageTurningMode = if (noteRow?.pageType == "pdf") settings.pdfPageTurningMode else settings.pageTurningMode,
                         doublePageMode = settings.doublePage,
                         autoCenter = settings.autoCenter,
                         autoSaveIntervalMs = settings.autoSaveIntervalMs
@@ -539,8 +545,13 @@ class CanvasViewModel(
             canvasPageIndex = -1
         }
         _uiState.value = _uiState.value.copy(pageTurningMode = mode)
+        val isPdf = note.value?.pageType == "pdf"
         viewModelScope.launch(Dispatchers.IO) {
-            settingsRepository?.updatePageTurningMode(mode)
+            if (isPdf) {
+                settingsRepository?.updatePdfPageTurningMode(mode)
+            } else {
+                settingsRepository?.updatePageTurningMode(mode)
+            }
         }
     }
 
@@ -648,6 +659,25 @@ class CanvasViewModel(
         viewModelScope.launch(Dispatchers.IO) {
             settingsRepository?.updateAutoShapeEnabled(next)
         }
+    }
+
+    fun toggleGridSnap(enabled: Boolean? = null) {
+        val next = enabled ?: !_uiState.value.gridSnapEnabled
+        _uiState.value = _uiState.value.copy(gridSnapEnabled = next)
+    }
+
+    fun setStrokeOpacity(opacity: Float) {
+        _uiState.value = _uiState.value.copy(strokeOpacity = opacity.coerceIn(0.05f, 1.0f))
+    }
+
+    fun setInfiniteGridPreset(preset: InfiniteGridPreset) {
+        _uiState.value = _uiState.value.copy(infiniteGridPreset = preset)
+    }
+
+    fun cycleInfiniteGridPreset() {
+        val values = InfiniteGridPreset.values()
+        val next = values[(_uiState.value.infiniteGridPreset.ordinal + 1) % values.size]
+        _uiState.value = _uiState.value.copy(infiniteGridPreset = next)
     }
 
     fun toggleReadingMode(enabled: Boolean? = null) {
@@ -887,7 +917,7 @@ class CanvasViewModel(
         } else {
             fileStore.getPageFile(noteId, pageIdx)
         }
-        if (!pageLoadedFromDisk && guardFile.exists()) return
+        if (!force && !pageLoadedFromDisk && guardFile.exists()) return
         // The encoder runs off the main thread while the canvas keeps drawing
         // into the same bitmap: encode a copy so the file can never be torn.
         val copy = withContext(Dispatchers.IO) {
@@ -901,6 +931,9 @@ class CanvasViewModel(
         // The copy is already made here; do not copy a second time.
         saveContentLayerDirect(pageIdx, copy)
         copy.recycle()
+        if (pageIdx == canvasPageIndex) {
+            pageLoadedFromDisk = true
+        }
         if (pendingSave?.second === bitmap) pendingSave = null
     }
 
@@ -1106,9 +1139,6 @@ class CanvasViewModel(
 
         /** Max wait for the first non-empty page list when restoring. */
         const val PAGE_RESTORE_TIMEOUT_MS = 2_000L
-
-        /** Upper bound on the blocking final write in [onCleared]. */
-        const val FINAL_PAGE_SAVE_TIMEOUT_MS = 250L
 
         const val KEY_SHOW_TABS = "show_tabs"
         const val KEY_DOCK_HORIZONTAL = "dock_horizontal"

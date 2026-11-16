@@ -13,7 +13,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
@@ -107,7 +107,10 @@ fun ReferencesSheet(
                         )
                     }
                 } else {
-                    items(backlinks, key = { it.id }) { note ->
+                    itemsIndexed(
+                        backlinks,
+                        key = { index, note -> "backlink_${note.id}_$index" }
+                    ) { _, note ->
                         BacklinkRow(
                             note = note,
                             dateText = dateFormat.format(Date(note.updatedAt)),
@@ -125,7 +128,10 @@ fun ReferencesSheet(
                         Hint("This note has no [[wiki links]] yet. Type [[ and pick a note.")
                     }
                 } else {
-                    items(outgoing, key = { it.targetKey }) { ref ->
+                    itemsIndexed(
+                        outgoing,
+                        key = { index, ref -> "outgoing_${ref.targetKey}_$index" }
+                    ) { _, ref ->
                         OutgoingRow(
                             ref = ref,
                             themeColor = themeColor,
@@ -146,10 +152,10 @@ fun ReferencesSheet(
                         )
                     }
                 } else {
-                    items(
+                    itemsIndexed(
                         blockBacklinks,
-                        key = { it.sourceNoteId + "|" + it.targetKey }
-                    ) { ref ->
+                        key = { index, ref -> "block_backlink_${ref.sourceNoteId}_${ref.targetKey}_$index" }
+                    ) { _, ref ->
                         BlockBacklinkRow(
                             ref = ref,
                             themeColor = themeColor,
@@ -167,7 +173,10 @@ fun ReferencesSheet(
                         Hint("This note has no ((block references)) yet.")
                     }
                 } else {
-                    items(blockOutgoing, key = { it.targetKey }) { ref ->
+                    itemsIndexed(
+                        blockOutgoing,
+                        key = { index, ref -> "block_outgoing_${ref.targetKey}_$index" }
+                    ) { _, ref ->
                         BlockRefRow(
                             ref = ref,
                             themeColor = themeColor,
