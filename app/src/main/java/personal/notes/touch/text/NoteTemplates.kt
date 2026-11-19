@@ -31,7 +31,7 @@ object NoteTemplates {
     const val STARTER_MEETING_CONTENT =
         "## Attendees\n\n## Agenda\n- \n\n## Decisions\n- \n\n## Actions\n- [ ] "
 
-    private val VARIABLE = Regex("""\{\{\s*([^{}]+?)\s*}}""")
+    private val VARIABLE = Regex("""\{\{\s*([^{}]+?)\s*\}\}""")
     private val DATE_WITH_PATTERN = Regex("""^date:(.+)$""")
 
     fun dailyTitle(nowMillis: Long, zone: TimeZone = TimeZone.getDefault()): String =

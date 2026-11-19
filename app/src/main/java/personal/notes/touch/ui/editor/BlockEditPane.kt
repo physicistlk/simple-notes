@@ -129,6 +129,7 @@ fun BlockEditPane(
 
     val noteIndex by viewModel.noteIndex.collectAsState()
     val wikiTitles = remember(noteIndex) { noteIndex.map { it.title } }
+    val subPages by viewModel.subPages.collectAsState()
     // A note linking to itself is never useful; the popup hides the open note.
     val selfTitle by viewModel.title.collectAsState()
 
@@ -176,8 +177,8 @@ fun BlockEditPane(
             state = listState,
             modifier = Modifier
                 .fillMaxSize()
-                .padding(horizontal = 16.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp)
+                .padding(horizontal = 20.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             itemsIndexed(visibleBlocks, key = { _, b -> b.id }) { _, block ->
                 BlockRow(
@@ -189,6 +190,7 @@ fun BlockEditPane(
                     themeColor = themeColor,
                     focusRequesters = focusRequesters,
                     wikiTitles = wikiTitles,
+                    subPages = subPages,
                     selfTitle = selfTitle,
                     onOpenNote = onOpenNote,
                     onOpenMenu = { menuBlockId = it }
@@ -449,7 +451,7 @@ private fun TransferBlockDialog(
 
 /** Slash menu is not offered inside atomic fenced/table blocks. */
 private val slashForbiddenTypes: Set<BlockType> =
-    setOf(BlockType.CODE, BlockType.TABLE, BlockType.QUERY)
+    setOf(BlockType.CODE, BlockType.TABLE, BlockType.QUERY, BlockType.SUBPAGE)
 
 /** Vertical travel (in dp) that moves a dragged block by one position. */
 private val REORDER_STEP = 44.dp
@@ -464,6 +466,7 @@ private fun BlockRow(
     themeColor: Color,
     focusRequesters: MutableMap<String, FocusRequester>,
     wikiTitles: List<String>,
+    subPages: List<NoteEntity>,
     selfTitle: String,
     onOpenMenu: (String) -> Unit,
     onOpenNote: (String) -> Unit = {}
@@ -686,32 +689,121 @@ private fun BlockRow(
                     color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.18f)
                 )
             }
-            BlockType.CODE -> {
-                Card(
+            BlockType.SUBPAGE -> {
+                val targetId = block.field.text.trim()
+                val childNote = subPages.firstOrNull { it.id == targetId }
+                val childTitle = childNote?.title?.ifBlank { "Untitled" } ?: "Sub-page"
+                Surface(
                     shape = RoundedCornerShape(8.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                    border = androidx.compose.foundation.BorderStroke(
+                        1.dp,
+                        MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f)
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable {
+                            if (targetId.isNotEmpty()) {
+                                viewModel.saveNow { onOpenNote(targetId) }
+                            }
+                        }
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 9.dp)
+                    ) {
+                        Text(
+                            text = "\uD83D\uDCC4",
+                            fontSize = 15.sp
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text(
+                            text = childTitle,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 1,
+                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Text(
+                            text = "Open ›",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = themeColor
+                        )
+                    }
+                }
+            }
+            BlockType.CODE -> {
+                val ctx = LocalContext.current
+                Card(
+                    shape = RoundedCornerShape(10.dp),
                     colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f)
+                    ),
+                    border = androidx.compose.foundation.BorderStroke(
+                        1.dp,
+                        MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f)
                     ),
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    BlockTextField(
-                        block = block,
-                        viewModel = viewModel,
-                        focusRequester = focus,
-                        onSlashArmed = { slashArmed = it },
-                        readOnly = isReadOnly,
-                        // Code is literal; markdown markers have no meaning there.
-                        inlineStyling = false,
-                        textStyle = TextStyle(
-                            fontFamily = FontFamily.Monospace,
-                            fontSize = 13.sp,
-                            lineHeight = 18.sp,
-                            color = MaterialTheme.colorScheme.onSurface
-                        ),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(12.dp)
-                    )
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.04f))
+                                .padding(horizontal = 12.dp, vertical = 5.dp)
+                        ) {
+                            Text(
+                                text = "CODE",
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                letterSpacing = 0.8.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                            )
+                            Text(
+                                text = "Copy",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = themeColor,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(4.dp))
+                                    .clickable {
+                                        val ok = ClipboardHelper.copyText(ctx, block.field.text, "Code")
+                                        Toast.makeText(
+                                            ctx,
+                                            if (ok) "Code copied" else "Code block is empty",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                    }
+                                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                        BlockTextField(
+                            block = block,
+                            viewModel = viewModel,
+                            focusRequester = focus,
+                            onSlashArmed = { slashArmed = it },
+                            readOnly = isReadOnly,
+                            // Code is literal; markdown markers have no meaning there.
+                            inlineStyling = false,
+                            textStyle = TextStyle(
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 13.sp,
+                                lineHeight = 20.sp,
+                                color = MaterialTheme.colorScheme.onSurface
+                            ),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(12.dp)
+                        )
+                    }
                 }
             }
             BlockType.TABLE -> {
@@ -896,20 +988,54 @@ private fun BlockRow(
                 }
             }
             BlockType.PARAGRAPH -> {
-                BlockTextField(
-                    block = block,
-                    viewModel = viewModel,
-                    focusRequester = focus,
-                    onSlashArmed = { slashArmed = it },
-                    readOnly = isReadOnly,
-                    isOnlyBlock = isOnlyBlock,
-                    textStyle = TextStyle(
-                        fontSize = 15.sp,
-                        lineHeight = 22.sp,
-                        color = MaterialTheme.colorScheme.onSurface
-                    ),
-                    modifier = Modifier.fillMaxWidth()
-                )
+                val links = remember(block.field.text) {
+                    WikiLinks.parse(block.field.text)
+                }
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    BlockTextField(
+                        block = block,
+                        viewModel = viewModel,
+                        focusRequester = focus,
+                        onSlashArmed = { slashArmed = it },
+                        readOnly = isReadOnly,
+                        isOnlyBlock = isOnlyBlock,
+                        textStyle = TextStyle(
+                            fontSize = 16.sp,
+                            lineHeight = 24.sp,
+                            color = MaterialTheme.colorScheme.onSurface
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    if (links.isNotEmpty()) {
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            modifier = Modifier
+                                .then(androidx.compose.ui.Modifier)
+                                .padding(top = 4.dp)
+                        ) {
+                            links.forEach { link ->
+                                val targetId = viewModel.noteIdForTitle(link.target)
+                                if (targetId != null) {
+                                    Surface(
+                                        shape = RoundedCornerShape(6.dp),
+                                        color = themeColor.copy(alpha = 0.10f),
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(6.dp))
+                                            .clickable { onOpenNote(targetId) }
+                                    ) {
+                                        Text(
+                                            text = "\uD83D\uDCC4 " + (link.alias ?: link.target) + " \u2197",
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.Medium,
+                                            color = themeColor,
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
                 }
             }
@@ -942,12 +1068,12 @@ private fun BlockRow(
 
 /** Heading text size (sp) + weight per level 1..6, mirroring the preview. */
 private fun headingStyle(level: Int): Pair<Int, FontWeight> = when (level) {
-    1 -> 22 to FontWeight.ExtraBold
-    2 -> 19 to FontWeight.Bold
-    3 -> 16 to FontWeight.SemiBold
-    4 -> 15 to FontWeight.SemiBold
-    5 -> 14 to FontWeight.Medium
-    else -> 13 to FontWeight.Medium
+    1 -> 26 to FontWeight.ExtraBold
+    2 -> 21 to FontWeight.Bold
+    3 -> 18 to FontWeight.SemiBold
+    4 -> 16 to FontWeight.SemiBold
+    5 -> 15 to FontWeight.Medium
+    else -> 14 to FontWeight.Medium
 }
 
 /**
@@ -1009,7 +1135,7 @@ private fun BlockTextField(
             .onPreviewKeyEvent { event ->
                 when {
                     event.type == KeyEventType.KeyDown && (event.key == Key.Enter || event.key == Key.NumPadEnter) &&
-                        !event.isShiftPressed -> {
+                        !event.isShiftPressed && block.type != BlockType.CODE -> {
                         viewModel.onEnterPressed(block.id)
                         true
                     }
@@ -1206,6 +1332,7 @@ private fun slashGlyph(command: BlockCommand): String = when (command) {
     BlockCommand.CODE -> "{ }"
     BlockCommand.TABLE -> "⊞"
     BlockCommand.IMAGE -> "🖼"
+    BlockCommand.SUBPAGE -> "📄"
     BlockCommand.LINK -> "🔗"
     BlockCommand.TAG -> "#"
     BlockCommand.HIGHLIGHT -> "≡"

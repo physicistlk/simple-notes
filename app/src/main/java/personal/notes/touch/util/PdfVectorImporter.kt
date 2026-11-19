@@ -97,27 +97,49 @@ object PdfVectorImporter {
     ): Bitmap? {
         val sourcePath = storeSource(context, noteId, imported.bytes)
         var firstPage: Bitmap? = null
+        val thumbW = minOf(targetWidth, 720)
+        val thumbH = minOf(targetHeight, 1020)
         for (i in 0 until imported.pageCount) {
-            val bitmap = try {
-                imported.document.renderPage(i, targetWidth, targetHeight)
-            } catch (e: Exception) {
-                e.printStackTrace()
-                onPageError("PDF import error: ${e.message}")
-                null
-            } ?: continue
             val pageIndex = if (i == 0 && reuseFirstPage) 0 else repository.addPage(noteId).index
-            fileStore.writePageFileAtomically(noteId, pageIndex) { tmp ->
-                FileOutputStream(tmp).use { out ->
-                    bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
-                }
-            }
             if (sourcePath != null) {
                 repository.setPagePdfSource(noteId, pageIndex, sourcePath, i)
-            }
-            if (firstPage == null) {
-                firstPage = bitmap
+                // Vector PDF pages render crisply on demand from pdfium; only page 0 needs
+                // a lightweight thumbnail PNG for the library card, preventing OOM/stalls on
+                // multi-page PDFs (previously rendering 2160x3056 bitmaps for every page).
+                if (i == 0) {
+                    val thumb = try {
+                        imported.document.renderPage(0, thumbW, thumbH)
+                    } catch (e: Throwable) {
+                        e.printStackTrace()
+                        null
+                    }
+                    if (thumb != null) {
+                        fileStore.writePageFileAtomically(noteId, pageIndex) { tmp ->
+                            FileOutputStream(tmp).use { out ->
+                                thumb.compress(Bitmap.CompressFormat.PNG, 90, out)
+                            }
+                        }
+                        firstPage = thumb
+                    }
+                }
             } else {
-                bitmap.recycle()
+                val bitmap = try {
+                    imported.document.renderPage(i, targetWidth, targetHeight)
+                } catch (e: Throwable) {
+                    e.printStackTrace()
+                    onPageError("PDF import error: ${e.message}")
+                    null
+                } ?: continue
+                fileStore.writePageFileAtomically(noteId, pageIndex) { tmp ->
+                    FileOutputStream(tmp).use { out ->
+                        bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+                    }
+                }
+                if (firstPage == null) {
+                    firstPage = bitmap
+                } else {
+                    bitmap.recycle()
+                }
             }
         }
         return firstPage

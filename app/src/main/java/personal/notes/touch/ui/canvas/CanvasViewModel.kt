@@ -380,8 +380,53 @@ class CanvasViewModel(
         restoreLastPage()
     }
 
+    private var previousNonEraserTool: CanvasTool? = null
+    private var toolBeforeEraser: CanvasTool = CanvasTool.PEN
+
     fun selectTool(tool: CanvasTool) {
-        _uiState.value = _uiState.value.copy(selectedTool = tool)
+        val current = _uiState.value.selectedTool
+        if (tool != current) {
+            if (tool == CanvasTool.ERASER) {
+                if (current != CanvasTool.ERASER) {
+                    toolBeforeEraser = current
+                }
+            } else {
+                if (current != CanvasTool.ERASER) {
+                    previousNonEraserTool = current
+                }
+                toolBeforeEraser = tool
+            }
+            _uiState.value = _uiState.value.copy(selectedTool = tool)
+        }
+    }
+
+    /**
+     * Cycles between the current non-eraser tool and the previous non-eraser tool.
+     * Never cycles to Eraser. If currently on Eraser, returns to [toolBeforeEraser].
+     */
+    fun cyclePreviousTool() {
+        val current = _uiState.value.selectedTool
+        if (current == CanvasTool.ERASER) {
+            selectTool(toolBeforeEraser)
+            return
+        }
+        val prev = previousNonEraserTool ?: return
+        if (prev != CanvasTool.ERASER && prev != current) {
+            selectTool(prev)
+        }
+    }
+
+    /**
+     * Toggles Eraser on/off (Xiaomi Pen 2 secondary button):
+     * pressing once selects Eraser; pressing again returns to the previous tool.
+     */
+    fun selectEraserTool() {
+        val current = _uiState.value.selectedTool
+        if (current == CanvasTool.ERASER) {
+            selectTool(toolBeforeEraser)
+        } else {
+            selectTool(CanvasTool.ERASER)
+        }
     }
 
     fun selectColor(color: Color) {
@@ -752,6 +797,10 @@ class CanvasViewModel(
         val file = fileStore.getPageFile(noteId, _currentPageIndex.value)
         return BitmapUtils.loadBitmapFromFile(file)
     }
+
+    /** Read-only overlay of the strokes written in continuous mode (null = none). */
+    suspend fun loadCurrentAnnotationOverlay(width: Int, height: Int): Bitmap? =
+        repository.loadAnnotationOverlay(noteId, _currentPageIndex.value, width, height)
 
     /**
      * True when the page bitmap currently shown in the canvas view came from

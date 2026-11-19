@@ -63,7 +63,9 @@ data class NoteRow(
     val note: NoteEntity,
     val tags: List<String>,
     val snippet: SearchSnippet? = null,
-    val titleMatch: Boolean = false
+    val titleMatch: Boolean = false,
+    /** Live sub-pages of this note (nested pages). */
+    val subPageCount: Int = 0
 )
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -113,6 +115,14 @@ class NoteListViewModel(
             initialValue = emptyList()
         )
 
+    private val subPageCounts: StateFlow<Map<String, Int>> = repository.observeSubPageCounts()
+        .map { rows -> rows.associate { it.parentNoteId to it.count } }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyMap()
+        )
+
     private val tagsByNote: StateFlow<Map<String, List<String>>> = repository.observeTagsByNote()
         .stateIn(
             scope = viewModelScope,
@@ -143,6 +153,9 @@ class NoteListViewModel(
                         )
                         repository.getNotesByFolders(ids)
                     }
+                    // A search looks through sub-pages too; the plain library
+                    // lists top-level notes only (sub-pages hang under a parent).
+                    state.searchQuery.isNotBlank() -> repository.getAllNotesIncludingSubPages()
                     else -> repository.getAllNotes()
                 }
             }
@@ -159,7 +172,7 @@ class NoteListViewModel(
      * lowercased key, display casing comes from the note.
      */
     val notes: StateFlow<List<NoteRow>> =
-        combine(baseNotes, _uiState, tagsByNote) { base, state, tags ->
+        combine(baseNotes, _uiState, tagsByNote, subPageCounts) { base, state, tags, subCounts ->
             val tokens = NoteSearch.tokens(state.searchQuery)
             val tag = state.selectedTag
             val filtered = base.filter { note ->
@@ -180,7 +193,8 @@ class NoteListViewModel(
                             NoteSearch.snippet(note.content.orEmpty(), tokens)
                         },
                         titleMatch = tokens.isNotEmpty() &&
-                            NoteSearch.containsAll(note.title, tokens)
+                            NoteSearch.containsAll(note.title, tokens),
+                        subPageCount = subCounts[note.id] ?: 0
                     )
                 }
             when (state.sortOrder) {

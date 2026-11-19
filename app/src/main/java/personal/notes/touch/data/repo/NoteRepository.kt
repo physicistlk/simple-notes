@@ -44,6 +44,12 @@ import personal.notes.touch.text.WikiLinks
 import personal.notes.touch.ui.editor.BlockPersistence
 import java.util.UUID
 
+/** How many parents the breadcrumb walks up before it gives up. */
+private const val MAX_NESTING_DEPTH = 32
+
+/** Upper bound for one cascade delete/restore of a sub-page tree. */
+private const val MAX_SUBTREE_NOTES = 10_000
+
 class NoteRepository(
     private val noteDao: NoteDao,
     private val noteBlockDao: NoteBlockDao,
@@ -81,6 +87,65 @@ class NoteRepository(
     }
 
     fun getFavorites(): Flow<List<NoteEntity>> = noteDao.getFavorites()
+
+    // ---- Nested pages ------------------------------------------------------------
+
+    /** Every live note including sub-pages (used while searching). */
+    fun getAllNotesIncludingSubPages(): Flow<List<NoteEntity>> = noteDao.getAllIncludingSubPages()
+
+    /** Live sub-pages of [parentId], oldest first. */
+    fun observeSubPages(parentId: String): Flow<List<NoteEntity>> = noteDao.observeSubPages(parentId)
+
+    fun observeSubPageCounts(): Flow<List<personal.notes.touch.data.db.dao.SubPageCount>> =
+        noteDao.observeSubPageCounts()
+
+    /**
+     * Creates an empty text note as a sub-page of [parentId], filed in the
+     * parent's notebook. Returns null when the parent does not exist.
+     */
+    suspend fun createSubPage(parentId: String, title: String = "Untitled"): NoteEntity? =
+        withContext(Dispatchers.IO) {
+            val parent = noteDao.getById(parentId) ?: return@withContext null
+            createNote(
+                title = title,
+                folderId = parent.folderId,
+                pageType = "text",
+                parentNoteId = parent.id
+            )
+        }
+
+    /**
+     * The parents of [noteId], outermost first (the breadcrumb). A guard stops
+     * at [MAX_NESTING_DEPTH] and on a cycle, so a corrupted parent link can
+     * never loop forever.
+     */
+    suspend fun getAncestors(noteId: String): List<NoteEntity> = withContext(Dispatchers.IO) {
+        val chain = ArrayList<NoteEntity>()
+        val seen = HashSet<String>()
+        seen.add(noteId)
+        var current = noteDao.getById(noteId)?.parentNoteId
+        while (current != null && chain.size < MAX_NESTING_DEPTH && seen.add(current)) {
+            val parent = noteDao.getById(current) ?: break
+            chain.add(parent)
+            current = parent.parentNoteId
+        }
+        chain.reversed()
+    }
+
+    /** [id] and every sub-page below it, parents before children. */
+    private suspend fun subtreeIds(id: String): List<String> {
+        val result = ArrayList<String>()
+        val seen = HashSet<String>()
+        val queue = ArrayDeque<String>()
+        queue.add(id)
+        while (queue.isNotEmpty() && result.size < MAX_SUBTREE_NOTES) {
+            val next = queue.removeFirst()
+            if (!seen.add(next)) continue
+            result.add(next)
+            noteDao.getChildIds(next).forEach { queue.add(it) }
+        }
+        return result
+    }
 
     fun getRecycledNotes(): Flow<List<NoteEntity>> = noteDao.getRecycled()
 
@@ -156,7 +221,8 @@ class NoteRepository(
     suspend fun createNote(
         title: String = "Untitled Note",
         folderId: String? = null,
-        pageType: String = "infinite"
+        pageType: String = "infinite",
+        parentNoteId: String? = null
     ): NoteEntity = withContext(Dispatchers.IO) {
         val noteId = UUID.randomUUID().toString()
         val now = System.currentTimeMillis()
@@ -169,7 +235,8 @@ class NoteRepository(
             createdAt = now,
             updatedAt = now,
             pageCount = 1,
-            pageType = pageType
+            pageType = pageType,
+            parentNoteId = parentNoteId
         )
         noteDao.insert(note)
 
@@ -511,7 +578,9 @@ class NoteRepository(
     }
 
     suspend fun softDeleteNote(id: String, deleted: Boolean = true) = withContext(Dispatchers.IO) {
-        noteDao.setDeleted(id, deleted, System.currentTimeMillis())
+        // Sub-pages follow their parent into the recycle bin and back out.
+        val now = System.currentTimeMillis()
+        subtreeIds(id).forEach { noteDao.setDeleted(it, deleted, now) }
     }
 
     suspend fun setFavorite(id: String, favorite: Boolean) = withContext(Dispatchers.IO) {
@@ -532,15 +601,18 @@ class NoteRepository(
     }
 
     suspend fun permanentlyDeleteNote(id: String) = withContext(Dispatchers.IO) {
-        // The references into the note go with it, otherwise the table grows
-        // with every permanent delete.
-        blockRefDao.deleteForNote(id)
-        noteBlockDao.deleteForNote(id)
-        noteTagDao.deleteForNote(id)
-        noteRefDao.deleteForNote(id)
-        pageDao.deleteForNote(id)
-        noteDao.delete(id)
-        fileStore.deleteNoteFiles(id)
+        // Sub-pages go with their parent, deepest first.
+        for (noteId in subtreeIds(id).reversed()) {
+            // The references into the note go with it, otherwise the table grows
+            // with every permanent delete.
+            blockRefDao.deleteForNote(noteId)
+            noteBlockDao.deleteForNote(noteId)
+            noteTagDao.deleteForNote(noteId)
+            noteRefDao.deleteForNote(noteId)
+            pageDao.deleteForNote(noteId)
+            noteDao.delete(noteId)
+            fileStore.deleteNoteFiles(noteId)
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -717,6 +789,52 @@ class NoteRepository(
     suspend fun loadPageBitmap(noteId: String, pageIndex: Int): android.graphics.Bitmap? = withContext(Dispatchers.IO) {
         val file = fileStore.getPageFile(noteId, pageIndex)
         personal.notes.touch.util.BitmapUtils.loadBitmapFromFile(file)
+    }
+
+    /**
+     * Composites the continuous-mode annotation layers (`page_{index}_annot_{layer}.png`)
+     * of a page into one transparent [width]x[height] bitmap, so single-page mode can show
+     * them. It is a read-only overlay: it is never merged into the page image, so the same
+     * strokes are not stored twice. Returns null when the page has no annotation layers.
+     */
+    suspend fun loadAnnotationOverlay(
+        noteId: String,
+        pageIndex: Int,
+        width: Int,
+        height: Int
+    ): android.graphics.Bitmap? = withContext(Dispatchers.IO) {
+        if (width <= 0 || height <= 0) return@withContext null
+        val prefix = "page_${pageIndex}_annot_"
+        val annotFiles = fileStore.getLayersDir(noteId).listFiles()
+            ?.filter {
+                it.name.startsWith(prefix) && it.name.endsWith(".png") &&
+                    it.name.removePrefix(prefix).removeSuffix(".png").toIntOrNull() != null
+            }
+            ?.sortedBy { it.name.removePrefix(prefix).removeSuffix(".png").toInt() }
+            ?: emptyList()
+        if (annotFiles.isEmpty()) return@withContext null
+
+        val target = personal.notes.touch.util.BitmapUtils.createSafeBitmap(width, height)
+        val canvas = android.graphics.Canvas(target)
+        val paint = android.graphics.Paint(
+            android.graphics.Paint.FILTER_BITMAP_FLAG or android.graphics.Paint.ANTI_ALIAS_FLAG
+        )
+        val dst = android.graphics.Rect(0, 0, width, height)
+        var drawn = false
+        for (file in annotFiles) {
+            val layerBmp = personal.notes.touch.util.BitmapUtils.loadBitmapFromFile(file) ?: continue
+            // A fixed page's layer is 1.5x as wide as the page (a quarter of the page on each side).
+            val srcLeft = (layerBmp.width / 6f).toInt().coerceIn(0, layerBmp.width)
+            val srcRight = (layerBmp.width * 5f / 6f).toInt().coerceIn(srcLeft, layerBmp.width)
+            canvas.drawBitmap(layerBmp, android.graphics.Rect(srcLeft, 0, srcRight, layerBmp.height), dst, paint)
+            layerBmp.recycle()
+            drawn = true
+        }
+        if (!drawn) {
+            target.recycle()
+            return@withContext null
+        }
+        target
     }
 
     /**

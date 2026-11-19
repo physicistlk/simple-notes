@@ -29,6 +29,9 @@ sealed class InfiniteCanvasItem {
     abstract val width: Float
     abstract val height: Float
     abstract val rotationDeg: Float
+    abstract val pageIndex: Int
+    abstract val layerIndex: Int
+    abstract val flipHorizontal: Boolean
 
     data class ImageItem(
         override val id: String,
@@ -37,7 +40,10 @@ sealed class InfiniteCanvasItem {
         override val centerY: Float,
         override val width: Float,
         override val height: Float,
-        override val rotationDeg: Float = 0f
+        override val rotationDeg: Float = 0f,
+        override val pageIndex: Int = 0,
+        override val layerIndex: Int = 1,
+        override val flipHorizontal: Boolean = false
     ) : InfiniteCanvasItem()
 
     data class PdfPageItem(
@@ -48,7 +54,10 @@ sealed class InfiniteCanvasItem {
         override val centerY: Float,
         override val width: Float,
         override val height: Float,
-        override val rotationDeg: Float = 0f
+        override val rotationDeg: Float = 0f,
+        override val pageIndex: Int = 0,
+        override val layerIndex: Int = 1,
+        override val flipHorizontal: Boolean = false
     ) : InfiniteCanvasItem()
 
     fun withTransform(
@@ -56,22 +65,36 @@ sealed class InfiniteCanvasItem {
         centerY: Float = this.centerY,
         width: Float = this.width,
         height: Float = this.height,
-        rotationDeg: Float = this.rotationDeg
+        rotationDeg: Float = this.rotationDeg,
+        pageIndex: Int = this.pageIndex,
+        layerIndex: Int = this.layerIndex,
+        flipHorizontal: Boolean = this.flipHorizontal
     ): InfiniteCanvasItem = when (this) {
         is ImageItem -> copy(
             centerX = centerX,
             centerY = centerY,
             width = width,
             height = height,
-            rotationDeg = rotationDeg
+            rotationDeg = rotationDeg,
+            pageIndex = pageIndex,
+            layerIndex = layerIndex,
+            flipHorizontal = flipHorizontal
         )
         is PdfPageItem -> copy(
             centerX = centerX,
             centerY = centerY,
             width = width,
             height = height,
-            rotationDeg = rotationDeg
+            rotationDeg = rotationDeg,
+            pageIndex = pageIndex,
+            layerIndex = layerIndex,
+            flipHorizontal = flipHorizontal
         )
+    }
+
+    fun duplicateWithNewId(): InfiniteCanvasItem = when (this) {
+        is ImageItem -> copy(id = UUID.randomUUID().toString())
+        is PdfPageItem -> copy(id = UUID.randomUUID().toString())
     }
 }
 
@@ -80,7 +103,13 @@ enum class InfiniteItemHandle {
     MOVE,
     DELETE,
     ROTATE,
-    RESIZE
+    MIRROR,
+    COPY,
+    RESIZE,
+    SCALE_LEFT,
+    SCALE_RIGHT,
+    SCALE_TOP,
+    SCALE_BOTTOM
 }
 
 object InfiniteItemsStore {
@@ -101,18 +130,48 @@ object InfiniteItemsStore {
                 val w = obj.optDouble("w", 400.0).toFloat().coerceAtLeast(40f)
                 val h = obj.optDouble("h", 400.0).toFloat().coerceAtLeast(40f)
                 val rot = obj.optDouble("rot", 0.0).toFloat()
+                val notePageIdx = obj.optInt("pageIndex", 0)
+                val layerIdx = obj.optInt("layerIndex", 1)
+                val flipH = obj.optBoolean("flipH", false)
                 when (type) {
                     "image" -> {
                         val fileName = obj.optString("file")
                         if (fileName.isNotEmpty()) {
-                            out.add(InfiniteCanvasItem.ImageItem(id, fileName, cx, cy, w, h, rot))
+                            out.add(
+                                InfiniteCanvasItem.ImageItem(
+                                    id = id,
+                                    fileName = fileName,
+                                    centerX = cx,
+                                    centerY = cy,
+                                    width = w,
+                                    height = h,
+                                    rotationDeg = rot,
+                                    pageIndex = notePageIdx,
+                                    layerIndex = layerIdx,
+                                    flipHorizontal = flipH
+                                )
+                            )
                         }
                     }
                     "pdf_page" -> {
                         val pdfFile = obj.optString("pdf")
                         val pageIdx = obj.optInt("page", 0)
                         if (pdfFile.isNotEmpty()) {
-                            out.add(InfiniteCanvasItem.PdfPageItem(id, pdfFile, pageIdx, cx, cy, w, h, rot))
+                            out.add(
+                                InfiniteCanvasItem.PdfPageItem(
+                                    id = id,
+                                    pdfFileName = pdfFile,
+                                    pdfPageIndex = pageIdx,
+                                    centerX = cx,
+                                    centerY = cy,
+                                    width = w,
+                                    height = h,
+                                    rotationDeg = rot,
+                                    pageIndex = notePageIdx,
+                                    layerIndex = layerIdx,
+                                    flipHorizontal = flipH
+                                )
+                            )
                         }
                     }
                 }
@@ -154,6 +213,9 @@ object InfiniteItemsStore {
                     put("w", item.width.toDouble())
                     put("h", item.height.toDouble())
                     put("rot", item.rotationDeg.toDouble())
+                    put("pageIndex", item.pageIndex)
+                    put("layerIndex", item.layerIndex)
+                    put("flipH", item.flipHorizontal)
                     when (item) {
                         is InfiniteCanvasItem.ImageItem -> {
                             put("type", "image")
@@ -455,19 +517,42 @@ fun hitTestInfiniteItemHandle(
     val (lx, ly) = worldToItemLocal(wx, wy, item)
     val hw = item.width / 2f
     val hh = item.height / 2f
-    val handleRadiusWorld = 28f / canvasScale.coerceAtLeast(0.1f)
+    val inv = 1f / canvasScale.coerceAtLeast(0.1f)
+    val handleRadiusWorld = 28f * inv
+    val mirrorOffsetX = (-hw + 38.4f * inv).coerceAtMost(0f)
 
-    // Top-left: Delete
-    if (kotlin.math.hypot((lx + hw).toDouble(), (ly + hh).toDouble()) <= handleRadiusWorld) {
+    // Corner 2 (Top-right): Delete / Cut
+    if (kotlin.math.hypot((lx - hw).toDouble(), (ly + hh).toDouble()) <= handleRadiusWorld) {
         return InfiniteItemHandle.DELETE
     }
-    // Top-right: Rotate
-    if (kotlin.math.hypot((lx - hw).toDouble(), (ly + hh).toDouble()) <= handleRadiusWorld) {
+    // Corner 1 (Top-left): Rotate
+    if (kotlin.math.hypot((lx + hw).toDouble(), (ly + hh).toDouble()) <= handleRadiusWorld) {
         return InfiniteItemHandle.ROTATE
     }
-    // Bottom-right: Resize
+    // Beside Corner 1 (Top-left + offset): Mirror horizontal flip
+    if (kotlin.math.hypot((lx - mirrorOffsetX).toDouble(), (ly + hh).toDouble()) <= handleRadiusWorld) {
+        return InfiniteItemHandle.MIRROR
+    }
+    // Corner 3 (Bottom-left): Copy (tap & drag)
+    if (kotlin.math.hypot((lx + hw).toDouble(), (ly - hh).toDouble()) <= handleRadiusWorld) {
+        return InfiniteItemHandle.COPY
+    }
+    // Corner 4 (Bottom-right): 1:1 Resize
     if (kotlin.math.hypot((lx - hw).toDouble(), (ly - hh).toDouble()) <= handleRadiusWorld) {
         return InfiniteItemHandle.RESIZE
+    }
+    // Edge midpoints: single-axis stretch/squeeze
+    if (kotlin.math.hypot((lx + hw).toDouble(), ly.toDouble()) <= handleRadiusWorld) {
+        return InfiniteItemHandle.SCALE_LEFT
+    }
+    if (kotlin.math.hypot((lx - hw).toDouble(), ly.toDouble()) <= handleRadiusWorld) {
+        return InfiniteItemHandle.SCALE_RIGHT
+    }
+    if (kotlin.math.hypot(lx.toDouble(), (ly + hh).toDouble()) <= handleRadiusWorld) {
+        return InfiniteItemHandle.SCALE_TOP
+    }
+    if (kotlin.math.hypot(lx.toDouble(), (ly - hh).toDouble()) <= handleRadiusWorld) {
+        return InfiniteItemHandle.SCALE_BOTTOM
     }
     // Interior: Move
     if (lx in -hw..hw && ly in -hh..hh) {
@@ -479,10 +564,14 @@ fun hitTestInfiniteItemHandle(
 fun hitTestInfiniteItems(
     wx: Float,
     wy: Float,
-    items: List<InfiniteCanvasItem>
+    items: List<InfiniteCanvasItem>,
+    pageIndex: Int? = null,
+    isLayerVisible: ((Int) -> Boolean)? = null
 ): InfiniteCanvasItem? {
     for (i in items.indices.reversed()) {
         val item = items[i]
+        if (pageIndex != null && item.pageIndex != pageIndex) continue
+        if (isLayerVisible != null && !isLayerVisible(item.layerIndex)) continue
         val (lx, ly) = worldToItemLocal(wx, wy, item)
         if (lx in -(item.width / 2f)..(item.width / 2f) &&
             ly in -(item.height / 2f)..(item.height / 2f)

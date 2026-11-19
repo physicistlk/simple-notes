@@ -13,6 +13,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.hoverable
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsHoveredAsState
 import androidx.compose.foundation.shape.CircleShape
@@ -714,5 +715,342 @@ fun LiquidGlassToolSlot(
         contentAlignment = Alignment.Center
     ) {
         content()
+    }
+}
+
+/**
+ * AGSL Signed-Distance-Field (SDF) smooth-minimum (`smin`) liquid glass morphing
+ * shader for two adjacent tool droplets. As `uMorph` springs from 0 -> 1, the
+ * second droplet pulls out horizontally to the right of the anchor droplet with
+ * a true liquid bridge, meniscus refraction tint, and directional specular glint.
+ */
+private const val LIQUID_MORPH_DROPLETS_AGSL = """
+uniform float2 uSize;
+uniform float  uSlotSize;
+uniform float  uRadius;
+uniform float  uGap;
+uniform float  uMorph;
+uniform float  uHoverSecond;
+uniform float  uExpandDown;
+uniform half4  uAccent;
+
+float sdRoundBox(float2 p, float2 b, float r) {
+    float2 q = abs(p) - b + float2(r);
+    return min(max(q.x, q.y), 0.0) + length(max(q, float2(0.0))) - r;
+}
+
+float smin(float a, float b, float k) {
+    float h = clamp(0.5 + 0.5 * (b - a) / max(k, 0.001), 0.0, 1.0);
+    return mix(b, a, h) - k * h * (1.0 - h);
+}
+
+float sceneSdf(float2 p) {
+    float halfS = uSlotSize * 0.5;
+    float2 c1 = float2(halfS, halfS);
+    float m = max(uMorph, 0.0);
+    float sep = (uSlotSize + uGap) * m;
+    float2 c2 = (uExpandDown > 0.5)
+        ? float2(halfS, halfS + sep)
+        : float2(halfS + sep, halfS);
+    float s2 = mix(0.68, 1.0, clamp(m, 0.0, 1.0));
+    float d1 = sdRoundBox(p - c1, float2(halfS), uRadius);
+    float d2 = sdRoundBox(p - c2, float2(halfS * s2), uRadius * s2);
+    float k = mix(16.0, 5.5, clamp(m, 0.0, 1.0)) * smoothstep(0.01, 0.15, m);
+    if (m < 0.01) return d1;
+    return smin(d1, d2, k);
+}
+
+half4 main(float2 fragCoord) {
+    float d = sceneSdf(fragCoord);
+    float aa = 1.25;
+    float alpha = 1.0 - smoothstep(-aa, aa, d);
+    if (alpha <= 0.001) return half4(0.0);
+
+    float eps = 1.2;
+    float2 n = normalize(float2(
+        sceneSdf(fragCoord + float2(eps, 0.0)) - sceneSdf(fragCoord - float2(eps, 0.0)),
+        sceneSdf(fragCoord + float2(0.0, eps)) - sceneSdf(fragCoord - float2(0.0, eps))
+    ) + float2(0.0001));
+
+    float bezel = 9.0;
+    float rimT = clamp(1.0 - (-d) / bezel, 0.0, 1.0);
+    float rimSmooth = rimT * rimT * (3.0 - 2.0 * rimT);
+
+    float vy = clamp(fragCoord.y / max(uSize.y, 1.0), 0.0, 1.0);
+    half3 col = mix(half3(0.975, 0.985, 1.0), half3(0.895, 0.925, 0.968), half(vy));
+
+    float axisCoord = (uExpandDown > 0.5) ? fragCoord.y : fragCoord.x;
+    float secondMask = smoothstep(uSlotSize * 0.85, uSlotSize * 1.15, axisCoord);
+    col = mix(col, uAccent.rgb, half(uHoverSecond * secondMask * 0.24));
+
+    // Refracted chromatic edge tint along the liquid meniscus.
+    half3 prism = mix(half3(0.75, 0.90, 1.0), half3(0.98, 0.82, 0.95), half(0.5 + 0.5 * n.x));
+    col = mix(col, prism, half(rimSmooth * 0.20));
+
+    // Outer Fresnel rim definition + inner caustic ring.
+    float edgeDark = pow(clamp(1.0 - (-d) / 2.6, 0.0, 1.0), 2.0);
+    col *= half(1.0 - 0.14 * edgeDark);
+    float caustic = exp(-pow((rimT - 0.35) / 0.18, 2.0));
+    col += half3(0.08, 0.09, 0.11) * half(caustic);
+
+    // Directional top-left specular glint + bottom-right bounce.
+    float2 L = normalize(float2(-0.55, -0.83));
+    float spec = pow(rimT, 2.4) * pow(max(dot(n, L), 0.0), 1.4);
+    float bounce = pow(rimT, 2.4) * 0.42 * pow(max(-dot(n, L), 0.0), 1.7);
+    col += half3(1.0) * half(0.85 * spec) + half3(0.85, 0.92, 1.0) * half(0.55 * bounce);
+
+    half bodyAlpha = half(alpha * 0.93);
+    return half4(clamp(col, 0.0, 1.0) * bodyAlpha, bodyAlpha);
+}
+"""
+
+/**
+ * AGSL SDF smooth-minimum (`smin`) liquid glass segmented pill toggle shader.
+ * As `uProgress` springs between 0 (left) and 1 (right), two internal capsules
+ * stretch and merge via `smin` like a fluid droplet sliding inside a glass track.
+ */
+private const val LIQUID_TOGGLE_AGSL = """
+uniform float2 uSize;
+uniform float  uProgress;
+uniform float  uStretch;
+uniform half3  uAccent;
+uniform float  uEnabled;
+
+float sdRoundBox(float2 p, float2 b, float r) {
+    float2 q = abs(p) - b + float2(r);
+    return min(max(q.x, q.y), 0.0) + length(max(q, float2(0.0))) - r;
+}
+
+float smin(float a, float b, float k) {
+    float h = clamp(0.5 + 0.5 * (b - a) / max(k, 0.001), 0.0, 1.0);
+    return mix(b, a, h) - k * h * (1.0 - h);
+}
+
+float thumbSdf(float2 p) {
+    float pad = 2.5;
+    float halfH = uSize.y * 0.5 - pad;
+    float halfW = (uSize.x * 0.5 - pad) * 0.5;
+    float leftX = pad + halfW;
+    float rightX = uSize.x - pad - halfW;
+    float cx = mix(leftX, rightX, clamp(uProgress, 0.0, 1.0));
+    // Trailing/leading droplet split during mid-flight for fluid elongation.
+    float split = uStretch * halfW * 0.42;
+    float d1 = sdRoundBox(p - float2(cx - split, uSize.y * 0.5), float2(halfW * (1.0 - uStretch * 0.10), halfH * (1.0 - uStretch * 0.08)), halfH);
+    float d2 = sdRoundBox(p - float2(cx + split, uSize.y * 0.5), float2(halfW * (1.0 - uStretch * 0.10), halfH * (1.0 - uStretch * 0.08)), halfH);
+    return smin(d1, d2, 10.0 * uStretch + 1.0);
+}
+
+half4 main(float2 fragCoord) {
+    float rTrack = uSize.y * 0.5;
+    float dTrack = sdRoundBox(fragCoord - uSize * 0.5, uSize * 0.5, rTrack);
+    float trackAlpha = 1.0 - smoothstep(-1.0, 1.0, dTrack);
+    if (trackAlpha <= 0.001) return half4(0.0);
+
+    // Subtle frosted glass track.
+    half3 trackCol = mix(half3(0.94, 0.955, 0.975), half3(0.985, 0.99, 1.0), half(fragCoord.y / max(uSize.y, 1.0)));
+    float trackRim = clamp(1.0 - (-dTrack) / 2.2, 0.0, 1.0);
+    half3 borderCol = (uEnabled > 0.5) ? mix(trackCol, uAccent, half(0.45)) : half3(0.82, 0.84, 0.87);
+    half3 outCol = mix(trackCol, borderCol, half(trackRim * 0.75));
+
+    // Liquid glass thumb droplet.
+    float dThumb = thumbSdf(fragCoord);
+    float thumbMask = 1.0 - smoothstep(-1.1, 1.1, dThumb);
+    if (thumbMask > 0.001 && uEnabled > 0.5) {
+        float eps = 1.1;
+        float2 n = normalize(float2(
+            thumbSdf(fragCoord + float2(eps, 0.0)) - thumbSdf(fragCoord - float2(eps, 0.0)),
+            thumbSdf(fragCoord + float2(0.0, eps)) - thumbSdf(fragCoord - float2(0.0, eps))
+        ) + float2(0.0001));
+        float rimT = clamp(1.0 - (-dThumb) / 8.0, 0.0, 1.0);
+        float vy = clamp(fragCoord.y / max(uSize.y, 1.0), 0.0, 1.0);
+        half3 thumbCol = mix(uAccent * half(1.08), uAccent * half(0.88), half(vy));
+        // Meniscus specular glint & inner caustic glow.
+        float2 L = normalize(float2(-0.45, -0.89));
+        float spec = pow(rimT, 2.2) * pow(max(dot(n, L), 0.0), 1.3);
+        float caustic = exp(-pow((rimT - 0.35) / 0.20, 2.0));
+        thumbCol += half3(1.0) * half(0.55 * spec + 0.14 * caustic);
+        outCol = mix(outCol, clamp(thumbCol, 0.0, 1.0), half(thumbMask));
+    }
+
+    return half4(outCol * half(trackAlpha), half(trackAlpha));
+}
+"""
+
+/**
+ * Draws the SDF `smin`-blended liquid glass background behind two horizontally
+ * adjacent droplets (used by `SelectionToolSlot`). Uses AGSL `RuntimeShader` on
+ * Android 13+ and a smooth Canvas fallback on older API levels.
+ */
+@Composable
+fun Modifier.liquidMorphDropletsBackground(
+    slotSizePx: Float,
+    gapPx: Float,
+    radiusPx: Float,
+    morphProgress: Float,
+    hoverSecond: Float,
+    accentColor: Color,
+    expandDown: Boolean = false
+): Modifier {
+    val shader = remember {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            runCatching { RuntimeShader(LIQUID_MORPH_DROPLETS_AGSL) }.getOrNull()
+        } else {
+            null
+        }
+    }
+    val paint = remember { Paint(Paint.ANTI_ALIAS_FLAG) }
+    return this.drawWithContent {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && shader != null && size.width > 0f && size.height > 0f) {
+            shader.setFloatUniform("uSize", size.width, size.height)
+            shader.setFloatUniform("uSlotSize", slotSizePx)
+            shader.setFloatUniform("uRadius", radiusPx)
+            shader.setFloatUniform("uGap", gapPx)
+            shader.setFloatUniform("uMorph", morphProgress)
+            shader.setFloatUniform("uHoverSecond", hoverSecond)
+            shader.setFloatUniform("uExpandDown", if (expandDown) 1f else 0f)
+            shader.setFloatUniform("uAccent", accentColor.red, accentColor.green, accentColor.blue, accentColor.alpha)
+            paint.shader = shader
+            drawIntoCanvas { canvas ->
+                canvas.nativeCanvas.drawRect(0f, 0f, size.width, size.height, paint)
+            }
+        } else {
+            val m = morphProgress.coerceAtLeast(0f)
+            val extW = if (expandDown) slotSizePx else slotSizePx + (slotSizePx + gapPx) * m
+            val extH = if (expandDown) slotSizePx + (slotSizePx + gapPx) * m else slotSizePx
+            drawRoundRect(
+                color = Color(0xFFF1F5FB).copy(alpha = 0.94f),
+                size = androidx.compose.ui.geometry.Size(extW.coerceAtMost(size.width), extH.coerceAtMost(size.height)),
+                cornerRadius = CornerRadius(radiusPx, radiusPx)
+            )
+            drawRoundRect(
+                color = Color.White.copy(alpha = 0.85f),
+                size = androidx.compose.ui.geometry.Size(extW.coerceAtMost(size.width), extH.coerceAtMost(size.height)),
+                cornerRadius = CornerRadius(radiusPx, radiusPx),
+                style = androidx.compose.ui.graphics.drawscope.Stroke(width = 1.2.dp.toPx())
+            )
+        }
+        drawContent()
+    }
+}
+
+/**
+ * Liquid Glass Morphing two-option segmented toggle (used for Vertical/Horizontal
+ * and Continuous/Single page turning controls). Uses AGSL SDF `smin` liquid
+ * droplet elongation + low-damping spring physics.
+ */
+@Composable
+fun LiquidMorphSegmentedToggle(
+    leftLabel: String,
+    rightLabel: String,
+    isRightSelected: Boolean,
+    accentColor: Color,
+    enabled: Boolean = true,
+    onSelectLeft: () -> Unit,
+    onSelectRight: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val progress by animateFloatAsState(
+        targetValue = if (isRightSelected) 1f else 0f,
+        animationSpec = spring(
+            dampingRatio = 0.56f,
+            stiffness = 340f
+        ),
+        label = "liquidToggleProgress"
+    )
+    val stretch = (4f * progress.coerceIn(0f, 1f) * (1f - progress.coerceIn(0f, 1f))).coerceIn(0f, 1f)
+    val shader = remember {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            runCatching { RuntimeShader(LIQUID_TOGGLE_AGSL) }.getOrNull()
+        } else {
+            null
+        }
+    }
+    val paint = remember { Paint(Paint.ANTI_ALIAS_FLAG) }
+
+    androidx.compose.foundation.layout.Box(
+        modifier = modifier
+            .drawWithContent {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && shader != null && size.width > 0f && size.height > 0f) {
+                    shader.setFloatUniform("uSize", size.width, size.height)
+                    shader.setFloatUniform("uProgress", progress)
+                    shader.setFloatUniform("uStretch", stretch)
+                    shader.setFloatUniform("uAccent", accentColor.red, accentColor.green, accentColor.blue)
+                    shader.setFloatUniform("uEnabled", if (enabled) 1f else 0f)
+                    paint.shader = shader
+                    drawIntoCanvas { canvas ->
+                        canvas.nativeCanvas.drawRect(0f, 0f, size.width, size.height, paint)
+                    }
+                } else {
+                    val r = size.height * 0.5f
+                    drawRoundRect(
+                        color = Color(0xFFF3F6FA),
+                        cornerRadius = CornerRadius(r, r)
+                    )
+                    if (enabled) {
+                        val pad = 2.5.dp.toPx()
+                        val thumbW = size.width * 0.5f - pad
+                        val thumbX = pad + (size.width * 0.5f - pad) * progress.coerceIn(0f, 1f)
+                        drawRoundRect(
+                            color = accentColor,
+                            topLeft = Offset(thumbX, pad),
+                            size = androidx.compose.ui.geometry.Size(thumbW, size.height - pad * 2f),
+                            cornerRadius = CornerRadius(r - pad, r - pad)
+                        )
+                    }
+                }
+                drawContent()
+            }
+    ) {
+        androidx.compose.foundation.layout.Row(
+            modifier = Modifier
+                .matchParentSize()
+        ) {
+            androidx.compose.foundation.layout.Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+                    .clickable(
+                        enabled = enabled,
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = onSelectLeft
+                    ),
+                contentAlignment = Alignment.Center
+            ) {
+                androidx.compose.material3.Text(
+                    text = leftLabel,
+                    fontSize = androidx.compose.ui.unit.TextUnit(12f, androidx.compose.ui.unit.TextUnitType.Sp),
+                    fontWeight = if (enabled && !isRightSelected) androidx.compose.ui.text.font.FontWeight.Bold else androidx.compose.ui.text.font.FontWeight.Medium,
+                    color = when {
+                        !enabled -> Color(0xFFBBBBBB)
+                        !isRightSelected -> Color.White
+                        else -> accentColor
+                    }
+                )
+            }
+            androidx.compose.foundation.layout.Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+                    .clickable(
+                        enabled = enabled,
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = onSelectRight
+                    ),
+                contentAlignment = Alignment.Center
+            ) {
+                androidx.compose.material3.Text(
+                    text = rightLabel,
+                    fontSize = androidx.compose.ui.unit.TextUnit(12f, androidx.compose.ui.unit.TextUnitType.Sp),
+                    fontWeight = if (enabled && isRightSelected) androidx.compose.ui.text.font.FontWeight.Bold else androidx.compose.ui.text.font.FontWeight.Medium,
+                    color = when {
+                        !enabled -> Color(0xFFBBBBBB)
+                        isRightSelected -> Color.White
+                        else -> accentColor
+                    }
+                )
+            }
+        }
     }
 }

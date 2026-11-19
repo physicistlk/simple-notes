@@ -13,6 +13,7 @@ import personal.notes.touch.ui.canvas.InkPatch
 import personal.notes.touch.ui.canvas.OpEntry
 import personal.notes.touch.ui.canvas.PageLayer
 import personal.notes.touch.ui.canvas.PageLayerStack
+import personal.notes.touch.ui.canvas.StrokeTransformSnapshot
 
 /**
  * Tests of the ink history of the continuous reader.
@@ -210,5 +211,88 @@ class ContinuousInkHistoryTest {
         val remainingOps = history.ops.filter { it.layer.index == base.index }
         assertEquals(1, remainingOps.size)
         assertTrue(remainingOps[0] === stroke1)
+    }
+
+    @Test
+    fun lassoMoveIsUndoneAndRedoneByTheReverseAndSameDelta() {
+        val history = InkHistory(PageLayerStack.base())
+        val op = InkOp.Stroke(stroke(), null, layer())
+        history.commit(op)
+        history.commitMove(listOf(op), 0.25f, -0.5f)
+        assertTrue(history.canUndo)
+
+        val deltas = mutableListOf<Pair<Float, Float>>()
+        assertTrue(
+            history.undo(
+                { _, _ -> }, { _, _ -> }, { _, _ -> },
+                { moved, dx, dy -> assertTrue(moved[0] === op); deltas.add(dx to dy) }
+            )
+        )
+        assertEquals(listOf(-0.25f to 0.5f), deltas)
+        assertEquals(1, history.ops.size)
+        assertTrue(history.canRedo)
+
+        assertTrue(
+            history.redo(
+                { _, _ -> }, { _, _ -> }, { _, _ -> },
+                { _, dx, dy -> deltas.add(dx to dy) }
+            )
+        )
+        assertEquals(0.25f to -0.5f, deltas[1])
+    }
+
+    @Test
+    fun lassoDeleteReusesClearAndUndoBringsTheStrokesBack() {
+        val history = InkHistory(PageLayerStack.base())
+        val a = InkOp.Stroke(stroke(), null, layer())
+        val b = InkOp.Stroke(stroke(), null, layer())
+        history.commit(a)
+        history.commit(b)
+        history.commitClear(emptyList(), listOf(OpEntry(0, a)))
+        assertEquals(1, history.ops.size)
+        assertTrue(history.ops[0] === b)
+
+        assertTrue(history.undo({ _, _ -> }, { _, _ -> }))
+        assertEquals(2, history.ops.size)
+        assertTrue(history.ops[0] === a)
+    }
+
+    @Test
+    fun lassoCopyAddBatchIsUndoneAndRedoneCleanly() {
+        val history = InkHistory(PageLayerStack.base())
+        val orig = InkOp.Stroke(stroke(), null, layer())
+        val copy = InkOp.Stroke(stroke(), null, layer())
+        history.commit(orig)
+        history.ops.add(copy)
+        history.commitAddBatch(listOf(copy))
+        assertEquals(2, history.ops.size)
+
+        assertTrue(history.undo({ _, _ -> }, { _, _ -> }))
+        assertEquals(1, history.ops.size)
+        assertTrue(history.ops[0] === orig)
+
+        assertTrue(history.redo({ _, _ -> }, { _, _ -> }))
+        assertEquals(2, history.ops.size)
+        assertTrue(history.ops[1] === copy)
+    }
+
+    @Test
+    fun lassoTransformSnapshotUndoRedoInvokesBeforeAndAfter() {
+        val history = InkHistory(PageLayerStack.base())
+        val op = InkOp.Stroke(stroke(), null, layer())
+        history.commit(op)
+        val before = op.stroke.points.map { personal.notes.touch.ui.canvas.InkPoint(it.x, it.y, it.w, it.tilt) }
+        val after = listOf(
+            personal.notes.touch.ui.canvas.InkPoint(0.5f, 0.5f, 0.01f),
+            personal.notes.touch.ui.canvas.InkPoint(0.6f, 0.6f, 0.01f)
+        )
+        history.commitTransform(listOf(StrokeTransformSnapshot(op, before, after, null, null)))
+
+        val events = mutableListOf<Boolean>()
+        assertTrue(history.undo({ _, _ -> }, { _, _ -> }, onTransform = { _, isUndo -> events.add(isUndo) }))
+        assertEquals(listOf(true), events)
+
+        assertTrue(history.redo({ _, _ -> }, { _, _ -> }, onTransform = { _, isUndo -> events.add(isUndo) }))
+        assertEquals(listOf(true, false), events)
     }
 }

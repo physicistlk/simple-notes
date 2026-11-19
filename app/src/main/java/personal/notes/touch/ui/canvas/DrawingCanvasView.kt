@@ -42,6 +42,8 @@ enum class CanvasTool {
     SHAPE_CIRCLE,
     SHAPE_LINE,
     LASSO,
+    /** Arrow pointer selection tool (Illustrator/Inkscape style): selects items or single strokes. */
+    SELECT,
     /** Shows a red dot with a short tail where the pen is; writes nothing. */
     LASER_POINTER,
     /** Graphite pencil with paper-tooth abrasion texture and stylus tilt shading. */
@@ -636,6 +638,10 @@ class DrawingCanvasView @JvmOverloads constructor(
             if (pdfRenderScale == 0f) pdfSessionBackground = value
             invalidate()
         }
+
+    /** Strokes written in continuous mode, shown read-only above the page image (never saved into it). */
+    var annotationOverlay: Bitmap? = null
+        set(value) { field = value; invalidate() }
 
     // ---- F-10: live vector PDF background --------------------------------
     // The page is rendered from its source document at the current zoom level
@@ -1390,7 +1396,7 @@ class DrawingCanvasView @JvmOverloads constructor(
                 shapePreviewPaint.strokeWidth = strokeWidthPx
                 shapePreviewPaint.alpha = 180
             }
-            CanvasTool.LASSO -> {
+            CanvasTool.LASSO, CanvasTool.SELECT -> {
                 strokePaint.xfermode = null
                 strokePaint.color = Color.parseColor("#FB6443")
                 strokePaint.strokeWidth = 3f
@@ -1621,6 +1627,9 @@ class DrawingCanvasView @JvmOverloads constructor(
                 3056
             } else if (height > 0) height else 1920
             initBackingBitmap(w, h)
+            if (pageType == "a4" || pageType == "pdf") {
+                fitOrCenterPage()
+            }
             undoStack.clear()
             clearRedoStack()
             notifyUndoRedo()
@@ -2378,6 +2387,9 @@ class DrawingCanvasView @JvmOverloads constructor(
         backingBitmap?.let { bmp ->
             canvas.drawBitmap(bmp, 0f, 0f, bitmapPaint)
         }
+        annotationOverlay?.let { ov ->
+            if (!ov.isRecycled) canvas.drawBitmap(ov, 0f, 0f, bitmapPaint)
+        }
 
         // 3a. F-10: PDF text selection highlight (cached rects, no native call
         // per frame; recomputed only when the selection changes).
@@ -2489,7 +2501,7 @@ class DrawingCanvasView @JvmOverloads constructor(
             )
         }
 
-        // Selection handles in view space
+        // Selection handles in view space (matches unified 4-corner + mirror handle order)
         if (selectedImageIndex in imageLayers.indices) {
             val layer = imageLayers[selectedImageIndex]
             if (!layer.bitmap.isRecycled) {
@@ -2509,23 +2521,17 @@ class DrawingCanvasView @JvmOverloads constructor(
                 val pTR = rotPt(halfW, -halfH)
                 val pBR = rotPt(halfW, halfH)
                 val pBL = rotPt(-halfW, halfH)
-                val pTC = rotPt(0f, -halfH)
-                val pRot = rotPt(0f, -halfH - 45f)
                 val pts = floatArrayOf(
                     pTL.first, pTL.second,
                     pTR.first, pTR.second,
                     pBR.first, pBR.second,
-                    pBL.first, pBL.second,
-                    pTC.first, pTC.second,
-                    pRot.first, pRot.second
+                    pBL.first, pBL.second
                 )
                 viewMatrix.mapPoints(pts)
                 val vTLx = pts[0]; val vTLy = pts[1]
                 val vTRx = pts[2]; val vTRy = pts[3]
                 val vBRx = pts[4]; val vBRy = pts[5]
                 val vBLx = pts[6]; val vBLy = pts[7]
-                val vTCx = pts[8]; val vTCy = pts[9]
-                val vRotX = pts[10]; val vRotY = pts[11]
 
                 // Bounding box border
                 val bboxPath = layerBboxPath.apply {
@@ -2538,31 +2544,33 @@ class DrawingCanvasView @JvmOverloads constructor(
                 }
                 canvas.drawPath(bboxPath, layerBboxPaint)
 
-                // Rotate stem line
-                canvas.drawLine(vTCx, vTCy, vRotX, vRotY, layerBboxPaint)
-
                 val handleR = 18f
 
-                // Rotate handle (Top, Green)
-                layerHandleFillPaint.color = android.graphics.Color.rgb(0x4C, 0xAF, 0x50)
-                canvas.drawCircle(vRotX, vRotY, handleR, layerHandleFillPaint)
-                canvas.drawCircle(vRotX, vRotY, handleR, layerHandleStrokePaint)
-                layerHandleTextPaint.textSize = 20f
-                canvas.drawText("↻", vRotX, vRotY + 7f, layerHandleTextPaint)
-
-                // Delete handle (Top-Left, Red)
-                layerHandleFillPaint.color = android.graphics.Color.rgb(0xE5, 0x39, 0x35)
+                // Corner 1 (Top-Left, Blue): Rotate handle
+                layerHandleFillPaint.color = android.graphics.Color.rgb(0x25, 0x63, 0xEB)
                 canvas.drawCircle(vTLx, vTLy, handleR, layerHandleFillPaint)
                 canvas.drawCircle(vTLx, vTLy, handleR, layerHandleStrokePaint)
-                layerHandleTextPaint.textSize = 18f
-                canvas.drawText("✕", vTLx, vTLy + 6f, layerHandleTextPaint)
+                layerHandleTextPaint.textSize = 20f
+                canvas.drawText("↻", vTLx, vTLy + 7f, layerHandleTextPaint)
 
-                // Resize handle (Bottom-Right, Blue)
-                layerHandleFillPaint.color = android.graphics.Color.rgb(0x21, 0x96, 0xF3)
-                canvas.drawCircle(vBRx, vBRy, handleR, layerHandleFillPaint)
-                canvas.drawCircle(vBRx, vBRy, handleR, layerHandleStrokePaint)
+                // Corner 2 (Top-Right, Red): Delete / Cut handle
+                layerHandleFillPaint.color = android.graphics.Color.rgb(0xDC, 0x26, 0x26)
+                canvas.drawCircle(vTRx, vTRy, handleR, layerHandleFillPaint)
+                canvas.drawCircle(vTRx, vTRy, handleR, layerHandleStrokePaint)
                 layerHandleTextPaint.textSize = 18f
-                canvas.drawText("⤡", vBRx, vBRy + 6f, layerHandleTextPaint)
+                canvas.drawText("✕", vTRx, vTRy + 6f, layerHandleTextPaint)
+
+                // Corner 3 (Bottom-Left, Orange): Copy handle
+                layerHandleFillPaint.color = android.graphics.Color.rgb(0xEA, 0x58, 0x0C)
+                canvas.drawCircle(vBLx, vBLy, handleR, layerHandleFillPaint)
+                canvas.drawCircle(vBLx, vBLy, handleR, layerHandleStrokePaint)
+                layerHandleTextPaint.textSize = 20f
+                canvas.drawText("+", vBLx, vBLy + 7f, layerHandleTextPaint)
+
+                // Corner 4 (Bottom-Right, White): 1:1 Resize handle
+                layerHandleFillPaint.color = android.graphics.Color.WHITE
+                canvas.drawCircle(vBRx, vBRy, handleR * 0.72f, layerHandleFillPaint)
+                canvas.drawCircle(vBRx, vBRy, handleR * 0.72f, layerBboxPaint)
             }
         }
         if (lassoState in listOf(LassoState.SELECTED, LassoState.DRAGGING, LassoState.RESIZING)) {
@@ -2665,8 +2673,9 @@ class DrawingCanvasView @JvmOverloads constructor(
         if (imageLayers.isEmpty()) return false
 
         var vTLx = 0f; var vTLy = 0f
+        var vTRx = 0f; var vTRy = 0f
+        var vBLx = 0f; var vBLy = 0f
         var vBRx = 0f; var vBRy = 0f
-        var vRotX = 0f; var vRotY = 0f
         var vCX = 0f; var vCY = 0f
         val selected = imageLayers.getOrNull(selectedImageIndex)
         if (selected != null && !selected.bitmap.isRecycled) {
@@ -2683,19 +2692,22 @@ class DrawingCanvasView @JvmOverloads constructor(
                 return Pair(cx + dx * cos - dy * sin, cy + dx * sin + dy * cos)
             }
             val pTL = rotPt(-halfW, -halfH)
+            val pTR = rotPt(halfW, -halfH)
+            val pBL = rotPt(-halfW, halfH)
             val pBR = rotPt(halfW, halfH)
-            val pRot = rotPt(0f, -halfH - 45f)
             val pts = floatArrayOf(
                 pTL.first, pTL.second,
+                pTR.first, pTR.second,
+                pBL.first, pBL.second,
                 pBR.first, pBR.second,
-                pRot.first, pRot.second,
                 cx, cy
             )
             viewMatrix.mapPoints(pts)
             vTLx = pts[0]; vTLy = pts[1]
-            vBRx = pts[2]; vBRy = pts[3]
-            vRotX = pts[4]; vRotY = pts[5]
-            vCX = pts[6]; vCY = pts[7]
+            vTRx = pts[2]; vTRy = pts[3]
+            vBLx = pts[4]; vBLy = pts[5]
+            vBRx = pts[6]; vBRy = pts[7]
+            vCX = pts[8]; vCY = pts[9]
         }
 
         val handleTouchSlop = 48f
@@ -2703,20 +2715,48 @@ class DrawingCanvasView @JvmOverloads constructor(
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 if (selected != null) {
-                    // 1. Check Delete handle (Top-Left, Red ✕)
-                    if (Math.hypot((event.x - vTLx).toDouble(), (event.y - vTLy).toDouble()) <= handleTouchSlop) {
+                    // 1. Corner 2 (Top-Right, Red ✕): Delete / Cut
+                    if (Math.hypot((event.x - vTRx).toDouble(), (event.y - vTRy).toDouble()) <= handleTouchSlop) {
                         deleteImageLayer(selectedImageIndex)
                         return true
                     }
-                    // 2. Check Rotate handle (Top stem, Green ↻)
-                    if (Math.hypot((event.x - vRotX).toDouble(), (event.y - vRotY).toDouble()) <= handleTouchSlop) {
+                    // 2. Corner 1 (Top-Left, Blue ↻): Rotate
+                    if (Math.hypot((event.x - vTLx).toDouble(), (event.y - vTLy).toDouble()) <= handleTouchSlop) {
                         saveUndoState()
                         imageInteractionMode = 4 // ROTATE
                         initialTouchAngle = Math.toDegrees(Math.atan2((event.y - vCY).toDouble(), (event.x - vCX).toDouble())).toFloat()
                         initialLayerRotation = selected.rotation
                         return true
                     }
-                    // 3. Check Resize handle (Bottom-Right, Blue ⤡)
+                    // 3. Corner 3 (Bottom-Left, Orange +): Copy (tap & drag)
+                    if (Math.hypot((event.x - vBLx).toDouble(), (event.y - vBLy).toDouble()) <= handleTouchSlop) {
+                        saveUndoState()
+                        val clonedBmp = selected.bitmap.copy(Bitmap.Config.ARGB_8888, true) ?: selected.bitmap
+                        val cloned = ImageLayer(
+                            bitmap = clonedBmp,
+                            x = selected.x + 24f,
+                            y = selected.y + 24f,
+                            scale = selected.scale,
+                            rotation = selected.rotation,
+                            opacity = selected.opacity,
+                            cropRect = selected.cropRect,
+                            visible = selected.visible,
+                            name = "${selected.name} Copy",
+                            ink = selected.ink.toMutableList()
+                        )
+                        imageLayers.add(cloned)
+                        selectedImageIndex = imageLayers.lastIndex
+                        imageInteractionMode = 1 // MOVE copy immediately
+                        imageDragStartX = x
+                        imageDragStartY = y
+                        imageLayerStartX = cloned.x
+                        imageLayerStartY = cloned.y
+                        layersDirty = true
+                        onLayersChanged?.invoke()
+                        invalidate()
+                        return true
+                    }
+                    // 4. Corner 4 (Bottom-Right, White): 1:1 Resize
                     if (Math.hypot((event.x - vBRx).toDouble(), (event.y - vBRy).toDouble()) <= handleTouchSlop) {
                         saveUndoState()
                         imageInteractionMode = 3 // RESIZE
@@ -2724,6 +2764,11 @@ class DrawingCanvasView @JvmOverloads constructor(
                         initialLayerScale = selected.scale
                         return true
                     }
+                }
+
+                // 5. Only allow selecting new image layers when using Arrow Select (SELECT)
+                if (currentTool != CanvasTool.SELECT && selectedImageIndex < 0) {
+                    return false
                 }
 
                 // 4. Check hit on any layer body to select & start drag/drop

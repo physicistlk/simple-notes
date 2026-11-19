@@ -159,10 +159,14 @@ import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerType
 import androidx.compose.ui.input.pointer.changedToUp
 import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
+import androidx.compose.ui.input.pointer.isSecondaryPressed
+import androidx.compose.ui.input.pointer.isTertiaryPressed
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.layout.onGloballyPositioned
@@ -198,7 +202,9 @@ import personal.notes.touch.ui.components.GlassOrigin
 import personal.notes.touch.ui.components.LiquidGlassShader
 import personal.notes.touch.ui.components.liquidGlassBackdrop
 import personal.notes.touch.ui.components.LiquidGlassStyle
+import personal.notes.touch.ui.components.LiquidMorphSegmentedToggle
 import personal.notes.touch.ui.components.liquidGlassRim
+import personal.notes.touch.ui.components.liquidMorphDropletsBackground
 import personal.notes.touch.ui.components.liquidStylusSpotlight
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -691,7 +697,12 @@ fun CanvasScreen(
 
     if (isInfiniteNote) {
         inkController.infiniteWorldBounds = {
-            val snapshot = infiniteItems
+            val activeIdx = currentPageIndex
+            val activeStack = inkController.layerStack(activeIdx)
+            val snapshot = infiniteItems.filter { item ->
+                item.pageIndex == activeIdx &&
+                    (activeStack.layerAt(item.layerIndex)?.visible != false)
+            }
             if (snapshot.isEmpty()) {
                 null
             } else {
@@ -713,7 +724,12 @@ fun CanvasScreen(
             }
         }
         inkController.infiniteBackdropDrawer = { canvas, worldLeft, worldTop, pxPerUnit ->
-            val snapshot = infiniteItems
+            val activeIdx = currentPageIndex
+            val activeStack = inkController.layerStack(activeIdx)
+            val snapshot = infiniteItems.filter { item ->
+                item.pageIndex == activeIdx &&
+                    (activeStack.layerAt(item.layerIndex)?.visible != false)
+            }
             if (snapshot.isNotEmpty()) {
                 val itemScale = pxPerUnit / 2160f
                 val worldRight = worldLeft + canvas.width.toFloat() / pxPerUnit
@@ -745,6 +761,9 @@ fun CanvasScreen(
                     canvas.translate(item.centerX, item.centerY)
                     if (item.rotationDeg != 0f) {
                         canvas.rotate(item.rotationDeg)
+                    }
+                    if (item.flipHorizontal) {
+                        canvas.scale(-1f, 1f)
                     }
                     dst.set(
                         -item.width / 2f,
@@ -1037,7 +1056,7 @@ fun CanvasScreen(
      * Continuous reading is on for every note type now (the infinite canvas
      * included), so this is the single definition the screen uses.
      */
-    val continuousMode = uiState.pageTurningMode == 0
+    val continuousMode = isContinuous
 
 
     // Load/save layers on page change. The INITIAL page/layer load lives in
@@ -1048,6 +1067,11 @@ fun CanvasScreen(
     // while the factory's own coroutine always reaches its own view. This
     // effect therefore skips its first (initial-composition) run — page 0 is
     // applied exactly once — and only handles real page flips.
+    LaunchedEffect(currentPageIndex) {
+        selectedImageIndex = -1
+        canvasViewRef?.selectedImageIndex = -1
+    }
+
     var pageEffectFirstRun by remember { mutableStateOf(true) }
     LaunchedEffect(currentPageIndex, uiState.pageTurningMode) {
         if (pageEffectFirstRun) {
@@ -1085,6 +1109,7 @@ fun CanvasScreen(
             val canvas = canvasViewRef
             if (canvas != null) {
                 canvas.backgroundBitmap = null
+                canvas.annotationOverlay = null
                 viewModel.setPageLoadedFromDisk(true)
                 applyPdfBackground(canvas, vectorPage)
                 canvas.setPageContent(strokes)
@@ -1093,6 +1118,15 @@ fun CanvasScreen(
             val savedBitmap = viewModel.loadCurrentPageBitmap()
             canvasViewRef?.setPageContent(savedBitmap)
             canvasViewRef?.backgroundBitmap = null
+            canvasViewRef?.let { v ->
+                v.annotationOverlay = if (note?.pageType == "a4") {
+                    inkController.composeAllLayersForSinglePage(
+                        pageIndex = currentPageIndex,
+                        targetWidth = v.getBackingBitmap()?.width ?: 2160,
+                        targetHeight = v.getBackingBitmap()?.height ?: 3056
+                    )
+                } else null
+            }
             viewModel.setPageLoadedFromDisk(savedBitmap != null)
             // The margins of the page carry their own ink.
             loadBeyondPageInk(currentPageIndex)
@@ -1107,8 +1141,28 @@ fun CanvasScreen(
         }
     }
 
+    // Pen barrel buttons (see PenButtonBus): 1 = cycle non-eraser tools, 2 = toggle eraser.
+    // Ownership-checked unregister prevents multi-tab switches from clearing the active tab's bus.
+    androidx.compose.runtime.DisposableEffect(viewModel) {
+        personal.notes.touch.PenButtonBus.register(
+            owner = viewModel,
+            primary = { viewModel.cyclePreviousTool() },
+            secondary = { viewModel.selectEraserTool() }
+        )
+        onDispose {
+            personal.notes.touch.PenButtonBus.unregister(viewModel)
+        }
+    }
+
+    var preferredSelectTool by remember { mutableStateOf(CanvasTool.LASSO) }
+    LaunchedEffect(uiState.selectedTool) {
+        if (uiState.selectedTool == CanvasTool.LASSO || uiState.selectedTool == CanvasTool.SELECT) {
+            preferredSelectTool = uiState.selectedTool
+        }
+    }
+
     val selectLassoTool: () -> Unit = {
-        if (isContinuous) {
+        if (isContinuous && !isInfiniteNote) {
             scope.launch {
                 inkController.flushCurrentSuspend()
                 viewModel.setPageTurningMode(1)
@@ -1118,6 +1172,10 @@ fun CanvasScreen(
         } else {
             viewModel.selectTool(CanvasTool.LASSO)
         }
+    }
+
+    val selectArrowTool: () -> Unit = {
+        viewModel.selectTool(CanvasTool.SELECT)
     }
 
     /**
@@ -1245,6 +1303,8 @@ fun CanvasScreen(
         uri?.let {
             if (isInfiniteNote) {
                 scope.launch {
+                    val targetPageIdx = viewModel.currentPageIndex.value
+                    val targetLayerIdx = inkController.layerStack(targetPageIdx).current?.index ?: 1
                     val placed = withContext(Dispatchers.IO) {
                         val fileName = viewModel.fileStore.saveNoteImage(viewModel.noteId, it) ?: return@withContext null
                         val file = viewModel.fileStore.getNoteAsset(viewModel.noteId, fileName) ?: return@withContext null
@@ -1264,7 +1324,9 @@ fun CanvasScreen(
                             centerX = cx,
                             centerY = cy,
                             width = w,
-                            height = h
+                            height = h,
+                            pageIndex = targetPageIdx,
+                            layerIndex = targetLayerIdx
                         )
                     }
                     if (placed != null) {
@@ -1273,7 +1335,9 @@ fun CanvasScreen(
                         selectedInfiniteItemId = placed.id
                         withContext(Dispatchers.IO) {
                             InfiniteItemsStore.save(viewModel.fileStore, viewModel.noteId, updated)
+                            inkController.generateAndSavePagePreview(targetPageIdx)
                         }
+                        savedPageGenerations[targetPageIdx] = (savedPageGenerations[targetPageIdx] ?: 0) + 1
                     } else {
                         android.widget.Toast.makeText(
                             context, "Could not load image", android.widget.Toast.LENGTH_SHORT
@@ -1312,6 +1376,8 @@ fun CanvasScreen(
 
     val importPdfToInfiniteCanvas: (Uri, Int) -> Unit = { sourceUri, requestedCols ->
         scope.launch {
+            val targetPageIdx = viewModel.currentPageIndex.value
+            val targetLayerIdx = inkController.layerStack(targetPageIdx).current?.index ?: 1
             val newPages = withContext(Dispatchers.IO) {
                 val pdfFileName = InfiniteItemsStore.copyPdfToNoteDir(
                     context, viewModel.fileStore, viewModel.noteId, sourceUri
@@ -1354,7 +1420,9 @@ fun CanvasScreen(
                                 centerX = cx,
                                 centerY = cy,
                                 width = w,
-                                height = h
+                                height = h,
+                                pageIndex = targetPageIdx,
+                                layerIndex = targetLayerIdx
                             )
                         )
                     }
@@ -1369,7 +1437,9 @@ fun CanvasScreen(
                 selectedInfiniteItemId = newPages.first().id
                 withContext(Dispatchers.IO) {
                     InfiniteItemsStore.save(viewModel.fileStore, viewModel.noteId, updated)
+                    inkController.generateAndSavePagePreview(targetPageIdx)
                 }
+                savedPageGenerations[targetPageIdx] = (savedPageGenerations[targetPageIdx] ?: 0) + 1
                 android.widget.Toast.makeText(
                     context,
                     "Placed ${newPages.size} PDF pages in ${requestedCols.coerceIn(1, 4)} column(s)",
@@ -2782,7 +2852,9 @@ fun CanvasScreen(
                                 }
                             }
                             onUndoRedoListener = { canUndo, canRedo ->
-                                viewModel.updateUndoRedo(canUndo, canRedo)
+                                if (!currentIsContinuous) {
+                                    viewModel.updateUndoRedo(canUndo, canRedo)
+                                }
                             }
                             onViewportChanged = {
                                 if (!currentIsContinuous) {
@@ -2849,6 +2921,13 @@ fun CanvasScreen(
                                         val savedBitmap = viewModel.loadCurrentPageBitmap()
                                         setPageContent(savedBitmap)
                                         backgroundBitmap = null
+                                        annotationOverlay = if (note?.pageType == "a4") {
+                                            inkController.composeAllLayersForSinglePage(
+                                                pageIndex = pageIdx,
+                                                targetWidth = getBackingBitmap()?.width ?: 2160,
+                                                targetHeight = getBackingBitmap()?.height ?: 3056
+                                            )
+                                        } else null
                                         viewModel.setPageLoadedFromDisk(savedBitmap != null)
                                         loadBeyondPageInk(pageIdx)
                                     }
@@ -2888,6 +2967,8 @@ fun CanvasScreen(
                         .fillMaxSize()
                         .onGloballyPositioned { canvasOriginInRoot = it.positionInRoot() }
                 )
+
+                val currentHandleReaderTransform by androidx.compose.runtime.rememberUpdatedState(handleReaderTransform)
 
                 // Continuous page overlay when continuous mode is active
                 if (isContinuous) {
@@ -2963,7 +3044,7 @@ fun CanvasScreen(
                                             previousDistance = distance
                                             if (pan != androidx.compose.ui.geometry.Offset.Zero || zoom != 1f) {
                                                 event.changes.forEach { it.consume() }
-                                                handleReaderTransform(centroid, pan, zoom)
+                                                currentHandleReaderTransform(centroid, pan, zoom)
                                             }
                                         }
                                     }
@@ -3043,16 +3124,17 @@ fun CanvasScreen(
                                 }
                         ) {
                             if (isInfiniteNote) {
-                                val page = pages.firstOrNull() ?: personal.notes.touch.data.db.entity.PageEntity(
+                                val activeInfPageIdx = currentPageIndex.coerceIn(0, (pages.size - 1).coerceAtLeast(0))
+                                val page = pages.getOrNull(activeInfPageIdx) ?: pages.firstOrNull() ?: personal.notes.touch.data.db.entity.PageEntity(
                                     id = java.util.UUID.randomUUID().toString(),
                                     noteId = viewModel.noteId,
-                                    index = 0,
+                                    index = activeInfPageIdx,
                                     bitmapPath = "",
                                     updatedAt = System.currentTimeMillis()
                                 )
                                 InfiniteCanvasView(
                                     page = page,
-                                    pageIndex = 0,
+                                    pageIndex = activeInfPageIdx,
                                     noteId = viewModel.noteId,
                                     ink = inkController,
                                     inkSettings = inkSettings,
@@ -3070,11 +3152,18 @@ fun CanvasScreen(
                                     onUpdateItem = { updated ->
                                         infiniteItems = infiniteItems.map { if (it.id == updated.id) updated else it }
                                     },
+                                    onDuplicateItem = { copy ->
+                                        val updated = infiniteItems + copy
+                                        infiniteItems = updated
+                                        selectedInfiniteItemId = copy.id
+                                    },
                                     onCommitItems = {
                                         val snapshot = infiniteItems
                                         scope.launch(Dispatchers.IO) {
                                             InfiniteItemsStore.save(viewModel.fileStore, viewModel.noteId, snapshot)
+                                            inkController.generateAndSavePagePreview(activeInfPageIdx)
                                         }
+                                        savedPageGenerations[activeInfPageIdx] = (savedPageGenerations[activeInfPageIdx] ?: 0) + 1
                                     },
                                     onDeleteItem = { itemId ->
                                         val updated = infiniteItems.filterNot { it.id == itemId }
@@ -3082,10 +3171,12 @@ fun CanvasScreen(
                                         if (selectedInfiniteItemId == itemId) selectedInfiniteItemId = null
                                         scope.launch(Dispatchers.IO) {
                                             InfiniteItemsStore.save(viewModel.fileStore, viewModel.noteId, updated)
+                                            inkController.generateAndSavePagePreview(activeInfPageIdx)
                                         }
+                                        savedPageGenerations[activeInfPageIdx] = (savedPageGenerations[activeInfPageIdx] ?: 0) + 1
                                     },
                                     onResetTransform = {
-                                        val center = inkController.computeArtworkCenter(0)
+                                        val center = inkController.computeArtworkCenter(activeInfPageIdx)
                                         continuousScale = 1.0f
                                         if (center != null) {
                                             continuousPanX = screenWidthPx / 2f - center.first
@@ -3105,7 +3196,7 @@ fun CanvasScreen(
                                         viewModel.setStrokeOpacity(newAlpha)
                                     },
                                     onQuickClear = {
-                                        inkController.clearCurrentLayer(0)
+                                        inkController.clearCurrentLayer(activeInfPageIdx)
                                     },
                                     onStylusDetected = { viewModel.onStylusDetected() },
                                     onPanZoom = { dPanX, dPanY, dZoom, centroid ->
@@ -4390,13 +4481,15 @@ fun CanvasScreen(
                                     }
                                 }
 
-                                // Lasso Selection Tool
-                                PencaseToolIcon(
-                                    drawableRes = R.drawable.ic_tool_lasso,
-                                    label = "Lasso",
-                                    isSelected = uiState.selectedTool == CanvasTool.LASSO,
+                                // Lasso / Arrow Selection Tool Slot (Horizontal dock -> morphs downward)
+                                SelectionToolSlot(
+                                    activeTool = preferredSelectTool,
+                                    isSelected = uiState.selectedTool == CanvasTool.LASSO ||
+                                        uiState.selectedTool == CanvasTool.SELECT,
                                     selectedTint = OrangePrimary,
-                                    onClick = selectLassoTool
+                                    expandDown = true,
+                                    onSelectLasso = selectLassoTool,
+                                    onSelectArrow = selectArrowTool
                                 )
 
                                 Box(
@@ -4416,8 +4509,8 @@ fun CanvasScreen(
                                 // 3 Stroke Width Presets (Horizontal bar line thickness)
                                 // Short tap picks the preset, long press opens the slider popup.
                                 val currentWidths =
-                                    if (uiState.selectedTool == CanvasTool.ERASER) dockEraserWidths
-                                    else dockWidths
+                                    (if (uiState.selectedTool == CanvasTool.ERASER) dockEraserWidths
+                                    else dockWidths).take(3)
                                 val widthPresets = currentWidths.map { it to "${it.toInt()}px" }
                                 val activeWidth = uiState.activeStrokeWidth()
                                 val isEraserTool = uiState.selectedTool == CanvasTool.ERASER
@@ -4851,13 +4944,15 @@ fun CanvasScreen(
                                     }
                                 }
 
-                                // Lasso Selection Tool
-                                PencaseToolIcon(
-                                    drawableRes = R.drawable.ic_tool_lasso,
-                                    label = "Lasso",
-                                    isSelected = uiState.selectedTool == CanvasTool.LASSO,
+                                // Lasso / Arrow Selection Tool Slot (Vertical dock -> morphs to the right)
+                                SelectionToolSlot(
+                                    activeTool = preferredSelectTool,
+                                    isSelected = uiState.selectedTool == CanvasTool.LASSO ||
+                                        uiState.selectedTool == CanvasTool.SELECT,
                                     selectedTint = OrangePrimary,
-                                    onClick = selectLassoTool
+                                    expandDown = false,
+                                    onSelectLasso = selectLassoTool,
+                                    onSelectArrow = selectArrowTool
                                 )
 
                                 Box(
@@ -5295,17 +5390,57 @@ fun CanvasScreen(
                         onToggleVisible = { index ->
                             val layer = layerStack.layerAt(index)
                             if (layer != null) {
-                                inkController.setLayerVisible(currentPageIndex, index, !layer.visible)
+                                val nextVis = !layer.visible
+                                inkController.setLayerVisible(currentPageIndex, index, nextVis)
+                                if (!nextVis) {
+                                    val sel = infiniteItems.firstOrNull { it.id == selectedInfiniteItemId }
+                                    if (sel != null && sel.pageIndex == currentPageIndex && sel.layerIndex == index) {
+                                        selectedInfiniteItemId = null
+                                    }
+                                }
+                                if (isInfiniteNote) {
+                                    scope.launch(Dispatchers.IO) {
+                                        inkController.generateAndSavePagePreview(currentPageIndex)
+                                    }
+                                    savedPageGenerations[currentPageIndex] = (savedPageGenerations[currentPageIndex] ?: 0) + 1
+                                }
                             }
                         },
                         onMore = { index -> layerActionIndex = index },
                         onAdd = { inkController.addLayer(currentPageIndex) },
                         onMerge = { index ->
-                            inkController.mergeLayer(currentPageIndex, index)
+                            if (inkController.mergeLayer(currentPageIndex, index)) {
+                                val updated = infiniteItems.map { item ->
+                                    if (item.pageIndex == currentPageIndex && item.layerIndex == index) {
+                                        item.withTransform(layerIndex = 1)
+                                    } else item
+                                }
+                                if (updated != infiniteItems) {
+                                    infiniteItems = updated
+                                    scope.launch(Dispatchers.IO) {
+                                        InfiniteItemsStore.save(viewModel.fileStore, viewModel.noteId, updated)
+                                        inkController.generateAndSavePagePreview(currentPageIndex)
+                                    }
+                                }
+                            }
                             layerActionIndex = -1
                         },
                         onDelete = { index ->
-                            inkController.deleteLayer(currentPageIndex, index)
+                            if (inkController.deleteLayer(currentPageIndex, index)) {
+                                val updated = infiniteItems.filterNot {
+                                    it.pageIndex == currentPageIndex && it.layerIndex == index
+                                }
+                                if (updated.size != infiniteItems.size) {
+                                    infiniteItems = updated
+                                    if ( updated.none { it.id == selectedInfiniteItemId } ) {
+                                        selectedInfiniteItemId = null
+                                    }
+                                    scope.launch(Dispatchers.IO) {
+                                        InfiniteItemsStore.save(viewModel.fileStore, viewModel.noteId, updated)
+                                        inkController.generateAndSavePagePreview(currentPageIndex)
+                                    }
+                                }
+                            }
                             layerActionIndex = -1
                         },
                         onCloseActions = { layerActionIndex = -1 },
@@ -6310,48 +6445,18 @@ fun CanvasScreen(
                                                 )
                                                 Spacer(modifier = Modifier.height(2.dp))
                                                 val isVert = uiState.pageTurningDirection == 0
-                                                Box(
+                                                LiquidMorphSegmentedToggle(
+                                                    leftLabel = "Vertical",
+                                                    rightLabel = "Horizontal",
+                                                    isRightSelected = !isVert,
+                                                    accentColor = OrangePrimary,
+                                                    enabled = true,
+                                                    onSelectLeft = { viewModel.setPageTurningDirection(0) },
+                                                    onSelectRight = { viewModel.setPageTurningDirection(1) },
                                                     modifier = Modifier
                                                         .fillMaxWidth()
-                                                        .height(32.dp)
-                                                        .clip(RoundedCornerShape(16.dp))
-                                                        .border(1.5.dp, OrangePrimary, RoundedCornerShape(16.dp))
-                                                ) {
-                                                    Row(modifier = Modifier.fillMaxSize()) {
-                                                        // Vertical button (left half)
-                                                        Box(
-                                                            modifier = Modifier
-                                                                .weight(1f)
-                                                                .fillMaxHeight()
-                                                                .background(if (isVert) OrangePrimary else Color.White)
-                                                                .clickable { viewModel.setPageTurningDirection(0) },
-                                                            contentAlignment = Alignment.Center
-                                                        ) {
-                                                            Text(
-                                                                text = "Vertical",
-                                                                fontSize = 12.sp,
-                                                                fontWeight = if (isVert) FontWeight.Bold else FontWeight.Normal,
-                                                                color = if (isVert) Color.White else OrangePrimary
-                                                            )
-                                                        }
-                                                        // Horizontal button (right half)
-                                                        Box(
-                                                            modifier = Modifier
-                                                                .weight(1f)
-                                                                .fillMaxHeight()
-                                                                .background(if (!isVert) OrangePrimary else Color.White)
-                                                                .clickable { viewModel.setPageTurningDirection(1) },
-                                                            contentAlignment = Alignment.Center
-                                                        ) {
-                                                            Text(
-                                                                text = "Horizontal",
-                                                                fontSize = 12.sp,
-                                                                fontWeight = if (!isVert) FontWeight.Bold else FontWeight.Normal,
-                                                                color = if (!isVert) Color.White else OrangePrimary
-                                                            )
-                                                        }
-                                                    }
-                                                }
+                                                        .height(34.dp)
+                                                )
 
                                                 Spacer(modifier = Modifier.height(6.dp))
 
@@ -6368,88 +6473,46 @@ fun CanvasScreen(
                                                     modifier = Modifier.fillMaxWidth()
                                                 )
                                                 Spacer(modifier = Modifier.height(2.dp))
-                                                Box(
+                                                LiquidMorphSegmentedToggle(
+                                                    leftLabel = "Continuous",
+                                                    rightLabel = "Single",
+                                                    isRightSelected = isSingleMode,
+                                                    accentColor = OrangePrimary,
+                                                    enabled = !isInfiniteNote,
+                                                    onSelectLeft = {
+                                                        if (!isContinuousMode) {
+                                                            scope.launch {
+                                                                canvasViewRef?.getBackingBitmap()?.let { bmp ->
+                                                                    viewModel.saveCurrentPageBitmapDirect(bmp, force = true)
+                                                                }
+                                                                if (canvasViewRef?.layersDirty == true) {
+                                                                    canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                                                                }
+                                                                viewModel.setPageTurningMode(0)
+                                                                val cur = viewModel.currentPageIndex.value
+                                                                savedPageGenerations[cur] = (savedPageGenerations[cur] ?: 0) + 1
+                                                            }
+                                                        }
+                                                    },
+                                                    onSelectRight = {
+                                                        if (!isSingleMode) {
+                                                            val targetIdx = (if (uiState.pageTurningDirection == 1) {
+                                                                continuousRowState.firstVisibleItemIndex
+                                                            } else if (uiState.doublePageMode) {
+                                                                val pairIdx = continuousColState.firstVisibleItemIndex
+                                                                val first = pairIdx * 2
+                                                                if (currentPageIndex == first || currentPageIndex == first + 1) currentPageIndex else first
+                                                            } else {
+                                                                continuousColState.firstVisibleItemIndex
+                                                            }).coerceIn(0, (pages.size - 1).coerceAtLeast(0))
+                                                            viewModel.setCurrentPageIndex(targetIdx)
+                                                            viewModel.setPageTurningMode(1)
+                                                        }
+                                                    },
                                                     modifier = Modifier
                                                         .fillMaxWidth()
-                                                        .height(32.dp)
-                                                        .clip(RoundedCornerShape(16.dp))
-                                                        .border(1.5.dp, OrangePrimary, RoundedCornerShape(16.dp))
-                                                ) {
-                                                    Row(modifier = Modifier.fillMaxSize()) {
-                                                        // Continuous button (left half)
-                                                        Box(
-                                                            modifier = Modifier
-                                                                .weight(1f)
-                                                                .fillMaxHeight()
-                                                                .background(if (!isInfiniteNote && isContinuousMode) OrangePrimary else Color.White)
-                                                                // An infinite canvas has no page
-                                                                // edges: the continuous reader
-                                                                // would cut it into sheets, so
-                                                                // the option is greyed out.
-                                                                .clickable(enabled = !isInfiniteNote) {
-                                                                    if (!isContinuousMode) {
-                                                                        scope.launch {
-                                                                            canvasViewRef?.getBackingBitmap()?.let { bmp ->
-                                                                                viewModel.saveCurrentPageBitmapDirect(bmp, force = true)
-                                                                            }
-                                                                            if (canvasViewRef?.layersDirty == true) {
-                                                                                canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                                                                            }
-                                                                            viewModel.setPageTurningMode(0)
-                                                                            val cur = viewModel.currentPageIndex.value
-                                                                            savedPageGenerations[cur] = (savedPageGenerations[cur] ?: 0) + 1
-                                                                        }
-                                                                    }
-                                                                },
-                                                            contentAlignment = Alignment.Center
-                                                        ) {
-                                                            Text(
-                                                                text = "Continuous",
-                                                                fontSize = 12.sp,
-                                                                fontWeight = if (!isInfiniteNote && isContinuousMode) FontWeight.Bold else FontWeight.Normal,
-                                                                color = when {
-                                                                    isInfiniteNote -> Color(0xFFBBBBBB)
-                                                                    isContinuousMode -> Color.White
-                                                                    else -> OrangePrimary
-                                                                }
-                                                            )
-                                                        }
-                                                        // Single button (right half)
-                                                        Box(
-                                                            modifier = Modifier
-                                                                .weight(1f)
-                                                                .fillMaxHeight()
-                                                                .background(if (!isInfiniteNote && isSingleMode) OrangePrimary else Color.White)
-                                                                .clickable(enabled = !isInfiniteNote) {
-                                                                    if (!isSingleMode) {
-                                                                        val targetIdx = (if (uiState.pageTurningDirection == 1) {
-                                                                            continuousRowState.firstVisibleItemIndex
-                                                                        } else if (uiState.doublePageMode) {
-                                                                            val pairIdx = continuousColState.firstVisibleItemIndex
-                                                                            val first = pairIdx * 2
-                                                                            if (currentPageIndex == first || currentPageIndex == first + 1) currentPageIndex else first
-                                                                        } else {
-                                                                            continuousColState.firstVisibleItemIndex
-                                                                        }).coerceIn(0, (pages.size - 1).coerceAtLeast(0))
-                                                                        viewModel.setCurrentPageIndex(targetIdx)
-                                                                        viewModel.setPageTurningMode(1)
-                                                                    }
-                                                                },
-                                                            contentAlignment = Alignment.Center
-                                                        ) {
-                                                            Text(
-                                                                text = "Single",
-                                                                fontSize = 12.sp,
-                                                                fontWeight = if (!isInfiniteNote && isSingleMode) FontWeight.Bold else FontWeight.Normal,
-                                                                color = when {
-                                                                    isInfiniteNote -> Color(0xFFBBBBBB)
-                                                                    isSingleMode -> Color.White
-                                                                    else -> OrangePrimary
-                                                                }
-                                                            )
-                                                        }
-                                                    }
-                                                }
+                                                        .height(34.dp)
+                                                )
 
 
                                                 Spacer(modifier = Modifier.height(6.dp))
@@ -6642,6 +6705,324 @@ fun PencaseToolIcon(
                 tint = if (isSelected) selectedTint else Color(0xFF1E293B),
                 modifier = Modifier.size(20.dp)
             )
+        }
+    }
+}
+
+/**
+ * Illustrator/Inkscape-style arrow pointer icon for the Selection tool ([CanvasTool.SELECT]).
+ */
+@Composable
+fun ArrowPointerIcon(
+    tint: Color,
+    modifier: Modifier = Modifier
+) {
+    androidx.compose.foundation.Canvas(modifier = modifier) {
+        val w = size.width
+        val h = size.height
+        val path = androidx.compose.ui.graphics.Path().apply {
+            moveTo(w * 0.24f, h * 0.14f)
+            lineTo(w * 0.24f, h * 0.82f)
+            lineTo(w * 0.43f, h * 0.64f)
+            lineTo(w * 0.56f, h * 0.88f)
+            lineTo(w * 0.67f, h * 0.82f)
+            lineTo(w * 0.54f, h * 0.58f)
+            lineTo(w * 0.80f, h * 0.56f)
+            close()
+        }
+        drawPath(path = path, color = tint)
+    }
+}
+
+/**
+ * Combined Lasso / Arrow Selection slot with in-place AGSL Liquid Glass Morphing:
+ * - Short tap activates [activeTool].
+ * - Press & hold (or stylus hover) morphs ONLY the alternate icon out horizontally
+ *   to the right via an SDF `smin` liquid droplet bridge.
+ * - Sliding your finger right onto the popped-out droplet and releasing (or tapping
+ *   it while hovered) switches tools immediately with zero separate Popup window.
+ */
+@Composable
+fun SelectionToolSlot(
+    activeTool: CanvasTool,
+    isSelected: Boolean,
+    selectedTint: Color = OrangePrimary,
+    expandDown: Boolean = true,
+    onSelectLasso: () -> Unit,
+    onSelectArrow: () -> Unit
+) {
+    var expanded by remember { mutableStateOf(false) }
+    var hoverSecond by remember { mutableStateOf(false) }
+    val alternateTool = if (activeTool == CanvasTool.SELECT) CanvasTool.LASSO else CanvasTool.SELECT
+
+    val density = LocalDensity.current
+    val slotDp = 36.dp
+    val gapDp = 8.dp
+    val slotSizePx = with(density) { slotDp.toPx() }
+    val gapPx = with(density) { gapDp.toPx() }
+    val radiusPx = with(density) { 13.dp.toPx() }
+
+    val morphProgress by androidx.compose.animation.core.animateFloatAsState(
+        targetValue = if (expanded) 1f else 0f,
+        animationSpec = androidx.compose.animation.core.spring(
+            dampingRatio = 0.52f,
+            stiffness = 360f
+        ),
+        label = "liquidSelectionMorph"
+    )
+    val hoverSecondAnim by androidx.compose.animation.core.animateFloatAsState(
+        targetValue = if (hoverSecond) 1f else 0f,
+        animationSpec = androidx.compose.animation.core.spring(
+            dampingRatio = 0.65f,
+            stiffness = 450f
+        ),
+        label = "liquidSelectionHoverSecond"
+    )
+    val scale by androidx.compose.animation.core.animateFloatAsState(
+        targetValue = if (isSelected) 1.06f else 1.0f,
+        animationSpec = androidx.compose.animation.core.spring(
+            dampingRatio = androidx.compose.animation.core.Spring.DampingRatioMediumBouncy,
+            stiffness = androidx.compose.animation.core.Spring.StiffnessMedium
+        ),
+        label = "selectSlotScale"
+    )
+
+    val clampedMorph = morphProgress.coerceAtLeast(0f)
+    val iconTint = if (isSelected) selectedTint else Color(0xFF1E293B)
+    val slotShape = RoundedCornerShape(13.dp)
+
+    fun triggerTool(tool: CanvasTool) {
+        if (tool == CanvasTool.SELECT) onSelectArrow() else onSelectLasso()
+    }
+
+    // Anchor stays a fixed 36x36dp slot so neither horizontal nor vertical dock ever shifts or clips.
+    Box(
+        modifier = Modifier
+            .size(slotDp)
+            .graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+            }
+            .clip(slotShape)
+            .background(
+                if (isSelected) {
+                    Brush.verticalGradient(
+                        colors = listOf(Color.White.copy(alpha = 0.95f), Color.White.copy(alpha = 0.62f))
+                    )
+                } else {
+                    Brush.verticalGradient(
+                        colors = listOf(Color.White.copy(alpha = 0.28f), Color.White.copy(alpha = 0.10f))
+                    )
+                }
+            )
+            .border(
+                width = if (isSelected) 1.25.dp else 0.7.dp,
+                color = if (isSelected) Color.White else Color.White.copy(alpha = 0.5f),
+                shape = slotShape
+            )
+            // Stylus hover opens the liquid droplet overlay; leaving collapses it.
+            .pointerInput(Unit) {
+                awaitPointerEventScope {
+                    while (true) {
+                        val event = awaitPointerEvent(PointerEventPass.Initial)
+                        val isStylusHover = event.changes.any {
+                            it.type == PointerType.Stylus || it.type == PointerType.Eraser
+                        }
+                        if (isStylusHover && event.type == androidx.compose.ui.input.pointer.PointerEventType.Enter) {
+                            expanded = true
+                        }
+                    }
+                }
+            }
+            // Local finger hold + slide (down in horizontal dock, right in vertical dock).
+            .pointerInput(activeTool, expandDown) {
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    down.consume()
+                    val longPressTimeout = viewConfiguration.longPressTimeoutMillis
+                    var released = false
+                    val held = withTimeoutOrNull(longPressTimeout) {
+                        while (true) {
+                            val ev = awaitPointerEvent()
+                            val ch = ev.changes.firstOrNull { it.id == down.id } ?: break
+                            if (!ch.pressed) {
+                                released = true
+                                break
+                            }
+                        }
+                    }
+                    if (released) {
+                        triggerTool(activeTool)
+                        expanded = false
+                        hoverSecond = false
+                        return@awaitEachGesture
+                    }
+                    if (held == null) {
+                        expanded = true
+                        hoverSecond = false
+                        while (true) {
+                            val ev = awaitPointerEvent()
+                            val ch = ev.changes.firstOrNull { it.id == down.id } ?: break
+                            val axisPos = if (expandDown) ch.position.y else ch.position.x
+                            hoverSecond = axisPos > slotSizePx * 0.72f
+                            ch.consume()
+                            if (!ch.pressed) {
+                                if (hoverSecond) {
+                                    triggerTool(alternateTool)
+                                } else {
+                                    triggerTool(activeTool)
+                                }
+                                expanded = false
+                                hoverSecond = false
+                                break
+                            }
+                        }
+                    }
+                }
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        if (activeTool == CanvasTool.SELECT) {
+            ArrowPointerIcon(tint = iconTint, modifier = Modifier.size(20.dp))
+        } else {
+            Icon(
+                painter = painterResource(id = R.drawable.ic_tool_lasso),
+                contentDescription = "Lasso",
+                tint = iconTint,
+                modifier = Modifier.size(20.dp)
+            )
+        }
+
+        // Unclipped liquid morphing overlay anchored directly over this 36x36dp slot:
+        // pops downward in Horizontal dock, or horizontally to the right in Vertical dock.
+        if (morphProgress > 0.02f) {
+            val fullSpanDp = slotDp + gapDp + slotDp
+            val overlayW = if (expandDown) slotDp else fullSpanDp
+            val overlayH = if (expandDown) fullSpanDp else slotDp
+            val anchorPositionProvider = remember {
+                object : PopupPositionProvider {
+                    override fun calculatePosition(
+                        anchorBounds: IntRect,
+                        windowSize: IntSize,
+                        layoutDirection: LayoutDirection,
+                        popupContentSize: IntSize
+                    ): IntOffset = IntOffset(anchorBounds.left, anchorBounds.top)
+                }
+            }
+            androidx.compose.ui.window.Popup(
+                popupPositionProvider = anchorPositionProvider,
+                onDismissRequest = {
+                    expanded = false
+                    hoverSecond = false
+                },
+                properties = androidx.compose.ui.window.PopupProperties(
+                    focusable = false,
+                    clippingEnabled = false
+                )
+            ) {
+                Box(
+                    modifier = Modifier
+                        .width(overlayW)
+                        .height(overlayH)
+                        .liquidMorphDropletsBackground(
+                            slotSizePx = slotSizePx,
+                            gapPx = gapPx,
+                            radiusPx = radiusPx,
+                            morphProgress = morphProgress,
+                            hoverSecond = hoverSecondAnim,
+                            accentColor = selectedTint,
+                            expandDown = expandDown
+                        )
+                        .pointerInput(Unit) {
+                            awaitPointerEventScope {
+                                while (true) {
+                                    val event = awaitPointerEvent(PointerEventPass.Initial)
+                                    val isStylusHover = event.changes.any {
+                                        it.type == PointerType.Stylus || it.type == PointerType.Eraser
+                                    }
+                                    if (isStylusHover) {
+                                        when (event.type) {
+                                            androidx.compose.ui.input.pointer.PointerEventType.Move -> {
+                                                val p = event.changes.firstOrNull()?.position ?: Offset.Zero
+                                                hoverSecond = (if (expandDown) p.y else p.x) > slotSizePx * 0.85f
+                                            }
+                                            androidx.compose.ui.input.pointer.PointerEventType.Exit -> {
+                                                expanded = false
+                                                hoverSecond = false
+                                            }
+                                            else -> Unit
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                ) {
+                    // Anchor icon (keeps active icon crisp on top of the liquid bridge)
+                    Box(
+                        modifier = Modifier
+                            .size(slotDp)
+                            .align(Alignment.TopStart)
+                            .clickable(
+                                interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                                indication = null
+                            ) {
+                                triggerTool(activeTool)
+                                expanded = false
+                                hoverSecond = false
+                            },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (activeTool == CanvasTool.SELECT) {
+                            ArrowPointerIcon(tint = iconTint, modifier = Modifier.size(20.dp))
+                        } else {
+                            Icon(
+                                painter = painterResource(id = R.drawable.ic_tool_lasso),
+                                contentDescription = "Lasso",
+                                tint = iconTint,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                    }
+
+                    // Extended alternate droplet (ONLY the alternate icon)
+                    val altTint = if (hoverSecond) selectedTint else Color(0xFF334155)
+                    val altScale = (0.55f + 0.45f * morphProgress.coerceIn(0f, 1.15f)) *
+                        (if (hoverSecond) 1.14f else 1.0f)
+                    val altOffsetX = if (expandDown) 0.dp else (slotDp + gapDp) * clampedMorph
+                    val altOffsetY = if (expandDown) (slotDp + gapDp) * clampedMorph else 0.dp
+                    Box(
+                        modifier = Modifier
+                            .size(slotDp)
+                            .align(Alignment.TopStart)
+                            .offset(x = altOffsetX, y = altOffsetY)
+                            .graphicsLayer {
+                                scaleX = altScale
+                                scaleY = altScale
+                                alpha = morphProgress.coerceIn(0f, 1f)
+                            }
+                            .clickable(
+                                interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                                indication = null
+                            ) {
+                                triggerTool(alternateTool)
+                                expanded = false
+                                hoverSecond = false
+                            },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (alternateTool == CanvasTool.SELECT) {
+                            ArrowPointerIcon(tint = altTint, modifier = Modifier.size(20.dp))
+                        } else {
+                            Icon(
+                                painter = painterResource(id = R.drawable.ic_tool_lasso),
+                                contentDescription = "Lasso",
+                                tint = altTint,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -7576,6 +7957,7 @@ fun InfiniteCanvasView(
     bitmapCache: InfiniteItemBitmapCache,
     onSelectItem: (String?) -> Unit,
     onUpdateItem: (InfiniteCanvasItem) -> Unit,
+    onDuplicateItem: (InfiniteCanvasItem) -> Unit,
     onCommitItems: () -> Unit,
     onDeleteItem: (String) -> Unit,
     onResetTransform: () -> Unit,
@@ -7588,8 +7970,25 @@ fun InfiniteCanvasView(
     onDismissOverlays: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    @Suppress("UNUSED_EXPRESSION")
+    ink.layersRevision
     val layerStack = ink.layerStack(pageIndex)
 
+    // The lasso selection belongs to the lasso tool: leaving the tool drops it.
+    androidx.compose.runtime.LaunchedEffect(inkSettings.tool) {
+        if (inkSettings.tool != CanvasTool.LASSO && inkSettings.tool != CanvasTool.SELECT) {
+            ink.lassoClear()
+        }
+        if (inkSettings.tool == CanvasTool.LASSO) {
+            onSelectItem(null)
+        }
+    }
+    androidx.compose.runtime.LaunchedEffect(pageIndex) {
+        ink.lassoClear()
+        onSelectItem(null)
+    }
+
+    val currentPageIndexState by androidx.compose.runtime.rememberUpdatedState(pageIndex)
     val currentScale by androidx.compose.runtime.rememberUpdatedState(scale)
     val currentPanX by androidx.compose.runtime.rememberUpdatedState(panX)
     val currentPanY by androidx.compose.runtime.rememberUpdatedState(panY)
@@ -7633,9 +8032,21 @@ fun InfiniteCanvasView(
             style = android.graphics.Paint.Style.FILL
         }
     }
-    val accentFill = remember {
+    val rotateFill = remember {
         android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
-            color = 0xFFFB6443.toInt()
+            color = 0xFF2563EB.toInt()
+            style = android.graphics.Paint.Style.FILL
+        }
+    }
+    val mirrorFill = remember {
+        android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xFF0D9488.toInt()
+            style = android.graphics.Paint.Style.FILL
+        }
+    }
+    val copyFill = remember {
+        android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xFFEA580C.toInt()
             style = android.graphics.Paint.Style.FILL
         }
     }
@@ -7648,7 +8059,7 @@ fun InfiniteCanvasView(
     }
     val itemDstRect = remember { android.graphics.RectF() }
 
-    LaunchedEffect(page.id, noteId) {
+    LaunchedEffect(page.id, pageIndex, noteId) {
         ink.ensureSessionForPage(page, pageIndex)
     }
 
@@ -7790,58 +8201,6 @@ fun InfiniteCanvasView(
 
                 paperBorder.strokeWidth = (1.5f / safeScale).coerceAtLeast(0.5f)
 
-                for (item in items) {
-                    val halfSpan = if (item.rotationDeg == 0f) 0f else maxOf(item.width, item.height) * 0.72f
-                    val halfW = if (item.rotationDeg == 0f) item.width * 0.5f + 32f else halfSpan
-                    val halfH = if (item.rotationDeg == 0f) item.height * 0.5f + 32f else halfSpan
-                    if (item.centerX + halfW < viewLeft || item.centerX - halfW > viewRight ||
-                        item.centerY + halfH < viewTop || item.centerY - halfH > viewBottom
-                    ) {
-                        continue
-                    }
-
-                    val bmp = when (item) {
-                        is InfiniteCanvasItem.ImageItem -> bitmapCache.getImageBitmap(item.fileName)
-                        is InfiniteCanvasItem.PdfPageItem -> bitmapCache.getPdfPageBitmap(item, scale)
-                    }
-                    val itemSave = native.save()
-                    native.translate(item.centerX, item.centerY)
-                    if (item.rotationDeg != 0f) {
-                        native.rotate(item.rotationDeg)
-                    }
-                    itemDstRect.set(
-                        -item.width / 2f,
-                        -item.height / 2f,
-                        item.width / 2f,
-                        item.height / 2f
-                    )
-                    if (item is InfiniteCanvasItem.PdfPageItem) {
-                        native.drawRect(itemDstRect, paperFill)
-                    }
-                    if (bmp != null && !bmp.isRecycled) {
-                        native.drawBitmap(bmp, null, itemDstRect, itemPaint)
-                    }
-                    if (item is InfiniteCanvasItem.PdfPageItem) {
-                        native.drawRect(itemDstRect, paperBorder)
-                    }
-                    if (item.id == selectedItemId) {
-                        selStroke.strokeWidth = (2.5f / safeScale).coerceAtLeast(1f)
-                        native.drawRect(itemDstRect, selStroke)
-                        val r = 16f / safeScale.coerceAtLeast(0.1f)
-                        iconPaint.textSize = 18f / safeScale.coerceAtLeast(0.1f)
-                        // Top-left: Delete
-                        native.drawCircle(itemDstRect.left, itemDstRect.top, r, deleteFill)
-                        native.drawText("✕", itemDstRect.left, itemDstRect.top + r * 0.35f, iconPaint)
-                        // Top-right: Rotate
-                        native.drawCircle(itemDstRect.right, itemDstRect.top, r, accentFill)
-                        native.drawText("↻", itemDstRect.right, itemDstRect.top + r * 0.35f, iconPaint)
-                        // Bottom-right: Resize
-                        native.drawCircle(itemDstRect.right, itemDstRect.bottom, r, handleFill)
-                        native.drawCircle(itemDstRect.right, itemDstRect.bottom, r, selStroke)
-                    }
-                    native.restoreToCount(itemSave)
-                }
-
                 val normMinX = viewLeft / 2160f
                 val normMinY = viewTop / 2160f
                 val normMaxX = viewRight / 2160f
@@ -7849,6 +8208,91 @@ fun InfiniteCanvasView(
 
                 layerStack.layers.forEach { layer ->
                     if (layer.visible) {
+                        for (item in items) {
+                            if (item.pageIndex != pageIndex || item.layerIndex != layer.index) continue
+                            val halfSpan = if (item.rotationDeg == 0f) 0f else maxOf(item.width, item.height) * 0.72f
+                            val halfW = if (item.rotationDeg == 0f) item.width * 0.5f + 32f else halfSpan
+                            val halfH = if (item.rotationDeg == 0f) item.height * 0.5f + 32f else halfSpan
+                            if (item.centerX + halfW < viewLeft || item.centerX - halfW > viewRight ||
+                                item.centerY + halfH < viewTop || item.centerY - halfH > viewBottom
+                            ) {
+                                continue
+                            }
+
+                            val bmp = when (item) {
+                                is InfiniteCanvasItem.ImageItem -> bitmapCache.getImageBitmap(item.fileName)
+                                is InfiniteCanvasItem.PdfPageItem -> bitmapCache.getPdfPageBitmap(item, scale)
+                            }
+                            val itemSave = native.save()
+                            native.translate(item.centerX, item.centerY)
+                            if (item.rotationDeg != 0f) {
+                                native.rotate(item.rotationDeg)
+                            }
+                            itemDstRect.set(
+                                -item.width / 2f,
+                                -item.height / 2f,
+                                item.width / 2f,
+                                item.height / 2f
+                            )
+                            val bmpSave = native.save()
+                            if (item.flipHorizontal) {
+                                native.scale(-1f, 1f)
+                            }
+                            if (item is InfiniteCanvasItem.PdfPageItem) {
+                                native.drawRect(itemDstRect, paperFill)
+                            }
+                            if (bmp != null && !bmp.isRecycled) {
+                                native.drawBitmap(bmp, null, itemDstRect, itemPaint)
+                            }
+                            if (item is InfiniteCanvasItem.PdfPageItem) {
+                                native.drawRect(itemDstRect, paperBorder)
+                            }
+                            native.restoreToCount(bmpSave)
+                            if (item.id == selectedItemId) {
+                                val inv = 1f / safeScale.coerceAtLeast(0.1f)
+                                selStroke.strokeWidth = (2.5f * inv).coerceAtLeast(1f)
+                                native.drawRect(itemDstRect, selStroke)
+                                val r = 16f * inv
+                                iconPaint.textSize = 17f * inv
+                                // Edge midpoint resize pills
+                                val pillLong = r * 0.9f
+                                val pillShort = r * 0.34f
+                                fun drawEdgePill(cx: Float, cy: Float, horiz: Boolean) {
+                                    val hw = if (horiz) pillLong else pillShort
+                                    val hh = if (horiz) pillShort else pillLong
+                                    val pr = android.graphics.RectF(cx - hw, cy - hh, cx + hw, cy + hh)
+                                    native.drawRoundRect(pr, pillShort, pillShort, handleFill)
+                                    native.drawRoundRect(pr, pillShort, pillShort, selStroke)
+                                }
+                                drawEdgePill(0f, itemDstRect.top, true)
+                                drawEdgePill(0f, itemDstRect.bottom, true)
+                                drawEdgePill(itemDstRect.left, 0f, false)
+                                drawEdgePill(itemDstRect.right, 0f, false)
+
+                                // Corner 1 (Top-Left, Blue): Rotate
+                                native.drawCircle(itemDstRect.left, itemDstRect.top, r, rotateFill)
+                                native.drawText("↻", itemDstRect.left, itemDstRect.top + r * 0.35f, iconPaint)
+
+                                // Beside Corner 1 (Teal): Mirror horizontal flip
+                                val mx = (itemDstRect.left + r * 2.4f).coerceAtMost(0f)
+                                native.drawCircle(mx, itemDstRect.top, r, mirrorFill)
+                                native.drawText("⇄", mx, itemDstRect.top + r * 0.35f, iconPaint)
+
+                                // Corner 2 (Top-Right, Red): Delete / Cut
+                                native.drawCircle(itemDstRect.right, itemDstRect.top, r, deleteFill)
+                                native.drawText("✕", itemDstRect.right, itemDstRect.top + r * 0.35f, iconPaint)
+
+                                // Corner 3 (Bottom-Left, Orange): Copy (tap & drag)
+                                native.drawCircle(itemDstRect.left, itemDstRect.bottom, r, copyFill)
+                                native.drawText("+", itemDstRect.left, itemDstRect.bottom + r * 0.35f, iconPaint)
+
+                                // Corner 4 (Bottom-Right, White): 1:1 Resize
+                                native.drawCircle(itemDstRect.right, itemDstRect.bottom, r * 0.68f, handleFill)
+                                native.drawCircle(itemDstRect.right, itemDstRect.bottom, r * 0.68f, selStroke)
+                            }
+                            native.restoreToCount(itemSave)
+                        }
+
                         val hasErase = ink.layerHasErase(pageIndex, layer)
                         val layerSave = if (hasErase) {
                             native.saveLayer(
@@ -7887,6 +8331,8 @@ fun InfiniteCanvasView(
             ink.previewRevision
             @Suppress("UNUSED_EXPRESSION")
             ink.laserRevision
+            @Suppress("UNUSED_EXPRESSION")
+            ink.lassoRevision
             drawIntoCanvas { canvas ->
                 val native = canvas.nativeCanvas
                 val count = native.save()
@@ -7900,12 +8346,14 @@ fun InfiniteCanvasView(
         Box(
             modifier = Modifier
                 .matchParentSize()
-                .pointerInput(page.id) {
+                .pointerInput(page.id, pageIndex) {
                     try {
                         awaitEachGesture {
+                            val down = awaitFirstDown(requireUnconsumed = false)
+                            // Read latest ink settings AFTER awaitFirstDown so tool/color/width
+                            // changes made while idle take effect immediately on the first stroke.
                             val settings = currentInkSettings
                             if (settings.readingMode) return@awaitEachGesture
-                            val down = awaitFirstDown(requireUnconsumed = false)
                             onDismissOverlays()
                             val isStylus = down.type == PointerType.Stylus || down.type == PointerType.Eraser
                             if (isStylus) onStylusDetected()
@@ -7913,8 +8361,15 @@ fun InfiniteCanvasView(
 
                             val downWorldX = (down.position.x - currentPanX) / currentScale.coerceAtLeast(0.1f)
                             val downWorldY = (down.position.y - currentPanY) / currentScale.coerceAtLeast(0.1f)
+                            val curPageIdx = currentPageIndexState
+                            val curLayerStack = ink.layerStack(curPageIdx)
+                            val isLayerVis: (Int) -> Boolean = { lIdx ->
+                                curLayerStack.layerAt(lIdx)?.visible != false
+                            }
                             val selItem = currentSelectedItemId?.let { id ->
-                                currentItems.firstOrNull { it.id == id }
+                                currentItems.firstOrNull {
+                                    it.id == id && it.pageIndex == curPageIdx && isLayerVis(it.layerIndex)
+                                }
                             }
                             var activeItem: InfiniteCanvasItem? = null
                             var activeHandle = InfiniteItemHandle.NONE
@@ -7925,9 +8380,18 @@ fun InfiniteCanvasView(
                                     activeHandle = h
                                 }
                             }
-                            if (activeHandle == InfiniteItemHandle.NONE && settings.tool == CanvasTool.LASSO) {
-                                val hit = hitTestInfiniteItems(downWorldX, downWorldY, currentItems)
+                            if (activeHandle == InfiniteItemHandle.NONE && settings.tool == CanvasTool.SELECT &&
+                                ink.hitTestLassoHandle(downWorldX, downWorldY, currentScale) == LassoHandle.NONE
+                            ) {
+                                val hit = hitTestInfiniteItems(
+                                    downWorldX,
+                                    downWorldY,
+                                    currentItems,
+                                    pageIndex = curPageIdx,
+                                    isLayerVisible = isLayerVis
+                                )
                                 if (hit != null) {
+                                    ink.lassoClear()
                                     onSelectItem(hit.id)
                                     activeItem = hit
                                     activeHandle = InfiniteItemHandle.MOVE
@@ -7941,7 +8405,29 @@ fun InfiniteCanvasView(
                                     onDeleteItem(activeItem.id)
                                     return@awaitEachGesture
                                 }
-                                val startItem = activeItem
+                                if (activeHandle == InfiniteItemHandle.MIRROR) {
+                                    onUpdateItem(activeItem.withTransform(flipHorizontal = !activeItem.flipHorizontal))
+                                    while (true) {
+                                        val event = awaitPointerEvent()
+                                        val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                        change.consume()
+                                        if (change.changedToUpIgnoreConsumed()) break
+                                    }
+                                    onCommitItems()
+                                    return@awaitEachGesture
+                                }
+                                val startItem = if (activeHandle == InfiniteItemHandle.COPY) {
+                                    val copy = activeItem.duplicateWithNewId()
+                                    onDuplicateItem(copy)
+                                    copy
+                                } else {
+                                    activeItem
+                                }
+                                val effectiveHandle = if (activeHandle == InfiniteItemHandle.COPY) {
+                                    InfiniteItemHandle.MOVE
+                                } else {
+                                    activeHandle
+                                }
                                 val startCx = startItem.centerX
                                 val startCy = startItem.centerY
                                 val startW = startItem.width
@@ -7954,13 +8440,18 @@ fun InfiniteCanvasView(
                                 val startAngle = Math.toDegrees(
                                     kotlin.math.atan2((downWorldY - startCy).toDouble(), (downWorldX - startCx).toDouble())
                                 ).toFloat()
+                                var movedDist = 0f
                                 while (true) {
                                     val event = awaitPointerEvent()
                                     if (event.changes.count { it.pressed } > 1) break
                                     val change = event.changes.firstOrNull { it.id == down.id } ?: break
                                     val curWx = (change.position.x - currentPanX) / currentScale.coerceAtLeast(0.1f)
                                     val curWy = (change.position.y - currentPanY) / currentScale.coerceAtLeast(0.1f)
-                                    val updated = when (activeHandle) {
+                                    movedDist = maxOf(
+                                        movedDist,
+                                        kotlin.math.hypot((curWx - downWorldX).toDouble(), (curWy - downWorldY).toDouble()).toFloat()
+                                    )
+                                    val updated = when (effectiveHandle) {
                                         InfiniteItemHandle.MOVE -> startItem.withTransform(
                                             centerX = startCx + (curWx - downWorldX),
                                             centerY = startCy + (curWy - downWorldY)
@@ -7976,6 +8467,18 @@ fun InfiniteCanvasView(
                                                 height = (startH * factor).coerceIn(80f, 8000f)
                                             )
                                         }
+                                        InfiniteItemHandle.SCALE_LEFT,
+                                        InfiniteItemHandle.SCALE_RIGHT -> {
+                                            val (lx, _) = worldToItemLocal(curWx, curWy, startItem)
+                                            val newW = (kotlin.math.abs(lx) * 2f).coerceIn(80f, 8000f)
+                                            startItem.withTransform(width = newW)
+                                        }
+                                        InfiniteItemHandle.SCALE_TOP,
+                                        InfiniteItemHandle.SCALE_BOTTOM -> {
+                                            val (_, ly) = worldToItemLocal(curWx, curWy, startItem)
+                                            val newH = (kotlin.math.abs(ly) * 2f).coerceIn(80f, 8000f)
+                                            startItem.withTransform(height = newH)
+                                        }
                                         InfiniteItemHandle.ROTATE -> {
                                             val curAngle = Math.toDegrees(
                                                 kotlin.math.atan2((curWy - startCy).toDouble(), (curWx - startCx).toDouble())
@@ -7987,6 +8490,15 @@ fun InfiniteCanvasView(
                                     onUpdateItem(updated)
                                     change.consume()
                                     if (change.changedToUpIgnoreConsumed()) break
+                                }
+                                if (activeHandle == InfiniteItemHandle.COPY && movedDist < 8f) {
+                                    val step = 36f / currentScale.coerceAtLeast(0.1f)
+                                    onUpdateItem(
+                                        startItem.withTransform(
+                                            centerX = startCx + step,
+                                            centerY = startCy + step
+                                        )
+                                    )
                                 }
                                 onCommitItems()
                                 return@awaitEachGesture
@@ -8018,6 +8530,207 @@ fun InfiniteCanvasView(
                                     if (change.changedToUpIgnoreConsumed()) break
                                 }
                                 ink.clearLaser()
+                                return@awaitEachGesture
+                            }
+
+                            if ((settings.tool == CanvasTool.LASSO || settings.tool == CanvasTool.SELECT) && isAllowedPointer) {
+                                down.consume()
+                                suspend fun androidx.compose.ui.input.pointer.AwaitPointerEventScope.handleStrokeSelectionHandle(
+                                    handle: LassoHandle
+                                ) {
+                                    val b = ink.lassoBounds() ?: return
+                                    when (handle) {
+                                        LassoHandle.DELETE -> {
+                                            ink.lassoDelete(pageIndex)
+                                            while (true) {
+                                                val event = awaitPointerEvent()
+                                                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                                change.consume()
+                                                if (change.changedToUpIgnoreConsumed()) break
+                                            }
+                                        }
+                                        LassoHandle.MIRROR -> {
+                                            ink.lassoMirrorHorizontal(pageIndex)
+                                            while (true) {
+                                                val event = awaitPointerEvent()
+                                                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                                change.consume()
+                                                if (change.changedToUpIgnoreConsumed()) break
+                                            }
+                                        }
+                                        LassoHandle.COPY -> {
+                                            if (ink.lassoStartCopy(pageIndex)) {
+                                                var lastPos = down.position
+                                                var movedDist = 0f
+                                                while (true) {
+                                                    val event = awaitPointerEvent()
+                                                    if (event.changes.count { it.pressed } > 1) break
+                                                    val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                                    val delta = change.position - lastPos
+                                                    lastPos = change.position
+                                                    movedDist += delta.getDistance()
+                                                    ink.lassoMove(
+                                                        pageIndex,
+                                                        delta.x / currentScale.coerceAtLeast(0.1f),
+                                                        delta.y / currentScale.coerceAtLeast(0.1f)
+                                                    )
+                                                    change.consume()
+                                                    if (change.changedToUpIgnoreConsumed()) break
+                                                }
+                                                if (movedDist < 8f) {
+                                                    val step = 28f / currentScale.coerceAtLeast(0.1f)
+                                                    ink.lassoMove(pageIndex, step, step)
+                                                }
+                                                ink.lassoCommitMove(pageIndex)
+                                            }
+                                        }
+                                        LassoHandle.ROTATE -> {
+                                            val cx = b.centerX()
+                                            val cy = b.centerY()
+                                            val startAngle = kotlin.math.atan2(
+                                                (downWorldY - cy).toDouble(),
+                                                (downWorldX - cx).toDouble()
+                                            ).toFloat()
+                                            ink.lassoBeginTransform()
+                                            while (true) {
+                                                val event = awaitPointerEvent()
+                                                if (event.changes.count { it.pressed } > 1) break
+                                                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                                val curWx = (change.position.x - currentPanX) / currentScale.coerceAtLeast(0.1f)
+                                                val curWy = (change.position.y - currentPanY) / currentScale.coerceAtLeast(0.1f)
+                                                val curAngle = kotlin.math.atan2(
+                                                    (curWy - cy).toDouble(),
+                                                    (curWx - cx).toDouble()
+                                                ).toFloat()
+                                                ink.lassoRotateTo(pageIndex, curAngle - startAngle, cx, cy)
+                                                change.consume()
+                                                if (change.changedToUpIgnoreConsumed()) break
+                                            }
+                                            ink.lassoCommitTransform(pageIndex)
+                                        }
+                                        LassoHandle.SCALE_CORNER_BR -> {
+                                            val ax = b.left
+                                            val ay = b.top
+                                            val startDiag = kotlin.math.hypot(
+                                                (downWorldX - ax).toDouble(),
+                                                (downWorldY - ay).toDouble()
+                                            ).toFloat().coerceAtLeast(16f)
+                                            ink.lassoBeginTransform()
+                                            while (true) {
+                                                val event = awaitPointerEvent()
+                                                if (event.changes.count { it.pressed } > 1) break
+                                                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                                val curWx = (change.position.x - currentPanX) / currentScale.coerceAtLeast(0.1f)
+                                                val curWy = (change.position.y - currentPanY) / currentScale.coerceAtLeast(0.1f)
+                                                val curDiag = kotlin.math.hypot(
+                                                    (curWx - ax).toDouble(),
+                                                    (curWy - ay).toDouble()
+                                                ).toFloat().coerceAtLeast(8f)
+                                                val f = (curDiag / startDiag).coerceIn(0.15f, 8.0f)
+                                                ink.lassoScaleTo(pageIndex, f, f, ax, ay)
+                                                change.consume()
+                                                if (change.changedToUpIgnoreConsumed()) break
+                                            }
+                                            ink.lassoCommitTransform(pageIndex)
+                                        }
+                                        LassoHandle.SCALE_LEFT,
+                                        LassoHandle.SCALE_RIGHT,
+                                        LassoHandle.SCALE_TOP,
+                                        LassoHandle.SCALE_BOTTOM -> {
+                                            val ax = when (handle) {
+                                                LassoHandle.SCALE_LEFT -> b.right
+                                                LassoHandle.SCALE_RIGHT -> b.left
+                                                else -> b.centerX()
+                                            }
+                                            val ay = when (handle) {
+                                                LassoHandle.SCALE_TOP -> b.bottom
+                                                LassoHandle.SCALE_BOTTOM -> b.top
+                                                else -> b.centerY()
+                                            }
+                                            val startSpanX = (downWorldX - ax).let {
+                                                if (kotlin.math.abs(it) < 16f) 16f else it
+                                            }
+                                            val startSpanY = (downWorldY - ay).let {
+                                                if (kotlin.math.abs(it) < 16f) 16f else it
+                                            }
+                                            ink.lassoBeginTransform()
+                                            while (true) {
+                                                val event = awaitPointerEvent()
+                                                if (event.changes.count { it.pressed } > 1) break
+                                                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                                val curWx = (change.position.x - currentPanX) / currentScale.coerceAtLeast(0.1f)
+                                                val curWy = (change.position.y - currentPanY) / currentScale.coerceAtLeast(0.1f)
+                                                val sx = if (handle == LassoHandle.SCALE_LEFT || handle == LassoHandle.SCALE_RIGHT) {
+                                                    ((curWx - ax) / startSpanX).coerceIn(0.15f, 8.0f)
+                                                } else {
+                                                    1f
+                                                }
+                                                val sy = if (handle == LassoHandle.SCALE_TOP || handle == LassoHandle.SCALE_BOTTOM) {
+                                                    ((curWy - ay) / startSpanY).coerceIn(0.15f, 8.0f)
+                                                } else {
+                                                    1f
+                                                }
+                                                ink.lassoScaleTo(pageIndex, sx, sy, ax, ay)
+                                                change.consume()
+                                                if (change.changedToUpIgnoreConsumed()) break
+                                            }
+                                            ink.lassoCommitTransform(pageIndex)
+                                        }
+                                        LassoHandle.MOVE -> {
+                                            var lastPos = down.position
+                                            while (true) {
+                                                val event = awaitPointerEvent()
+                                                if (event.changes.count { it.pressed } > 1) break
+                                                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                                val delta = change.position - lastPos
+                                                lastPos = change.position
+                                                ink.lassoMove(
+                                                    pageIndex,
+                                                    delta.x / currentScale.coerceAtLeast(0.1f),
+                                                    delta.y / currentScale.coerceAtLeast(0.1f)
+                                                )
+                                                change.consume()
+                                                if (change.changedToUpIgnoreConsumed()) break
+                                            }
+                                            ink.lassoCommitMove(pageIndex)
+                                        }
+                                        LassoHandle.NONE -> Unit
+                                    }
+                                }
+
+                                val hitHandle = ink.hitTestLassoHandle(downWorldX, downWorldY, currentScale)
+                                if (hitHandle != LassoHandle.NONE) {
+                                    handleStrokeSelectionHandle(hitHandle)
+                                    return@awaitEachGesture
+                                }
+
+                                if (settings.tool == CanvasTool.SELECT) {
+                                    if (ink.selectSingleStrokeAt(pageIndex, downWorldX, downWorldY, currentScale)) {
+                                        handleStrokeSelectionHandle(LassoHandle.MOVE)
+                                    } else {
+                                        ink.lassoClear()
+                                    }
+                                    return@awaitEachGesture
+                                }
+
+                                ink.lassoClear()
+                                val loop = mutableListOf(Pair(downWorldX, downWorldY))
+                                while (true) {
+                                    val event = awaitPointerEvent()
+                                    if (event.changes.count { it.pressed } > 1) break
+                                    val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                    loop.add(
+                                        Pair(
+                                            (change.position.x - currentPanX) / currentScale.coerceAtLeast(0.1f),
+                                            (change.position.y - currentPanY) / currentScale.coerceAtLeast(0.1f)
+                                        )
+                                    )
+                                    ink.lassoUpdatePath(loop)
+                                    change.consume()
+                                    if (change.changedToUpIgnoreConsumed()) break
+                                }
+                                val picked = ink.lassoFinish(pageIndex, loop)
+                                if (picked == 0) ink.lassoClear()
                                 return@awaitEachGesture
                             }
 
@@ -8427,13 +9140,14 @@ fun ContinuousPageView(
         }
         LaunchedEffect(page.id, noteId, savedGeneration, activeSessionReady, layerTick) {
             if (activeSessionReady) {
-                // The session has the page: it holds the layers it writes on.
-                savedLayers = emptyMap()
                 return@LaunchedEffect
             }
-            savedLayers = ink.composeDisplayLayers(
+            val loaded = ink.composeDisplayLayers(
                 pageIndex, displayWidthPx.roundToInt()
             )
+            if (!ink.isActiveSession(pageIndex)) {
+                savedLayers = loaded
+            }
         }
 
         LaunchedEffect(page.id, page.updatedAt, renderWidthKey, noteId, activeSessionReady, savedGeneration) {

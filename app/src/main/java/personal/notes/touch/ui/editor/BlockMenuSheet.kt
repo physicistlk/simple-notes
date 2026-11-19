@@ -158,6 +158,7 @@ private fun typeLabel(block: EditableBlock): String = when (block.type) {
     BlockType.IMAGE -> "Image"
     BlockType.DIVIDER -> "Divider"
     BlockType.QUERY -> "Query block"
+    BlockType.SUBPAGE -> "Sub-page"
 }
 
 @Composable

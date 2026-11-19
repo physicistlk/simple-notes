@@ -1,9 +1,10 @@
 package personal.notes.touch.data.db.entity
 
 import androidx.room.Entity
+import androidx.room.Index
 import androidx.room.PrimaryKey
 
-@Entity(tableName = "notes")
+@Entity(tableName = "notes", indices = [Index(value = ["parentNoteId"])])
 data class NoteEntity(
     @PrimaryKey val id: String,
     val title: String,
@@ -22,5 +23,11 @@ data class NoteEntity(
      * so reopening a note never reorders the library ([updatedAt] stays put).
      * The canvas clamps it to the pages that still exist on open.
      */
-    val lastPageIndex: Int = 0
+    val lastPageIndex: Int = 0,
+    /**
+     * The note this one is a sub-page of (Notion-style nesting), or null for a
+     * top-level note. Sub-pages are listed under their parent, not in the
+     * library; trashing/restoring a parent carries its sub-pages along.
+     */
+    val parentNoteId: String? = null
 )

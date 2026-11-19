@@ -146,7 +146,20 @@ class MainActivity : AppCompatActivity() {
 
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
         StylusTiltTracker.update(ev)
+        PenButtonBus.onMotion(ev)
         return super.dispatchTouchEvent(ev)
+    }
+
+    /** Hover events carry the pen button state while the pen is in the air. */
+    override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean {
+        PenButtonBus.onMotion(ev)
+        return super.dispatchGenericMotionEvent(ev)
+    }
+
+    /** Some pens report their buttons as key events (KEYCODE_STYLUS_BUTTON_*). */
+    override fun dispatchKeyEvent(event: android.view.KeyEvent): Boolean {
+        if (PenButtonBus.onKey(event)) return true
+        return super.dispatchKeyEvent(event)
     }
 
     override fun onDestroy() {
@@ -178,5 +191,106 @@ object StylusTiltTracker {
         } else {
             currentTiltRad = 0f
         }
+    }
+}
+
+
+/**
+ * Pen barrel buttons, delivered once per press whichever way the pen reports them:
+ * as [MotionEvent.getButtonState] bits (touching or hovering) or as stylus key events.
+ *
+ * Button 1 ([onPrimary]) and button 2 ([onSecondary]) are set by the canvas screen while
+ * it is open. Everything the pen reports is logged under the tag `PenButtons`
+ * (`adb logcat -s PenButtons`) to see what a given pen actually sends.
+ */
+object PenButtonBus {
+    @Volatile var onPrimary: (() -> Unit)? = null
+    @Volatile var onSecondary: (() -> Unit)? = null
+    @Volatile private var owner: Any? = null
+
+    fun register(owner: Any, primary: () -> Unit, secondary: () -> Unit) {
+        this.owner = owner
+        this.onPrimary = primary
+        this.onSecondary = secondary
+    }
+
+    fun unregister(owner: Any) {
+        if (this.owner === owner) {
+            this.owner = null
+            this.onPrimary = null
+            this.onSecondary = null
+        }
+    }
+
+    private const val TAG = "PenButtons"
+    private var lastMask = 0
+    private var lastRawButtons = 0
+
+    private const val PRIMARY_BITS = MotionEvent.BUTTON_STYLUS_PRIMARY or MotionEvent.BUTTON_SECONDARY
+    private const val SECONDARY_BITS = MotionEvent.BUTTON_STYLUS_SECONDARY or MotionEvent.BUTTON_TERTIARY
+
+    fun onMotion(ev: MotionEvent) {
+        if (ev.pointerCount <= 0) return
+        val tool = ev.getToolType(0)
+        if (tool != MotionEvent.TOOL_TYPE_STYLUS && tool != MotionEvent.TOOL_TYPE_ERASER) return
+        val raw = ev.buttonState
+        if (raw != lastRawButtons) {
+            android.util.Log.d(TAG, "motion action=${ev.actionMasked} tool=$tool buttonState=0x${raw.toString(16)}")
+            lastRawButtons = raw
+        }
+        val primary = (raw and PRIMARY_BITS) != 0
+        val secondary = (raw and SECONDARY_BITS) != 0
+        val mask = (if (primary) 1 else 0) or (if (secondary) 2 else 0)
+        val rising = mask and lastMask.inv()
+        lastMask = mask
+        if (rising and 1 != 0) onPrimary?.invoke()
+        if (rising and 2 != 0) onSecondary?.invoke()
+    }
+
+    /**
+     * Returns true when the key was a pen button and was handled.
+     *
+     * Xiaomi Smart Pen (Gen 1 / Gen 2 / Focus Pen) pairs as an external Bluetooth HID
+     * keyboard ("Xiaomi Smart Pen", vendor 0x1915, product 0x4d81) and emits
+     * [android.view.KeyEvent.KEYCODE_PAGE_DOWN] / [android.view.KeyEvent.KEYCODE_DPAD_DOWN]
+     * for the lower (primary) barrel button and [android.view.KeyEvent.KEYCODE_PAGE_UP] /
+     * [android.view.KeyEvent.KEYCODE_DPAD_UP] for the upper (secondary) barrel button.
+     */
+    fun onKey(ev: android.view.KeyEvent): Boolean {
+        val code = ev.keyCode
+        val devName = ev.device?.name.orEmpty()
+        val isXiaomiOrBtPen = devName.contains("Pen", ignoreCase = true) ||
+            devName.contains("Stylus", ignoreCase = true)
+        val isPageUpDownWhileCanvasActive = (onPrimary != null || onSecondary != null) &&
+            (code == android.view.KeyEvent.KEYCODE_PAGE_UP ||
+                code == android.view.KeyEvent.KEYCODE_PAGE_DOWN)
+        val isStylusKeyCode = code == android.view.KeyEvent.KEYCODE_STYLUS_BUTTON_PRIMARY ||
+            code == android.view.KeyEvent.KEYCODE_STYLUS_BUTTON_SECONDARY ||
+            code == android.view.KeyEvent.KEYCODE_STYLUS_BUTTON_TERTIARY ||
+            code == android.view.KeyEvent.KEYCODE_STYLUS_BUTTON_TAIL ||
+            (ev.source and android.view.InputDevice.SOURCE_STYLUS) == android.view.InputDevice.SOURCE_STYLUS
+        if (!isXiaomiOrBtPen && !isPageUpDownWhileCanvasActive && !isStylusKeyCode) return false
+
+        android.util.Log.d(
+            TAG,
+            "key code=$code action=${ev.action} repeat=${ev.repeatCount} dev='$devName' source=0x${ev.source.toString(16)}"
+        )
+        val isPrimaryKey = code == android.view.KeyEvent.KEYCODE_STYLUS_BUTTON_PRIMARY ||
+            code == android.view.KeyEvent.KEYCODE_PAGE_DOWN ||
+            code == android.view.KeyEvent.KEYCODE_DPAD_DOWN
+        val isSecondaryKey = code == android.view.KeyEvent.KEYCODE_STYLUS_BUTTON_SECONDARY ||
+            code == android.view.KeyEvent.KEYCODE_STYLUS_BUTTON_TERTIARY ||
+            code == android.view.KeyEvent.KEYCODE_PAGE_UP ||
+            code == android.view.KeyEvent.KEYCODE_DPAD_UP
+        if (!isPrimaryKey && !isSecondaryKey) return false
+
+        if (ev.action == android.view.KeyEvent.ACTION_DOWN && ev.repeatCount == 0) {
+            if (isPrimaryKey) {
+                onPrimary?.invoke()
+            } else {
+                onSecondary?.invoke()
+            }
+        }
+        return onPrimary != null || onSecondary != null
     }
 }

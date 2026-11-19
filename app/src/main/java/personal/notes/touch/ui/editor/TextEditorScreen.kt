@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -133,6 +134,8 @@ fun TextEditorScreen(
     val wordStats by viewModel.wordStats.collectAsState()
     val showEmojiSheet by viewModel.showEmojiSheet.collectAsState()
     val backlinks by viewModel.backlinks.collectAsState()
+    val subPages by viewModel.subPages.collectAsState()
+    val ancestors by viewModel.ancestors.collectAsState()
     val outgoingRefs by viewModel.outgoingRefs.collectAsState()
     val outgoingBlockRefs by viewModel.outgoingBlockRefs.collectAsState()
     val blockBacklinks by viewModel.blockBacklinks.collectAsState()
@@ -269,139 +272,236 @@ fun TextEditorScreen(
                     onSave = { viewModel.saveNow() }
                 )
             } else {
-                TopAppBar(
-                    navigationIcon = {
-                        IconButton(onClick = {
-                            viewModel.saveNow { onBackClick() }
-                        }) {
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                                contentDescription = "Back",
-                                tint = Color.White
-                            )
-                        }
-                    },
-                    title = {
-                        Column {
-                            Text(
-                                text = if (title.isBlank()) "Untitled Note" else title,
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 17.sp,
-                                maxLines = 1,
-                                color = Color.White
-                            )
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                if (!isReadOnly && isSaving) {
-                                    CircularProgressIndicator(
-                                        modifier = Modifier.size(10.dp),
-                                        strokeWidth = 1.5.dp,
-                                        color = Color.White.copy(alpha = 0.8f)
+                Surface(
+                    color = MaterialTheme.colorScheme.surface,
+                    tonalElevation = 1.dp,
+                    shadowElevation = 2.dp
+                ) {
+                    Column {
+                        TopAppBar(
+                            navigationIcon = {
+                                IconButton(
+                                    onClick = { viewModel.saveNow { onBackClick() } },
+                                    modifier = Modifier
+                                        .padding(start = 4.dp)
+                                        .size(38.dp)
+                                        .clip(RoundedCornerShape(10.dp))
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                                        contentDescription = "Back",
+                                        tint = MaterialTheme.colorScheme.onSurface
+                                    )
+                                }
+                            },
+                            title = {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    if (ancestors.isNotEmpty()) {
+                                        val lastParent = ancestors.last()
+                                        Surface(
+                                            shape = RoundedCornerShape(6.dp),
+                                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f),
+                                            modifier = Modifier
+                                                .clip(RoundedCornerShape(6.dp))
+                                                .clickable { onOpenNote(lastParent.id) }
+                                        ) {
+                                            Text(
+                                                text = "\uD83D\uDCC4 " + lastParent.title.ifBlank { "Untitled" },
+                                                fontSize = 13.sp,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                modifier = Modifier
+                                                    .widthIn(max = 180.dp)
+                                                    .padding(horizontal = 8.dp, vertical = 3.dp)
+                                            )
+                                        }
+                                        Text(
+                                            text = "/",
+                                            fontSize = 14.sp,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+                                        )
+                                    }
+                                    Text(
+                                        text = "\uD83D\uDCDD " + (if (title.isBlank()) "Untitled Note" else title),
+                                        fontWeight = FontWeight.SemiBold,
+                                        fontSize = 15.sp,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        color = MaterialTheme.colorScheme.onSurface,
+                                        modifier = Modifier.widthIn(max = 260.dp)
                                     )
                                     Spacer(modifier = Modifier.width(4.dp))
+                                    Surface(
+                                        shape = RoundedCornerShape(999.dp),
+                                        color = if (isReadOnly) {
+                                            Color(0xFFFFF3CD)
+                                        } else {
+                                            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f)
+                                        }
+                                    ) {
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                        ) {
+                                            if (!isReadOnly && isSaving) {
+                                                CircularProgressIndicator(
+                                                    modifier = Modifier.size(10.dp),
+                                                    strokeWidth = 1.5.dp,
+                                                    color = themeColor
+                                                )
+                                                Spacer(modifier = Modifier.width(5.dp))
+                                            } else {
+                                                Box(
+                                                    modifier = Modifier
+                                                        .size(6.dp)
+                                                        .clip(CircleShape)
+                                                        .background(
+                                                            if (isReadOnly) Color(0xFFD97706) else Color(0xFF10B981)
+                                                        )
+                                                )
+                                                Spacer(modifier = Modifier.width(5.dp))
+                                            }
+                                            val statusText = when {
+                                                isReadOnly -> "Locked"
+                                                isSaving -> "Saving"
+                                                else -> "Saved"
+                                            }
+                                            Text(
+                                                text = "$statusText · ${wordStats.wordCount}w",
+                                                fontSize = 11.sp,
+                                                fontWeight = FontWeight.Medium,
+                                                color = if (isReadOnly) {
+                                                    Color(0xFF92400E)
+                                                } else {
+                                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                                }
+                                            )
+                                        }
+                                    }
                                 }
-                                val statusText = if (isReadOnly) "Read-only" else if (isSaving) "Saving..." else "Auto-saved (1s)"
-                                Text(
-                                    text = "${wordStats.wordCount} words · ${wordStats.charCount} chars · $statusText",
-                                    fontSize = 11.sp,
-                                    color = Color.White.copy(alpha = 0.75f)
-                                )
-                            }
-                        }
-                    },
-                    actions = {
-                        // Mode Switcher: Edit, Split, Preview
-                        Row(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(20.dp))
-                                .background(Color.White.copy(alpha = 0.15f))
-                                .padding(2.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            ModeTabButton(
-                                label = "Edit",
-                                isSelected = editorMode == EditorMode.EDIT,
-                                themeColor = themeColor,
-                                onClick = { viewModel.setEditorMode(EditorMode.EDIT) }
-                            )
-                            ModeTabButton(
-                                label = "Split",
-                                isSelected = editorMode == EditorMode.SPLIT,
-                                themeColor = themeColor,
-                                onClick = { viewModel.setEditorMode(EditorMode.SPLIT) }
-                            )
-                            ModeTabButton(
-                                label = "Preview",
-                                isSelected = editorMode == EditorMode.PREVIEW,
-                                themeColor = themeColor,
-                                onClick = { viewModel.setEditorMode(EditorMode.PREVIEW) }
-                            )
-                        }
+                            },
+                            actions = {
+                                // Notion-style Mode Switcher pill: Edit | Split | Read
+                                Row(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(10.dp))
+                                        .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f))
+                                        .padding(3.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    ModeTabButton(
+                                        label = "Write",
+                                        isSelected = editorMode == EditorMode.EDIT,
+                                        themeColor = themeColor,
+                                        onClick = { viewModel.setEditorMode(EditorMode.EDIT) }
+                                    )
+                                    ModeTabButton(
+                                        label = "Split",
+                                        isSelected = editorMode == EditorMode.SPLIT,
+                                        themeColor = themeColor,
+                                        onClick = { viewModel.setEditorMode(EditorMode.SPLIT) }
+                                    )
+                                    ModeTabButton(
+                                        label = "Read",
+                                        isSelected = editorMode == EditorMode.PREVIEW,
+                                        themeColor = themeColor,
+                                        onClick = { viewModel.setEditorMode(EditorMode.PREVIEW) }
+                                    )
+                                }
 
-                        Spacer(modifier = Modifier.width(6.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
 
-                        IconButton(onClick = { viewModel.toggleFindBar() }) {
-                            Icon(
-                                imageVector = Icons.Default.Search,
-                                contentDescription = "Find and replace",
-                                tint = Color.White
-                            )
-                        }
+                                if (!isReadOnly) {
+                                    Surface(
+                                        shape = RoundedCornerShape(9.dp),
+                                        color = themeColor.copy(alpha = 0.12f),
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(9.dp))
+                                            .clickable { viewModel.addSubPage(onOpenNote) }
+                                    ) {
+                                        Text(
+                                            text = "+ Sub-page",
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = themeColor,
+                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                }
 
-                        IconButton(onClick = { viewModel.toggleReadOnly() }) {
-                            Icon(
-                                imageVector = if (isReadOnly) Icons.Default.Lock else Icons.Default.LockOpen,
-                                contentDescription = if (isReadOnly) "Read-only mode" else "Editable mode",
-                                tint = if (isReadOnly) Color(0xFFFFD54F) else Color.White
-                            )
-                        }
+                                IconButton(onClick = { viewModel.toggleFindBar() }) {
+                                    Icon(
+                                        imageVector = Icons.Default.Search,
+                                        contentDescription = "Find and replace",
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
 
-                        // Two-pane workspace: this note + one picked from a searchable list.
-                        IconButton(onClick = {
-                            viewModel.saveNow()
-                            showOpenBeside = true
-                        }) {
-                            Icon(
-                                imageVector = Icons.Default.VerticalSplit,
-                                contentDescription = "Open beside",
-                                tint = Color.White
-                            )
-                        }
+                                IconButton(onClick = {
+                                    viewModel.saveNow()
+                                    showReferences = true
+                                }) {
+                                    Icon(
+                                        imageVector = Icons.Default.Link,
+                                        contentDescription = "References",
+                                        tint = if (backlinks.isNotEmpty() || outgoingRefs.isNotEmpty()) {
+                                            themeColor
+                                        } else {
+                                            MaterialTheme.colorScheme.onSurfaceVariant
+                                        }
+                                    )
+                                }
 
-                        // References: backlinks + outgoing wiki links (schema 7 index).
-                        IconButton(onClick = {
-                            viewModel.saveNow()
-                            showReferences = true
-                        }) {
-                            Icon(
-                                imageVector = Icons.Default.Link,
-                                contentDescription = "References",
-                                tint = Color.White
-                            )
-                        }
+                                IconButton(onClick = {
+                                    viewModel.saveNow()
+                                    showOpenBeside = true
+                                }) {
+                                    Icon(
+                                        imageVector = Icons.Default.VerticalSplit,
+                                        contentDescription = "Open beside",
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
 
-                        IconButton(onClick = {
-                            viewModel.saveNow()
-                            showExportDialog = true
-                        }) {
-                            Icon(
-                                imageVector = Icons.Default.Share,
-                                contentDescription = "Export Note",
-                                tint = Color.White
-                            )
-                        }
+                                IconButton(onClick = { viewModel.toggleReadOnly() }) {
+                                    Icon(
+                                        imageVector = if (isReadOnly) Icons.Default.Lock else Icons.Default.LockOpen,
+                                        contentDescription = if (isReadOnly) "Read-only mode" else "Editable mode",
+                                        tint = if (isReadOnly) Color(0xFFD97706) else MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
 
-                        IconButton(onClick = { viewModel.saveNow() }) {
-                            Icon(
-                                imageVector = Icons.Default.Check,
-                                contentDescription = "Save Note",
-                                tint = Color.White
+                                IconButton(onClick = {
+                                    viewModel.saveNow()
+                                    showExportDialog = true
+                                }) {
+                                    Icon(
+                                        imageVector = Icons.Default.Share,
+                                        contentDescription = "Export Note",
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+
+                                IconButton(onClick = { viewModel.saveNow() }) {
+                                    Icon(
+                                        imageVector = Icons.Default.Check,
+                                        contentDescription = "Save Note",
+                                        tint = themeColor
+                                    )
+                                }
+                            },
+                            colors = TopAppBarDefaults.topAppBarColors(
+                                containerColor = MaterialTheme.colorScheme.surface
                             )
-                        }
-                    },
-                    colors = TopAppBarDefaults.topAppBarColors(
-                        containerColor = themeColor
-                    )
-            )
+                        )
+                        HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f))
+                    }
+                }
             }
         }
     ) { innerPadding ->
@@ -499,9 +599,6 @@ fun TextEditorScreen(
 
             // Formatting Toolbar (Visible in EDIT and SPLIT modes when not read-only)
             if (editorMode != EditorMode.PREVIEW && !isReadOnly) {
-                // In the block editor the toolbar transforms the ACTIVE block;
-                // in Split (no focused block) it falls back to the raw-source
-                // helpers so old behaviour is preserved.
                 val blockCommandsActive = activeBlockId != null && editorMode == EditorMode.EDIT
                 FormattingToolbar(
                     viewModel = viewModel,
@@ -510,112 +607,172 @@ fun TextEditorScreen(
                     onOutlineClick = { showOutlineSheet = true },
                     onPickImage = { viewModel.requestImagePick() }
                 )
-                HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f))
+                HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f))
             }
 
-            // Note Title input field
-            if (editorMode != EditorMode.PREVIEW) {
-                TextField(
-                    value = title,
-                    onValueChange = { if (!isReadOnly) viewModel.onTitleChange(it) },
-                    readOnly = isReadOnly,
-                    placeholder = {
-                        Text(
-                            text = "Note Title...",
-                            fontSize = 20.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.4f)
-                        )
-                    },
-                    textStyle = TextStyle(
-                        fontSize = 20.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onSurface
-                    ),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 6.dp),
-                    colors = TextFieldDefaults.colors(
-                        focusedContainerColor = Color.Transparent,
-                        unfocusedContainerColor = Color.Transparent,
-                        focusedIndicatorColor = Color.Transparent,
-                        unfocusedIndicatorColor = Color.Transparent
-                    ),
-                    singleLine = true
-                )
-                HorizontalDivider(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.05f))
-            }
-
-            // Editor / Preview Body
+            // Centered Notion-style Document Sheet
             Box(
+                contentAlignment = Alignment.TopCenter,
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f)
+                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.22f))
+                    .padding(
+                        horizontal = if (editorMode == EditorMode.SPLIT) 0.dp else 24.dp,
+                        vertical = if (editorMode == EditorMode.SPLIT) 0.dp else 10.dp
+                    )
             ) {
-                when (editorMode) {
-                    EditorMode.EDIT -> {
-                        // Phase-1 block editor: one styled field per block.
-                        BlockEditPane(
-                            viewModel = viewModel,
-                            listState = listState,
-                            modifier = Modifier.fillMaxSize()
+                Surface(
+                    shape = if (editorMode == EditorMode.SPLIT) {
+                        RoundedCornerShape(0.dp)
+                    } else {
+                        RoundedCornerShape(14.dp)
+                    },
+                    color = MaterialTheme.colorScheme.surface,
+                    shadowElevation = if (editorMode == EditorMode.SPLIT) 0.dp else 2.dp,
+                    border = if (editorMode == EditorMode.SPLIT) {
+                        null
+                    } else {
+                        androidx.compose.foundation.BorderStroke(
+                            1.dp,
+                            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f)
+                        )
+                    },
+                    modifier = Modifier
+                        .then(
+                            if (editorMode == EditorMode.SPLIT) {
+                                Modifier.fillMaxWidth()
+                            } else {
+                                Modifier
+                                    .widthIn(max = 860.dp)
+                                    .fillMaxWidth()
+                            }
+                        )
+                        .fillMaxHeight()
+                ) {
+                Column(
+                    modifier = Modifier.fillMaxSize()
+                ) {
+                    // Breadcrumb of the parents of a sub-page: Parent › Child.
+                    if (ancestors.isNotEmpty()) {
+                        BreadcrumbRow(
+                            ancestors = ancestors,
+                            current = title.ifBlank { "Untitled Note" },
+                            onOpen = onOpenNote
                         )
                     }
-                    EditorMode.PREVIEW -> {
-                        PreviewPane(
-                            title = title,
-                            content = contentValue.text,
-                            noteId = viewModel.noteId,
-                            fileStore = viewModel.fileStore,
-                            onToggleChecklist = { lineIdx, checked ->
-                                viewModel.toggleChecklist(lineIdx, checked)
-                            },
-                            onWikiClick = { wikiTitle ->
-                                viewModel.noteIdForTitle(wikiTitle)?.let(onOpenNote)
-                            },
-                            blockRefLabels = blockRefLabels,
-                            onBlockRefClick = { key -> blockRefNotes[key]?.let(onOpenNote) },
+
+                    // Notion Hero Title & Metadata Header
+                    if (editorMode != EditorMode.PREVIEW) {
+                        Column(
                             modifier = Modifier
-                                .fillMaxSize()
-                                .padding(16.dp)
+                                .fillMaxWidth()
+                                .padding(horizontal = 28.dp)
+                                .padding(top = 18.dp, bottom = 6.dp)
+                        ) {
+                            BasicTextField(
+                                value = title,
+                                onValueChange = { if (!isReadOnly) viewModel.onTitleChange(it) },
+                                readOnly = isReadOnly,
+                                singleLine = true,
+                                cursorBrush = SolidColor(themeColor),
+                                textStyle = TextStyle(
+                                    fontSize = 30.sp,
+                                    lineHeight = 36.sp,
+                                    fontWeight = FontWeight.ExtraBold,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                ),
+                                decorationBox = { innerTextField ->
+                                    Box(modifier = Modifier.fillMaxWidth()) {
+                                        if (title.isEmpty()) {
+                                            Text(
+                                                text = "Untitled",
+                                                fontSize = 30.sp,
+                                                lineHeight = 36.sp,
+                                                fontWeight = FontWeight.ExtraBold,
+                                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.25f)
+                                            )
+                                        }
+                                        innerTextField()
+                                    }
+                                },
+                                modifier = Modifier.fillMaxWidth()
+                            )
+
+                            Spacer(modifier = Modifier.height(6.dp))
+
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                            ) {
+                                Text(
+                                    text = "${wordStats.wordCount} words · ${wordStats.charCount} chars",
+                                    fontSize = 12.sp,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                                )
+                                if (subPages.isNotEmpty()) {
+                                    Text(
+                                        text = "·  ${subPages.size} sub-page" + if (subPages.size == 1) "" else "s",
+                                        fontSize = 12.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                                    )
+                                }
+                                if (backlinks.isNotEmpty()) {
+                                    Text(
+                                        text = "·  ${backlinks.size} backlink" + if (backlinks.size == 1) "" else "s",
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Medium,
+                                        color = themeColor,
+                                        modifier = Modifier.clickable { showReferences = true }
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    // Notion-style Sub-pages block list (shows only legacy sub-pages that are not already embedded inline in the blocks)
+                    val blocksList by viewModel.blocks.collectAsState()
+                    val inlineSubPageIds = remember(blocksList) {
+                        blocksList.filter { it.type == BlockType.SUBPAGE }
+                            .map { it.field.text.trim() }
+                            .toSet()
+                    }
+                    val unplacedSubPages = remember(subPages, inlineSubPageIds) {
+                        subPages.filter { it.id !in inlineSubPageIds }
+                    }
+                    if (unplacedSubPages.isNotEmpty()) {
+                        SubPagesRow(
+                            subPages = unplacedSubPages,
+                            canAdd = false,
+                            themeColor = themeColor,
+                            onOpen = onOpenNote,
+                            onAdd = { viewModel.addSubPage(onOpenNote) }
                         )
                     }
-                    EditorMode.SPLIT -> {
-                        Row(modifier = Modifier.fillMaxSize()) {
-                            // Left: raw markdown source (legacy editing surface)
-                            Box(
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .fillMaxHeight()
-                                    .padding(16.dp)
-                            ) {
-                                EditPane(
-                                    value = contentValue,
-                                    onValueChange = { viewModel.onContentChange(it) },
+
+                    // Editor / Preview Body
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f)
+                    ) {
+                        when (editorMode) {
+                            EditorMode.EDIT -> {
+                                BlockEditPane(
+                                    viewModel = viewModel,
+                                    listState = listState,
+                                    onOpenNote = onOpenNote,
                                     modifier = Modifier.fillMaxSize()
                                 )
                             }
-
-                            // Divider
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxHeight()
-                                    .width(1.dp)
-                                    .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f))
-                            )
-
-                            // Right: Live Rich Preview
-                            Box(
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .fillMaxHeight()
-                                    .padding(16.dp)
-                            ) {
+                            EditorMode.PREVIEW -> {
                                 PreviewPane(
                                     title = title,
                                     content = contentValue.text,
                                     noteId = viewModel.noteId,
                                     fileStore = viewModel.fileStore,
+                                    subPages = subPages,
+                                    onOpenSubPage = onOpenNote,
                                     onToggleChecklist = { lineIdx, checked ->
                                         viewModel.toggleChecklist(lineIdx, checked)
                                     },
@@ -624,11 +781,62 @@ fun TextEditorScreen(
                                     },
                                     blockRefLabels = blockRefLabels,
                                     onBlockRefClick = { key -> blockRefNotes[key]?.let(onOpenNote) },
-                                    modifier = Modifier.fillMaxSize()
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .padding(horizontal = 28.dp, vertical = 16.dp)
                                 )
+                            }
+                            EditorMode.SPLIT -> {
+                                Row(modifier = Modifier.fillMaxSize()) {
+                                    Box(
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .fillMaxHeight()
+                                            .padding(horizontal = 24.dp, vertical = 16.dp)
+                                    ) {
+                                        EditPane(
+                                            value = contentValue,
+                                            onValueChange = { viewModel.onContentChange(it) },
+                                            modifier = Modifier.fillMaxSize()
+                                        )
+                                    }
+
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxHeight()
+                                            .width(1.dp)
+                                            .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.10f))
+                                    )
+
+                                    Box(
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .fillMaxHeight()
+                                            .padding(horizontal = 24.dp, vertical = 16.dp)
+                                    ) {
+                                        PreviewPane(
+                                            title = title,
+                                            content = contentValue.text,
+                                            noteId = viewModel.noteId,
+                                            fileStore = viewModel.fileStore,
+                                            subPages = subPages,
+                                            onOpenSubPage = onOpenNote,
+                                            onToggleChecklist = { lineIdx, checked ->
+                                                viewModel.toggleChecklist(lineIdx, checked)
+                                            },
+                                            onWikiClick = { wikiTitle ->
+                                                viewModel.noteIdForTitle(wikiTitle)?.let(onOpenNote)
+                                            },
+                                            blockRefLabels = blockRefLabels,
+                                            onBlockRefClick = { key -> blockRefNotes[key]?.let(onOpenNote) },
+                                            modifier = Modifier.fillMaxSize()
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
+                }
                 }
             }
         }
@@ -682,6 +890,164 @@ fun TextEditorScreen(
     }
 }
 
+/** "Parent › Child" path above the title of a sub-page; every parent is a link. */
+@Composable
+private fun BreadcrumbRow(
+    ancestors: List<NoteEntity>,
+    current: String,
+    onOpen: (String) -> Unit
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .horizontalScroll(rememberScrollState())
+            .padding(horizontal = 28.dp)
+            .padding(top = 12.dp, bottom = 2.dp)
+    ) {
+        ancestors.forEach { parent ->
+            Surface(
+                shape = RoundedCornerShape(6.dp),
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
+                modifier = Modifier
+                    .clip(RoundedCornerShape(6.dp))
+                    .clickable { onOpen(parent.id) }
+            ) {
+                Text(
+                    text = "\uD83D\uDCC4 " + parent.title.ifBlank { "Untitled" },
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                )
+            }
+            Text(
+                text = "›",
+                fontSize = 13.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
+                modifier = Modifier.padding(horizontal = 6.dp)
+            )
+        }
+        Text(
+            text = current,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            color = MaterialTheme.colorScheme.onSurface
+        )
+    }
+}
+
+/** Notion-style sub-page blocks under the page header, plus a subtle "+ New sub-page" row. */
+@Composable
+private fun SubPagesRow(
+    subPages: List<NoteEntity>,
+    canAdd: Boolean,
+    themeColor: Color,
+    onOpen: (String) -> Unit,
+    onAdd: () -> Unit
+) {
+    if (subPages.isEmpty() && !canAdd) return
+    Column(
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 28.dp, vertical = 8.dp)
+    ) {
+        if (subPages.isNotEmpty()) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 2.dp)
+            ) {
+                Text(
+                    text = "SUB-PAGES",
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 0.8.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+                )
+                if (canAdd) {
+                    Text(
+                        text = "+ New sub-page",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = themeColor,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .clickable(onClick = onAdd)
+                            .padding(horizontal = 6.dp, vertical = 2.dp)
+                    )
+                }
+            }
+            subPages.forEach { page ->
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                    border = androidx.compose.foundation.BorderStroke(
+                        1.dp,
+                        MaterialTheme.colorScheme.onSurface.copy(alpha = 0.07f)
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable { onOpen(page.id) }
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 8.dp)
+                    ) {
+                        Text(
+                            text = "\uD83D\uDCC4",
+                            fontSize = 15.sp
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text(
+                            text = page.title.ifBlank { "Untitled" },
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Text(
+                            text = "Open ›",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = themeColor
+                        )
+                    }
+                }
+            }
+        } else if (canAdd) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(6.dp))
+                    .clickable(onClick = onAdd)
+                    .padding(horizontal = 6.dp, vertical = 4.dp)
+            ) {
+                Text(
+                    text = "+ Add a sub-page",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.65f)
+                )
+            }
+        }
+        HorizontalDivider(
+            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f),
+            modifier = Modifier.padding(top = 6.dp)
+        )
+    }
+}
+
 @Composable
 private fun ModeTabButton(
     label: String,
@@ -690,18 +1056,19 @@ private fun ModeTabButton(
     onClick: () -> Unit
 ) {
     Surface(
-        shape = RoundedCornerShape(16.dp),
-        color = if (isSelected) Color.White else Color.Transparent,
+        shape = RoundedCornerShape(8.dp),
+        color = if (isSelected) MaterialTheme.colorScheme.surface else Color.Transparent,
+        shadowElevation = if (isSelected) 1.dp else 0.dp,
         modifier = Modifier
-            .clip(RoundedCornerShape(16.dp))
+            .clip(RoundedCornerShape(8.dp))
             .clickable(onClick = onClick)
     ) {
         Text(
             text = label,
             fontSize = 12.sp,
-            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
-            color = if (isSelected) themeColor else Color.White,
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+            fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium,
+            color = if (isSelected) themeColor else MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 5.dp)
         )
     }
 }
@@ -852,15 +1219,19 @@ private fun ToolbarButton(
     onClick: () -> Unit
 ) {
     Surface(
-        shape = RoundedCornerShape(8.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant,
+        shape = RoundedCornerShape(7.dp),
+        color = MaterialTheme.colorScheme.surface,
+        border = androidx.compose.foundation.BorderStroke(
+            1.dp,
+            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.09f)
+        ),
         modifier = Modifier
-            .clip(RoundedCornerShape(8.dp))
+            .clip(RoundedCornerShape(7.dp))
             .clickable(onClick = onClick)
     ) {
         Text(
             text = text,
-            fontSize = 13.sp,
+            fontSize = 12.sp,
             fontWeight = if (bold) FontWeight.Bold else FontWeight.Medium,
             fontStyle = if (italic) FontStyle.Italic else FontStyle.Normal,
             fontFamily = if (mono) FontFamily.Monospace else FontFamily.Default,
@@ -869,8 +1240,8 @@ private fun ToolbarButton(
                 strike -> TextDecoration.LineThrough
                 else -> TextDecoration.None
             },
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp)
+            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.85f),
+            modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp)
         )
     }
 }
@@ -923,6 +1294,8 @@ private fun PreviewPane(
     content: String,
     noteId: String,
     fileStore: NoteFileStore,
+    subPages: List<NoteEntity> = emptyList(),
+    onOpenSubPage: (String) -> Unit = {},
     onToggleChecklist: (lineIndex: Int, isChecked: Boolean) -> Unit,
     onWikiClick: (String) -> Unit = {},
     blockRefLabels: Map<String, String> = emptyMap(),
@@ -1178,6 +1551,51 @@ private fun PreviewPane(
                         modifier = Modifier.padding(vertical = 8.dp),
                         color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.15f)
                     )
+                }
+                is RichBlock.SubPage -> {
+                    val childNote = subPages.firstOrNull { it.id == block.noteId }
+                    val childTitle = childNote?.title?.ifBlank { "Untitled" } ?: "Sub-page"
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                        border = androidx.compose.foundation.BorderStroke(
+                            1.dp,
+                            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f)
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable {
+                                if (block.noteId.isNotEmpty()) {
+                                    onOpenSubPage(block.noteId)
+                                }
+                            }
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 9.dp)
+                        ) {
+                            Text(text = "\uD83D\uDCC4", fontSize = 15.sp)
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Text(
+                                text = childTitle,
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.onSurface,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Text(
+                                text = "Open ›",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = themeColor
+                            )
+                        }
+                    }
                 }
                 is RichBlock.CodeBlock -> {
                     Card(

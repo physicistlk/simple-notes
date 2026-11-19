@@ -16,9 +16,30 @@ data class NoteGraphEdge(
     val targetNoteId: String
 )
 
+/** Number of live sub-pages of one note, for the library badge. */
+data class SubPageCount(val parentNoteId: String, val count: Int)
+
 @Dao
 interface NoteDao {
+    /** Every live note including sub-pages (search looks through all of them). */
     @Query("SELECT * FROM notes WHERE deleted = 0 ORDER BY updatedAt DESC")
+    fun getAllIncludingSubPages(): Flow<List<NoteEntity>>
+
+    /** Live sub-pages of [parentId], in the order they were created. */
+    @Query("SELECT * FROM notes WHERE deleted = 0 AND parentNoteId = :parentId ORDER BY createdAt ASC")
+    fun observeSubPages(parentId: String): Flow<List<NoteEntity>>
+
+    @Query(
+        "SELECT parentNoteId AS parentNoteId, COUNT(*) AS count FROM notes " +
+            "WHERE deleted = 0 AND parentNoteId IS NOT NULL GROUP BY parentNoteId"
+    )
+    fun observeSubPageCounts(): Flow<List<SubPageCount>>
+
+    /** Direct children of [parentId], live or trashed (cascade delete/restore). */
+    @Query("SELECT id FROM notes WHERE parentNoteId = :parentId")
+    suspend fun getChildIds(parentId: String): List<String>
+
+    @Query("SELECT * FROM notes WHERE deleted = 0 AND parentNoteId IS NULL ORDER BY updatedAt DESC")
     fun getAll(): Flow<List<NoteEntity>>
 
     @Query("SELECT * FROM notes WHERE id = :id LIMIT 1")
@@ -27,12 +48,12 @@ interface NoteDao {
     @Query("SELECT * FROM notes WHERE id = :id LIMIT 1")
     fun getByIdFlow(id: String): Flow<NoteEntity?>
 
-    @Query("SELECT * FROM notes WHERE deleted = 0 AND folderId = :folderId ORDER BY updatedAt DESC")
+    @Query("SELECT * FROM notes WHERE deleted = 0 AND parentNoteId IS NULL AND folderId = :folderId ORDER BY updatedAt DESC")
     fun getByFolder(folderId: String?): Flow<List<NoteEntity>>
 
     /** Notes in any of [folderIds] — one notebook subtree in a single query. */
     @Query(
-        "SELECT * FROM notes WHERE deleted = 0 AND folderId IN (:folderIds) " +
+        "SELECT * FROM notes WHERE deleted = 0 AND parentNoteId IS NULL AND folderId IN (:folderIds) " +
             "ORDER BY updatedAt DESC"
     )
     fun getByFolders(folderIds: List<String>): Flow<List<NoteEntity>>
@@ -40,7 +61,10 @@ interface NoteDao {
     @Query("SELECT * FROM notes WHERE deleted = 0 AND favorite = 1 ORDER BY updatedAt DESC")
     fun getFavorites(): Flow<List<NoteEntity>>
 
-    @Query("SELECT * FROM notes WHERE deleted = 1 ORDER BY updatedAt DESC")
+    @Query(
+        "SELECT * FROM notes WHERE deleted = 1 AND (parentNoteId IS NULL OR " +
+            "parentNoteId NOT IN (SELECT id FROM notes WHERE deleted = 1)) ORDER BY updatedAt DESC"
+    )
     fun getRecycled(): Flow<List<NoteEntity>>
 
     /**
@@ -111,7 +135,7 @@ interface NoteDao {
      */
     @Query(
         "SELECT folderId AS folderId, COUNT(*) AS count FROM notes " +
-            "WHERE deleted = 0 GROUP BY folderId"
+            "WHERE deleted = 0 AND parentNoteId IS NULL GROUP BY folderId"
     )
     fun observeFolderCounts(): Flow<List<FolderCount>>
 

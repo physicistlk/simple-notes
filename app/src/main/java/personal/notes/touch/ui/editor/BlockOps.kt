@@ -161,7 +161,8 @@ object BlockOps {
             prev.type == BlockType.TABLE ||
             prev.type == BlockType.IMAGE ||
             prev.type == BlockType.CODE ||
-            prev.type == BlockType.QUERY
+            prev.type == BlockType.QUERY ||
+            prev.type == BlockType.SUBPAGE
         if (prevIsStructured || (prev.type == BlockType.HEADING && prev.field.text.isEmpty())) {
             if (cur.type != BlockType.PARAGRAPH) {
                 return BackspaceResult(demote(), cur.id)
@@ -201,7 +202,8 @@ object BlockOps {
 
     private fun BlockType.notDemotable(): Boolean =
         this == BlockType.CODE || this == BlockType.TABLE ||
-            this == BlockType.IMAGE || this == BlockType.DIVIDER
+            this == BlockType.IMAGE || this == BlockType.DIVIDER ||
+            this == BlockType.SUBPAGE
 
     /**
      * Wraps the selection (or inserts a placeholder) of this block's field with

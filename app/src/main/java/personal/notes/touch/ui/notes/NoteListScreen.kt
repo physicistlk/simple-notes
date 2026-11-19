@@ -1277,6 +1277,7 @@ fun NoteListScreen(
                                 note = note,
                                 tags = row.tags,
                                 snippet = row.snippet,
+                                subPageCount = row.subPageCount,
                                 isSelected = isSelected,
                                 dateFormatter = dateFormatter,
                                 onCardClick = {
@@ -1323,6 +1324,7 @@ fun NoteListScreen(
                                 note = note,
                                 tags = row.tags,
                                 snippet = row.snippet,
+                                subPageCount = row.subPageCount,
                                 isSelected = isSelected,
                                 dateFormatter = dateFormatter,
                                 onCardClick = {
@@ -1685,6 +1687,8 @@ fun TouchNotesCard(
     note: NoteEntity,
     tags: List<String> = emptyList(),
     snippet: SearchSnippet? = null,
+    /** Live sub-pages of this note (shown as "N sub-pages"). */
+    subPageCount: Int = 0,
     isSelected: Boolean,
     dateFormatter: SimpleDateFormat,
     onCardClick: () -> Unit,
@@ -1842,6 +1846,21 @@ fun TouchNotesCard(
             fontSize = 12.sp,
             color = Color.Gray
         )
+
+        // Nested pages: a sub-page found by search says so, a parent counts its children.
+        if (note.parentNoteId != null || subPageCount > 0) {
+            Spacer(modifier = Modifier.height(3.dp))
+            Text(
+                text = when {
+                    note.parentNoteId != null -> "\u21B3 Sub-page"
+                    subPageCount == 1 -> "1 sub-page"
+                    else -> "$subPageCount sub-pages"
+                },
+                fontSize = 11.sp,
+                color = Color.Gray,
+                maxLines = 1
+            )
+        }
 
         // Search hit: the matched excerpt, tokens emphasised.
         if (snippet != null) {

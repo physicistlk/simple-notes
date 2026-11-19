@@ -27,7 +27,9 @@ enum class BlockType {
     TABLE,
     IMAGE,
     /** An embedded live query over the knowledge base. */
-    QUERY
+    QUERY,
+    /** Inline Notion-style child sub-page card placed in the flow of the note body. */
+    SUBPAGE
 }
 
 /**
@@ -75,6 +77,8 @@ object BlockModel {
     private val IMAGE_LINE = Regex("""^!\[[^\]]*\]\([^)]*\)$""")
     /** Embedded query: `{{query: tag:project alpha}}`, one block per line. */
     private val QUERY_LINE = Regex("""^\{\{query:\s*(.*?)\s*\}\}$""")
+    /** Inline sub-page block: `{{subpage: <noteId>}}`, placed wherever the user created it. */
+    private val SUBPAGE_LINE = Regex("""^\{\{subpage:\s*([^{}]+?)\s*\}\}$""")
 
     fun blockId(startLine: Int): String = "blk$startLine"
 
@@ -87,7 +91,7 @@ object BlockModel {
         BlockType.NUMBERED -> INDENT_UNIT.repeat(b.indent) + "${b.order}. "
         BlockType.TASK -> INDENT_UNIT.repeat(b.indent) + if (b.checked) "- [x] " else "- [ ] "
         BlockType.QUOTE -> "> "
-        BlockType.QUERY -> ""
+        BlockType.QUERY, BlockType.SUBPAGE -> ""
         else -> ""
     }
 
@@ -101,6 +105,7 @@ object BlockModel {
         BlockType.IMAGE -> listOf(b.field.text)
         BlockType.DIVIDER -> listOf("---")
         BlockType.QUERY -> listOf("{{query:${b.field.text.trim()}}}")
+        BlockType.SUBPAGE -> listOf("{{subpage:${b.field.text.trim()}}}")
         else -> listOf(markerPrefix(b) + b.field.text)
     }
 
@@ -149,6 +154,18 @@ object BlockModel {
                         id = blockId(i),
                         type = BlockType.QUERY,
                         field = TextFieldValue(expression)
+                    )
+                    i++
+                }
+                SUBPAGE_LINE.matches(trimmed) -> {
+                    val targetId = SUBPAGE_LINE.matchEntire(trimmed)
+                        ?.groupValues?.getOrNull(1)
+                        ?.trim()
+                        .orEmpty()
+                    out += EditableBlock(
+                        id = blockId(i),
+                        type = BlockType.SUBPAGE,
+                        field = TextFieldValue(targetId)
                     )
                     i++
                 }
@@ -285,6 +302,7 @@ object BlockModel {
         if (t.startsWith(CODE_FENCE)) return null
         if (t == "---" || t == "***" || t == "___") return null
         if (QUERY_LINE.matches(t)) return null
+        if (SUBPAGE_LINE.matches(t)) return null
         if (t.startsWith("#")) return null
         val indented = line.trimStart()
         if (indented.startsWith("> ")) return null
@@ -336,6 +354,7 @@ enum class BlockCommand(val label: String, val groupName: String) {
     CODE("Code block", SLASH_GROUP_BASIC),
     TABLE("Table", SLASH_GROUP_RICH),
     IMAGE("Image", SLASH_GROUP_RICH),
+    SUBPAGE("Sub-page", SLASH_GROUP_RICH),
     QUERY("Query block", SLASH_GROUP_RICH),
     LINK("Link", SLASH_GROUP_RICH),
     TAG("Tag", SLASH_GROUP_RICH),
@@ -351,7 +370,7 @@ enum class BlockCommand(val label: String, val groupName: String) {
         fun slashGroups(): List<Pair<String, List<BlockCommand>>> = listOf(
             GROUP_HEADINGS to listOf(H1, H2, H3, H4, H5, H6),
             GROUP_BASIC to listOf(BULLET, NUMBERED, TASK, QUOTE, DIVIDER, CODE),
-            GROUP_RICH to listOf(TABLE, IMAGE, QUERY, LINK, TAG, HIGHLIGHT, EMOJI)
+            GROUP_RICH to listOf(SUBPAGE, TABLE, IMAGE, QUERY, LINK, TAG, HIGHLIGHT, EMOJI)
         )
     }
 }

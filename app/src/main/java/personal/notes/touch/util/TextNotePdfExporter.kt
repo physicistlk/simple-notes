@@ -270,29 +270,46 @@ object TextNotePdfExporter {
                 MarkdownExport.Kind.TABLE -> {
                     val rows = block.rows
                     if (rows.isEmpty()) continue
-                    rows.forEachIndexed { rowIndex, row ->
-                        val lineText = row.joinToString("  \u2502  ") { InlineMarkdown.plain(it) }
-                        val rowPaint = paint(
-                            9.5f,
-                            INK,
-                            bold = rowIndex == 0,
-                            mono = true
-                        )
-                        val layout = layoutOf(lineText.ifBlank { " " }, rowPaint, contentWidth.toInt(), 1f)
-                        ensureSpace(layout.height.toFloat() + 4f)
-                        drawLayout(layout, 0f)
-                        y += 2f
-                        if (rowIndex == 0) {
-                            val rule = Paint().apply {
-                                color = RULE
-                                strokeWidth = 1f
-                                style = Paint.Style.STROKE
-                            }
-                            canvas.drawLine(MARGIN, y, PAGE_W - MARGIN, y, rule)
-                            y += 4f
-                        }
+                    val colCount = rows.maxOf { it.size }.coerceAtLeast(1)
+                    val colW = contentWidth / colCount.toFloat()
+                    val cellPadX = 6f
+                    val cellPadY = 5f
+                    val borderPaint = Paint().apply {
+                        color = RULE
+                        strokeWidth = 0.8f
+                        style = Paint.Style.STROKE
                     }
-                    y += 6f
+                    val headerBgPaint = Paint().apply {
+                        color = CODE_BG
+                        style = Paint.Style.FILL
+                    }
+                    y += 4f
+                    rows.forEachIndexed { rowIndex, row ->
+                        val cellPaint = paint(10f, INK, bold = rowIndex == 0)
+                        val innerW = (colW - cellPadX * 2f).toInt().coerceAtLeast(16)
+                        val cellLayouts = (0 until colCount).map { cIdx ->
+                            val raw = row.getOrElse(cIdx) { "" }
+                            layoutOf(spannable(raw.ifBlank { " " }), cellPaint, innerW, 1f)
+                        }
+                        val rowH = (cellLayouts.maxOfOrNull { it.height.toFloat() } ?: 14f) + cellPadY * 2f
+                        ensureSpace(rowH)
+                        val top = y
+                        val bottom = y + rowH
+                        if (rowIndex == 0) {
+                            canvas.drawRect(MARGIN, top, MARGIN + contentWidth, bottom, headerBgPaint)
+                        }
+                        for (cIdx in 0 until colCount) {
+                            val left = MARGIN + cIdx * colW
+                            val right = left + colW
+                            canvas.drawRect(left, top, right, bottom, borderPaint)
+                            canvas.save()
+                            canvas.translate(left + cellPadX, top + cellPadY)
+                            cellLayouts[cIdx].draw(canvas)
+                            canvas.restore()
+                        }
+                        y = bottom
+                    }
+                    y += 8f
                 }
                 MarkdownExport.Kind.IMAGE -> {
                     val alt = InlineMarkdown.plain(block.text).ifBlank { "image" }

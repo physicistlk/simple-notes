@@ -132,7 +132,9 @@ class TextEditorViewModel(
         if (query.isEmpty()) return emptyList()
         val matches = mutableListOf<FindMatch>()
         blocks.forEachIndexed { idx, block ->
-            if (block.type == BlockType.DIVIDER || block.type == BlockType.IMAGE || block.type == BlockType.QUERY) {
+            if (block.type == BlockType.DIVIDER || block.type == BlockType.IMAGE ||
+                block.type == BlockType.QUERY || block.type == BlockType.SUBPAGE
+            ) {
                 return@forEachIndexed
             }
             val text = block.field.text
@@ -249,7 +251,9 @@ class TextEditorViewModel(
         val caseSensitive = _findCaseSensitive.value
         var count = 0
         val updated = _blocks.value.map { block ->
-            if (block.type == BlockType.DIVIDER || block.type == BlockType.IMAGE || block.type == BlockType.QUERY) {
+            if (block.type == BlockType.DIVIDER || block.type == BlockType.IMAGE ||
+                block.type == BlockType.QUERY || block.type == BlockType.SUBPAGE
+            ) {
                 block
             } else {
                 val text = block.field.text
@@ -359,6 +363,71 @@ class TextEditorViewModel(
             started = SharingStarted.WhileSubscribed(5000),
             initialValue = emptyList()
         )
+
+    /** Live sub-pages of this note (Notion-style nested pages), oldest first. */
+    val subPages: StateFlow<List<NoteEntity>> = repository.observeSubPages(noteId)
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
+
+    /** The parents of this note, outermost first - the breadcrumb. */
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    val ancestors: StateFlow<List<NoteEntity>> = note
+        .map { it?.parentNoteId }
+        .distinctUntilChanged()
+        .flatMapLatest { flow { emit(repository.getAncestors(noteId)) } }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
+
+    /**
+     * Creates an empty sub-page under this note, inserts an inline `{{subpage: <id>}}`
+     * block right where the user is editing (active block position), saves the updated
+     * parent note, and hands the new sub-page's id to [onCreated] so the screen can open it.
+     */
+    fun addSubPage(onCreated: (String) -> Unit) {
+        viewModelScope.launch {
+            runCatching { repository.createSubPage(noteId) }
+                .onSuccess { created ->
+                    if (created != null) {
+                        insertSubPageBlock(created.id)
+                        performSave(_title.value, _contentValue.value.text)
+                        onCreated(created.id)
+                    }
+                }
+                .onFailure { it.printStackTrace() }
+        }
+    }
+
+    /** Inserts `{{subpage:<subPageId>}}` at/after the active block in the current page flow. */
+    fun insertSubPageBlock(subPageId: String) {
+        if (subPageId.isBlank()) return
+        val subBlock = EditableBlock(
+            id = BlockPersistence.newBlockId(),
+            type = BlockType.SUBPAGE,
+            field = TextFieldValue(subPageId.trim())
+        )
+        val list = _blocks.value
+        val activeIndex = list.indexOfFirst { it.id == _activeBlockId.value }
+        val mutable = list.toMutableList()
+        val paragraph = freshParagraph()
+        if (activeIndex >= 0 &&
+            list[activeIndex].type == BlockType.PARAGRAPH &&
+            list[activeIndex].field.text.isEmpty()
+        ) {
+            mutable[activeIndex] = subBlock
+            mutable.add(activeIndex + 1, paragraph)
+        } else {
+            val at = if (activeIndex >= 0) activeIndex + 1 else mutable.size
+            mutable.add(at, subBlock)
+            mutable.add(at + 1, paragraph)
+        }
+        publishBlocks(mutable, FocusTarget(paragraph.id))
+    }
 
     /** `[[…]]` written in this note, resolved or not. */
     val outgoingRefs: StateFlow<List<RefTarget>> = repository.observeOutgoingRefs(noteId)
@@ -873,7 +942,7 @@ class TextEditorViewModel(
         // An image block is one markdown row (![alt](file)): splitting it
         // would leave an invalid image and a stray paragraph.
         val enteredNewline = cur.type != BlockType.CODE && cur.type != BlockType.QUERY &&
-            cur.type != BlockType.IMAGE &&
+            cur.type != BlockType.IMAGE && cur.type != BlockType.SUBPAGE &&
             grew &&
             sel.collapsed &&
             sel.start in 1..newValue.text.length &&
@@ -995,7 +1064,7 @@ class TextEditorViewModel(
         val idx = list.indexOfFirst { it.id == id }
         if (idx < 0) return
         val cur = list[idx]
-        if (cur.type == BlockType.CODE || cur.type == BlockType.QUERY) return // one-line blocks
+        if (cur.type == BlockType.CODE || cur.type == BlockType.QUERY || cur.type == BlockType.SUBPAGE) return // one-line blocks
         lastEnterSplitTime = now
         lastSplitBlockId = id
         val f = cur.field
@@ -1031,7 +1100,7 @@ class TextEditorViewModel(
         if (!cur.field.selection.collapsed || cur.field.selection.start != 0) return false
         // Atomic fenced/static blocks keep native behaviour only.
         if (cur.type == BlockType.CODE || cur.type == BlockType.TABLE || cur.type == BlockType.IMAGE ||
-            cur.type == BlockType.QUERY
+            cur.type == BlockType.QUERY || cur.type == BlockType.SUBPAGE
         ) {
             return false
         }
@@ -1142,7 +1211,7 @@ class TextEditorViewModel(
         val copyIndex = before.indexOfFirst { it.id == id } + 1
         val copy = updated.getOrNull(copyIndex) ?: return
         val focus = when (copy.type) {
-            BlockType.DIVIDER, BlockType.IMAGE -> null
+            BlockType.DIVIDER, BlockType.IMAGE, BlockType.SUBPAGE -> null
             else -> FocusTarget(copy.id)
         }
         publishBlocks(updated, focus)
@@ -1334,6 +1403,11 @@ class TextEditorViewModel(
                 mutable[idx] = clean.copy(field = bodyField)
                 finish(mutable, FocusTarget(clean.id))
                 requestImagePick()
+            }
+            BlockCommand.SUBPAGE -> {
+                mutable[idx] = clean.copy(field = bodyField)
+                finish(mutable, FocusTarget(clean.id))
+                addSubPage {}
             }
             BlockCommand.LINK -> {
                 mutable[idx] = clean.copy(field = bodyField)

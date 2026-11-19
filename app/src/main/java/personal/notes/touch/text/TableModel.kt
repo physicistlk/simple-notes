@@ -18,15 +18,42 @@ object TableModel {
 
     private val SEPARATOR = Regex("""^:?-{1,}:?$""")
 
+    /** Splits a markdown table row on unescaped `|` characters and unescapes `\|`. */
+    private fun splitRowCells(inner: String): List<String> {
+        val cells = ArrayList<String>()
+        val cur = StringBuilder()
+        var i = 0
+        while (i < inner.length) {
+            val c = inner[i]
+            if (c == '\\' && i + 1 < inner.length && inner[i + 1] == '|') {
+                cur.append('|')
+                i += 2
+            } else if (c == '|') {
+                cells.add(cur.toString().trim().replace("<br>", "\n", ignoreCase = true))
+                cur.setLength(0)
+                i++
+            } else {
+                cur.append(c)
+                i++
+            }
+        }
+        cells.add(cur.toString().trim().replace("<br>", "\n", ignoreCase = true))
+        return cells
+    }
+
     /** Parses [markdown]; null when there is no usable row at all. */
     fun parse(markdown: String): Table? {
         val rows = ArrayList<List<String>>()
         for (raw in markdown.split('\n')) {
             val line = raw.trim()
             if (!line.startsWith("|")) continue
-            val cells = line.removePrefix("|").removeSuffix("|")
-                .split('|')
-                .map { it.trim().replace("<br>", "\n", ignoreCase = true) }
+            val withoutStart = line.removePrefix("|")
+            val inner = if (withoutStart.endsWith("|") && !withoutStart.endsWith("\\|")) {
+                withoutStart.dropLast(1)
+            } else {
+                withoutStart
+            }
+            val cells = splitRowCells(inner)
             if (cells.all { SEPARATOR.matches(it) }) continue
             if (cells.isEmpty()) continue
             rows.add(cells)
@@ -43,6 +70,7 @@ object TableModel {
         fun line(cells: List<String>): String =
             "| " + (0 until width).joinToString(" | ") { idx ->
                 cells.getOrElse(idx) { "" }
+                    .replace("|", "\\|")
                     .replace("\r\n", "<br>")
                     .replace("\n", "<br>")
                     .replace("\r", "<br>")

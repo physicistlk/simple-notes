@@ -164,6 +164,9 @@ internal class InkPatch(
  * current layer of the page, and a stroke stays on its layer until the layer
  * is merged into the base layer.
  */
+/** Radius (screen px) of the delete handle on the infinite-canvas lasso selection. */
+internal const val LASSO_HANDLE_RADIUS_PX = 20f
+
 internal sealed class InkOp {
     /**
      * The layer the operation belongs to.
@@ -195,15 +198,46 @@ internal sealed class InkOp {
  * out of the committed list again, an eraser by putting back the pixels it
  * cleared.
  */
+internal enum class LassoHandle {
+    NONE,
+    MOVE,
+    ROTATE,
+    MIRROR,
+    DELETE,
+    COPY,
+    SCALE_CORNER_BR,
+    SCALE_LEFT,
+    SCALE_RIGHT,
+    SCALE_TOP,
+    SCALE_BOTTOM
+}
+
+internal class StrokeTransformSnapshot(
+    val op: InkOp.Stroke,
+    val beforePoints: List<InkPoint>,
+    val afterPoints: List<InkPoint>,
+    val beforeShape: Path?,
+    val afterShape: Path?
+)
+
 internal sealed class InkAction {
     /** A stroke was added to the committed list. */
     class Add(val op: InkOp.Stroke) : InkAction()
+
+    /** A batch of duplicated strokes was added (lasso/selection copy). */
+    class AddBatch(val added: List<InkOp.Stroke>) : InkAction()
 
     /** An eraser was applied; its op holds the pixels before and after. */
     class Erase(val op: InkOp.Erase) : InkAction()
 
     /** The page was cleared: the patches keep the ink, [removed] the strokes. */
     class Clear(val patches: List<InkPatch>, val removed: List<OpEntry>) : InkAction()
+
+    /** Strokes were moved by ([dx], [dy]) in normalised page units (lasso move). */
+    class Move(val ops: List<InkOp.Stroke>, val dx: Float, val dy: Float) : InkAction()
+
+    /** Strokes were transformed (rotate / scale / mirror / move) with before+after snapshots. */
+    class Transform(val snapshots: List<StrokeTransformSnapshot>) : InkAction()
 
     /** A layer was added to the stack of the page. */
     class AddLayer(val layer: PageLayer) : InkAction()
@@ -273,6 +307,26 @@ internal class InkHistory(private val stack: PageLayerStack) {
         redoStack.clear()
     }
 
+    /** Records that [moved] strokes were translated by ([dx], [dy]); the move itself is already applied. */
+    fun commitMove(moved: List<InkOp.Stroke>, dx: Float, dy: Float) {
+        undoStack.addLast(InkAction.Move(moved, dx, dy))
+        redoStack.clear()
+    }
+
+    /** Records a batch of duplicated strokes added by lasso/selection copy. */
+    fun commitAddBatch(added: List<InkOp.Stroke>) {
+        if (added.isEmpty()) return
+        undoStack.addLast(InkAction.AddBatch(added))
+        redoStack.clear()
+    }
+
+    /** Records a snapshot-based stroke transform (rotate / scale / mirror). */
+    fun commitTransform(snapshots: List<StrokeTransformSnapshot>) {
+        if (snapshots.isEmpty()) return
+        undoStack.addLast(InkAction.Transform(snapshots))
+        redoStack.clear()
+    }
+
     /** A layer was added to the stack of the page. */
     fun commitAddLayer(layer: PageLayer) {
         undoStack.addLast(InkAction.AddLayer(layer))
@@ -312,11 +366,16 @@ internal class InkHistory(private val stack: PageLayerStack) {
     fun undo(
         onErase: (InkOp.Erase, Boolean) -> Unit,
         onClear: (List<InkPatch>, Boolean) -> Unit,
-        onLayer: (InkAction, Boolean) -> Unit = { _, _ -> }
+        onLayer: (InkAction, Boolean) -> Unit = { _, _ -> },
+        onMove: (List<InkOp.Stroke>, Float, Float) -> Unit = { _, _, _ -> },
+        onTransform: (List<StrokeTransformSnapshot>, Boolean) -> Unit = { _, _ -> }
     ): Boolean {
         val action = undoStack.removeLastOrNull() ?: return false
         when (action) {
             is InkAction.Add -> ops.removeLastOrNull()
+            is InkAction.AddBatch -> action.added.forEach { copied -> ops.removeAll { it === copied } }
+            is InkAction.Move -> onMove(action.ops, -action.dx, -action.dy)
+            is InkAction.Transform -> onTransform(action.snapshots, true)
             is InkAction.Erase -> {
                 ops.removeLastOrNull()
                 onErase(action.op, true)
@@ -355,11 +414,16 @@ internal class InkHistory(private val stack: PageLayerStack) {
     fun redo(
         onErase: (InkOp.Erase, Boolean) -> Unit,
         onClear: (List<InkPatch>, Boolean) -> Unit,
-        onLayer: (InkAction, Boolean) -> Unit = { _, _ -> }
+        onLayer: (InkAction, Boolean) -> Unit = { _, _ -> },
+        onMove: (List<InkOp.Stroke>, Float, Float) -> Unit = { _, _, _ -> },
+        onTransform: (List<StrokeTransformSnapshot>, Boolean) -> Unit = { _, _ -> }
     ): Boolean {
         val action = redoStack.removeLastOrNull() ?: return false
         when (action) {
             is InkAction.Add -> ops.add(action.op)
+            is InkAction.AddBatch -> ops.addAll(action.added)
+            is InkAction.Move -> onMove(action.ops, action.dx, action.dy)
+            is InkAction.Transform -> onTransform(action.snapshots, false)
             is InkAction.Erase -> {
                 ops.add(action.op)
                 onErase(action.op, false)
@@ -403,6 +467,9 @@ internal class InkHistory(private val stack: PageLayerStack) {
     /** How much memory one undo action keeps alive. */
     private fun actionBytes(action: InkAction): Long = when (action) {
         is InkAction.Add -> 0L
+        is InkAction.AddBatch -> 0L
+        is InkAction.Move -> 0L
+        is InkAction.Transform -> 0L
         is InkAction.Erase -> action.op.patches.sumOf { it.bytes }
         is InkAction.Clear -> action.patches.sumOf { it.bytes }
         is InkAction.AddLayer -> 0L
@@ -1617,13 +1684,19 @@ class ContinuousInkController(
      * back the pixels it cleared.
      */
     fun undo(): Boolean {
-        val s = session ?: return false
+        val s = session
+        android.util.Log.d("InkUndo", "undo session=${s != null} canUndo=${s?.canUndo} ops=${s?.history?.ops?.size}")
+        if (s == null) return false
         val undone = s.history.undo(
             onErase = { op, restore -> restoreErase(s, op, restore) },
             onClear = { patches, restore -> restoreClear(s, patches, restore) },
-            onLayer = { action, restored -> applyLayerAction(s, action, restored) }
+            onLayer = { action, restored -> applyLayerAction(s, action, restored) },
+            onMove = { moved, dx, dy -> moved.forEach { translateStroke(it, dx, dy) } },
+            onTransform = { snapshots, isUndo -> applyStrokeSnapshots(snapshots, isUndo) }
         )
         if (!undone) return false
+        lassoOps = emptyList()
+        lassoRevision++
         s.dirty = true
         s.opRevision++
         scheduleGlassCopy(s)
@@ -1636,13 +1709,19 @@ class ContinuousInkController(
 
     /** Redoes the last undone operation. */
     fun redo(): Boolean {
-        val s = session ?: return false
+        val s = session
+        android.util.Log.d("InkUndo", "redo session=${s != null} canRedo=${s?.canRedo}")
+        if (s == null) return false
         val redone = s.history.redo(
             onErase = { op, restore -> restoreErase(s, op, restore) },
             onClear = { patches, restore -> restoreClear(s, patches, restore) },
-            onLayer = { action, restored -> applyLayerAction(s, action, restored) }
+            onLayer = { action, restored -> applyLayerAction(s, action, restored) },
+            onMove = { moved, dx, dy -> moved.forEach { translateStroke(it, dx, dy) } },
+            onTransform = { snapshots, isUndo -> applyStrokeSnapshots(snapshots, isUndo) }
         )
         if (!redone) return false
+        lassoOps = emptyList()
+        lassoRevision++
         s.dirty = true
         s.opRevision++
         scheduleGlassCopy(s)
@@ -2103,12 +2182,12 @@ class ContinuousInkController(
                 } ?: emptyList()
             )
         }
-        val previewOpsSnapshot = if (s.pageIndex == 0 && s.pageType == "infinite") {
+        val previewOpsSnapshot = if (s.pageType == "infinite") {
             s.history.ops.toList()
         } else {
             emptyList()
         }
-        val previewStackSnapshot = if (s.pageIndex == 0 && s.pageType == "infinite") {
+        val previewStackSnapshot = if (s.pageType == "infinite") {
             s.stack
         } else {
             null
@@ -2118,8 +2197,8 @@ class ContinuousInkController(
                 noteId, s.pageIndex, PageLayerMeta.encode(s.stack, tilesInfo)
             )
             deleteStaleLayerFiles(s)
-            if (s.pageIndex == 0 && s.pageType == "infinite" && previewStackSnapshot != null) {
-                generateAndSavePagePreview(previewOpsSnapshot, previewStackSnapshot)
+            if (s.pageType == "infinite" && previewStackSnapshot != null) {
+                generateAndSavePagePreview(s.pageIndex, previewOpsSnapshot, previewStackSnapshot)
             }
         }
         storedStacks.remove(s.pageIndex)
@@ -2128,9 +2207,41 @@ class ContinuousInkController(
         onSaved(s.pageIndex)
     }
 
-    private fun generateAndSavePagePreview(ops: List<InkOp>, stack: PageLayerStack) {
+    /**
+     * Generates and writes the thumbnail/page preview PNG for an infinite canvas page,
+     * including both placed [InfiniteCanvasItem]s (images and PDF pages) and visible
+     * layer strokes so the home-screen card and page drawer show imported items.
+     */
+    internal suspend fun generateAndSavePagePreview(
+        pageIndex: Int = 0,
+        ops: List<InkOp>? = null,
+        stack: PageLayerStack? = null
+    ) {
         try {
-            val pageFile = repository.fileStore.getPageFile(noteId, 0)
+            val pageFile = repository.fileStore.getPageFile(noteId, pageIndex)
+            val resolvedStack = stack ?: layerStack(pageIndex)
+            val resolvedOps = ops ?: getSession(pageIndex)?.history?.ops?.toList() ?: run {
+                val loaded = mutableListOf<InkOp>()
+                for (layer in resolvedStack.layers) {
+                    val lOps = repository.loadPageLayerOps(noteId, pageIndex, layer.index)
+                    if (lOps != null) {
+                        for (op in lOps) {
+                            when (op) {
+                                is InkOp.Stroke -> op.layer = layer
+                                is InkOp.Erase -> op.layer = layer
+                            }
+                        }
+                        loaded.addAll(lOps)
+                    }
+                }
+                loaded
+            }
+            val pageItems = InfiniteItemsStore.load(repository.fileStore, noteId)
+                .filter { item ->
+                    item.pageIndex == pageIndex &&
+                        (resolvedStack.layerAt(item.layerIndex)?.visible != false)
+                }
+
             val thumbW = 360
             val thumbH = 500
             val bitmap = Bitmap.createBitmap(thumbW, thumbH, Bitmap.Config.ARGB_8888)
@@ -2142,8 +2253,17 @@ class ContinuousInkController(
             var maxX = -Float.MAX_VALUE
             var maxY = -Float.MAX_VALUE
             var count = 0
-            for (op in ops) {
-                if (op is InkOp.Stroke) {
+            for (item in pageItems) {
+                val hw = item.width * 0.55f
+                val hh = item.height * 0.55f
+                if (item.centerX - hw < minX) minX = item.centerX - hw
+                if (item.centerX + hw > maxX) maxX = item.centerX + hw
+                if (item.centerY - hh < minY) minY = item.centerY - hh
+                if (item.centerY + hh > maxY) maxY = item.centerY + hh
+                count++
+            }
+            for (op in resolvedOps) {
+                if (op is InkOp.Stroke && resolvedStack.layerAt(op.layer.index)?.visible != false) {
                     for (p in op.stroke.points) {
                         val px = p.x * 2160f
                         val py = p.y * 2160f
@@ -2158,7 +2278,7 @@ class ContinuousInkController(
             if (count > 0 && minX <= maxX && minY <= maxY) {
                 val strokeW = (maxX - minX).coerceAtLeast(100f)
                 val strokeH = (maxY - minY).coerceAtLeast(100f)
-                val padding = 40f
+                val padding = 32f
                 val scale = kotlin.math.min(
                     (thumbW - padding * 2f) / strokeW,
                     (thumbH - padding * 2f) / strokeH
@@ -2169,9 +2289,67 @@ class ContinuousInkController(
                     thumbH / 2f - (minY + maxY) / 2f * scale
                 )
                 canvas.scale(scale, scale)
-                for (layer in stack.layers) {
+
+                val itemPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
+                val paperFill = Paint().apply {
+                    color = android.graphics.Color.WHITE
+                    style = Paint.Style.FILL
+                }
+                val paperBorder = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = 0xFFD0D5DD.toInt()
+                    style = Paint.Style.STROKE
+                    strokeWidth = (1.5f / scale.coerceAtLeast(0.05f)).coerceAtLeast(1f)
+                }
+                val dstRect = RectF()
+
+                for (layer in resolvedStack.layers) {
                     if (!layer.visible) continue
-                    val layerOps = ops.filter { it.layer.index == layer.index }
+                    for (item in pageItems) {
+                        if (item.layerIndex != layer.index) continue
+                        val bmp: Bitmap? = when (item) {
+                            is InfiniteCanvasItem.ImageItem -> {
+                                val file = repository.fileStore.getNoteAsset(noteId, item.fileName)
+                                if (file != null && file.exists()) {
+                                    personal.notes.touch.util.BitmapUtils.loadThumbnail(file, 360, 360)
+                                } else null
+                            }
+                            is InfiniteCanvasItem.PdfPageItem -> {
+                                val file = repository.fileStore.getNoteAsset(noteId, item.pdfFileName)
+                                if (file != null && file.exists()) {
+                                    val doc = personal.notes.touch.util.PdfiumDocument.open(file)
+                                    try {
+                                        val tw = 320
+                                        val th = (320f * (item.height / item.width.coerceAtLeast(1f))).roundToInt().coerceAtLeast(1)
+                                        doc?.renderPage(item.pdfPageIndex, tw, th)
+                                    } finally {
+                                        doc?.close()
+                                    }
+                                } else null
+                            }
+                        }
+                        val itemSave = canvas.save()
+                        canvas.translate(item.centerX, item.centerY)
+                        if (item.rotationDeg != 0f) {
+                            canvas.rotate(item.rotationDeg)
+                        }
+                        if (item.flipHorizontal) {
+                            canvas.scale(-1f, 1f)
+                        }
+                        dstRect.set(-item.width / 2f, -item.height / 2f, item.width / 2f, item.height / 2f)
+                        if (item is InfiniteCanvasItem.PdfPageItem) {
+                            canvas.drawRect(dstRect, paperFill)
+                        }
+                        if (bmp != null && !bmp.isRecycled) {
+                            canvas.drawBitmap(bmp, null, dstRect, itemPaint)
+                            bmp.recycle()
+                        }
+                        if (item is InfiniteCanvasItem.PdfPageItem) {
+                            canvas.drawRect(dstRect, paperBorder)
+                        }
+                        canvas.restoreToCount(itemSave)
+                    }
+
+                    val layerOps = resolvedOps.filter { it.layer.index == layer.index }
                     if (layerOps.isEmpty()) continue
                     val hasErase = layerOps.any { it is InkOp.Erase }
                     val layerSave = if (hasErase) {
@@ -2708,8 +2886,9 @@ class ContinuousInkController(
             val bg = s.background
             if (bg != null && !bg.isRecycled) {
                 val ratio = s.pageRatio
-                val page = ContinuousPageGeometry.pageRect(s.pageType, ratio, 1f, 1f)
-                val layerR = ContinuousPageGeometry.layerRect(s.pageType, ratio, 1f, 1f)
+                val boxR = ContinuousPageGeometry.boxRatio(s.pageType, ratio)
+                val page = ContinuousPageGeometry.pageRect(s.pageType, ratio, boxR, 1f)
+                val layerR = ContinuousPageGeometry.layerRect(s.pageType, ratio, boxR, 1f)
                 if (!layerR.empty && !page.empty) {
                     val destLeft = (page.left - layerR.left) / layerR.width * width
                     val destTop = (page.top - layerR.top) / layerR.height * height
@@ -2760,7 +2939,8 @@ class ContinuousInkController(
         val ops = s.history.ops.filter { it.layer.index == layer.index }
         if (ops.isNotEmpty()) {
             val ratio = s.pageRatio
-            val rect = ContinuousPageGeometry.layerRect(s.pageType, ratio, 1f, 1f)
+            val boxR = ContinuousPageGeometry.boxRatio(s.pageType, ratio)
+            val rect = ContinuousPageGeometry.layerRect(s.pageType, ratio, boxR, 1f)
             if (!rect.empty) {
                 val sx = width.toFloat() / rect.width
                 val sy = height.toFloat() / rect.height
@@ -2966,41 +3146,156 @@ class ContinuousInkController(
      * The layer is a grid of tiles, so the preview is composed from the
      * tiles: every tile is drawn at its own place in the small bitmap.
      */
-    fun layerThumbnail(pageIndex: Int, layer: PageLayer): Bitmap? {
+    suspend fun layerThumbnail(pageIndex: Int, layer: PageLayer): Bitmap? {
         val s = getSession(pageIndex) ?: return null
-        val store = s.layerTiles[layer] ?: return null
-        val grid = store.grid
-        if (grid.width <= 0 || grid.height <= 0) return null
-        if (store.existingTiles().isEmpty()) return null
+        val store = s.layerTiles[layer]
+        val layerOps = s.history.ops.filter { it.layer.index == layer.index }
+        val pageItems = if (s.pageType == "infinite") {
+            InfiniteItemsStore.load(repository.fileStore, noteId)
+                .filter { it.pageIndex == pageIndex && it.layerIndex == layer.index }
+        } else {
+            emptyList()
+        }
+        if (s.pageType == "infinite") {
+            if (layerOps.isEmpty() && pageItems.isEmpty()) return null
+            return try {
+                val width = THUMBNAIL_SIZE
+                val height = THUMBNAIL_SIZE
+                val thumb = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                val canvas = Canvas(thumb)
+                var minX = Float.MAX_VALUE
+                var minY = Float.MAX_VALUE
+                var maxX = -Float.MAX_VALUE
+                var maxY = -Float.MAX_VALUE
+                var count = 0
+                for (item in pageItems) {
+                    val hw = item.width * 0.55f
+                    val hh = item.height * 0.55f
+                    if (item.centerX - hw < minX) minX = item.centerX - hw
+                    if (item.centerX + hw > maxX) maxX = item.centerX + hw
+                    if (item.centerY - hh < minY) minY = item.centerY - hh
+                    if (item.centerY + hh > maxY) maxY = item.centerY + hh
+                    count++
+                }
+                for (op in layerOps) {
+                    if (op is InkOp.Stroke) {
+                        for (p in op.stroke.points) {
+                            val px = p.x * 2160f
+                            val py = p.y * 2160f
+                            if (px < minX) minX = px
+                            if (px > maxX) maxX = px
+                            if (py < minY) minY = py
+                            if (py > maxY) maxY = py
+                            count++
+                        }
+                    }
+                }
+                if (count > 0 && minX <= maxX && minY <= maxY) {
+                    val spanW = (maxX - minX).coerceAtLeast(100f)
+                    val spanH = (maxY - minY).coerceAtLeast(100f)
+                    val pad = 12f
+                    val sc = kotlin.math.min((width - pad * 2f) / spanW, (height - pad * 2f) / spanH)
+                    canvas.save()
+                    canvas.translate(
+                        width / 2f - (minX + maxX) / 2f * sc,
+                        height / 2f - (minY + maxY) / 2f * sc
+                    )
+                    canvas.scale(sc, sc)
+                    val itemPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
+                    val dst = RectF()
+                    for (item in pageItems) {
+                        val bmp = when (item) {
+                            is InfiniteCanvasItem.ImageItem -> {
+                                val f = repository.fileStore.getNoteAsset(noteId, item.fileName)
+                                if (f != null && f.exists()) {
+                                    personal.notes.touch.util.BitmapUtils.loadThumbnail(f, 120, 120)
+                                } else null
+                            }
+                            is InfiniteCanvasItem.PdfPageItem -> {
+                                val f = repository.fileStore.getNoteAsset(noteId, item.pdfFileName)
+                                if (f != null && f.exists()) {
+                                    val doc = personal.notes.touch.util.PdfiumDocument.open(f)
+                                    try {
+                                        doc?.renderPage(item.pdfPageIndex, 120, 160)
+                                    } finally {
+                                        doc?.close()
+                                    }
+                                } else null
+                            }
+                        }
+                        if (bmp != null && !bmp.isRecycled) {
+                            val sv = canvas.save()
+                            canvas.translate(item.centerX, item.centerY)
+                            if (item.rotationDeg != 0f) canvas.rotate(item.rotationDeg)
+                            if (item.flipHorizontal) canvas.scale(-1f, 1f)
+                            dst.set(-item.width / 2f, -item.height / 2f, item.width / 2f, item.height / 2f)
+                            canvas.drawBitmap(bmp, null, dst, itemPaint)
+                            bmp.recycle()
+                            canvas.restoreToCount(sv)
+                        }
+                    }
+                    for (op in layerOps) {
+                        if (op is InkOp.Stroke) drawInfiniteOpStroke(canvas, op)
+                    }
+                    canvas.restore()
+                }
+                thumb
+            } catch (e: Throwable) {
+                e.printStackTrace()
+                null
+            }
+        }
+        val grid = store?.grid
+        val hasTiles = store != null && grid != null && grid.width > 0 && grid.height > 0 && store.existingTiles().isNotEmpty()
+        if (!hasTiles && layerOps.isEmpty()) return null
         return try {
+            val layerW = if (grid != null && grid.width > 0) grid.width else s.inkWidth.coerceAtLeast(1)
+            val layerH = if (grid != null && grid.height > 0) grid.height else s.inkHeight.coerceAtLeast(1)
             val width = THUMBNAIL_SIZE
-            val height = (width * grid.height.toFloat() / grid.width).roundToInt().coerceAtLeast(1)
+            val height = (width * layerH.toFloat() / layerW).roundToInt().coerceAtLeast(1)
             val thumb = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
             val canvas = Canvas(thumb)
             val paint = Paint(Paint.FILTER_BITMAP_FLAG)
-            for (index in store.existingTiles()) {
-                val tx = grid.tileColumn(index)
-                val ty = grid.tileRow(index)
-                if (tx < 0 || ty < 0) continue
-                val bitmap = store.tile(tx, ty) ?: continue
-                if (bitmap.isRecycled) continue
-                val left = grid.tileLeft(tx)
-                val top = grid.tileTop(ty)
-                val right = left + grid.tileWidth(tx)
-                val bottom = top + grid.tileHeight(ty)
-                canvas.drawBitmap(
-                    bitmap,
-                    // The source is the tile itself (its own pixels), the
-                    // destination is its place in the small picture.
-                    Rect(0, 0, grid.tileWidth(tx), grid.tileHeight(ty)),
-                    RectF(
-                        left / grid.width.toFloat() * width,
-                        top / grid.height.toFloat() * height,
-                        right / grid.width.toFloat() * width,
-                        bottom / grid.height.toFloat() * height
-                    ),
-                    paint
-                )
+            if (hasTiles && store != null && grid != null) {
+                for (index in store.existingTiles()) {
+                    val tx = grid.tileColumn(index)
+                    val ty = grid.tileRow(index)
+                    if (tx < 0 || ty < 0) continue
+                    val bitmap = store.tile(tx, ty) ?: continue
+                    if (bitmap.isRecycled) continue
+                    val left = grid.tileLeft(tx)
+                    val top = grid.tileTop(ty)
+                    val right = left + grid.tileWidth(tx)
+                    val bottom = top + grid.tileHeight(ty)
+                    canvas.drawBitmap(
+                        bitmap,
+                        // The source is the tile itself (its own pixels), the
+                        // destination is its place in the small picture.
+                        Rect(0, 0, grid.tileWidth(tx), grid.tileHeight(ty)),
+                        RectF(
+                            left / grid.width.toFloat() * width,
+                            top / grid.height.toFloat() * height,
+                            right / grid.width.toFloat() * width,
+                            bottom / grid.height.toFloat() * height
+                        ),
+                        paint
+                    )
+                }
+            }
+            if (layerOps.isNotEmpty()) {
+                val rect = s.layerRectInBox
+                if (!rect.empty) {
+                    val sx = width.toFloat() / rect.width
+                    val sy = height.toFloat() / rect.height
+                    for (op in layerOps) {
+                        if (op is InkOp.Stroke) {
+                            val save = canvas.save()
+                            canvas.translate(-rect.left * sx, -rect.top * sy)
+                            drawStroke(canvas, op.stroke, sx, sy, preview = false)
+                            canvas.restoreToCount(save)
+                        }
+                    }
+                }
             }
             thumb
         } catch (e: Throwable) {
@@ -3094,6 +3389,7 @@ class ContinuousInkController(
      * Draws the live uncommitted preview stroke on the infinite canvas.
      */
     fun drawPreviewInfinite(canvas: Canvas, pageIndex: Int, scale: Float = 1f) {
+        drawLassoOverlay(canvas, scale)
         if (laserPageIndex == pageIndex) {
             val comp = if (scale > 0f) 1f / scale else 1f
             drawLaser(canvas, 2160f, 2160f, comp)
@@ -3102,6 +3398,520 @@ class ContinuousInkController(
         if (s.pageIndex != pageIndex) return
         val stroke = s.live ?: return
         drawStroke(canvas, stroke, 2160f, 2160f, preview = true)
+    }
+
+    // ---- Infinite canvas lasso & arrow selection (freehand strokes) -----------------
+
+    private var lassoOps: List<InkOp.Stroke> = emptyList()
+    private var lassoPoly: List<Pair<Float, Float>> = emptyList()
+    private var lassoMoveDx = 0f
+    private var lassoMoveDy = 0f
+    private var lassoTransformBefore: List<Triple<InkOp.Stroke, List<InkPoint>, Path?>>? = null
+
+    /** Bumped whenever the lasso path, selection or selected strokes change. */
+    var lassoRevision by mutableIntStateOf(0)
+
+    private val lassoPathPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        color = 0xFFFB6443.toInt()
+    }
+    private val lassoFillPaint2 = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = 0x22FB6443
+    }
+    private val lassoHandlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = 0xFFDC2626.toInt()
+    }
+    private val lassoRotateHandlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = 0xFF2563EB.toInt()
+    }
+    private val lassoMirrorHandlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = 0xFF0D9488.toInt()
+    }
+    private val lassoCopyHandlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = 0xFFEA580C.toInt()
+    }
+    private val lassoWhiteFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = android.graphics.Color.WHITE
+    }
+    private val lassoBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        color = 0xFFFB6443.toInt()
+    }
+    private val lassoCrossPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        color = android.graphics.Color.WHITE
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+    }
+
+    private fun applyStrokeSnapshots(snapshots: List<StrokeTransformSnapshot>, isUndo: Boolean) {
+        for (snap in snapshots) {
+            val st = snap.op.stroke
+            val pts = if (isUndo) snap.beforePoints else snap.afterPoints
+            st.points.clear()
+            pts.forEach { st.points.add(InkPoint(it.x, it.y, it.w, it.tilt)) }
+            st.cachedCount = -1
+            st.boundsCount = -1
+            val srcShape = if (isUndo) snap.beforeShape else snap.afterShape
+            val dstShape = snap.op.shape
+            if (srcShape != null && dstShape != null) {
+                dstShape.set(srcShape)
+            }
+        }
+    }
+
+    private fun translateStroke(op: InkOp.Stroke, dxNorm: Float, dyNorm: Float) {
+        val st = op.stroke
+        for (i in st.points.indices) {
+            val p = st.points[i]
+            st.points[i] = InkPoint(p.x + dxNorm, p.y + dyNorm, p.w, p.tilt)
+        }
+        st.cachedCount = -1
+        st.boundsCount = -1
+        op.shape?.offset(dxNorm * 2160f, dyNorm * 2160f)
+    }
+
+    private fun pointInPolygon(x: Float, y: Float, poly: List<Pair<Float, Float>>): Boolean {
+        var inside = false
+        var j = poly.size - 1
+        for (i in poly.indices) {
+            val (xi, yi) = poly[i]
+            val (xj, yj) = poly[j]
+            if ((yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) inside = !inside
+            j = i
+        }
+        return inside
+    }
+
+    /** Shows the lasso loop while it is being drawn (world pixels, 2160 scale). */
+    fun lassoUpdatePath(points: List<Pair<Float, Float>>) {
+        lassoPoly = points.toList()
+        lassoRevision++
+    }
+
+    fun lassoClear() {
+        if (lassoOps.isEmpty() && lassoPoly.isEmpty()) return
+        lassoOps = emptyList()
+        lassoPoly = emptyList()
+        lassoMoveDx = 0f
+        lassoMoveDy = 0f
+        lassoTransformBefore = null
+        lassoRevision++
+    }
+
+    fun hasLassoSelection(): Boolean = lassoOps.isNotEmpty()
+
+    /**
+     * Selects the committed strokes of [pageIndex] with at least half of their points inside
+     * the closed loop [polygon] (world pixels). Returns how many strokes were selected.
+     */
+    fun lassoFinish(pageIndex: Int, polygon: List<Pair<Float, Float>>): Int {
+        lassoPoly = emptyList()
+        lassoMoveDx = 0f
+        lassoMoveDy = 0f
+        lassoTransformBefore = null
+        val s = getSession(pageIndex)
+        if (s == null || polygon.size < 3) {
+            lassoOps = emptyList()
+            lassoRevision++
+            return 0
+        }
+        val picked = mutableListOf<InkOp.Stroke>()
+        for (op in s.history.ops) {
+            if (op !is InkOp.Stroke || !op.layer.visible) continue
+            val pts = op.stroke.points
+            if (pts.isEmpty()) continue
+            var inside = 0
+            for (p in pts) if (pointInPolygon(p.x * 2160f, p.y * 2160f, polygon)) inside++
+            if (inside * 2 >= pts.size) picked.add(op)
+        }
+        lassoOps = picked
+        lassoRevision++
+        return picked.size
+    }
+
+    /**
+     * Selects the single closest stroke at world coordinates ([wx], [wy]) on [pageIndex],
+     * used by the Arrow Selection tool. Returns true if a stroke was selected.
+     */
+    fun selectSingleStrokeAt(pageIndex: Int, wx: Float, wy: Float, scale: Float): Boolean {
+        val s = getSession(pageIndex) ?: return false
+        val tol = 22f / scale.coerceAtLeast(0.1f)
+        val tolSq = tol * tol
+        var bestOp: InkOp.Stroke? = null
+        var bestDistSq = Float.MAX_VALUE
+        for (op in s.history.ops.asReversed()) {
+            if (op !is InkOp.Stroke || !op.layer.visible) continue
+            val st = op.stroke
+            st.ensureBounds()
+            if (wx < st.minX * 2160f - tol || wx > st.maxX * 2160f + tol ||
+                wy < st.minY * 2160f - tol || wy > st.maxY * 2160f + tol
+            ) {
+                continue
+            }
+            for (p in st.points) {
+                val dx = p.x * 2160f - wx
+                val dy = p.y * 2160f - wy
+                val d2 = dx * dx + dy * dy
+                if (d2 <= tolSq && d2 < bestDistSq) {
+                    bestDistSq = d2
+                    bestOp = op
+                }
+            }
+        }
+        lassoPoly = emptyList()
+        lassoMoveDx = 0f
+        lassoMoveDy = 0f
+        lassoTransformBefore = null
+        lassoOps = if (bestOp != null) listOf(bestOp) else emptyList()
+        lassoRevision++
+        return bestOp != null
+    }
+
+    /** Bounds of the selection in world pixels (left, top, right, bottom), or null. */
+    fun lassoBounds(): android.graphics.RectF? {
+        if (lassoOps.isEmpty()) return null
+        var l = Float.MAX_VALUE
+        var t = Float.MAX_VALUE
+        var r = -Float.MAX_VALUE
+        var b = -Float.MAX_VALUE
+        for (op in lassoOps) {
+            val st = op.stroke
+            st.ensureBounds()
+            if (st.minX * 2160f < l) l = st.minX * 2160f
+            if (st.minY * 2160f < t) t = st.minY * 2160f
+            if (st.maxX * 2160f > r) r = st.maxX * 2160f
+            if (st.maxY * 2160f > b) b = st.maxY * 2160f
+        }
+        return android.graphics.RectF(l, t, r, b)
+    }
+
+    fun lassoContains(wx: Float, wy: Float): Boolean = lassoBounds()?.contains(wx, wy) == true
+
+    private fun mirrorHandlePos(b: android.graphics.RectF, scale: Float): Pair<Float, Float> {
+        val inv = 1f / scale.coerceAtLeast(0.1f)
+        val gap = (LASSO_HANDLE_RADIUS_PX * 2.4f) * inv
+        val mx = (b.left + gap).coerceAtMost(b.centerX().coerceAtLeast(b.left + gap * 0.5f))
+        return mx to b.top
+    }
+
+    internal fun hitTestLassoHandle(wx: Float, wy: Float, scale: Float): LassoHandle {
+        val b = lassoBounds() ?: return LassoHandle.NONE
+        val inv = 1f / scale.coerceAtLeast(0.1f)
+        val hitR = LASSO_HANDLE_RADIUS_PX * 1.8f * inv
+        val hitR2 = hitR * hitR
+        fun near(hx: Float, hy: Float): Boolean {
+            val dx = wx - hx
+            val dy = wy - hy
+            return dx * dx + dy * dy <= hitR2
+        }
+        // Corner 2: Top-Right -> Cut / Delete
+        if (near(b.right, b.top)) return LassoHandle.DELETE
+        // Corner 1: Top-Left -> Rotate
+        if (near(b.left, b.top)) return LassoHandle.ROTATE
+        // Beside Rotate -> Mirror
+        val (mx, my) = mirrorHandlePos(b, scale)
+        if (near(mx, my)) return LassoHandle.MIRROR
+        // Corner 3: Bottom-Left -> Copy (tap & drag)
+        if (near(b.left, b.bottom)) return LassoHandle.COPY
+        // Corner 4: Bottom-Right -> Free 1:1 Scale
+        if (near(b.right, b.bottom)) return LassoHandle.SCALE_CORNER_BR
+        // Edge midpoints -> single-axis stretch/squeeze
+        if (near(b.left, b.centerY())) return LassoHandle.SCALE_LEFT
+        if (near(b.right, b.centerY())) return LassoHandle.SCALE_RIGHT
+        if (near(b.centerX(), b.top)) return LassoHandle.SCALE_TOP
+        if (near(b.centerX(), b.bottom)) return LassoHandle.SCALE_BOTTOM
+        if (b.contains(wx, wy)) return LassoHandle.MOVE
+        return LassoHandle.NONE
+    }
+
+    /** Captures before-snapshots for a non-translation transform (rotate / scale). */
+    fun lassoBeginTransform() {
+        if (lassoOps.isEmpty()) return
+        lassoTransformBefore = lassoOps.map { op ->
+            Triple(
+                op,
+                op.stroke.points.map { InkPoint(it.x, it.y, it.w, it.tilt) },
+                op.shape?.let { Path(it) }
+            )
+        }
+    }
+
+    /** Rotates selected strokes by [deltaRad] around ([pivotX], [pivotY]) in world px. */
+    fun lassoRotateTo(pageIndex: Int, deltaRad: Float, pivotX: Float, pivotY: Float) {
+        val snap = lassoTransformBefore ?: return
+        val cos = kotlin.math.cos(deltaRad.toDouble()).toFloat()
+        val sin = kotlin.math.sin(deltaRad.toDouble()).toFloat()
+        val pxNorm = pivotX / 2160f
+        val pyNorm = pivotY / 2160f
+        val matrix = android.graphics.Matrix().apply {
+            setRotate(Math.toDegrees(deltaRad.toDouble()).toFloat(), pivotX, pivotY)
+        }
+        for ((op, beforePts, beforeShape) in snap) {
+            val st = op.stroke
+            st.points.clear()
+            for (p in beforePts) {
+                val dx = p.x - pxNorm
+                val dy = p.y - pyNorm
+                val rx = pxNorm + dx * cos - dy * sin
+                val ry = pyNorm + dx * sin + dy * cos
+                st.points.add(InkPoint(rx, ry, p.w, p.tilt))
+            }
+            st.cachedCount = -1
+            st.boundsCount = -1
+            if (beforeShape != null && op.shape != null) {
+                op.shape.set(beforeShape)
+                op.shape.transform(matrix)
+            }
+        }
+        getSession(pageIndex)?.let { it.opRevision++ }
+        revision++
+        lassoRevision++
+    }
+
+    /** Scales selected strokes around ([anchorX], [anchorY]) in world px. */
+    fun lassoScaleTo(pageIndex: Int, scaleX: Float, scaleY: Float, anchorX: Float, anchorY: Float) {
+        val snap = lassoTransformBefore ?: return
+        val sx = scaleX.coerceIn(0.15f, 8.0f)
+        val sy = scaleY.coerceIn(0.15f, 8.0f)
+        val axNorm = anchorX / 2160f
+        val ayNorm = anchorY / 2160f
+        val matrix = android.graphics.Matrix().apply {
+            setScale(sx, sy, anchorX, anchorY)
+        }
+        for ((op, beforePts, beforeShape) in snap) {
+            val st = op.stroke
+            st.points.clear()
+            for (p in beforePts) {
+                val nx = axNorm + (p.x - axNorm) * sx
+                val ny = ayNorm + (p.y - ayNorm) * sy
+                st.points.add(InkPoint(nx, ny, p.w, p.tilt))
+            }
+            st.cachedCount = -1
+            st.boundsCount = -1
+            if (beforeShape != null && op.shape != null) {
+                op.shape.set(beforeShape)
+                op.shape.transform(matrix)
+            }
+        }
+        getSession(pageIndex)?.let { it.opRevision++ }
+        revision++
+        lassoRevision++
+    }
+
+    /** Commits the active snapshot transform (rotate / scale) into undo history. */
+    fun lassoCommitTransform(pageIndex: Int) {
+        val snap = lassoTransformBefore ?: return
+        lassoTransformBefore = null
+        val s = getSession(pageIndex) ?: return
+        val records = snap.map { (op, beforePts, beforeShape) ->
+            StrokeTransformSnapshot(
+                op = op,
+                beforePoints = beforePts,
+                afterPoints = op.stroke.points.map { InkPoint(it.x, it.y, it.w, it.tilt) },
+                beforeShape = beforeShape,
+                afterShape = op.shape?.let { Path(it) }
+            )
+        }
+        s.history.commitTransform(records)
+        s.dirty = true
+        s.opRevision++
+        scheduleSave(s)
+        revision++
+        lassoRevision++
+        onUndoRedoChanged(s.canUndo, s.canRedo)
+    }
+
+    /** Mirrors the selected strokes horizontally across their bounding-box center X. */
+    fun lassoMirrorHorizontal(pageIndex: Int): Boolean {
+        val b = lassoBounds() ?: return false
+        val s = getSession(pageIndex) ?: return false
+        val cx = b.centerX()
+        val cxNorm = cx / 2160f
+        val matrix = android.graphics.Matrix().apply { setScale(-1f, 1f, cx, b.centerY()) }
+        val records = lassoOps.map { op ->
+            val beforePts = op.stroke.points.map { InkPoint(it.x, it.y, it.w, it.tilt) }
+            val beforeShape = op.shape?.let { Path(it) }
+            val st = op.stroke
+            for (i in st.points.indices) {
+                val p = st.points[i]
+                st.points[i] = InkPoint(2f * cxNorm - p.x, p.y, p.w, p.tilt)
+            }
+            st.cachedCount = -1
+            st.boundsCount = -1
+            op.shape?.transform(matrix)
+            StrokeTransformSnapshot(
+                op = op,
+                beforePoints = beforePts,
+                afterPoints = op.stroke.points.map { InkPoint(it.x, it.y, it.w, it.tilt) },
+                beforeShape = beforeShape,
+                afterShape = op.shape?.let { Path(it) }
+            )
+        }
+        s.history.commitTransform(records)
+        s.dirty = true
+        s.opRevision++
+        scheduleSave(s)
+        revision++
+        lassoRevision++
+        onUndoRedoChanged(s.canUndo, s.canRedo)
+        return true
+    }
+
+    /**
+     * Clones the currently selected strokes, adds the copies to [pageIndex],
+     * switches the selection to the copies, and prepares them for immediate drag.
+     */
+    fun lassoStartCopy(pageIndex: Int): Boolean {
+        val s = getSession(pageIndex) ?: return false
+        if (lassoOps.isEmpty()) return false
+        val copies = lassoOps.map { src ->
+            val st = ContinuousStroke(
+                tool = src.stroke.tool,
+                color = src.stroke.color,
+                baseWidthNorm = src.stroke.baseWidthNorm,
+                autoShapeEnabled = src.stroke.autoShapeEnabled,
+                points = src.stroke.points.map { InkPoint(it.x, it.y, it.w, it.tilt) }.toMutableList()
+            )
+            InkOp.Stroke(st, src.shape?.let { Path(it) }, src.layer)
+        }
+        s.history.ops.addAll(copies)
+        s.history.commitAddBatch(copies)
+        lassoOps = copies
+        lassoMoveDx = 0f
+        lassoMoveDy = 0f
+        s.dirty = true
+        s.opRevision++
+        scheduleSave(s)
+        revision++
+        lassoRevision++
+        onUndoRedoChanged(s.canUndo, s.canRedo)
+        return true
+    }
+
+    /** Moves the selected strokes live by a world-pixel delta; [lassoCommitMove] makes it undoable. */
+    fun lassoMove(pageIndex: Int, dxWorld: Float, dyWorld: Float) {
+        if (lassoOps.isEmpty()) return
+        val dx = dxWorld / 2160f
+        val dy = dyWorld / 2160f
+        lassoOps.forEach { translateStroke(it, dx, dy) }
+        lassoMoveDx += dx
+        lassoMoveDy += dy
+        getSession(pageIndex)?.let { it.opRevision++ }
+        revision++
+        lassoRevision++
+    }
+
+    fun lassoCommitMove(pageIndex: Int) {
+        val s = getSession(pageIndex) ?: return
+        if (lassoOps.isEmpty() || (lassoMoveDx == 0f && lassoMoveDy == 0f)) return
+        s.history.commitMove(lassoOps, lassoMoveDx, lassoMoveDy)
+        lassoMoveDx = 0f
+        lassoMoveDy = 0f
+        s.dirty = true
+        s.opRevision++
+        scheduleSave(s)
+        revision++
+        onUndoRedoChanged(s.canUndo, s.canRedo)
+    }
+
+    /** Deletes the selected strokes, with undo. */
+    fun lassoDelete(pageIndex: Int): Boolean {
+        val s = getSession(pageIndex) ?: return false
+        if (lassoOps.isEmpty()) return false
+        val removed = mutableListOf<OpEntry>()
+        s.history.ops.forEachIndexed { idx, op ->
+            if (lassoOps.any { it === op }) removed.add(OpEntry(idx, op))
+        }
+        lassoOps = emptyList()
+        lassoRevision++
+        if (removed.isEmpty()) return false
+        s.history.commitClear(emptyList(), removed)
+        s.dirty = true
+        s.opRevision++
+        scheduleSave(s)
+        revision++
+        onUndoRedoChanged(s.canUndo, s.canRedo)
+        return true
+    }
+
+    /**
+     * Draws the lasso loop, the selection frame, edge resize pills, Corner 4 (free 1:1 scale),
+     * Corner 1 (Rotate), Mirror beside Rotate, Corner 2 (Cut), and Corner 3 (Copy).
+     */
+    fun drawLassoOverlay(canvas: Canvas, scale: Float) {
+        val inv = if (scale > 0f) 1f / scale else 1f
+        val poly = lassoPoly
+        if (poly.size > 1) {
+            val path = Path()
+            path.moveTo(poly[0].first, poly[0].second)
+            for (i in 1 until poly.size) path.lineTo(poly[i].first, poly[i].second)
+            lassoPathPaint.strokeWidth = 3f * inv
+            lassoPathPaint.pathEffect = android.graphics.DashPathEffect(floatArrayOf(14f * inv, 10f * inv), 0f)
+            canvas.drawPath(path, lassoPathPaint)
+            path.close()
+            canvas.drawPath(path, lassoFillPaint2)
+        }
+        val b = lassoBounds() ?: return
+        lassoPathPaint.strokeWidth = 3f * inv
+        lassoPathPaint.pathEffect = android.graphics.DashPathEffect(floatArrayOf(14f * inv, 10f * inv), 0f)
+        canvas.drawRect(b, lassoPathPaint)
+
+        val r = LASSO_HANDLE_RADIUS_PX * inv
+        val k = r * 0.42f
+        lassoCrossPaint.strokeWidth = 2.8f * inv
+        lassoBorderPaint.strokeWidth = 2.5f * inv
+
+        // Edge midpoint resize pills (axis-constrained stretch/squeeze)
+        val pillLong = r * 0.9f
+        val pillShort = r * 0.34f
+        fun drawPill(cx: Float, cy: Float, horizontal: Boolean) {
+            val hw = if (horizontal) pillLong else pillShort
+            val hh = if (horizontal) pillShort else pillLong
+            val rect = android.graphics.RectF(cx - hw, cy - hh, cx + hw, cy + hh)
+            canvas.drawRoundRect(rect, pillShort, pillShort, lassoWhiteFillPaint)
+            canvas.drawRoundRect(rect, pillShort, pillShort, lassoBorderPaint)
+        }
+        drawPill(b.centerX(), b.top, true)
+        drawPill(b.centerX(), b.bottom, true)
+        drawPill(b.left, b.centerY(), false)
+        drawPill(b.right, b.centerY(), false)
+
+        // Corner 4 (Bottom-Right): free 1:1 proportional scale handle
+        val c4r = r * 0.65f
+        canvas.drawCircle(b.right, b.bottom, c4r, lassoWhiteFillPaint)
+        canvas.drawCircle(b.right, b.bottom, c4r, lassoBorderPaint)
+
+        // Corner 1 (Top-Left): Rotate handle
+        canvas.drawCircle(b.left, b.top, r, lassoRotateHandlePaint)
+        val arc = android.graphics.RectF(b.left - k, b.top - k, b.left + k, b.top + k)
+        canvas.drawArc(arc, -40f, 260f, false, lassoCrossPaint)
+        canvas.drawLine(b.left + k * 0.55f, b.top - k * 0.85f, b.left + k * 0.95f, b.top - k * 0.25f, lassoCrossPaint)
+
+        // Beside Rotate: Mirror horizontal flip button
+        val (mx, my) = mirrorHandlePos(b, scale)
+        canvas.drawCircle(mx, my, r, lassoMirrorHandlePaint)
+        canvas.drawLine(mx - k, my, mx + k, my, lassoCrossPaint)
+        canvas.drawLine(mx - k, my, mx - k * 0.45f, my - k * 0.45f, lassoCrossPaint)
+        canvas.drawLine(mx - k, my, mx - k * 0.45f, my + k * 0.45f, lassoCrossPaint)
+        canvas.drawLine(mx + k, my, mx + k * 0.45f, my - k * 0.45f, lassoCrossPaint)
+        canvas.drawLine(mx + k, my, mx + k * 0.45f, my + k * 0.45f, lassoCrossPaint)
+
+        // Corner 2 (Top-Right): Cut / Delete (X)
+        canvas.drawCircle(b.right, b.top, r, lassoHandlePaint)
+        canvas.drawLine(b.right - k, b.top - k, b.right + k, b.top + k, lassoCrossPaint)
+        canvas.drawLine(b.right - k, b.top + k, b.right + k, b.top - k, lassoCrossPaint)
+
+        // Corner 3 (Bottom-Left): Copy (+)
+        canvas.drawCircle(b.left, b.bottom, r, lassoCopyHandlePaint)
+        canvas.drawLine(b.left - k * 0.85f, b.bottom, b.left + k * 0.85f, b.bottom, lassoCrossPaint)
+        canvas.drawLine(b.left, b.bottom - k * 0.85f, b.left, b.bottom + k * 0.85f, lassoCrossPaint)
     }
 
     /**
@@ -3159,6 +3969,54 @@ class ContinuousInkController(
     internal fun layerOps(pageIndex: Int, layer: PageLayer): List<InkOp> {
         val s = getSession(pageIndex) ?: return emptyList()
         return s.history.ops.filter { it.layer.index == layer.index }
+    }
+
+    /**
+     * Composes all visible continuous-mode layers (tiles + vector ops JSON) of [pageIndex]
+     * into a single transparent [targetWidth]x[targetHeight] overlay for Single-Page mode.
+     *
+     * For A4 pages (`marginFor("a4") == 0f`), continuous strokes live directly in the
+     * normalized `[0..1, 0..1]` box of the A4 page itself (`2160 x 3056`), so they map
+     * 1:1 onto `[0..targetWidth, 0..targetHeight]` with zero horizontal cropping or skew!
+     * For PDF pages (`marginFor("pdf") == 1f`), continuous layers are `3x` page width
+     * (`1.0f` left margin + `1.0f` page + `1.0f` right margin), so the center `1/3`
+     * (`1/3..2/3`) is mapped to the page rect.
+     */
+    suspend fun composeAllLayersForSinglePage(
+        pageIndex: Int,
+        targetWidth: Int,
+        targetHeight: Int
+    ): Bitmap? = withContext(Dispatchers.IO) {
+        if (targetWidth <= 0 || targetHeight <= 0) return@withContext null
+        val stack = layerStack(pageIndex)
+        val visibleLayers = stack.layers.filter { it.visible }
+        if (visibleLayers.isEmpty()) return@withContext null
+
+        val margin = ContinuousPageGeometry.marginFor(pageType)
+        val layerSpanFactor = 1f + 2f * margin
+        val composeWidth = (targetWidth * layerSpanFactor).roundToInt().coerceAtLeast(1)
+
+        val composedLayers = mutableListOf<Bitmap>()
+        for (layer in visibleLayers) {
+            val bmp = composeDisplayLayer(pageIndex, layer, composeWidth)
+            if (bmp != null) composedLayers.add(bmp)
+        }
+        if (composedLayers.isEmpty()) return@withContext null
+
+        val target = personal.notes.touch.util.BitmapUtils.createSafeBitmap(targetWidth, targetHeight)
+        val canvas = Canvas(target)
+        val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
+        val dst = Rect(0, 0, targetWidth, targetHeight)
+        val leftFrac = margin / layerSpanFactor
+        val rightFrac = (margin + 1f) / layerSpanFactor
+        for (layerBmp in composedLayers) {
+            val srcLeft = (layerBmp.width * leftFrac).roundToInt().coerceIn(0, layerBmp.width)
+            val srcRight = (layerBmp.width * rightFrac).roundToInt().coerceIn(srcLeft, layerBmp.width)
+            val src = Rect(srcLeft, 0, srcRight, layerBmp.height)
+            canvas.drawBitmap(layerBmp, src, dst, paint)
+            layerBmp.recycle()
+        }
+        target
     }
 
     /**
@@ -3290,10 +4148,17 @@ class ContinuousInkController(
                 }
             } else {
                 val ratio = rasterPageRatio(pageIndex)
-                val rect = ContinuousPageGeometry.layerRect(pageType, ratio, 1f, 1f)
+                val boxRatio = ContinuousPageGeometry.boxRatio(pageType, ratio)
+                val rect = ContinuousPageGeometry.layerRect(pageType, ratio, boxRatio, 1f)
                 if (!rect.empty) {
                     val sx = displayWidthPx.toFloat() / rect.width
                     val sy = displayHeight.toFloat() / rect.height
+                    val hasErase = ops.any { it is InkOp.Erase }
+                    val eraseSave = if (hasErase) {
+                        canvas.saveLayer(0f, 0f, displayWidthPx.toFloat(), displayHeight.toFloat(), null)
+                    } else {
+                        -1
+                    }
                     for (op in ops) {
                         when (op) {
                             is InkOp.Stroke -> {
@@ -3318,9 +4183,15 @@ class ContinuousInkController(
                                 }
                             }
                             is InkOp.Erase -> {
-                                // Eraser clears pixels
+                                val save = canvas.save()
+                                canvas.translate(-rect.left * sx, -rect.top * sy)
+                                drawStroke(canvas, op.stroke, sx, sy, preview = false)
+                                canvas.restoreToCount(save)
                             }
                         }
+                    }
+                    if (eraseSave >= 0) {
+                        canvas.restoreToCount(eraseSave)
                     }
                 }
             }

@@ -25,6 +25,8 @@ sealed class RichBlock {
     data class Table(val rows: List<String>) : RichBlock()
     /** Image block (v2, P1.5): ![alt](url). */
     data class Image(val alt: String, val url: String) : RichBlock()
+    /** Inline sub-page block: {{subpage:noteId}}. */
+    data class SubPage(val noteId: String) : RichBlock()
     object Divider : RichBlock()
     data class CodeBlock(val code: String) : RichBlock()
 }
@@ -95,6 +97,14 @@ object RichTextParser {
             // Horizontal Divider
             if (trimmed == "---" || trimmed == "***" || trimmed == "___") {
                 blocks.add(RichBlock.Divider)
+                i++
+                continue
+            }
+
+            // Inline sub-page: {{subpage: <id>}}
+            val subPageMatch = Regex("""^\{\{subpage:\s*([^{}]+?)\s*\}\}$""").find(trimmed)
+            if (subPageMatch != null) {
+                blocks.add(RichBlock.SubPage(subPageMatch.groupValues[1].trim()))
                 i++
                 continue
             }
