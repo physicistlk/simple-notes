@@ -10,7 +10,6 @@ import android.graphics.Rect
 import android.graphics.RectF
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import kotlinx.coroutines.CoroutineScope
@@ -21,7 +20,11 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import personal.notes.touch.data.db.entity.PageEntity
 import personal.notes.touch.data.repo.NoteRepository
+import personal.notes.touch.util.MarginExportMath
+import personal.notes.touch.util.MarginInkPresence
+import personal.notes.touch.util.PageAspectCache
 import personal.notes.touch.util.PdfDocumentCache
+import personal.notes.touch.util.PdfModeReconciliationPolicy
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
@@ -164,8 +167,8 @@ internal class InkPatch(
  * current layer of the page, and a stroke stays on its layer until the layer
  * is merged into the base layer.
  */
-/** Radius (screen px) of the delete handle on the infinite-canvas lasso selection. */
-internal const val LASSO_HANDLE_RADIUS_PX = 20f
+/** Radius (screen px) of the delete handle on the continuous lasso selection. */
+internal const val LASSO_HANDLE_RADIUS_PX = ContinuousStrokeTransformMath.HANDLE_RADIUS_PX
 
 internal sealed class InkOp {
     /**
@@ -189,27 +192,6 @@ internal sealed class InkOp {
         val patches: List<InkPatch>,
         override var layer: PageLayer
     ) : InkOp()
-}
-
-/**
- * One undoable change of the ink layer.
- *
- * Undo works on this list and not on pixels: a stroke is undone by taking it
- * out of the committed list again, an eraser by putting back the pixels it
- * cleared.
- */
-internal enum class LassoHandle {
-    NONE,
-    MOVE,
-    ROTATE,
-    MIRROR,
-    DELETE,
-    COPY,
-    SCALE_CORNER_BR,
-    SCALE_LEFT,
-    SCALE_RIGHT,
-    SCALE_TOP,
-    SCALE_BOTTOM
 }
 
 internal class StrokeTransformSnapshot(
@@ -641,12 +623,21 @@ class ContinuousInkSession internal constructor(
 
     internal var background: Bitmap? = null
     internal var backgroundWidth: Int = 0
+    internal var singlePageStrokes: Bitmap? = null
+    internal var singlePageStrokesDirty: Boolean = false
     internal var ready: Boolean = false
     internal var loadJob: Job? = null
     internal var saveJob: Job? = null
     internal var dirty: Boolean = false
     internal var savedWhileActive: Boolean = false
     internal var live: ContinuousStroke? = null
+    internal var memoizedMarginPresence: MarginInkPresence? = null
+    internal var memoizedMarginRev: Int = -1
+    internal var memoizedLayersRev: Int = -1
+
+    internal fun invalidateMarginPresence() {
+        memoizedMarginPresence = null
+    }
 
     /**
      * The layer the writing goes on (the current layer of the stack).
@@ -782,6 +773,17 @@ class ContinuousInkController(
         private set
 
     /**
+     * Bumped when per-page margin ink presence changes (from IO refresh or session edits).
+     */
+    var marginPresenceRevision by mutableIntStateOf(0)
+        private set
+
+    private val marginPresenceLock = Any()
+    private val marginPresenceCache = HashMap<Int, MarginInkPresence>()
+    private val pagePresenceGeneration = HashMap<Int, Long>()
+    private var globalPresenceGeneration: Long = 0L
+
+    /**
      * Bumped on every sample of the stroke in progress. It is read only in
      * the draw phase (the live-stroke canvas), never in composition, so the
      * pen can move without a recomposition per event.
@@ -792,17 +794,431 @@ class ContinuousInkController(
     var session: ContinuousInkSession? by mutableStateOf(null)
         private set
 
+    private val warmSessions = LinkedHashMap<Int, ContinuousInkSession>()
     private val closingSessions = mutableMapOf<Int, ContinuousInkSession>()
+
+    private fun isWarmOrActiveSession(s: ContinuousInkSession): Boolean =
+        session === s || warmSessions[s.pageIndex] === s
 
     fun getSession(pageIndex: Int): ContinuousInkSession? {
         val s = session
         if (s != null && s.pageIndex == pageIndex) return s
+        warmSessions[pageIndex]?.let { return it }
         return closingSessions[pageIndex]
     }
 
     fun isActiveSession(pageIndex: Int): Boolean {
         val s = session
-        return s != null && s.pageIndex == pageIndex && s.isReady
+        if (s != null && s.pageIndex == pageIndex && s.isReady) return true
+        return warmSessions[pageIndex]?.isReady == true
+    }
+
+    /**
+     * Fast per-page margin ink presence across visible annotation layers (`PDF-QOL-6`).
+     * Queries active/closing sessions synchronously, or returns the IO-cached presence
+     * populated by [refreshMarginInkPresence] / [persist].
+     */
+    fun marginInkPresence(pageIndex: Int): MarginInkPresence {
+        if (ContinuousPageGeometry.isInfinite(pageType) ||
+            ContinuousPageGeometry.marginFor(pageType) <= 0f
+        ) {
+            return MarginInkPresence.NONE
+        }
+        val s = getSession(pageIndex)
+        if (s != null && s.ready) {
+            val base = if (s.memoizedMarginPresence != null &&
+                s.memoizedMarginRev == revision &&
+                s.memoizedLayersRev == layersRevision
+            ) {
+                s.memoizedMarginPresence ?: MarginInkPresence.NONE
+            } else {
+                val computed = computeCommittedSessionMarginPresence(s)
+                s.memoizedMarginPresence = computed
+                s.memoizedMarginRev = revision
+                s.memoizedLayersRev = layersRevision
+                synchronized(marginPresenceLock) {
+                    marginPresenceCache[pageIndex] = computed
+                }
+                computed
+            }
+            var acc = base
+            val margin = ContinuousPageGeometry.marginFor(s.pageType)
+            if (margin > 0f && s.stack.current?.visible == true) {
+                s.live?.let {
+                    acc = MarginExportMath.mergePresence(acc, detectStrokeMarginPresence(it, margin))
+                }
+                for (pendingStroke in s.pending) {
+                    acc = MarginExportMath.mergePresence(
+                        acc,
+                        detectStrokeMarginPresence(pendingStroke, margin)
+                    )
+                }
+            }
+            return acc
+        }
+        var acc = synchronized(marginPresenceLock) {
+            marginPresenceCache[pageIndex] ?: MarginInkPresence.NONE
+        }
+        if (s != null && s.pageIndex == pageIndex) {
+            val margin = ContinuousPageGeometry.marginFor(s.pageType)
+            if (margin > 0f && s.stack.current?.visible != false) {
+                s.live?.let {
+                    acc = MarginExportMath.mergePresence(acc, detectStrokeMarginPresence(it, margin))
+                }
+                for (pendingStroke in s.pending) {
+                    acc = MarginExportMath.mergePresence(
+                        acc,
+                        detectStrokeMarginPresence(pendingStroke, margin)
+                    )
+                }
+            }
+        }
+        return acc
+    }
+
+    /**
+     * Inspects disk-backed visible annotation layers (`_ops.json`, tile indices/straddling strips,
+     * and legacy un-tiled PNGs) for [pageIndex] on [Dispatchers.IO] and updates [marginPresenceCache].
+     */
+    suspend fun refreshMarginInkPresence(pageIndex: Int): MarginInkPresence =
+        withContext(Dispatchers.IO) {
+            if (ContinuousPageGeometry.isInfinite(pageType) ||
+                ContinuousPageGeometry.marginFor(pageType) <= 0f
+            ) {
+                return@withContext MarginInkPresence.NONE
+            }
+            val (startGlobalGen, startPageGen, activeSession) = withContext(Dispatchers.Main.immediate) {
+                val active = getSession(pageIndex)?.takeIf { it.ready }
+                val (g, p) = synchronized(marginPresenceLock) {
+                    globalPresenceGeneration to (pagePresenceGeneration[pageIndex] ?: 0L)
+                }
+                Triple(g, p, active)
+            }
+            if (activeSession != null) {
+                return@withContext withContext(Dispatchers.Main.immediate) {
+                    marginInkPresence(pageIndex)
+                }
+            }
+            val metaFile = repository.fileStore.getAnnotationMetaFile(noteId, pageIndex)
+            val metaText = try {
+                if (metaFile.exists()) metaFile.readText() else null
+            } catch (_: Exception) {
+                null
+            }
+            val stack = metaText?.let { PageLayerMeta.decode(it) } ?: PageLayerStack.base()
+            val tilesInfoMap = metaText?.let { PageLayerMeta.decodeTiles(it) } ?: emptyMap()
+            val margin = ContinuousPageGeometry.marginFor(pageType)
+            var acc = MarginInkPresence.NONE
+
+            for (layer in stack.layers) {
+                if (!layer.visible) continue
+                val ops = try {
+                    repository.loadPageLayerOps(noteId, pageIndex, layer.index)
+                } catch (_: Exception) {
+                    null
+                }
+                if (!ops.isNullOrEmpty()) {
+                    for (op in ops) {
+                        if (op is InkOp.Stroke) {
+                            acc = MarginExportMath.mergePresence(
+                                acc,
+                                detectStrokeMarginPresence(op.stroke, margin)
+                            )
+                        }
+                    }
+                }
+                val tilesInfo = tilesInfoMap[layer.index]
+                if (tilesInfo != null && tilesInfo.tiles.isNotEmpty() &&
+                    tilesInfo.width > 0 && tilesInfo.tileSize > 0
+                ) {
+                    for (name in tilesInfo.tiles) {
+                        val pos = LayerTileGrid.parseTileName(name) ?: continue
+                        val (tx, ty) = pos
+                        val tileFile = repository.fileStore.getAnnotationLayerTileFile(
+                            noteId, pageIndex, layer.index, tx, ty
+                        )
+                        if (!tileFile.exists()) continue
+                        val span = MarginExportMath.tileNormalizedXSpan(
+                            tx, tilesInfo.width, tilesInfo.tileSize, margin
+                        ) ?: continue
+                        val tileW = (tilesInfo.width - tx * tilesInfo.tileSize)
+                            .coerceIn(0, tilesInfo.tileSize)
+                        val leftEnd = MarginExportMath.tileLeftMarginEndLocalPx(
+                            tx, tilesInfo.width, tilesInfo.tileSize, margin
+                        )
+                        val rightStart = MarginExportMath.tileRightMarginStartLocalPx(
+                            tx, tilesInfo.width, tilesInfo.tileSize, margin
+                        )
+                        if (leftEnd >= tileW && tileW > 0) {
+                            acc = MarginExportMath.mergePresence(
+                                acc,
+                                MarginInkPresence(
+                                    hasLeftMarginInk = true,
+                                    leftMinX = span.first.coerceAtLeast(-margin)
+                                )
+                            )
+                        } else if (rightStart <= 0 && tileW > 0) {
+                            acc = MarginExportMath.mergePresence(
+                                acc,
+                                MarginInkPresence(
+                                    hasRightMarginInk = true,
+                                    rightMaxX = span.second.coerceAtMost(1f + margin)
+                                )
+                            )
+                        } else if (leftEnd > 0 || rightStart < tileW) {
+                            val bmp = decodeLayerBitmap(tileFile)
+                            if (bmp != null) {
+                                try {
+                                    if (leftEnd > 0 && hasOpaquePixelInRect(bmp, 0, 0, leftEnd, bmp.height)) {
+                                        acc = MarginExportMath.mergePresence(
+                                            acc,
+                                            MarginInkPresence(
+                                                hasLeftMarginInk = true,
+                                                leftMinX = span.first.coerceAtLeast(-margin)
+                                            )
+                                        )
+                                    }
+                                    if (rightStart < bmp.width &&
+                                        hasOpaquePixelInRect(bmp, rightStart, 0, bmp.width, bmp.height)
+                                    ) {
+                                        acc = MarginExportMath.mergePresence(
+                                            acc,
+                                            MarginInkPresence(
+                                                hasRightMarginInk = true,
+                                                rightMaxX = span.second.coerceAtMost(1f + margin)
+                                            )
+                                        )
+                                    }
+                                } finally {
+                                    if (!bmp.isRecycled) bmp.recycle()
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    val legacyFile = repository.fileStore.getAnnotationLayerFile(
+                        noteId, pageIndex, layer.index
+                    )
+                    if (legacyFile.exists()) {
+                        val opts = android.graphics.BitmapFactory.Options().apply {
+                            inPreferredConfig = Bitmap.Config.ARGB_8888
+                            inSampleSize = 4
+                        }
+                        val bmp = try {
+                            android.graphics.BitmapFactory.decodeFile(legacyFile.absolutePath, opts)
+                        } catch (_: Throwable) {
+                            null
+                        }
+                        if (bmp != null) {
+                            try {
+                                val (pageLeftPx, pageRightPx) =
+                                    MarginExportMath.layerPagePixelBounds(bmp.width, margin)
+                                if (pageLeftPx > 0 &&
+                                    hasOpaquePixelInRect(bmp, 0, 0, pageLeftPx, bmp.height)
+                                ) {
+                                    acc = MarginExportMath.mergePresence(
+                                        acc,
+                                        MarginInkPresence(
+                                            hasLeftMarginInk = true,
+                                            leftMinX = -margin * 0.5f
+                                        )
+                                    )
+                                }
+                                if (pageRightPx < bmp.width &&
+                                    hasOpaquePixelInRect(bmp, pageRightPx, 0, bmp.width, bmp.height)
+                                ) {
+                                    acc = MarginExportMath.mergePresence(
+                                        acc,
+                                        MarginInkPresence(
+                                            hasRightMarginInk = true,
+                                            rightMaxX = 1f + margin * 0.5f
+                                        )
+                                    )
+                                }
+                            } finally {
+                                if (!bmp.isRecycled) bmp.recycle()
+                            }
+                        }
+                    }
+                }
+            }
+
+            withContext(Dispatchers.Main.immediate) {
+                val nowActive = getSession(pageIndex)?.takeIf { it.ready }
+                if (nowActive != null) {
+                    return@withContext marginInkPresence(pageIndex)
+                }
+                val prev = synchronized(marginPresenceLock) {
+                    val curPageGen = pagePresenceGeneration[pageIndex] ?: 0L
+                    if (globalPresenceGeneration != startGlobalGen || curPageGen != startPageGen) {
+                        return@withContext marginPresenceCache[pageIndex] ?: MarginInkPresence.NONE
+                    }
+                    val old = marginPresenceCache.put(pageIndex, acc)
+                    pagePresenceGeneration[pageIndex] = curPageGen + 1L
+                    old
+                }
+                if (prev != acc) {
+                    marginPresenceRevision++
+                }
+                acc
+            }
+        }
+
+    private fun computeCommittedSessionMarginPresence(s: ContinuousInkSession): MarginInkPresence {
+        val margin = ContinuousPageGeometry.marginFor(s.pageType)
+        if (margin <= 0f || ContinuousPageGeometry.isInfinite(s.pageType)) {
+            return MarginInkPresence.NONE
+        }
+        val visibleLayers = s.stack.layers.filter { it.visible }
+        if (visibleLayers.isEmpty()) return MarginInkPresence.NONE
+        val visibleIndices = visibleLayers.map { it.index }.toHashSet()
+        var acc = MarginInkPresence.NONE
+
+        for (op in s.history.ops) {
+            if (op is InkOp.Stroke && op.layer.index in visibleIndices) {
+                acc = MarginExportMath.mergePresence(acc, detectStrokeMarginPresence(op.stroke, margin))
+            }
+        }
+        for (layer in visibleLayers) {
+            for (placement in s.tilesOf(layer)) {
+                val store = placement.tiles
+                val grid = placement.grid
+                val layerW = grid.width
+                val tileSize = grid.tileSize
+                for (index in store.existingTiles()) {
+                    val tx = grid.tileColumn(index)
+                    val ty = grid.tileRow(index)
+                    if (tx < 0 || ty < 0) continue
+                    val tile = store.tile(tx, ty) ?: continue
+                    if (tile.isRecycled) continue
+                    val span = MarginExportMath.tileNormalizedXSpan(
+                        tx, layerW, tileSize, margin
+                    ) ?: continue
+                    val leftEnd = MarginExportMath.tileLeftMarginEndLocalPx(
+                        tx, layerW, tileSize, margin
+                    )
+                    if (leftEnd >= tile.width && tile.width > 0) {
+                        acc = MarginExportMath.mergePresence(
+                            acc,
+                            MarginInkPresence(
+                                hasLeftMarginInk = true,
+                                leftMinX = span.first.coerceAtLeast(-margin)
+                            )
+                        )
+                    } else if (leftEnd > 0 && hasOpaquePixelInRect(tile, 0, 0, leftEnd, tile.height)) {
+                        acc = MarginExportMath.mergePresence(
+                            acc,
+                            MarginInkPresence(
+                                hasLeftMarginInk = true,
+                                leftMinX = span.first.coerceAtLeast(-margin)
+                            )
+                        )
+                    }
+                    val rightStart = MarginExportMath.tileRightMarginStartLocalPx(
+                        tx, layerW, tileSize, margin
+                    )
+                    if (rightStart <= 0 && tile.width > 0) {
+                        acc = MarginExportMath.mergePresence(
+                            acc,
+                            MarginInkPresence(
+                                hasRightMarginInk = true,
+                                rightMaxX = span.second.coerceAtMost(1f + margin)
+                            )
+                        )
+                    } else if (rightStart < tile.width &&
+                        hasOpaquePixelInRect(tile, rightStart, 0, tile.width, tile.height)
+                    ) {
+                        acc = MarginExportMath.mergePresence(
+                            acc,
+                            MarginInkPresence(
+                                hasRightMarginInk = true,
+                                rightMaxX = span.second.coerceAtMost(1f + margin)
+                            )
+                        )
+                    }
+                }
+            }
+        }
+        return acc
+    }
+
+    private fun computeSessionMarginPresence(s: ContinuousInkSession): MarginInkPresence {
+        val margin = ContinuousPageGeometry.marginFor(s.pageType)
+        if (margin <= 0f || ContinuousPageGeometry.isInfinite(s.pageType)) {
+            return MarginInkPresence.NONE
+        }
+        var acc = computeCommittedSessionMarginPresence(s)
+        if (s.stack.current?.visible == true) {
+            s.live?.let {
+                acc = MarginExportMath.mergePresence(acc, detectStrokeMarginPresence(it, margin))
+            }
+            for (pendingStroke in s.pending) {
+                acc = MarginExportMath.mergePresence(
+                    acc,
+                    detectStrokeMarginPresence(pendingStroke, margin)
+                )
+            }
+        }
+        return acc
+    }
+
+    private fun detectStrokeMarginPresence(
+        stroke: ContinuousStroke,
+        margin: Float
+    ): MarginInkPresence {
+        if (stroke.points.isEmpty() || !margin.isFinite() || margin <= 0f) {
+            return MarginInkPresence.NONE
+        }
+        var hasLeft = false
+        var hasRight = false
+        var minLeft = 0f
+        var maxRight = 1f
+        for (p in stroke.points) {
+            val x = p.x
+            if (!x.isFinite()) continue
+            if (x < 0f) {
+                hasLeft = true
+                val clamped = x.coerceAtLeast(-margin)
+                if (clamped < minLeft) minLeft = clamped
+            } else if (x > 1f) {
+                hasRight = true
+                val clamped = x.coerceAtMost(1f + margin)
+                if (clamped > maxRight) maxRight = clamped
+            }
+        }
+        return if (!hasLeft && !hasRight) {
+            MarginInkPresence.NONE
+        } else {
+            MarginInkPresence(hasLeft, hasRight, minLeft, maxRight)
+        }
+    }
+
+    private fun hasOpaquePixelInRect(
+        bitmap: Bitmap,
+        left: Int,
+        top: Int,
+        right: Int,
+        bottom: Int
+    ): Boolean {
+        if (bitmap.isRecycled) return false
+        val l = left.coerceIn(0, bitmap.width)
+        val t = top.coerceIn(0, bitmap.height)
+        val r = right.coerceIn(l, bitmap.width)
+        val b = bottom.coerceIn(t, bitmap.height)
+        val w = r - l
+        if (w <= 0 || b <= t) return false
+        val row = IntArray(w)
+        for (y in t until b) {
+            try {
+                bitmap.getPixels(row, 0, w, l, y, w, 1)
+            } catch (_: Throwable) {
+                return false
+            }
+            for (px in row) {
+                if ((px ushr 24) != 0) return true
+            }
+        }
+        return false
     }
 
     /**
@@ -840,12 +1256,16 @@ class ContinuousInkController(
         private set
 
     /** The laser trail in page-normalised coordinates. */
-    private val laserTrail = mutableStateListOf<LaserSample>()
+    private val laserTrail = ArrayList<LaserSample>()
 
     /** Moves the laser dot; nothing is written to the page. */
     fun updateLaser(pageIndex: Int, x: Float, y: Float) {
+        val now = System.currentTimeMillis()
         laserPageIndex = pageIndex
-        laserTrail.add(LaserSample(x, y, System.currentTimeMillis()))
+        while (laserTrail.isNotEmpty() && now - laserTrail.first().time > LASER_TRAIL_MS) {
+            laserTrail.removeAt(0)
+        }
+        laserTrail.add(LaserSample(x, y, now))
         while (laserTrail.size > 40) laserTrail.removeAt(0)
         laserActive = true
         // The laser is only read in the draw phase, so it must not bump the
@@ -932,6 +1352,7 @@ class ContinuousInkController(
         addPoint(stroke, x, y, pressure, settings, tilt)
         s.live = null
         finishStroke(s, stroke, settings.autoShapeEnabled)
+        s.invalidateMarginPresence()
         revision++
     }
 
@@ -1020,30 +1441,59 @@ class ContinuousInkController(
 
     // ---- session lifecycle ---------------------------------------------
 
+    private fun touchWarmSession(s: ContinuousInkSession) {
+        warmSessions.remove(s.pageIndex)
+        warmSessions[s.pageIndex] = s
+    }
+
+    private fun evictWarmSessionsIfNeeded(keepPageIndex: Int) {
+        while (warmSessions.size > MAX_WARM_SESSIONS) {
+            val candidate = warmSessions.entries.firstOrNull { (idx, sess) ->
+                idx != keepPageIndex && sess !== session && sess.live == null && idx != lassoPageIndex
+            } ?: warmSessions.entries.firstOrNull { (idx, sess) ->
+                idx != keepPageIndex && sess.live == null
+            } ?: break
+            warmSessions.remove(candidate.key)
+            if (session === candidate.value) {
+                session = null
+            }
+            flushNow(candidate.value)
+        }
+    }
+
     private fun ensureSession(
         page: PageEntity,
         pageIndex: Int,
         boxWidth: Float,
         boxHeight: Float,
-        renderWidthPx: Int
+        renderWidthPx: Int,
+        activate: Boolean = true
     ): ContinuousInkSession {
-        val existing = session
-        if (existing != null && existing.pageIndex == pageIndex) {
-            // The box may have grown (the zoom changed it): the strokes are
-            // normalised to it, so the session has to know the new size.
-            existing.boxWidth = boxWidth
-            existing.boxHeight = boxHeight
-            return existing
-        }
-        if (existing != null) {
-            flushNow(existing)
+        val warm = warmSessions[pageIndex] ?: session?.takeIf { it.pageIndex == pageIndex }
+        if (warm != null) {
+            if (boxWidth > 0f && boxHeight > 0f) {
+                warm.boxWidth = boxWidth
+                warm.boxHeight = boxHeight
+            }
+            touchWarmSession(warm)
+            if (activate && session !== warm) {
+                session = warm
+                onUndoRedoChanged(warm.canUndo, warm.canRedo)
+            }
+            return warm
         }
         val closing = closingSessions.remove(pageIndex)
         if (closing != null) {
-            closing.boxWidth = boxWidth
-            closing.boxHeight = boxHeight
-            session = closing
-            onUndoRedoChanged(closing.history.canUndo, closing.history.canRedo)
+            if (boxWidth > 0f && boxHeight > 0f) {
+                closing.boxWidth = boxWidth
+                closing.boxHeight = boxHeight
+            }
+            touchWarmSession(closing)
+            evictWarmSessionsIfNeeded(pageIndex)
+            if (activate) {
+                session = closing
+                onUndoRedoChanged(closing.history.canUndo, closing.history.canRedo)
+            }
             return closing
         }
         val isVector = page.pdfSourcePath.isNotEmpty() && page.pdfPageIndex >= 0
@@ -1056,8 +1506,12 @@ class ContinuousInkController(
         created.boxWidth = boxWidth
         created.boxHeight = boxHeight
         created.pageRatio = ratio
-        session = created
-        onUndoRedoChanged(false, false)
+        touchWarmSession(created)
+        evictWarmSessionsIfNeeded(pageIndex)
+        if (activate) {
+            session = created
+            onUndoRedoChanged(false, false)
+        }
         startLoad(created, page, renderWidthPx)
         return created
     }
@@ -1070,10 +1524,23 @@ class ContinuousInkController(
      */
     private fun pageRatioOf(page: PageEntity, isVector: Boolean): Float {
         if (isVector) {
-            val size = pdfDocCache.document(page.pdfSourcePath)?.pageSize(page.pdfPageIndex)
-            if (size != null && size[0] > 0f && size[1] > 0f) return size[0] / size[1]
+            val fallback = ContinuousPageGeometry.defaultRatio(pageType)
+            return PageAspectCache.default.getOrLoad(page.pdfSourcePath, page.pdfPageIndex, fallback) {
+                pdfDocCache.document(page.pdfSourcePath)?.pageSize(page.pdfPageIndex)
+            }
         }
         return ContinuousPageGeometry.defaultRatio(pageType)
+    }
+
+    private suspend fun resolvePageRatio(pageIndex: Int, page: PageEntity?): Float {
+        val p = page ?: repository.getPage(noteId, pageIndex)
+        if (p != null && p.pdfSourcePath.isNotEmpty() && p.pdfPageIndex >= 0) {
+            val fallback = ContinuousPageGeometry.defaultRatio(pageType)
+            return PageAspectCache.default.getOrLoad(p.pdfSourcePath, p.pdfPageIndex, fallback) {
+                pdfDocCache.document(p.pdfSourcePath)?.pageSize(p.pdfPageIndex)
+            }
+        }
+        return rasterPageRatio(pageIndex)
     }
 
     /**
@@ -1265,10 +1732,16 @@ class ContinuousInkController(
                             android.util.Log.d("TouchNotes", "load: page=${s.pageIndex} layer=${layer.index} no ops file")
                         }
                     }
-                    LoadedLayers(stack, stores, loadedHeight)
+                    val spStrokes = if (s.isVector && !PdfModeReconciliationPolicy.continuousPdfRenderIncludesInk()) {
+                        repository.loadPageStrokes(noteId, s.pageIndex)
+                    } else {
+                        null
+                    }
+                    LoadedLayers(stack, stores, loadedHeight, spStrokes)
                 }
-                if (session !== s) {
+                if (!isWarmOrActiveSession(s) && !s.dirty && s.pending.isEmpty()) {
                     loaded.stores.values.forEach { store -> store.release() }
+                    loaded.singlePageStrokes?.recycle()
                     return@launch
                 }
                 s.stack.load(loaded.stack.layers, loaded.stack.currentIndex)
@@ -1287,28 +1760,33 @@ class ContinuousInkController(
                     }
                 }
                 if (s.isVector) {
-                    s.background = withContext(Dispatchers.IO) {
-                        renderContinuousPage(
-                            page, s.pageIndex, noteId, pdfDocCache, repository,
-                            renderWidthPx.coerceAtLeast(720), includeInk = true
-                        )
+                    val spStrokes = loaded.singlePageStrokes
+                    if (isWarmOrActiveSession(s) || s.dirty || s.pending.isNotEmpty()) {
+                        s.singlePageStrokes = spStrokes
+                    } else {
+                        spStrokes?.recycle()
                     }
-                    s.backgroundWidth = renderWidthPx
                 }
                 // Strokes drawn while the layer decoded: commit them now, in
                 // order, so the first stroke is not lost to the load.
                 val queued = s.pending.toList()
                 s.pending.clear()
                 for (stroke in queued) commit(s, stroke, stroke.autoShapeEnabled)
+                s.invalidateMarginPresence()
                 s.ready = true
-                if (s.dirty) scheduleSave(s)
-                // The glass wants the writing of the layer: its copy is built
-                // in the background, so it is there when the dock is drawn.
-                scheduleGlassCopy(s)
-                onUndoRedoChanged(s.canUndo, s.canRedo)
-                revision++
-                layersRevision++
+                if (isWarmOrActiveSession(s)) {
+                    if (s.dirty) scheduleSave(s)
+                    if (session === s) {
+                        // The glass wants the writing of the layer: its copy is built
+                        // in the background, so it is there when the dock is drawn.
+                        scheduleGlassCopy(s)
+                        onUndoRedoChanged(s.canUndo, s.canRedo)
+                    }
+                    revision++
+                    layersRevision++
+                }
             } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
                 e.printStackTrace()
             }
         }
@@ -1318,7 +1796,8 @@ class ContinuousInkController(
     private class LoadedLayers(
         val stack: PageLayerStack,
         val stores: Map<PageLayer, LayerTiles>,
-        val height: Int
+        val height: Int,
+        val singlePageStrokes: Bitmap? = null
     )
 
     /**
@@ -1439,8 +1918,8 @@ class ContinuousInkController(
 
     /** Re-renders the clean page under the ink when the zoom changed enough. */
     fun refreshBackground(page: PageEntity, pageIndex: Int, renderWidthPx: Int) {
-        val s = session ?: return
-        if (s.pageIndex != pageIndex) return
+        val s = getSession(pageIndex) ?: return
+        if (s.background == null) return
         if (!s.isVector || !s.ready) return
         if (renderWidthPx <= 0) return
         val current = s.backgroundWidth
@@ -1452,10 +1931,11 @@ class ContinuousInkController(
             val bg = withContext(Dispatchers.IO) {
                 renderContinuousPage(
                     page, s.pageIndex, noteId, pdfDocCache, repository,
-                    renderWidthPx, includeInk = true
+                    renderWidthPx,
+                    includeInk = PdfModeReconciliationPolicy.continuousPdfRenderIncludesInk()
                 )
             }
-            if (session === s && bg != null) {
+            if (isWarmOrActiveSession(s) && bg != null) {
                 s.background = bg
                 revision++
             } else {
@@ -1469,6 +1949,9 @@ class ContinuousInkController(
     private fun finishStroke(s: ContinuousInkSession, stroke: ContinuousStroke, autoShapeEnabled: Boolean = stroke.autoShapeEnabled) {
         if (!s.ready) {
             s.pending.add(stroke)
+            if (stroke.points.isNotEmpty()) {
+                s.dirty = true
+            }
             return
         }
         commit(s, stroke, autoShapeEnabled)
@@ -1535,7 +2018,7 @@ class ContinuousInkController(
         }
         val padFactor = if (stroke.tool == CanvasTool.HIGHLIGHTER) 0.85f else 0.6f
         return ContinuousPageGeometry.strokeBounds(
-            stroke.points, s.boxWidth, s.boxHeight, padFactor, 4f
+            stroke.points, s.boxWidth, s.boxHeight, padFactor, 4f, minWidthNorm = effectiveWidthNorm
         )
     }
 
@@ -1561,40 +2044,81 @@ class ContinuousInkController(
         val layer = s.stack.current ?: return
         val patches = mutableListOf<InkPatch>()
         val bounds = strokeBoundsInInk(stroke, s)
+        val sp = if (s.isVector && layer.index == PageLayerStack.BASE_LAYER_INDEX) {
+            s.singlePageStrokes?.takeIf { !it.isRecycled }
+        } else null
         if (s.pageType != "infinite") {
-            if (bounds == null) return
-            for (placement in s.tilesOf(layer)) {
-                val store = placement.tiles
-                val grid = placement.grid
-                val touched = grid.tilesForRect(bounds.left, bounds.top, bounds.right, bounds.bottom)
-                for (index in touched) {
-                    val tx = grid.tileColumn(index)
-                    val ty = grid.tileRow(index)
-                    if (tx < 0 || ty < 0) continue
-                    // Nothing to wipe in a tile that does not exist: it is not
-                    // created just to be emptied again.
-                    val tile = store.tile(tx, ty) ?: continue
-                    if (tile.isRecycled) continue
-                    val rect = LayerTilePatch.rectInTile(
-                        grid, tx, ty, bounds.left, bounds.top, bounds.right, bounds.bottom
-                    ) ?: continue
-                    val before = capture(tile, Rect(rect[0], rect[1], rect[2], rect[3])) ?: continue
-                    val after: IntArray?
-                    synchronized(s.inkLock) {
-                        val canvas = Canvas(tile)
-                        drawEraseInTile(canvas, s, stroke, grid, tx, ty)
-                        after = capture(tile, Rect(rect[0], rect[1], rect[2], rect[3]))
-                    }
-                    patches.add(
-                        InkPatch(
-                            tx, ty,
-                            rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1],
-                            before, after, store
+            if (bounds == null && sp == null) return
+            if (bounds != null) {
+                for (placement in s.tilesOf(layer)) {
+                    val store = placement.tiles
+                    val grid = placement.grid
+                    val touched = grid.tilesForRect(bounds.left, bounds.top, bounds.right, bounds.bottom)
+                    for (index in touched) {
+                        val tx = grid.tileColumn(index)
+                        val ty = grid.tileRow(index)
+                        if (tx < 0 || ty < 0) continue
+                        // Nothing to wipe in a tile that does not exist: it is not
+                        // created just to be emptied again.
+                        val tile = store.tile(tx, ty) ?: continue
+                        if (tile.isRecycled) continue
+                        val rect = LayerTilePatch.rectInTile(
+                            grid, tx, ty, bounds.left, bounds.top, bounds.right, bounds.bottom
+                        ) ?: continue
+                        val before = capture(tile, Rect(rect[0], rect[1], rect[2], rect[3])) ?: continue
+                        val after: IntArray?
+                        synchronized(s.inkLock) {
+                            val canvas = Canvas(tile)
+                            drawEraseInTile(canvas, s, stroke, grid, tx, ty)
+                            after = capture(tile, Rect(rect[0], rect[1], rect[2], rect[3]))
+                        }
+                        patches.add(
+                            InkPatch(
+                                tx, ty,
+                                rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1],
+                                before, after, store
+                            )
                         )
-                    )
-                    // A tile without ink costs nothing: it goes back to the
-                    // system right away.
-                    store.releaseIfEmpty(tx, ty)
+                        // A tile without ink costs nothing: it goes back to the
+                        // system right away.
+                        store.releaseIfEmpty(tx, ty)
+                    }
+                }
+            }
+            // Non-destructive continuous eraser over Single-Page strokes_<i>.png when Layer 1 is active
+            if (sp != null) {
+                val pRect = s.pageRectInBox
+                val boxB = strokeBoundsInBox(stroke, s)
+                if (!pRect.empty && boxB != null) {
+                    val sxSp = sp.width.toFloat() / pRect.width
+                    val sySp = sp.height.toFloat() / pRect.height
+                    val spLeft = ((boxB.left - pRect.left) * sxSp).toInt().coerceIn(0, sp.width)
+                    val spTop = ((boxB.top - pRect.top) * sySp).toInt().coerceIn(0, sp.height)
+                    val spRight = ((boxB.right - pRect.left) * sxSp).toInt().coerceIn(spLeft, sp.width)
+                    val spBottom = ((boxB.bottom - pRect.top) * sySp).toInt().coerceIn(spTop, sp.height)
+                    if (spRight > spLeft && spBottom > spTop) {
+                        val spRect = Rect(spLeft, spTop, spRight, spBottom)
+                        val before = capture(sp, spRect)
+                        if (before != null) {
+                            val after: IntArray?
+                            synchronized(s.inkLock) {
+                                val canvas = Canvas(sp)
+                                val save = canvas.save()
+                                canvas.translate(-pRect.left * sxSp, -pRect.top * sySp)
+                                drawStroke(canvas, stroke, sxSp, sySp, preview = false)
+                                canvas.restoreToCount(save)
+                                after = capture(sp, spRect)
+                            }
+                            patches.add(
+                                InkPatch(
+                                    -1, -1,
+                                    spLeft, spTop, spRight - spLeft, spBottom - spTop,
+                                    before, after, target = null
+                                )
+                            )
+                            s.singlePageStrokesDirty = true
+                        }
+                    }
                 }
             }
         }
@@ -1691,14 +2215,14 @@ class ContinuousInkController(
             onErase = { op, restore -> restoreErase(s, op, restore) },
             onClear = { patches, restore -> restoreClear(s, patches, restore) },
             onLayer = { action, restored -> applyLayerAction(s, action, restored) },
-            onMove = { moved, dx, dy -> moved.forEach { translateStroke(it, dx, dy) } },
+            onMove = { moved, dx, dy -> moved.forEach { translateStroke(it, dx, dy, s) } },
             onTransform = { snapshots, isUndo -> applyStrokeSnapshots(snapshots, isUndo) }
         )
         if (!undone) return false
-        lassoOps = emptyList()
-        lassoRevision++
+        lassoClear()
         s.dirty = true
         s.opRevision++
+        s.invalidateMarginPresence()
         scheduleGlassCopy(s)
         scheduleSave(s)
         revision++
@@ -1716,14 +2240,14 @@ class ContinuousInkController(
             onErase = { op, restore -> restoreErase(s, op, restore) },
             onClear = { patches, restore -> restoreClear(s, patches, restore) },
             onLayer = { action, restored -> applyLayerAction(s, action, restored) },
-            onMove = { moved, dx, dy -> moved.forEach { translateStroke(it, dx, dy) } },
+            onMove = { moved, dx, dy -> moved.forEach { translateStroke(it, dx, dy, s) } },
             onTransform = { snapshots, isUndo -> applyStrokeSnapshots(snapshots, isUndo) }
         )
         if (!redone) return false
-        lassoOps = emptyList()
-        lassoRevision++
+        lassoClear()
         s.dirty = true
         s.opRevision++
+        s.invalidateMarginPresence()
         scheduleGlassCopy(s)
         scheduleSave(s)
         revision++
@@ -1778,8 +2302,34 @@ class ContinuousInkController(
     private fun restoreErase(s: ContinuousInkSession, op: InkOp.Erase, restore: Boolean) {
         synchronized(s.inkLock) {
             op.patches.forEach { patch ->
-                val store = patch.target ?: return@forEach
-                restorePatch(store, patch, useAfter = !restore)
+                val store = patch.target
+                if (store != null) {
+                    restorePatch(store, patch, useAfter = !restore)
+                } else if (patch.tx == -1 && patch.ty == -1) {
+                    val sp = s.singlePageStrokes
+                    if (sp != null && !sp.isRecycled) {
+                        val pixels = if (!restore) patch.after else patch.before
+                        if (pixels != null) {
+                            try {
+                                sp.setPixels(pixels, 0, patch.w, patch.x, patch.y, patch.w, patch.h)
+                            } catch (e: Exception) {
+                                e.printStackTrace()
+                            }
+                        } else if (!restore) {
+                            val clearPaint = Paint().apply {
+                                xfermode = PorterDuffXfermode(PorterDuff.Mode.CLEAR)
+                            }
+                            Canvas(sp).drawRect(
+                                patch.x.toFloat(),
+                                patch.y.toFloat(),
+                                (patch.x + patch.w).toFloat(),
+                                (patch.y + patch.h).toFloat(),
+                                clearPaint
+                            )
+                        }
+                        s.singlePageStrokesDirty = true
+                    }
+                }
             }
         }
         s.tilesRevision++
@@ -1797,17 +2347,37 @@ class ContinuousInkController(
         synchronized(s.inkLock) {
             if (restore) {
                 patches.forEach { patch ->
-                    val store = patch.target ?: return@forEach
-                    restorePatch(store, patch, useAfter = false)
+                    val store = patch.target
+                    if (store != null) {
+                        restorePatch(store, patch, useAfter = false)
+                    } else if (patch.tx == -1 && patch.ty == -1) {
+                        val sp = s.singlePageStrokes
+                        if (sp != null && !sp.isRecycled) {
+                            try {
+                                sp.setPixels(patch.before, 0, patch.w, patch.x, patch.y, patch.w, patch.h)
+                                s.singlePageStrokesDirty = true
+                            } catch (e: Exception) {
+                                e.printStackTrace()
+                            }
+                        }
+                    }
                 }
             } else {
                 patches.forEach { patch ->
-                    val store = patch.target ?: return@forEach
-                    val tile = store.tile(patch.tx, patch.ty) ?: return@forEach
-                    if (tile.isRecycled) return@forEach
-                    tile.eraseColor(android.graphics.Color.TRANSPARENT)
-                    store.markDirty(patch.tx, patch.ty)
-                    store.releaseIfEmpty(patch.tx, patch.ty)
+                    val store = patch.target
+                    if (store != null) {
+                        val tile = store.tile(patch.tx, patch.ty) ?: return@forEach
+                        if (tile.isRecycled) return@forEach
+                        tile.eraseColor(android.graphics.Color.TRANSPARENT)
+                        store.markDirty(patch.tx, patch.ty)
+                        store.releaseIfEmpty(patch.tx, patch.ty)
+                    } else if (patch.tx == -1 && patch.ty == -1) {
+                        val sp = s.singlePageStrokes
+                        if (sp != null && !sp.isRecycled) {
+                            sp.eraseColor(android.graphics.Color.TRANSPARENT)
+                            s.singlePageStrokesDirty = true
+                        }
+                    }
                 }
             }
         }
@@ -1854,38 +2424,27 @@ class ContinuousInkController(
 
     /** Clears in-place ink on a specific page, supporting undo. */
     fun clearPage(pageIndex: Int, page: PageEntity? = null, renderWidthPx: Int = 2160): Boolean {
-        val s = session
-        if (s != null && s.pageIndex == pageIndex) {
+        val s = getSession(pageIndex)
+        if (s != null) {
+            touchWarmSession(s)
+            session = s
             return if (s.ready) {
                 clearSession(s)
             } else {
                 scope.launch {
                     s.loadJob?.join()
-                    if (session === s && s.ready) {
+                    if (isWarmOrActiveSession(s) && s.ready) {
                         clearSession(s)
                     }
                 }
                 true
             }
         }
-        if (s != null) {
-            flushNow(s)
-            releaseBitmaps(s)
-            session = null
-            onUndoRedoChanged(false, false)
-        }
         if (page == null) return false
-        val isVector = page.pdfSourcePath.isNotEmpty() && page.pdfPageIndex >= 0
-        val ratio = pageRatioOf(page, isVector)
-        val size = ContinuousPageGeometry.layerSize(pageType, ratio)
-        val created = ContinuousInkSession(pageIndex, isVector, size.width, size.height, pageType)
-        created.pageRatio = ratio
-        session = created
-        onUndoRedoChanged(false, false)
-        startLoad(created, page, renderWidthPx)
+        val created = ensureSession(page, pageIndex, 0f, 0f, renderWidthPx, activate = true)
         scope.launch {
             created.loadJob?.join()
-            if (session === created && created.ready) {
+            if (isWarmOrActiveSession(created) && created.ready) {
                 clearSession(created)
             }
         }
@@ -1906,9 +2465,16 @@ class ContinuousInkController(
      */
     private fun clearSession(s: ContinuousInkSession): Boolean {
         val layer = s.stack.current ?: return false
+        if (lassoPageIndex == s.pageIndex) {
+            lassoClear()
+        }
         val placements = s.tilesOf(layer)
         val layerOps = s.history.ops.filter { it.layer.index == layer.index }
-        val hasInk = placements.any { !it.tiles.isEmpty() }
+        val sp = if (s.isVector && layer.index == PageLayerStack.BASE_LAYER_INDEX) {
+            s.singlePageStrokes?.takeIf { !it.isRecycled }
+        } else null
+        val spBounds = sp?.let { findContentBounds(it) }
+        val hasInk = placements.any { !it.tiles.isEmpty() } || spBounds != null
         if (!hasInk && layerOps.isEmpty()) return false
         val patches = mutableListOf<InkPatch>()
         for (placement in placements) {
@@ -1936,6 +2502,21 @@ class ContinuousInkController(
                 store.releaseIfEmpty(tx, ty)
             }
         }
+        if (sp != null && spBounds != null) {
+            val before = capture(sp, spBounds)
+            if (before != null) {
+                synchronized(s.inkLock) { sp.eraseColor(android.graphics.Color.TRANSPARENT) }
+                patches.add(
+                    InkPatch(
+                        -1, -1,
+                        spBounds.left, spBounds.top,
+                        spBounds.width(), spBounds.height(),
+                        before, null, target = null
+                    )
+                )
+                s.singlePageStrokesDirty = true
+            }
+        }
         // The strokes of this layer go away with its ink; the undo keeps
         // both, so the clear can be taken back.
         val removed = mutableListOf<OpEntry>()
@@ -1947,9 +2528,21 @@ class ContinuousInkController(
         s.dirty = true
         s.tilesRevision++
         s.opRevision++
+        s.invalidateMarginPresence()
+        val updatedPresence = computeSessionMarginPresence(s)
+        s.memoizedMarginPresence = updatedPresence
+        val prevPresence = synchronized(marginPresenceLock) {
+            pagePresenceGeneration[s.pageIndex] = (pagePresenceGeneration[s.pageIndex] ?: 0L) + 1L
+            marginPresenceCache.put(s.pageIndex, updatedPresence)
+        }
+        if (prevPresence != updatedPresence) {
+            marginPresenceRevision++
+        }
         scheduleGlassCopy(s)
         scheduleSave(s)
         revision++
+        s.memoizedMarginRev = revision
+        s.memoizedLayersRev = layersRevision
         onUndoRedoChanged(s.canUndo, s.canRedo)
         return true
     }
@@ -2137,9 +2730,9 @@ class ContinuousInkController(
                         // The tile was released (the eraser emptied it): its
                         // file must go, or the old writing would come back.
                         withContext(Dispatchers.IO) {
-                            repository.fileStore.getAnnotationLayerTileFile(
+                            repository.deletePageLayerTile(
                                 noteId, s.pageIndex, layer.index, tx, ty
-                            ).delete()
+                            )
                         }
                     }
                 }
@@ -2196,6 +2789,27 @@ class ContinuousInkController(
             repository.savePageLayerMeta(
                 noteId, s.pageIndex, PageLayerMeta.encode(s.stack, tilesInfo)
             )
+            if (s.singlePageStrokesDirty) {
+                val sp = s.singlePageStrokes
+                if (sp != null && !sp.isRecycled) {
+                    val hasContent = findContentBounds(sp) != null
+                    val spOk = if (hasContent) {
+                        repository.savePageStrokes(noteId, s.pageIndex, sp)
+                    } else {
+                        val file = repository.fileStore.getStrokesFile(noteId, s.pageIndex)
+                        val deleted = if (file.exists()) file.delete() else true
+                        if (deleted) repository.touchNoteUpdatedAt(noteId)
+                        deleted
+                    }
+                    if (spOk) {
+                        s.singlePageStrokesDirty = false
+                    } else {
+                        s.dirty = true
+                    }
+                } else {
+                    s.singlePageStrokesDirty = false
+                }
+            }
             deleteStaleLayerFiles(s)
             if (s.pageType == "infinite" && previewStackSnapshot != null) {
                 generateAndSavePagePreview(s.pageIndex, previewOpsSnapshot, previewStackSnapshot)
@@ -2203,6 +2817,19 @@ class ContinuousInkController(
         }
         storedStacks.remove(s.pageIndex)
         storedStacks[s.pageIndex] = s.stack
+        withContext(Dispatchers.Main.immediate) {
+            val presence = computeSessionMarginPresence(s)
+            s.memoizedMarginPresence = presence
+            s.memoizedMarginRev = revision
+            s.memoizedLayersRev = layersRevision
+            val prevPresence = synchronized(marginPresenceLock) {
+                pagePresenceGeneration[s.pageIndex] = (pagePresenceGeneration[s.pageIndex] ?: 0L) + 1L
+                marginPresenceCache.put(s.pageIndex, presence)
+            }
+            if (prevPresence != presence) {
+                marginPresenceRevision++
+            }
+        }
         s.savedWhileActive = true
         onSaved(s.pageIndex)
     }
@@ -2450,10 +3077,8 @@ class ContinuousInkController(
         val target = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(target)
         val paint = Paint(Paint.FILTER_BITMAP_FLAG)
-        // The page part of a layer: a fixed page's layer is a third wider
-        // than its page (the margin on both sides), an infinite page's layer
-        // is its page.
-        val pageFraction = if (ContinuousPageGeometry.isInfinite(pageType)) 1f else 1f / 1.5f
+        // The page part of a layer: margins match ContinuousPageGeometry.marginFor(pageType).
+        val pageFraction = PdfModeReconciliationPolicy.fitLayerPageFraction(pageType)
         val srcLeft = source.width * (1f - pageFraction) / 2f
         val srcWidth = source.width * pageFraction
         val dstLeft = width * (1f - pageFraction) / 2f
@@ -2474,9 +3099,11 @@ class ContinuousInkController(
 
     /** Writes a dirty session immediately (page switch, mode exit, dispose). */
     fun flushNow(s: ContinuousInkSession) {
+        warmSessions.remove(s.pageIndex)
         s.saveJob?.cancel()
         s.saveJob = null
-        if (!s.dirty) {
+        val hasPendingWork = s.dirty || s.pending.isNotEmpty()
+        if (!hasPendingWork) {
             if (s.savedWhileActive) {
                 // Was already saved to disk while active; keep in closingSessions briefly so
                 // page switch does not flicker before disk reload takes effect.
@@ -2485,7 +3112,7 @@ class ContinuousInkController(
                     kotlinx.coroutines.delay(120)
                     withContext(Dispatchers.Main) {
                         closingSessions.remove(s.pageIndex)
-                        if (session !== s) {
+                        if (!isWarmOrActiveSession(s)) {
                             releaseBitmaps(s)
                         }
                         revision++
@@ -2493,7 +3120,17 @@ class ContinuousInkController(
                     }
                 }
             } else {
-                if (session !== s) {
+                if (s.ready) {
+                    val presence = computeSessionMarginPresence(s)
+                    val prev = synchronized(marginPresenceLock) {
+                        pagePresenceGeneration[s.pageIndex] = (pagePresenceGeneration[s.pageIndex] ?: 0L) + 1L
+                        marginPresenceCache.put(s.pageIndex, presence)
+                    }
+                    if (prev != presence) {
+                        marginPresenceRevision++
+                    }
+                }
+                if (!isWarmOrActiveSession(s)) {
                     releaseBitmaps(s)
                 }
             }
@@ -2505,14 +3142,26 @@ class ContinuousInkController(
             // The copies of the layers and the strokes drawn into them
             // happen off the main thread: the pen must not wait for them.
             try {
-                persist(s)
-            } catch (e: OutOfMemoryError) {
-                e.printStackTrace()
-                s.dirty = true
+                s.loadJob?.join()
+            } catch (_: Exception) {}
+            if (s.pending.isNotEmpty()) {
+                withContext(Dispatchers.Main.immediate) {
+                    val queued = s.pending.toList()
+                    s.pending.clear()
+                    for (stroke in queued) commit(s, stroke, stroke.autoShapeEnabled)
+                }
+            }
+            if (s.dirty) {
+                try {
+                    persist(s)
+                } catch (e: OutOfMemoryError) {
+                    e.printStackTrace()
+                    s.dirty = true
+                }
             }
             withContext(Dispatchers.Main) {
                 closingSessions.remove(s.pageIndex)
-                if (session !== s) {
+                if (!isWarmOrActiveSession(s)) {
                     releaseBitmaps(s)
                 }
                 revision++
@@ -2521,21 +3170,82 @@ class ContinuousInkController(
         }
     }
 
-    /** Writes the current session synchronously on IO (suspends until saved). */
-    suspend fun flushCurrentSuspend() {
-        val s = session ?: return
+    private suspend fun flushOneSessionSuspend(s: ContinuousInkSession) {
         s.saveJob?.cancel()
         s.saveJob = null
-        if (!s.dirty) return
-        persist(s)
+        s.loadJob?.join()
+        s.saveJob?.cancel()
+        s.saveJob = null
+        if (s.pending.isNotEmpty()) {
+            withContext(Dispatchers.Main.immediate) {
+                val queued = s.pending.toList()
+                s.pending.clear()
+                for (stroke in queued) commit(s, stroke, stroke.autoShapeEnabled)
+            }
+        }
+        if (s.dirty) {
+            persist(s)
+        }
     }
 
-    /** Flushes and cleans up the session synchronously on IO. */
+    /** Writes all warm/current sessions synchronously on IO (suspends until saved). */
+    suspend fun flushCurrentSuspend() {
+        val all = (warmSessions.values.toList() + listOfNotNull(session)).distinct()
+        for (s in all) {
+            flushOneSessionSuspend(s)
+        }
+    }
+
+    /** Flushes and cleans up all warm/active sessions synchronously on IO. */
     suspend fun releaseSessionSuspend() {
-        val s = session ?: return
-        session = null
+        lassoClear()
+        val others = warmSessions.values.filter { it !== session }
+        for (other in others) {
+            warmSessions.remove(other.pageIndex)
+            flushOneSessionSuspend(other)
+            if (other.ready) {
+                val presence = computeSessionMarginPresence(other)
+                val prev = synchronized(marginPresenceLock) {
+                    pagePresenceGeneration[other.pageIndex] = (pagePresenceGeneration[other.pageIndex] ?: 0L) + 1L
+                    marginPresenceCache.put(other.pageIndex, presence)
+                }
+                if (prev != presence) {
+                    marginPresenceRevision++
+                }
+            }
+            releaseBitmaps(other)
+        }
+        val s = session ?: run {
+            warmSessions.clear()
+            revision++
+            onUndoRedoChanged(false, false)
+            return
+        }
         s.saveJob?.cancel()
-        s.loadJob?.cancel()
+        s.saveJob = null
+        s.loadJob?.join()
+        if (session !== s) return
+        s.saveJob?.cancel()
+        s.saveJob = null
+        if (s.pending.isNotEmpty()) {
+            withContext(Dispatchers.Main.immediate) {
+                val queued = s.pending.toList()
+                s.pending.clear()
+                for (stroke in queued) commit(s, stroke, stroke.autoShapeEnabled)
+            }
+        }
+        if (s.ready) {
+            val presence = computeSessionMarginPresence(s)
+            val prev = synchronized(marginPresenceLock) {
+                pagePresenceGeneration[s.pageIndex] = (pagePresenceGeneration[s.pageIndex] ?: 0L) + 1L
+                marginPresenceCache.put(s.pageIndex, presence)
+            }
+            if (prev != presence) {
+                marginPresenceRevision++
+            }
+        }
+        warmSessions.remove(s.pageIndex)
+        session = null
         if (s.dirty) {
             persist(s)
         }
@@ -2544,33 +3254,63 @@ class ContinuousInkController(
         onUndoRedoChanged(false, false)
     }
 
-    /** Writes the current session now (called before leaving the reader). */
+    /** Writes all warm/current sessions now (called before leaving the reader). */
     fun flushCurrent() {
-        session?.let { flushNow(it) }
+        val all = (warmSessions.values.toList() + listOfNotNull(session)).distinct()
+        session = null
+        warmSessions.clear()
+        for (s in all) {
+            flushNow(s)
+        }
     }
 
-    /** Leaves continuous mode: flush, free the layer, restore the toolbar. */
+    /** Leaves continuous mode: flush, free the layers, restore the toolbar. */
     fun releaseSession() {
-        val s = session ?: return
+        lassoClear()
+        val all = (warmSessions.values.toList() + listOfNotNull(session)).distinct()
+        warmSessions.clear()
         session = null
-        s.saveJob?.cancel()
-        s.loadJob?.cancel()
-        if (s.dirty) {
-            s.dirty = false
-            appScope.launch {
-                // The copies of the layers and the strokes drawn into them
-                // happen off the main thread.
-                try {
-                    persist(s)
-                } catch (e: OutOfMemoryError) {
-                    e.printStackTrace()
-                    s.dirty = true
+        if (all.isEmpty()) return
+        for (s in all) {
+            if (s.ready) {
+                val presence = computeSessionMarginPresence(s)
+                val prev = synchronized(marginPresenceLock) {
+                    pagePresenceGeneration[s.pageIndex] = (pagePresenceGeneration[s.pageIndex] ?: 0L) + 1L
+                    marginPresenceCache.put(s.pageIndex, presence)
                 }
-                releaseBitmaps(s)
-                onSaved(s.pageIndex)
+                if (prev != presence) {
+                    marginPresenceRevision++
+                }
             }
-        } else {
-            releaseBitmaps(s)
+            val hasPendingWork = s.dirty || s.pending.isNotEmpty()
+            s.saveJob?.cancel()
+            if (hasPendingWork) {
+                appScope.launch {
+                    try {
+                        s.loadJob?.join()
+                    } catch (_: Exception) {}
+                    if (s.pending.isNotEmpty()) {
+                        withContext(Dispatchers.Main.immediate) {
+                            val queued = s.pending.toList()
+                            s.pending.clear()
+                            for (stroke in queued) commit(s, stroke, stroke.autoShapeEnabled)
+                        }
+                    }
+                    if (s.dirty) {
+                        try {
+                            persist(s)
+                        } catch (e: OutOfMemoryError) {
+                            e.printStackTrace()
+                            s.dirty = true
+                        }
+                    }
+                    releaseBitmaps(s)
+                    onSaved(s.pageIndex)
+                }
+            } else {
+                s.loadJob?.cancel()
+                releaseBitmaps(s)
+            }
         }
         revision++
         onUndoRedoChanged(false, false)
@@ -2579,11 +3319,19 @@ class ContinuousInkController(
     /** Cancels all active loads/saves and releases sessions without saving. */
     fun discardAll() {
         cancelStroke()
+        lassoClear()
+        synchronized(marginPresenceLock) {
+            marginPresenceCache.clear()
+            globalPresenceGeneration++
+        }
+        marginPresenceRevision++
         val s = session
         session = null
+        val warm = warmSessions.values.toList()
+        warmSessions.clear()
         val closing = closingSessions.values.toList()
         closingSessions.clear()
-        val allSessions = (listOfNotNull(s) + closing).distinct()
+        val allSessions = (listOfNotNull(s) + warm + closing).distinct()
         for (sess in allSessions) {
             sess.saveJob?.cancel()
             sess.loadJob?.cancel()
@@ -2599,25 +3347,40 @@ class ContinuousInkController(
     fun dispose(appScope: CoroutineScope) {
         val s = session
         session = null
+        val warm = warmSessions.values.toList()
+        warmSessions.clear()
         val closing = closingSessions.values.toList()
         closingSessions.clear()
-        val allSessions = (listOfNotNull(s) + closing).distinct()
+        val allSessions = (listOfNotNull(s) + warm + closing).distinct()
         for (sess in allSessions) {
             sess.saveJob?.cancel()
-            sess.loadJob?.cancel()
-            if (sess.dirty) {
+            val hasPendingWork = sess.dirty || sess.pending.isNotEmpty()
+            if (hasPendingWork) {
                 appScope.launch {
                     // The copies of the layers and the strokes drawn into them
                     // happen off the main thread.
                     try {
-                        persist(sess)
-                    } catch (e: OutOfMemoryError) {
-                        e.printStackTrace()
-                        sess.dirty = true
+                        sess.loadJob?.join()
+                    } catch (_: Exception) {}
+                    if (sess.pending.isNotEmpty()) {
+                        withContext(Dispatchers.Main.immediate) {
+                            val queued = sess.pending.toList()
+                            sess.pending.clear()
+                            for (stroke in queued) commit(sess, stroke, stroke.autoShapeEnabled)
+                        }
+                    }
+                    if (sess.dirty) {
+                        try {
+                            persist(sess)
+                        } catch (e: OutOfMemoryError) {
+                            e.printStackTrace()
+                            sess.dirty = true
+                        }
                     }
                     releaseBitmaps(sess)
                 }
             } else {
+                sess.loadJob?.cancel()
                 releaseBitmaps(sess)
             }
         }
@@ -2635,6 +3398,8 @@ class ContinuousInkController(
         s.glassLayer = null
         s.opRevision = 0
         s.background = null
+        s.singlePageStrokes = null
+        s.singlePageStrokesDirty = false
         // The strokes are on disk now: the reader reloads the page from the
         // file, so the committed list must not draw them a second time.
         s.history.ops.clear()
@@ -2881,10 +3646,15 @@ class ContinuousInkController(
         val canvas = Canvas(out)
         val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
 
-        // 1. Draw vector PDF background if present
+        // 1. Draw vector PDF background & Layer1 single-page strokes if present
         if (s.isVector) {
             val bg = s.background
-            if (bg != null && !bg.isRecycled) {
+            val sp = s.singlePageStrokes
+            val drawSp = PdfModeReconciliationPolicy.shouldDrawSinglePageStrokes(
+                hasStrokes = sp != null && !sp.isRecycled,
+                baseLayerVisible = s.stack.layerAt(PageLayerStack.BASE_LAYER_INDEX)?.visible != false
+            )
+            if ((bg != null && !bg.isRecycled) || drawSp) {
                 val ratio = s.pageRatio
                 val boxR = ContinuousPageGeometry.boxRatio(s.pageType, ratio)
                 val page = ContinuousPageGeometry.pageRect(s.pageType, ratio, boxR, 1f)
@@ -2894,12 +3664,13 @@ class ContinuousInkController(
                     val destTop = (page.top - layerR.top) / layerR.height * height
                     val destWidth = page.width / layerR.width * width
                     val destHeight = page.height / layerR.height * height
-                    canvas.drawBitmap(
-                        bg,
-                        null,
-                        RectF(destLeft, destTop, destLeft + destWidth, destTop + destHeight),
-                        paint
-                    )
+                    val destRect = RectF(destLeft, destTop, destLeft + destWidth, destTop + destHeight)
+                    if (bg != null && !bg.isRecycled) {
+                        canvas.drawBitmap(bg, null, destRect, paint)
+                    }
+                    if (drawSp && sp != null && !sp.isRecycled) {
+                        canvas.drawBitmap(sp, null, destRect, paint)
+                    }
                 }
             }
         }
@@ -2993,7 +3764,7 @@ class ContinuousInkController(
             val copy = withContext(Dispatchers.IO) { composeGlassCopy(s, store) }
             s.glassPending = false
             s.glassPendingLayer = null
-            if (session === s || closingSessions.containsValue(s)) {
+            if (isWarmOrActiveSession(s) || closingSessions.containsValue(s)) {
                 if (copy != null) {
                     s.glassBitmap = copy
                     s.glassRevision = targetRev
@@ -3016,17 +3787,37 @@ class ContinuousInkController(
     }
 
     /**
-     * Makes sure the page has an ink session.
-     *
-     * The layer stack of a page lives in its session, so the layer panel
-     * needs one: without it the panel could only read the stack of the
-     * disk.
+     * Makes sure the page has an ink session without evicting other visible warm pages.
      */
     fun ensureSessionForPage(page: PageEntity, pageIndex: Int): ContinuousInkSession? {
-        val existing = session
-        if (existing != null && existing.pageIndex == pageIndex) return existing
-        if (existing != null) flushNow(existing)
-        return ensureSession(page, pageIndex, 0f, 0f, 0)
+        return ensureSession(page, pageIndex, 0f, 0f, 0, activate = true)
+    }
+
+    /**
+     * Pre-warms a visible page's session in the LRU pool without stealing [session] focus
+     * from the page the user is actively working on.
+     */
+    fun prewarmSessionForPage(page: PageEntity, pageIndex: Int): ContinuousInkSession {
+        return ensureSession(page, pageIndex, 0f, 0f, 0, activate = session == null)
+    }
+
+    /** Ensures the session for [pageIndex] exists and finishes its initial disk load. */
+    suspend fun ensureSessionReady(page: PageEntity, pageIndex: Int): ContinuousInkSession? {
+        val s = ensureSessionForPage(page, pageIndex) ?: return null
+        s.loadJob?.join()
+        return if (isWarmOrActiveSession(s) && s.ready) s else null
+    }
+
+    /** Reloads `strokes_<i>.png` into the active vector session (e.g., after Merge to base). */
+    suspend fun reloadSinglePageStrokes(pageIndex: Int) {
+        val s = getSession(pageIndex) ?: return
+        if (!s.isVector) return
+        val sp = withContext(Dispatchers.IO) { repository.loadPageStrokes(noteId, pageIndex) }
+        s.singlePageStrokes = sp
+        s.singlePageStrokesDirty = false
+        s.tilesRevision++
+        scheduleGlassCopy(s)
+        revision++
     }
 
     /**
@@ -3050,7 +3841,12 @@ class ContinuousInkController(
     fun selectLayer(pageIndex: Int, index: Int): Boolean {
         val s = getSession(pageIndex)
         if (s == null || !s.ready) return false
+        val previousIndex = s.stack.currentIndex
         if (!s.stack.select(index)) return false
+        if (previousIndex != s.stack.currentIndex) {
+            s.dirty = true
+            scheduleSave(s)
+        }
         // The glass shows the writing of the current layer: it needs the
         // copy of the new one.
         scheduleGlassCopy(s)
@@ -3069,7 +3865,11 @@ class ContinuousInkController(
         val s = getSession(pageIndex)
         if (s == null || !s.ready) return false
         if (!s.stack.setVisible(index, visible)) return false
+        if (!visible && lassoPageIndex == pageIndex && lassoOps.any { it.layer.index == index }) {
+            lassoClear()
+        }
         s.dirty = true
+        s.invalidateMarginPresence()
         scheduleSave(s)
         revision++
         layersRevision++
@@ -3087,8 +3887,12 @@ class ContinuousInkController(
         if (s == null || !s.ready) return false
         if (index == PageLayerStack.BASE_LAYER_INDEX) return false
         val layer = s.stack.layerAt(index) ?: return false
+        if (lassoPageIndex == pageIndex && lassoOps.any { it.layer.index == index }) {
+            lassoClear()
+        }
         s.history.commitRemoveLayer(layer, merged = false)
         s.dirty = true
+        s.invalidateMarginPresence()
         scheduleSave(s)
         scheduleGlassCopy(s)
         revision++
@@ -3109,6 +3913,9 @@ class ContinuousInkController(
         if (index == PageLayerStack.BASE_LAYER_INDEX) return false
         val layer = s.stack.layerAt(index) ?: return false
         val base = s.stack.layerAt(PageLayerStack.BASE_LAYER_INDEX) ?: return false
+        if (lassoPageIndex == pageIndex && lassoOps.any { it.layer.index == index }) {
+            lassoClear()
+        }
         // The pixels of the layer become part of the base layer: the base
         // draws them as its own while the merge lasts.
         val folded = s.merged.getOrPut(base) { mutableListOf() }
@@ -3118,6 +3925,7 @@ class ContinuousInkController(
         // The writing of the layer is part of the base layer now: the tiles
         // of the base layer changed.
         s.tilesRevision++
+        s.invalidateMarginPresence()
         scheduleSave(s)
         scheduleGlassCopy(s)
         revision++
@@ -3383,24 +4191,51 @@ class ContinuousInkController(
                 is InkOp.Erase -> drawStroke(canvas, op.stroke, 2160f, 2160f, preview = false)
             }
         }
+        val liveEraser = liveEraserStroke(pageIndex, layer)
+        if (liveEraser != null) {
+            drawStroke(canvas, liveEraser, 2160f, 2160f, preview = false)
+        }
+    }
+
+    private val eraserCursorPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        color = 0xAA334155.toInt()
+    }
+    private val eraserCursorFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = 0x20FFFFFF
+    }
+
+    private fun drawEraserCursor(canvas: Canvas, stroke: ContinuousStroke, w: Float, h: Float, invScale: Float) {
+        if (stroke.points.isEmpty()) return
+        val cx = stroke.endX * w
+        val cy = stroke.endY * h
+        val radius = (stroke.baseWidthNorm * w * 0.5f).coerceAtLeast(4f * invScale)
+        eraserCursorPaint.strokeWidth = (1.8f * invScale).coerceAtLeast(1f)
+        canvas.drawCircle(cx, cy, radius, eraserCursorFillPaint)
+        canvas.drawCircle(cx, cy, radius, eraserCursorPaint)
     }
 
     /**
      * Draws the live uncommitted preview stroke on the infinite canvas.
      */
     fun drawPreviewInfinite(canvas: Canvas, pageIndex: Int, scale: Float = 1f) {
-        drawLassoOverlay(canvas, scale)
+        drawLassoOverlay(canvas, scale, pageIndex, 2160f, 2160f)
         if (laserPageIndex == pageIndex) {
             val comp = if (scale > 0f) 1f / scale else 1f
             drawLaser(canvas, 2160f, 2160f, comp)
         }
-        val s = session ?: return
-        if (s.pageIndex != pageIndex) return
+        val s = getSession(pageIndex) ?: return
         val stroke = s.live ?: return
-        drawStroke(canvas, stroke, 2160f, 2160f, preview = true)
+        if (stroke.tool == CanvasTool.ERASER) {
+            val inv = if (scale > 0f) 1f / scale else 1f
+            drawEraserCursor(canvas, stroke, 2160f, 2160f, inv)
+        } else {
+            drawStroke(canvas, stroke, 2160f, 2160f, preview = true)
+        }
     }
 
-    // ---- Infinite canvas lasso & arrow selection (freehand strokes) -----------------
+    // ---- Continuous lasso & arrow selection (freehand strokes) -----------------
 
     private var lassoOps: List<InkOp.Stroke> = emptyList()
     private var lassoPoly: List<Pair<Float, Float>> = emptyList()
@@ -3408,8 +4243,73 @@ class ContinuousInkController(
     private var lassoMoveDy = 0f
     private var lassoTransformBefore: List<Triple<InkOp.Stroke, List<InkPoint>, Path?>>? = null
 
+    /** Page index owning the active lasso loop or selection (-1 when inactive). */
+    var lassoPageIndex by mutableIntStateOf(-1)
+        private set
+
     /** Bumped whenever the lasso path, selection or selected strokes change. */
     var lassoRevision by mutableIntStateOf(0)
+
+    private data class LassoDims(
+        val boxW: Float,
+        val boxH: Float,
+        val boxRatio: Float,
+        val margin: Float,
+        val clampToBounds: Boolean
+    )
+
+    private fun resolveLassoDimensions(
+        s: ContinuousInkSession?,
+        boxWidth: Float = 0f,
+        boxHeight: Float = 0f
+    ): LassoDims {
+        val type = s?.pageType ?: pageType
+        if (type == "infinite") {
+            return LassoDims(2160f, 2160f, 1f, 1f, clampToBounds = false)
+        }
+        val ratio = ContinuousPageGeometry.boxRatio(
+            type,
+            s?.pageRatio ?: ContinuousPageGeometry.defaultRatio(type)
+        )
+        val resolvedW: Float
+        val resolvedH: Float
+        if (boxWidth.isFinite() && boxHeight.isFinite() && boxWidth > 0f && boxHeight > 0f) {
+            resolvedW = boxWidth
+            resolvedH = boxHeight
+        } else if (s != null && s.boxWidth.isFinite() && s.boxHeight.isFinite() && s.boxWidth > 0f && s.boxHeight > 0f) {
+            resolvedW = s.boxWidth
+            resolvedH = s.boxHeight
+        } else {
+            resolvedW = ContinuousPageGeometry.PAGE_WIDTH.toFloat()
+            resolvedH = ContinuousPageGeometry.PAGE_WIDTH / ratio
+        }
+        val actualRatio = ContinuousStrokeTransformMath.safeBoxRatio(resolvedW / resolvedH, ratio)
+        return LassoDims(
+            boxW = resolvedW,
+            boxH = resolvedH,
+            boxRatio = actualRatio,
+            margin = ContinuousPageGeometry.marginFor(type),
+            clampToBounds = true
+        )
+    }
+
+    private fun shapePivotToLayer(
+        s: ContinuousInkSession?,
+        xNorm: Float,
+        yNorm: Float
+    ): Pair<Float, Float> {
+        if (s == null || s.pageType == "infinite") {
+            return (xNorm * 2160f) to (yNorm * 2160f)
+        }
+        val lp = ContinuousPageGeometry.layerPoint(
+            s.layerRectInBox,
+            xNorm,
+            yNorm,
+            s.inkWidth,
+            s.inkHeight
+        )
+        return lp.x to lp.y
+    }
 
     private val lassoPathPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
@@ -3434,6 +4334,10 @@ class ContinuousInkController(
     private val lassoCopyHandlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
         color = 0xFFEA580C.toInt()
+    }
+    private val lassoScaleHandlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = 0xFF7C3AED.toInt()
     }
     private val lassoWhiteFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
@@ -3466,7 +4370,12 @@ class ContinuousInkController(
         }
     }
 
-    private fun translateStroke(op: InkOp.Stroke, dxNorm: Float, dyNorm: Float) {
+    private fun translateStroke(
+        op: InkOp.Stroke,
+        dxNorm: Float,
+        dyNorm: Float,
+        s: ContinuousInkSession? = null
+    ) {
         val st = op.stroke
         for (i in st.points.indices) {
             val p = st.points[i]
@@ -3474,31 +4383,46 @@ class ContinuousInkController(
         }
         st.cachedCount = -1
         st.boundsCount = -1
-        op.shape?.offset(dxNorm * 2160f, dyNorm * 2160f)
-    }
-
-    private fun pointInPolygon(x: Float, y: Float, poly: List<Pair<Float, Float>>): Boolean {
-        var inside = false
-        var j = poly.size - 1
-        for (i in poly.indices) {
-            val (xi, yi) = poly[i]
-            val (xj, yj) = poly[j]
-            if ((yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) inside = !inside
-            j = i
+        if (s == null || s.pageType == "infinite") {
+            op.shape?.offset(dxNorm * 2160f, dyNorm * 2160f)
+        } else {
+            val rect = s.layerRectInBox
+            if (!rect.empty && s.inkWidth > 0 && s.inkHeight > 0) {
+                op.shape?.offset(
+                    dxNorm * s.inkWidth / rect.width,
+                    dyNorm * s.inkHeight / rect.height
+                )
+            }
         }
-        return inside
     }
 
     /** Shows the lasso loop while it is being drawn (world pixels, 2160 scale). */
     fun lassoUpdatePath(points: List<Pair<Float, Float>>) {
-        lassoPoly = points.toList()
+        lassoUpdatePath(session?.pageIndex ?: -1, points, 2160f, 2160f)
+    }
+
+    /** Shows the lasso loop while it is being drawn on [pageIndex] in ([boxWidth], [boxHeight]) pixels. */
+    fun lassoUpdatePath(
+        pageIndex: Int,
+        points: List<Pair<Float, Float>>,
+        boxWidth: Float = 2160f,
+        boxHeight: Float = 2160f
+    ) {
+        val dims = resolveLassoDimensions(getSession(pageIndex), boxWidth, boxHeight)
+        lassoPageIndex = pageIndex
+        lassoPoly = points.map { (x, y) -> (x / dims.boxW) to (y / dims.boxH) }
         lassoRevision++
     }
 
+    /** True while a lasso loop, move, or handle transform drag is actively in progress. */
+    var isManipulatingLasso by mutableStateOf(false)
+
     fun lassoClear() {
-        if (lassoOps.isEmpty() && lassoPoly.isEmpty()) return
+        isManipulatingLasso = false
+        if (lassoOps.isEmpty() && lassoPoly.isEmpty() && lassoPageIndex == -1 && lassoTransformBefore == null) return
         lassoOps = emptyList()
         lassoPoly = emptyList()
+        lassoPageIndex = -1
         lassoMoveDx = 0f
         lassoMoveDy = 0f
         lassoTransformBefore = null
@@ -3507,11 +4431,64 @@ class ContinuousInkController(
 
     fun hasLassoSelection(): Boolean = lassoOps.isNotEmpty()
 
+    fun hasLassoSelectionOnPage(pageIndex: Int): Boolean =
+        lassoPageIndex == pageIndex && lassoOps.isNotEmpty()
+
+    fun clearLassoIfNotOnPage(pageIndex: Int) {
+        if (lassoPageIndex != -1 && lassoPageIndex != pageIndex) {
+            lassoClear()
+        }
+    }
+
+    /** Rolls back any uncommitted in-progress transform (rotate / scale). */
+    fun cancelActiveLassoTransform() {
+        val snap = lassoTransformBefore ?: return
+        lassoTransformBefore = null
+        for ((op, beforePts, beforeShape) in snap) {
+            val st = op.stroke
+            st.points.clear()
+            beforePts.forEach { st.points.add(InkPoint(it.x, it.y, it.w, it.tilt)) }
+            st.cachedCount = -1
+            st.boundsCount = -1
+            if (beforeShape != null && op.shape != null) {
+                op.shape.set(beforeShape)
+            }
+        }
+        revision++
+        lassoRevision++
+    }
+
+    /** Cleans up or rolls back an aborted lasso loop, move, or transform gesture. */
+    fun cancelLassoGesture() {
+        isManipulatingLasso = false
+        if (lassoTransformBefore != null) {
+            cancelActiveLassoTransform()
+        }
+        if (lassoMoveDx != 0f || lassoMoveDy != 0f) {
+            val s = if (lassoPageIndex >= 0) getSession(lassoPageIndex) else null
+            lassoOps.forEach { translateStroke(it, -lassoMoveDx, -lassoMoveDy, s) }
+            lassoMoveDx = 0f
+            lassoMoveDy = 0f
+            revision++
+            lassoRevision++
+        }
+        if (lassoPoly.isNotEmpty() && lassoOps.isEmpty()) {
+            lassoPoly = emptyList()
+            lassoPageIndex = -1
+            lassoRevision++
+        }
+    }
+
     /**
      * Selects the committed strokes of [pageIndex] with at least half of their points inside
-     * the closed loop [polygon] (world pixels). Returns how many strokes were selected.
+     * the closed loop [polygon] (box pixels). Returns how many strokes were selected.
      */
-    fun lassoFinish(pageIndex: Int, polygon: List<Pair<Float, Float>>): Int {
+    fun lassoFinish(
+        pageIndex: Int,
+        polygon: List<Pair<Float, Float>>,
+        boxWidth: Float = 2160f,
+        boxHeight: Float = 2160f
+    ): Int {
         lassoPoly = emptyList()
         lassoMoveDx = 0f
         lassoMoveDy = 0f
@@ -3519,116 +4496,130 @@ class ContinuousInkController(
         val s = getSession(pageIndex)
         if (s == null || polygon.size < 3) {
             lassoOps = emptyList()
+            lassoPageIndex = -1
             lassoRevision++
             return 0
         }
-        val picked = mutableListOf<InkOp.Stroke>()
-        for (op in s.history.ops) {
-            if (op !is InkOp.Stroke || !op.layer.visible) continue
-            val pts = op.stroke.points
-            if (pts.isEmpty()) continue
-            var inside = 0
-            for (p in pts) if (pointInPolygon(p.x * 2160f, p.y * 2160f, polygon)) inside++
-            if (inside * 2 >= pts.size) picked.add(op)
-        }
+        val dims = resolveLassoDimensions(s, boxWidth, boxHeight)
+        val polyNorm = polygon.map { (x, y) -> (x / dims.boxW) to (y / dims.boxH) }
+        val visibleOps = s.history.ops.filterIsInstance<InkOp.Stroke>().filter { it.layer.visible }
+        val pickedIndices = ContinuousStrokeTransformMath.selectStrokesInLasso(
+            visibleOps.map { it.stroke },
+            polyNorm
+        )
+        val picked = pickedIndices.map { visibleOps[it] }
         lassoOps = picked
+        lassoPageIndex = if (picked.isNotEmpty()) pageIndex else -1
         lassoRevision++
         return picked.size
     }
 
     /**
-     * Selects the single closest stroke at world coordinates ([wx], [wy]) on [pageIndex],
+     * Selects the single closest stroke at box coordinates ([wx], [wy]) on [pageIndex],
      * used by the Arrow Selection tool. Returns true if a stroke was selected.
      */
-    fun selectSingleStrokeAt(pageIndex: Int, wx: Float, wy: Float, scale: Float): Boolean {
+    fun selectSingleStrokeAt(
+        pageIndex: Int,
+        wx: Float,
+        wy: Float,
+        scale: Float,
+        boxWidth: Float = 2160f,
+        boxHeight: Float = 2160f
+    ): Boolean {
         val s = getSession(pageIndex) ?: return false
-        val tol = 22f / scale.coerceAtLeast(0.1f)
-        val tolSq = tol * tol
-        var bestOp: InkOp.Stroke? = null
-        var bestDistSq = Float.MAX_VALUE
-        for (op in s.history.ops.asReversed()) {
-            if (op !is InkOp.Stroke || !op.layer.visible) continue
-            val st = op.stroke
-            st.ensureBounds()
-            if (wx < st.minX * 2160f - tol || wx > st.maxX * 2160f + tol ||
-                wy < st.minY * 2160f - tol || wy > st.maxY * 2160f + tol
-            ) {
-                continue
-            }
-            for (p in st.points) {
-                val dx = p.x * 2160f - wx
-                val dy = p.y * 2160f - wy
-                val d2 = dx * dx + dy * dy
-                if (d2 <= tolSq && d2 < bestDistSq) {
-                    bestDistSq = d2
-                    bestOp = op
-                }
-            }
-        }
+        val dims = resolveLassoDimensions(s, boxWidth, boxHeight)
+        val tapXNorm = wx / dims.boxW
+        val tapYNorm = wy / dims.boxH
+        val toleranceIso = (22f / scale.coerceAtLeast(0.1f)) / dims.boxH
+        val visibleOps = s.history.ops.filterIsInstance<InkOp.Stroke>().filter { it.layer.visible }
+        val bestIdx = ContinuousStrokeTransformMath.hitTestSingleStrokeIndex(
+            visibleOps.map { it.stroke },
+            tapXNorm,
+            tapYNorm,
+            dims.boxRatio,
+            toleranceIso
+        )
         lassoPoly = emptyList()
         lassoMoveDx = 0f
         lassoMoveDy = 0f
         lassoTransformBefore = null
+        val bestOp = if (bestIdx >= 0) visibleOps[bestIdx] else null
         lassoOps = if (bestOp != null) listOf(bestOp) else emptyList()
+        lassoPageIndex = if (bestOp != null) pageIndex else -1
         lassoRevision++
         return bestOp != null
     }
 
-    /** Bounds of the selection in world pixels (left, top, right, bottom), or null. */
-    fun lassoBounds(): android.graphics.RectF? {
+    /** Bounds of the selection in box pixels (left, top, right, bottom), or null. */
+    fun lassoBounds(
+        pageIndex: Int = lassoPageIndex,
+        boxWidth: Float = 2160f,
+        boxHeight: Float = 2160f,
+        scale: Float = 1f
+    ): android.graphics.RectF? {
         if (lassoOps.isEmpty()) return null
-        var l = Float.MAX_VALUE
-        var t = Float.MAX_VALUE
-        var r = -Float.MAX_VALUE
-        var b = -Float.MAX_VALUE
-        for (op in lassoOps) {
-            val st = op.stroke
-            st.ensureBounds()
-            if (st.minX * 2160f < l) l = st.minX * 2160f
-            if (st.minY * 2160f < t) t = st.minY * 2160f
-            if (st.maxX * 2160f > r) r = st.maxX * 2160f
-            if (st.maxY * 2160f > b) b = st.maxY * 2160f
-        }
-        return android.graphics.RectF(l, t, r, b)
+        if (pageIndex != -1 && lassoPageIndex != -1 && lassoPageIndex != pageIndex) return null
+        val activePage = if (pageIndex != -1) pageIndex else lassoPageIndex
+        val s = if (activePage >= 0) getSession(activePage) else session
+        val dims = resolveLassoDimensions(s, boxWidth, boxHeight)
+        val rawNorm = ContinuousStrokeTransformMath.selectionBounds(
+            lassoOps.map { it.stroke },
+            dims.boxRatio
+        ) ?: return null
+        val norm = ContinuousStrokeTransformMath.expandBoundsForHandles(
+            rawNorm,
+            dims.boxRatio,
+            dims.boxH,
+            scale
+        )
+        return android.graphics.RectF(
+            norm.left * dims.boxW,
+            norm.top * dims.boxH,
+            norm.right * dims.boxW,
+            norm.bottom * dims.boxH
+        )
     }
 
-    fun lassoContains(wx: Float, wy: Float): Boolean = lassoBounds()?.contains(wx, wy) == true
+    fun lassoContains(
+        wx: Float,
+        wy: Float,
+        pageIndex: Int = lassoPageIndex,
+        boxWidth: Float = 2160f,
+        boxHeight: Float = 2160f
+    ): Boolean = lassoBounds(pageIndex, boxWidth, boxHeight)?.contains(wx, wy) == true
 
-    private fun mirrorHandlePos(b: android.graphics.RectF, scale: Float): Pair<Float, Float> {
-        val inv = 1f / scale.coerceAtLeast(0.1f)
-        val gap = (LASSO_HANDLE_RADIUS_PX * 2.4f) * inv
-        val mx = (b.left + gap).coerceAtMost(b.centerX().coerceAtLeast(b.left + gap * 0.5f))
-        return mx to b.top
-    }
+    fun hitTestLassoHandle(wx: Float, wy: Float, scale: Float): LassoHandle =
+        hitTestLassoHandle(lassoPageIndex, wx, wy, 2160f, 2160f, scale)
 
-    internal fun hitTestLassoHandle(wx: Float, wy: Float, scale: Float): LassoHandle {
-        val b = lassoBounds() ?: return LassoHandle.NONE
-        val inv = 1f / scale.coerceAtLeast(0.1f)
-        val hitR = LASSO_HANDLE_RADIUS_PX * 1.8f * inv
-        val hitR2 = hitR * hitR
-        fun near(hx: Float, hy: Float): Boolean {
-            val dx = wx - hx
-            val dy = wy - hy
-            return dx * dx + dy * dy <= hitR2
-        }
-        // Corner 2: Top-Right -> Cut / Delete
-        if (near(b.right, b.top)) return LassoHandle.DELETE
-        // Corner 1: Top-Left -> Rotate
-        if (near(b.left, b.top)) return LassoHandle.ROTATE
-        // Beside Rotate -> Mirror
-        val (mx, my) = mirrorHandlePos(b, scale)
-        if (near(mx, my)) return LassoHandle.MIRROR
-        // Corner 3: Bottom-Left -> Copy (tap & drag)
-        if (near(b.left, b.bottom)) return LassoHandle.COPY
-        // Corner 4: Bottom-Right -> Free 1:1 Scale
-        if (near(b.right, b.bottom)) return LassoHandle.SCALE_CORNER_BR
-        // Edge midpoints -> single-axis stretch/squeeze
-        if (near(b.left, b.centerY())) return LassoHandle.SCALE_LEFT
-        if (near(b.right, b.centerY())) return LassoHandle.SCALE_RIGHT
-        if (near(b.centerX(), b.top)) return LassoHandle.SCALE_TOP
-        if (near(b.centerX(), b.bottom)) return LassoHandle.SCALE_BOTTOM
-        if (b.contains(wx, wy)) return LassoHandle.MOVE
-        return LassoHandle.NONE
+    fun hitTestLassoHandle(
+        pageIndex: Int,
+        wx: Float,
+        wy: Float,
+        boxWidth: Float,
+        boxHeight: Float,
+        scale: Float
+    ): LassoHandle {
+        if (lassoOps.isEmpty() || lassoPageIndex != pageIndex) return LassoHandle.NONE
+        val s = getSession(pageIndex)
+        val dims = resolveLassoDimensions(s, boxWidth, boxHeight)
+        val rawBounds = ContinuousStrokeTransformMath.selectionBounds(
+            lassoOps.map { it.stroke },
+            dims.boxRatio
+        ) ?: return LassoHandle.NONE
+        val bounds = ContinuousStrokeTransformMath.expandBoundsForHandles(
+            rawBounds,
+            dims.boxRatio,
+            dims.boxH,
+            scale
+        )
+        return ContinuousStrokeTransformMath.hitTestHandle(
+            bounds = bounds,
+            tapXNorm = wx / dims.boxW,
+            tapYNorm = wy / dims.boxH,
+            boxRatio = dims.boxRatio,
+            boxHeightPx = dims.boxH,
+            scale = scale
+        )
     }
 
     /** Captures before-snapshots for a non-translation transform (rotate / scale). */
@@ -3643,26 +4634,37 @@ class ContinuousInkController(
         }
     }
 
-    /** Rotates selected strokes by [deltaRad] around ([pivotX], [pivotY]) in world px. */
-    fun lassoRotateTo(pageIndex: Int, deltaRad: Float, pivotX: Float, pivotY: Float) {
+    /** Rotates selected strokes by [deltaRad] around ([pivotX], [pivotY]) in box px. */
+    fun lassoRotateTo(
+        pageIndex: Int,
+        deltaRad: Float,
+        pivotX: Float,
+        pivotY: Float,
+        boxWidth: Float = 2160f,
+        boxHeight: Float = 2160f
+    ) {
         val snap = lassoTransformBefore ?: return
-        val cos = kotlin.math.cos(deltaRad.toDouble()).toFloat()
-        val sin = kotlin.math.sin(deltaRad.toDouble()).toFloat()
-        val pxNorm = pivotX / 2160f
-        val pyNorm = pivotY / 2160f
+        val s = getSession(pageIndex)
+        val dims = resolveLassoDimensions(s, boxWidth, boxHeight)
+        val pxNorm = pivotX / dims.boxW
+        val pyNorm = pivotY / dims.boxH
+        val (shapePivotX, shapePivotY) = shapePivotToLayer(s, pxNorm, pyNorm)
         val matrix = android.graphics.Matrix().apply {
-            setRotate(Math.toDegrees(deltaRad.toDouble()).toFloat(), pivotX, pivotY)
+            setRotate(Math.toDegrees(deltaRad.toDouble()).toFloat(), shapePivotX, shapePivotY)
         }
         for ((op, beforePts, beforeShape) in snap) {
+            val rotated = ContinuousStrokeTransformMath.rotatePoints(
+                points = beforePts,
+                deltaRad = deltaRad,
+                pivotXNorm = pxNorm,
+                pivotYNorm = pyNorm,
+                boxRatio = dims.boxRatio,
+                margin = dims.margin,
+                clampToBounds = dims.clampToBounds
+            )
             val st = op.stroke
             st.points.clear()
-            for (p in beforePts) {
-                val dx = p.x - pxNorm
-                val dy = p.y - pyNorm
-                val rx = pxNorm + dx * cos - dy * sin
-                val ry = pyNorm + dx * sin + dy * cos
-                st.points.add(InkPoint(rx, ry, p.w, p.tilt))
-            }
+            st.points.addAll(rotated)
             st.cachedCount = -1
             st.boundsCount = -1
             if (beforeShape != null && op.shape != null) {
@@ -3670,29 +4672,54 @@ class ContinuousInkController(
                 op.shape.transform(matrix)
             }
         }
-        getSession(pageIndex)?.let { it.opRevision++ }
+        s?.let {
+            it.opRevision++
+            it.invalidateMarginPresence()
+        }
         revision++
         lassoRevision++
     }
 
-    /** Scales selected strokes around ([anchorX], [anchorY]) in world px. */
-    fun lassoScaleTo(pageIndex: Int, scaleX: Float, scaleY: Float, anchorX: Float, anchorY: Float) {
+    /** Scales selected strokes around ([anchorX], [anchorY]) in box px. */
+    fun lassoScaleTo(
+        pageIndex: Int,
+        scaleX: Float,
+        scaleY: Float,
+        anchorX: Float,
+        anchorY: Float,
+        boxWidth: Float = 2160f,
+        boxHeight: Float = 2160f
+    ) {
         val snap = lassoTransformBefore ?: return
-        val sx = scaleX.coerceIn(0.15f, 8.0f)
-        val sy = scaleY.coerceIn(0.15f, 8.0f)
-        val axNorm = anchorX / 2160f
-        val ayNorm = anchorY / 2160f
+        val s = getSession(pageIndex)
+        val dims = resolveLassoDimensions(s, boxWidth, boxHeight)
+        val sx = scaleX.coerceIn(
+            ContinuousStrokeTransformMath.DEFAULT_MIN_SCALE,
+            ContinuousStrokeTransformMath.DEFAULT_MAX_SCALE
+        )
+        val sy = scaleY.coerceIn(
+            ContinuousStrokeTransformMath.DEFAULT_MIN_SCALE,
+            ContinuousStrokeTransformMath.DEFAULT_MAX_SCALE
+        )
+        val axNorm = anchorX / dims.boxW
+        val ayNorm = anchorY / dims.boxH
+        val (shapeAnchorX, shapeAnchorY) = shapePivotToLayer(s, axNorm, ayNorm)
         val matrix = android.graphics.Matrix().apply {
-            setScale(sx, sy, anchorX, anchorY)
+            setScale(sx, sy, shapeAnchorX, shapeAnchorY)
         }
         for ((op, beforePts, beforeShape) in snap) {
+            val scaled = ContinuousStrokeTransformMath.scalePoints(
+                points = beforePts,
+                scaleX = sx,
+                scaleY = sy,
+                anchorXNorm = axNorm,
+                anchorYNorm = ayNorm,
+                margin = dims.margin,
+                clampToBounds = dims.clampToBounds
+            )
             val st = op.stroke
             st.points.clear()
-            for (p in beforePts) {
-                val nx = axNorm + (p.x - axNorm) * sx
-                val ny = ayNorm + (p.y - ayNorm) * sy
-                st.points.add(InkPoint(nx, ny, p.w, p.tilt))
-            }
+            st.points.addAll(scaled)
             st.cachedCount = -1
             st.boundsCount = -1
             if (beforeShape != null && op.shape != null) {
@@ -3700,7 +4727,10 @@ class ContinuousInkController(
                 op.shape.transform(matrix)
             }
         }
-        getSession(pageIndex)?.let { it.opRevision++ }
+        s?.let {
+            it.opRevision++
+            it.invalidateMarginPresence()
+        }
         revision++
         lassoRevision++
     }
@@ -3722,6 +4752,8 @@ class ContinuousInkController(
         s.history.commitTransform(records)
         s.dirty = true
         s.opRevision++
+        s.invalidateMarginPresence()
+        scheduleGlassCopy(s)
         scheduleSave(s)
         revision++
         lassoRevision++
@@ -3729,20 +4761,33 @@ class ContinuousInkController(
     }
 
     /** Mirrors the selected strokes horizontally across their bounding-box center X. */
-    fun lassoMirrorHorizontal(pageIndex: Int): Boolean {
-        val b = lassoBounds() ?: return false
+    fun lassoMirrorHorizontal(
+        pageIndex: Int,
+        boxWidth: Float = 2160f,
+        boxHeight: Float = 2160f
+    ): Boolean {
         val s = getSession(pageIndex) ?: return false
-        val cx = b.centerX()
-        val cxNorm = cx / 2160f
-        val matrix = android.graphics.Matrix().apply { setScale(-1f, 1f, cx, b.centerY()) }
+        if (lassoOps.isEmpty() || lassoPageIndex != pageIndex) return false
+        val dims = resolveLassoDimensions(s, boxWidth, boxHeight)
+        val normBounds = ContinuousStrokeTransformMath.selectionBounds(
+            lassoOps.map { it.stroke },
+            dims.boxRatio
+        ) ?: return false
+        val cxNorm = normBounds.centerX
+        val (shapeCx, shapeCy) = shapePivotToLayer(s, cxNorm, normBounds.centerY)
+        val matrix = android.graphics.Matrix().apply { setScale(-1f, 1f, shapeCx, shapeCy) }
         val records = lassoOps.map { op ->
             val beforePts = op.stroke.points.map { InkPoint(it.x, it.y, it.w, it.tilt) }
             val beforeShape = op.shape?.let { Path(it) }
+            val mirrored = ContinuousStrokeTransformMath.mirrorHorizontalPoints(
+                points = beforePts,
+                centerXNorm = cxNorm,
+                margin = dims.margin,
+                clampToBounds = dims.clampToBounds
+            )
             val st = op.stroke
-            for (i in st.points.indices) {
-                val p = st.points[i]
-                st.points[i] = InkPoint(2f * cxNorm - p.x, p.y, p.w, p.tilt)
-            }
+            st.points.clear()
+            st.points.addAll(mirrored)
             st.cachedCount = -1
             st.boundsCount = -1
             op.shape?.transform(matrix)
@@ -3757,6 +4802,8 @@ class ContinuousInkController(
         s.history.commitTransform(records)
         s.dirty = true
         s.opRevision++
+        s.invalidateMarginPresence()
+        scheduleGlassCopy(s)
         scheduleSave(s)
         revision++
         lassoRevision++
@@ -3770,7 +4817,7 @@ class ContinuousInkController(
      */
     fun lassoStartCopy(pageIndex: Int): Boolean {
         val s = getSession(pageIndex) ?: return false
-        if (lassoOps.isEmpty()) return false
+        if (lassoOps.isEmpty() || lassoPageIndex != pageIndex) return false
         val copies = lassoOps.map { src ->
             val st = ContinuousStroke(
                 tool = src.stroke.tool,
@@ -3784,10 +4831,13 @@ class ContinuousInkController(
         s.history.ops.addAll(copies)
         s.history.commitAddBatch(copies)
         lassoOps = copies
+        lassoPageIndex = pageIndex
         lassoMoveDx = 0f
         lassoMoveDy = 0f
         s.dirty = true
         s.opRevision++
+        s.invalidateMarginPresence()
+        scheduleGlassCopy(s)
         scheduleSave(s)
         revision++
         lassoRevision++
@@ -3795,15 +4845,37 @@ class ContinuousInkController(
         return true
     }
 
-    /** Moves the selected strokes live by a world-pixel delta; [lassoCommitMove] makes it undoable. */
-    fun lassoMove(pageIndex: Int, dxWorld: Float, dyWorld: Float) {
-        if (lassoOps.isEmpty()) return
-        val dx = dxWorld / 2160f
-        val dy = dyWorld / 2160f
-        lassoOps.forEach { translateStroke(it, dx, dy) }
+    /** Moves the selected strokes live by a box-pixel delta; [lassoCommitMove] makes it undoable. */
+    fun lassoMove(
+        pageIndex: Int,
+        dxWorld: Float,
+        dyWorld: Float,
+        boxWidth: Float = 2160f,
+        boxHeight: Float = 2160f
+    ) {
+        if (lassoOps.isEmpty() || lassoPageIndex != pageIndex) return
+        val s = getSession(pageIndex)
+        val dims = resolveLassoDimensions(s, boxWidth, boxHeight)
+        val rawDx = dxWorld / dims.boxW
+        val rawDy = dyWorld / dims.boxH
+        val (dx, dy) = if (dims.clampToBounds) {
+            val pb = ContinuousStrokeTransformMath.pointsBounds(lassoOps.map { it.stroke })
+            if (pb != null) {
+                ContinuousStrokeTransformMath.clampTranslationDelta(pb, rawDx, rawDy, dims.margin)
+            } else {
+                rawDx to rawDy
+            }
+        } else {
+            rawDx to rawDy
+        }
+        if (dx == 0f && dy == 0f) return
+        lassoOps.forEach { translateStroke(it, dx, dy, s) }
         lassoMoveDx += dx
         lassoMoveDy += dy
-        getSession(pageIndex)?.let { it.opRevision++ }
+        s?.let {
+            it.opRevision++
+            it.invalidateMarginPresence()
+        }
         revision++
         lassoRevision++
     }
@@ -3816,6 +4888,8 @@ class ContinuousInkController(
         lassoMoveDy = 0f
         s.dirty = true
         s.opRevision++
+        s.invalidateMarginPresence()
+        scheduleGlassCopy(s)
         scheduleSave(s)
         revision++
         onUndoRedoChanged(s.canUndo, s.canRedo)
@@ -3824,17 +4898,20 @@ class ContinuousInkController(
     /** Deletes the selected strokes, with undo. */
     fun lassoDelete(pageIndex: Int): Boolean {
         val s = getSession(pageIndex) ?: return false
-        if (lassoOps.isEmpty()) return false
+        if (lassoOps.isEmpty() || lassoPageIndex != pageIndex) return false
         val removed = mutableListOf<OpEntry>()
         s.history.ops.forEachIndexed { idx, op ->
             if (lassoOps.any { it === op }) removed.add(OpEntry(idx, op))
         }
         lassoOps = emptyList()
+        lassoPageIndex = -1
         lassoRevision++
         if (removed.isEmpty()) return false
         s.history.commitClear(emptyList(), removed)
         s.dirty = true
         s.opRevision++
+        s.invalidateMarginPresence()
+        scheduleGlassCopy(s)
         scheduleSave(s)
         revision++
         onUndoRedoChanged(s.canUndo, s.canRedo)
@@ -3845,20 +4922,53 @@ class ContinuousInkController(
      * Draws the lasso loop, the selection frame, edge resize pills, Corner 4 (free 1:1 scale),
      * Corner 1 (Rotate), Mirror beside Rotate, Corner 2 (Cut), and Corner 3 (Copy).
      */
-    fun drawLassoOverlay(canvas: Canvas, scale: Float) {
+    fun drawLassoOverlay(
+        canvas: Canvas,
+        scale: Float,
+        pageIndex: Int = lassoPageIndex,
+        boxWidth: Float = 2160f,
+        boxHeight: Float = 2160f
+    ) {
+        if (pageIndex != -1 && lassoPageIndex != pageIndex) return
+        val s = if (lassoPageIndex >= 0) getSession(lassoPageIndex) else session
+        val dims = resolveLassoDimensions(s, boxWidth, boxHeight)
         val inv = if (scale > 0f) 1f / scale else 1f
         val poly = lassoPoly
         if (poly.size > 1) {
             val path = Path()
-            path.moveTo(poly[0].first, poly[0].second)
-            for (i in 1 until poly.size) path.lineTo(poly[i].first, poly[i].second)
+            path.moveTo(poly[0].first * dims.boxW, poly[0].second * dims.boxH)
+            for (i in 1 until poly.size) {
+                path.lineTo(poly[i].first * dims.boxW, poly[i].second * dims.boxH)
+            }
             lassoPathPaint.strokeWidth = 3f * inv
             lassoPathPaint.pathEffect = android.graphics.DashPathEffect(floatArrayOf(14f * inv, 10f * inv), 0f)
             canvas.drawPath(path, lassoPathPaint)
             path.close()
             canvas.drawPath(path, lassoFillPaint2)
         }
-        val b = lassoBounds() ?: return
+        if (lassoOps.isEmpty()) return
+        val rawNormBounds = ContinuousStrokeTransformMath.selectionBounds(
+            lassoOps.map { it.stroke },
+            dims.boxRatio
+        ) ?: return
+        val normBounds = ContinuousStrokeTransformMath.expandBoundsForHandles(
+            rawNormBounds,
+            dims.boxRatio,
+            dims.boxH,
+            scale
+        )
+        val layout = ContinuousStrokeTransformMath.computeHandleLayout(
+            bounds = normBounds,
+            boxRatio = dims.boxRatio,
+            boxHeightPx = dims.boxH,
+            scale = scale
+        )
+        val b = android.graphics.RectF(
+            normBounds.left * dims.boxW,
+            normBounds.top * dims.boxH,
+            normBounds.right * dims.boxW,
+            normBounds.bottom * dims.boxH
+        )
         lassoPathPaint.strokeWidth = 3f * inv
         lassoPathPaint.pathEffect = android.graphics.DashPathEffect(floatArrayOf(14f * inv, 10f * inv), 0f)
         canvas.drawRect(b, lassoPathPaint)
@@ -3878,24 +4988,32 @@ class ContinuousInkController(
             canvas.drawRoundRect(rect, pillShort, pillShort, lassoWhiteFillPaint)
             canvas.drawRoundRect(rect, pillShort, pillShort, lassoBorderPaint)
         }
-        drawPill(b.centerX(), b.top, true)
-        drawPill(b.centerX(), b.bottom, true)
-        drawPill(b.left, b.centerY(), false)
-        drawPill(b.right, b.centerY(), false)
+        drawPill(layout.scaleTop.first * dims.boxW, layout.scaleTop.second * dims.boxH, true)
+        drawPill(layout.scaleBottom.first * dims.boxW, layout.scaleBottom.second * dims.boxH, true)
+        drawPill(layout.scaleLeft.first * dims.boxW, layout.scaleLeft.second * dims.boxH, false)
+        drawPill(layout.scaleRight.first * dims.boxW, layout.scaleRight.second * dims.boxH, false)
 
-        // Corner 4 (Bottom-Right): free 1:1 proportional scale handle
-        val c4r = r * 0.65f
-        canvas.drawCircle(b.right, b.bottom, c4r, lassoWhiteFillPaint)
-        canvas.drawCircle(b.right, b.bottom, c4r, lassoBorderPaint)
+        // Corner 4 (Bottom-Right): full-size free 1:1 proportional scale handle with diagonal arrows
+        val c4x = layout.scaleCornerBR.first * dims.boxW
+        val c4y = layout.scaleCornerBR.second * dims.boxH
+        canvas.drawCircle(c4x, c4y, r, lassoScaleHandlePaint)
+        canvas.drawLine(c4x - k, c4y - k, c4x + k, c4y + k, lassoCrossPaint)
+        canvas.drawLine(c4x - k, c4y - k, c4x - k * 0.25f, c4y - k, lassoCrossPaint)
+        canvas.drawLine(c4x - k, c4y - k, c4x - k, c4y - k * 0.25f, lassoCrossPaint)
+        canvas.drawLine(c4x + k, c4y + k, c4x + k * 0.25f, c4y + k, lassoCrossPaint)
+        canvas.drawLine(c4x + k, c4y + k, c4x + k, c4y + k * 0.25f, lassoCrossPaint)
 
         // Corner 1 (Top-Left): Rotate handle
-        canvas.drawCircle(b.left, b.top, r, lassoRotateHandlePaint)
-        val arc = android.graphics.RectF(b.left - k, b.top - k, b.left + k, b.top + k)
+        val rx = layout.rotateCenter.first * dims.boxW
+        val ry = layout.rotateCenter.second * dims.boxH
+        canvas.drawCircle(rx, ry, r, lassoRotateHandlePaint)
+        val arc = android.graphics.RectF(rx - k, ry - k, rx + k, ry + k)
         canvas.drawArc(arc, -40f, 260f, false, lassoCrossPaint)
-        canvas.drawLine(b.left + k * 0.55f, b.top - k * 0.85f, b.left + k * 0.95f, b.top - k * 0.25f, lassoCrossPaint)
+        canvas.drawLine(rx + k * 0.55f, ry - k * 0.85f, rx + k * 0.95f, ry - k * 0.25f, lassoCrossPaint)
 
         // Beside Rotate: Mirror horizontal flip button
-        val (mx, my) = mirrorHandlePos(b, scale)
+        val mx = layout.mirrorCenter.first * dims.boxW
+        val my = layout.mirrorCenter.second * dims.boxH
         canvas.drawCircle(mx, my, r, lassoMirrorHandlePaint)
         canvas.drawLine(mx - k, my, mx + k, my, lassoCrossPaint)
         canvas.drawLine(mx - k, my, mx - k * 0.45f, my - k * 0.45f, lassoCrossPaint)
@@ -3904,14 +5022,31 @@ class ContinuousInkController(
         canvas.drawLine(mx + k, my, mx + k * 0.45f, my + k * 0.45f, lassoCrossPaint)
 
         // Corner 2 (Top-Right): Cut / Delete (X)
-        canvas.drawCircle(b.right, b.top, r, lassoHandlePaint)
-        canvas.drawLine(b.right - k, b.top - k, b.right + k, b.top + k, lassoCrossPaint)
-        canvas.drawLine(b.right - k, b.top + k, b.right + k, b.top - k, lassoCrossPaint)
+        val dx = layout.deleteCenter.first * dims.boxW
+        val dy = layout.deleteCenter.second * dims.boxH
+        canvas.drawCircle(dx, dy, r, lassoHandlePaint)
+        canvas.drawLine(dx - k, dy - k, dx + k, dy + k, lassoCrossPaint)
+        canvas.drawLine(dx - k, dy + k, dx + k, dy - k, lassoCrossPaint)
 
         // Corner 3 (Bottom-Left): Copy (+)
-        canvas.drawCircle(b.left, b.bottom, r, lassoCopyHandlePaint)
-        canvas.drawLine(b.left - k * 0.85f, b.bottom, b.left + k * 0.85f, b.bottom, lassoCrossPaint)
-        canvas.drawLine(b.left, b.bottom - k * 0.85f, b.left, b.bottom + k * 0.85f, lassoCrossPaint)
+        val cxCopy = layout.copyCenter.first * dims.boxW
+        val cyCopy = layout.copyCenter.second * dims.boxH
+        canvas.drawCircle(cxCopy, cyCopy, r, lassoCopyHandlePaint)
+        canvas.drawLine(cxCopy - k * 0.85f, cyCopy, cxCopy + k * 0.85f, cyCopy, lassoCrossPaint)
+        canvas.drawLine(cxCopy, cyCopy - k * 0.85f, cxCopy, cyCopy + k * 0.85f, lassoCrossPaint)
+    }
+
+    /** Draws the active lasso loop / selection overlay for [pageIndex] in view coordinates. */
+    fun drawLassoOverlayForPage(
+        canvas: Canvas,
+        pageIndex: Int,
+        viewWidth: Float,
+        viewHeight: Float,
+        scale: Float = 1f
+    ) {
+        if (lassoPageIndex != pageIndex) return
+        if (viewWidth <= 0f || viewHeight <= 0f) return
+        drawLassoOverlay(canvas, scale, pageIndex, viewWidth, viewHeight)
     }
 
     /**
@@ -3921,6 +5056,9 @@ class ContinuousInkController(
     fun clearCurrentLayer(pageIndex: Int): Boolean {
         val s = getSession(pageIndex) ?: return false
         val layer = s.stack.current ?: return false
+        if (lassoPageIndex == pageIndex && lassoOps.any { it.layer.index == layer.index }) {
+            lassoClear()
+        }
         val removed = mutableListOf<OpEntry>()
         s.history.ops.forEachIndexed { idx, op ->
             if (op.layer.index == layer.index) removed.add(OpEntry(idx, op))
@@ -3929,8 +5067,20 @@ class ContinuousInkController(
         s.history.commitClear(emptyList(), removed)
         s.dirty = true
         s.opRevision++
+        s.invalidateMarginPresence()
+        val updatedPresence = computeSessionMarginPresence(s)
+        s.memoizedMarginPresence = updatedPresence
+        val prevPresence = synchronized(marginPresenceLock) {
+            pagePresenceGeneration[pageIndex] = (pagePresenceGeneration[pageIndex] ?: 0L) + 1L
+            marginPresenceCache.put(pageIndex, updatedPresence)
+        }
+        if (prevPresence != updatedPresence) {
+            marginPresenceRevision++
+        }
         scheduleSave(s)
         revision++
+        s.memoizedMarginRev = revision
+        s.memoizedLayersRev = layersRevision
         onUndoRedoChanged(s.canUndo, s.canRedo)
         return true
     }
@@ -3963,6 +5113,10 @@ class ContinuousInkController(
                 is InkOp.Erase -> drawStroke(canvas, op.stroke, viewWidth, viewHeight, preview = false)
             }
         }
+        val liveEraser = liveEraserStroke(pageIndex, layer)
+        if (liveEraser != null) {
+            drawStroke(canvas, liveEraser, viewWidth, viewHeight, preview = false)
+        }
     }
 
     /** The committed operations of one layer of a page. */
@@ -3985,7 +5139,8 @@ class ContinuousInkController(
     suspend fun composeAllLayersForSinglePage(
         pageIndex: Int,
         targetWidth: Int,
-        targetHeight: Int
+        targetHeight: Int,
+        page: PageEntity? = null
     ): Bitmap? = withContext(Dispatchers.IO) {
         if (targetWidth <= 0 || targetHeight <= 0) return@withContext null
         val stack = layerStack(pageIndex)
@@ -3998,7 +5153,7 @@ class ContinuousInkController(
 
         val composedLayers = mutableListOf<Bitmap>()
         for (layer in visibleLayers) {
-            val bmp = composeDisplayLayer(pageIndex, layer, composeWidth)
+            val bmp = composeDisplayLayer(pageIndex, layer, composeWidth, page = page)
             if (bmp != null) composedLayers.add(bmp)
         }
         if (composedLayers.isEmpty()) return@withContext null
@@ -4007,8 +5162,7 @@ class ContinuousInkController(
         val canvas = Canvas(target)
         val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
         val dst = Rect(0, 0, targetWidth, targetHeight)
-        val leftFrac = margin / layerSpanFactor
-        val rightFrac = (margin + 1f) / layerSpanFactor
+        val (leftFrac, rightFrac) = PdfModeReconciliationPolicy.singlePageCropFractions(pageType)
         for (layerBmp in composedLayers) {
             val srcLeft = (layerBmp.width * leftFrac).roundToInt().coerceIn(0, layerBmp.width)
             val srcRight = (layerBmp.width * rightFrac).roundToInt().coerceIn(srcLeft, layerBmp.width)
@@ -4030,7 +5184,8 @@ class ContinuousInkController(
     suspend fun composeDisplayLayer(
         pageIndex: Int,
         layer: PageLayer,
-        displayWidthPx: Int
+        displayWidthPx: Int,
+        page: PageEntity? = null
     ): Bitmap? = withContext(Dispatchers.IO) {
         val metaText = try {
             val f = repository.fileStore.getAnnotationMetaFile(noteId, pageIndex)
@@ -4062,7 +5217,7 @@ class ContinuousInkController(
                 tiles = listOf(Pair(Pair(0, 0), bitmap))
             } else {
                 tiles = emptyList()
-                val ratio = rasterPageRatio(pageIndex)
+                val ratio = resolvePageRatio(pageIndex, page)
                 val size = if (tilesInfo != null && tilesInfo.width > 0 && tilesInfo.height > 0) {
                     ContinuousPageGeometry.LayerSize(tilesInfo.width, tilesInfo.height)
                 } else {
@@ -4073,7 +5228,7 @@ class ContinuousInkController(
             }
         } else {
             tiles = emptyList()
-            val ratio = rasterPageRatio(pageIndex)
+            val ratio = resolvePageRatio(pageIndex, page)
             val size = if (tilesInfo != null && tilesInfo.width > 0 && tilesInfo.height > 0) {
                 ContinuousPageGeometry.LayerSize(tilesInfo.width, tilesInfo.height)
             } else {
@@ -4147,7 +5302,11 @@ class ContinuousInkController(
                     canvas.restoreToCount(save)
                 }
             } else {
-                val ratio = rasterPageRatio(pageIndex)
+                val ratio = if (layerWidth > 0 && layerHeight > 0) {
+                    ContinuousPageGeometry.ratioOfLayer(pageType, layerWidth, layerHeight)
+                } else {
+                    resolvePageRatio(pageIndex, page)
+                }
                 val boxRatio = ContinuousPageGeometry.boxRatio(pageType, ratio)
                 val rect = ContinuousPageGeometry.layerRect(pageType, ratio, boxRatio, 1f)
                 if (!rect.empty) {
@@ -4206,7 +5365,8 @@ class ContinuousInkController(
      */
     suspend fun composeDisplayLayers(
         pageIndex: Int,
-        displayWidthPx: Int
+        displayWidthPx: Int,
+        page: PageEntity? = null
     ): Map<Int, Bitmap?> {
         val result = LinkedHashMap<Int, Bitmap?>()
         try {
@@ -4215,12 +5375,27 @@ class ContinuousInkController(
             val stack = text?.let { PageLayerMeta.decode(it) } ?: PageLayerStack.base()
             for (layer in stack.layers) {
                 if (!layer.visible) continue
-                result[layer.index] = composeDisplayLayer(pageIndex, layer, displayWidthPx)
+                result[layer.index] = composeDisplayLayer(pageIndex, layer, displayWidthPx, page = page)
             }
         } catch (e: Exception) {
             e.printStackTrace()
         }
         return result
+    }
+
+    /**
+     * Returns the live uncommitted eraser stroke on [pageIndex] when its active layer matches [layer].
+     */
+    internal fun liveEraserStroke(pageIndex: Int, layer: PageLayer): ContinuousStroke? {
+        val s = getSession(pageIndex) ?: return null
+        val live = s.live ?: return null
+        if (live.tool != CanvasTool.ERASER) return null
+        val activeIdx = s.stack.current?.index ?: PageLayerStack.BASE_LAYER_INDEX
+        return if (activeIdx == layer.index) live else null
+    }
+
+    internal fun drawLiveEraserCut(canvas: Canvas, stroke: ContinuousStroke, viewWidth: Float, viewHeight: Float) {
+        drawStroke(canvas, stroke, viewWidth, viewHeight, preview = false)
     }
 
     /**
@@ -4317,15 +5492,27 @@ class ContinuousInkController(
      * Draws the live (uncommitted) stroke into the page box. Public because the
      * reader draws it from a Compose Canvas, above the page bitmap.
      */
-    fun drawPreview(canvas: Canvas, pageIndex: Int, viewWidth: Float, viewHeight: Float) {
+    fun drawPreview(
+        canvas: Canvas,
+        pageIndex: Int,
+        viewWidth: Float,
+        viewHeight: Float,
+        includeLasso: Boolean = true
+    ) {
+        if (includeLasso) {
+            drawLassoOverlayForPage(canvas, pageIndex, viewWidth, viewHeight, scale = 1f)
+        }
         // The laser dot belongs to the page the pointer is on.
         if (laserPageIndex == pageIndex) {
             drawLaser(canvas, viewWidth, viewHeight)
         }
-        val s = session ?: return
-        if (s.pageIndex != pageIndex) return
+        val s = getSession(pageIndex) ?: return
         val stroke = s.live ?: return
-        drawStroke(canvas, stroke, viewWidth, viewHeight, preview = true)
+        if (stroke.tool == CanvasTool.ERASER) {
+            drawEraserCursor(canvas, stroke, viewWidth, viewHeight, 1f)
+        } else {
+            drawStroke(canvas, stroke, viewWidth, viewHeight, preview = true)
+        }
     }
 
     /** The red laser dot with a smooth fading gradient tail. */
@@ -4337,23 +5524,25 @@ class ContinuousInkController(
     ) {
         if (!laserActive || laserTrail.isEmpty()) return
         val now = System.currentTimeMillis()
-        while (laserTrail.isNotEmpty() && now - laserTrail.first().time > LASER_TRAIL_MS) {
-            laserTrail.removeAt(0)
+        var firstValid = 0
+        while (firstValid < laserTrail.size && now - laserTrail[firstValid].time > LASER_TRAIL_MS) {
+            firstValid++
         }
-        if (laserTrail.isEmpty()) return
+        if (firstValid >= laserTrail.size) return
+        val activeCount = laserTrail.size - firstValid
         val unitScale = (viewWidth / 1600f).coerceAtLeast(0.6f) * scaleCompensation
         val strokeW = 6.5f * unitScale
-        if (laserTrail.size >= 2) {
+        if (activeCount >= 2) {
             val path = Path()
-            val p0 = laserTrail[0]
+            val p0 = laserTrail[firstValid]
             val p0x = p0.x * viewWidth
             val p0y = p0.y * viewHeight
             path.moveTo(p0x, p0y)
-            if (laserTrail.size == 2) {
-                val p1 = laserTrail[1]
+            if (activeCount == 2) {
+                val p1 = laserTrail[firstValid + 1]
                 path.lineTo(p1.x * viewWidth, p1.y * viewHeight)
             } else {
-                for (i in 1 until laserTrail.size - 1) {
+                for (i in (firstValid + 1) until (laserTrail.size - 1)) {
                     val cur = laserTrail[i]
                     val next = laserTrail[i + 1]
                     val cx = cur.x * viewWidth
@@ -4365,7 +5554,7 @@ class ContinuousInkController(
                 val last = laserTrail.last()
                 path.lineTo(last.x * viewWidth, last.y * viewHeight)
             }
-            val tail = laserTrail.first()
+            val tail = laserTrail[firstValid]
             val head = laserTrail.last()
             val tx = tail.x * viewWidth
             val ty = tail.y * viewHeight
@@ -4415,204 +5604,7 @@ class ContinuousInkController(
         h: Float,
         preview: Boolean
     ) {
-        if (stroke.points.isEmpty()) return
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE
-            strokeCap = Paint.Cap.ROUND
-            strokeJoin = Paint.Join.ROUND
-            color = stroke.color
-        }
-        val widthPx = stroke.baseWidthNorm * w
-        when (stroke.tool) {
-            CanvasTool.SHAPE_RECT -> {
-                paint.strokeWidth = widthPx
-                canvas.drawRect(
-                    min(stroke.startX, stroke.endX) * w,
-                    min(stroke.startY, stroke.endY) * h,
-                    max(stroke.startX, stroke.endX) * w,
-                    max(stroke.startY, stroke.endY) * h,
-                    paint
-                )
-            }
-            CanvasTool.SHAPE_CIRCLE -> {
-                paint.strokeWidth = widthPx
-                val cx = (stroke.startX + stroke.endX) / 2f * w
-                val cy = (stroke.startY + stroke.endY) / 2f * h
-                val rx = (stroke.endX - stroke.startX) / 2f * w
-                val ry = (stroke.endY - stroke.startY) / 2f * h
-                canvas.drawOval(
-                    cx - kotlin.math.abs(rx), cy - kotlin.math.abs(ry),
-                    cx + kotlin.math.abs(rx), cy + kotlin.math.abs(ry),
-                    paint
-                )
-            }
-            CanvasTool.SHAPE_LINE -> {
-                paint.strokeWidth = widthPx
-                canvas.drawLine(
-                    stroke.startX * w, stroke.startY * h,
-                    stroke.endX * w, stroke.endY * h, paint
-                )
-            }
-            CanvasTool.HIGHLIGHTER -> {
-                paint.strokeWidth = widthPx * 3.2f
-                paint.strokeCap = Paint.Cap.SQUARE
-                paint.strokeJoin = Paint.Join.BEVEL
-                paint.alpha = 110
-                canvas.drawPath(smoothPath(stroke, w, h), paint)
-            }
-            CanvasTool.ERASER -> {
-                if (preview) {
-                    // The real erase clears pixels, which would punch a hole
-                    // through the Compose layer; show a grey swath instead.
-                    paint.color = 0x44222222
-                    paint.strokeWidth = widthPx
-                    canvas.drawPath(smoothPath(stroke, w, h), paint)
-                } else {
-                    paint.strokeWidth = widthPx
-                    paint.xfermode = PorterDuffXfermode(PorterDuff.Mode.CLEAR)
-                    canvas.drawPath(smoothPath(stroke, w, h), paint)
-                }
-            }
-            CanvasTool.FOUNTAIN_PEN, CanvasTool.PEN -> {
-                val pts = stroke.points
-                val count = pts.size
-                paint.style = Paint.Style.FILL
-                val cached1 = stroke.cachedPath1
-                val canUseCache = !preview &&
-                    stroke.cachedCount == count &&
-                    stroke.cachedW == w &&
-                    stroke.cachedH == h &&
-                    cached1 != null
-                val ribbon = if (canUseCache && cached1 != null) {
-                    cached1
-                } else {
-                    val xs = FloatArray(count) { pts[it].x * w }
-                    val ys = FloatArray(count) { pts[it].y * h }
-                    val ws = FloatArray(count) { (pts[it].w * w).coerceAtLeast(1f) }
-                    val built = PencilGrainShader.buildVariableWidthRibbon(
-                        xs, ys, ws, count, widthMultiplier = 1f, taperEnds = true
-                    )
-                    if (!preview) {
-                        stroke.cachedW = w
-                        stroke.cachedH = h
-                        stroke.cachedCount = count
-                        stroke.cachedPath1 = built
-                    }
-                    built
-                }
-                canvas.drawPath(ribbon, paint)
-            }
-            CanvasTool.PENCIL -> {
-                // Concepts-style 3-layer concentric variable-width graphite ribbon:
-                // zero vertex beading, fibrous stippled edges, and tilt-modulated core.
-                val pts = stroke.points
-                val count = pts.size
-                val cached1 = stroke.cachedPath1
-                val cached2 = stroke.cachedPath2
-                val canUseCache = !preview &&
-                    stroke.cachedCount == count &&
-                    stroke.cachedW == w &&
-                    stroke.cachedH == h &&
-                    cached1 != null &&
-                    cached2 != null
-                val avgTilt: Float
-                val pathEdge: Path
-                val pathMid: Path
-                val pathCore: Path?
-                if (canUseCache && cached1 != null && cached2 != null) {
-                    avgTilt = stroke.cachedAvgTilt
-                    pathEdge = cached1
-                    pathMid = cached2
-                    pathCore = stroke.cachedPath3
-                } else {
-                    val xs = FloatArray(count) { pts[it].x * w }
-                    val ys = FloatArray(count) { pts[it].y * h }
-                    val ws = FloatArray(count) { (pts[it].w * w).coerceAtLeast(1.2f) }
-                    var tiltSum = 0f
-                    for (i in 0 until count) tiltSum += pts[i].tilt
-                    avgTilt = (tiltSum / count.coerceAtLeast(1)).coerceIn(0f, 1f)
-                    pathEdge = PencilGrainShader.buildVariableWidthRibbon(
-                        xs, ys, ws, count, widthMultiplier = 1.14f, taperEnds = false
-                    )
-                    pathMid = PencilGrainShader.buildVariableWidthRibbon(
-                        xs, ys, ws, count, widthMultiplier = 0.80f, taperEnds = true
-                    )
-                    pathCore = PencilGrainShader.buildVariableWidthRibbon(
-                        xs, ys, ws, count, widthMultiplier = 0.45f * (1f - 0.30f * avgTilt), taperEnds = true
-                    )
-                    if (!preview) {
-                        stroke.cachedW = w
-                        stroke.cachedH = h
-                        stroke.cachedCount = count
-                        stroke.cachedAvgTilt = avgTilt
-                        stroke.cachedPath1 = pathEdge
-                        stroke.cachedPath2 = pathMid
-                        stroke.cachedPath3 = pathCore
-                    }
-                }
-
-                val baseAlpha = android.graphics.Color.alpha(stroke.color).coerceIn(24, 255)
-                paint.style = Paint.Style.FILL
-
-                // 1. Outer fibrous paper-tooth halo (catches high paper peaks at edges)
-                paint.shader = PencilGrainShader.shaderEdge
-                paint.alpha = (baseAlpha * (0.28f + 0.16f * avgTilt)).roundToInt().coerceIn(10, 255)
-                canvas.drawPath(pathEdge, paint)
-
-                // 2. Mid graphite body (textured tooth with transparent valleys)
-                paint.shader = PencilGrainShader.shaderMid
-                paint.alpha = (baseAlpha * (0.58f - 0.18f * avgTilt)).roundToInt().coerceIn(18, 255)
-                canvas.drawPath(pathMid, paint)
-
-                // 3. Inner graphite core (crisp when upright, dissolves into soft wash when tilted)
-                val coreAlpha = (baseAlpha * (0.78f - 0.52f * avgTilt)).roundToInt()
-                if (coreAlpha >= 14 && pathCore != null) {
-                    paint.shader = PencilGrainShader.shaderCore
-                    paint.alpha = coreAlpha.coerceIn(14, 255)
-                    canvas.drawPath(pathCore, paint)
-                }
-            }
-            CanvasTool.SHAPE_FILL -> {
-                // Concepts-style Draw + Fill: dynamically closes from current endpoint to start point
-                if (stroke.points.size < 3) {
-                    paint.style = Paint.Style.FILL
-                    val pt = stroke.points.first()
-                    canvas.drawCircle(pt.x * w, pt.y * h, (widthPx * 0.5f).coerceAtLeast(2f), paint)
-                } else {
-                    paint.style = Paint.Style.FILL
-                    val path = smoothPath(stroke, w, h)
-                    path.close()
-                    canvas.drawPath(path, paint)
-                }
-            }
-            else -> {
-                paint.strokeWidth = widthPx
-                canvas.drawPath(smoothPath(stroke, w, h), paint)
-            }
-        }
-    }
-
-    /** Quadratic midpoint path, the same smoothing single-page mode uses. */
-    private fun smoothPath(stroke: ContinuousStroke, w: Float, h: Float): Path {
-        val path = Path()
-        val points = stroke.points
-        if (points.isEmpty()) return path
-        path.moveTo(points[0].x * w, points[0].y * h)
-        if (points.size == 1) {
-            path.lineTo(points[0].x * w + 0.01f, points[0].y * h)
-            return path
-        }
-        for (i in 1 until points.size - 1) {
-            val p = points[i]
-            val n = points[i + 1]
-            path.quadTo(
-                p.x * w, p.y * h,
-                (p.x + n.x) / 2f * w, (p.y + n.y) / 2f * h
-            )
-        }
-        val last = points.last()
-        path.lineTo(last.x * w, last.y * h)
-        return path
+        ContinuousStrokeRenderer.drawStroke(canvas, stroke, w, h, preview)
     }
 
     private companion object {
@@ -4632,5 +5624,7 @@ class ContinuousInkController(
         const val MAX_UNDO_BYTES = 48L * 1024L * 1024L
         /** The width of the preview of a layer in the layer panel. */
         const val THUMBNAIL_SIZE = 120
+        /** Maximum number of visible/recent pages kept warm in memory simultaneously. */
+        const val MAX_WARM_SESSIONS = 6
     }
 }

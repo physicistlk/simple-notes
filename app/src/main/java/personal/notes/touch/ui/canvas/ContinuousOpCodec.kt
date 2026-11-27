@@ -39,18 +39,21 @@ internal object ContinuousOpCodec {
     }
 
     private fun appendStroke(sb: StringBuilder, s: ContinuousStroke) {
+        val safeBaseWidth = if (s.baseWidthNorm.isFinite() && s.baseWidthNorm >= 0f) s.baseWidthNorm else 0.005f
         sb.append(",\"tool\":\"").append(s.tool.name).append('"')
         sb.append(",\"color\":").append(s.color)
-        sb.append(",\"baseWidthNorm\":").append(s.baseWidthNorm)
+        sb.append(",\"baseWidthNorm\":").append(safeBaseWidth)
         sb.append(",\"autoShapeEnabled\":").append(s.autoShapeEnabled)
         sb.append(",\"points\":[")
         var firstP = true
         for (p in s.points) {
+            if (!p.x.isFinite() || !p.y.isFinite()) continue
+            val safeW = if (p.w.isFinite() && p.w >= 0f) p.w else safeBaseWidth
             if (!firstP) sb.append(',')
             firstP = false
             sb.append("{\"x\":").append(p.x)
                 .append(",\"y\":").append(p.y)
-                .append(",\"w\":").append(p.w)
+                .append(",\"w\":").append(safeW)
                 .append('}')
         }
         sb.append(']')
@@ -79,6 +82,7 @@ internal object ContinuousOpCodec {
         val tool = try { CanvasTool.valueOf(toolName) } catch (e: Exception) { return null }
         val color = (obj["color"] as? Number)?.toInt() ?: return null
         val baseWidthNorm = (obj["baseWidthNorm"] as? Number)?.toFloat() ?: return null
+        if (!baseWidthNorm.isFinite() || baseWidthNorm < 0f) return null
         val autoShapeEnabled = obj["autoShapeEnabled"] as? Boolean ?: return null
         val ptsRaw = obj["points"] as? List<*> ?: return null
         val points = mutableListOf<InkPoint>()
@@ -87,6 +91,7 @@ internal object ContinuousOpCodec {
             val x = (pm["x"] as? Number)?.toFloat() ?: return null
             val y = (pm["y"] as? Number)?.toFloat() ?: return null
             val w = (pm["w"] as? Number)?.toFloat() ?: return null
+            if (!x.isFinite() || !y.isFinite() || !w.isFinite() || w < 0f) return null
             points.add(InkPoint(x, y, w))
         }
         val stroke = ContinuousStroke(tool, color, baseWidthNorm, autoShapeEnabled, points)

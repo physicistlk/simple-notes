@@ -6,14 +6,19 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import personal.notes.touch.ui.canvas.CanvasTool
+import personal.notes.touch.ui.canvas.ContinuousOpCodec
+import personal.notes.touch.ui.canvas.ContinuousPageGeometry
 import personal.notes.touch.ui.canvas.ContinuousStroke
+import personal.notes.touch.ui.canvas.ContinuousStrokeTransformMath
 import personal.notes.touch.ui.canvas.InkHistory
 import personal.notes.touch.ui.canvas.InkOp
 import personal.notes.touch.ui.canvas.InkPatch
+import personal.notes.touch.ui.canvas.InkPoint
 import personal.notes.touch.ui.canvas.OpEntry
 import personal.notes.touch.ui.canvas.PageLayer
 import personal.notes.touch.ui.canvas.PageLayerStack
 import personal.notes.touch.ui.canvas.StrokeTransformSnapshot
+import kotlin.math.PI
 
 /**
  * Tests of the ink history of the continuous reader.
@@ -294,5 +299,204 @@ class ContinuousInkHistoryTest {
 
         assertTrue(history.redo({ _, _ -> }, { _, _ -> }, onTransform = { _, isUndo -> events.add(isUndo) }))
         assertEquals(listOf(true, false), events)
+    }
+
+    private fun applyTransformSnapshots(snapshots: List<StrokeTransformSnapshot>, isUndo: Boolean) {
+        for (snap in snapshots) {
+            val pts = if (isUndo) snap.beforePoints else snap.afterPoints
+            snap.op.stroke.points.clear()
+            snap.op.stroke.points.addAll(pts.map { InkPoint(it.x, it.y, it.w, it.tilt) })
+        }
+    }
+
+    @Test
+    fun aspectCorrectRotationTransformUndoRedoAndCodecRoundTrip() {
+        val ratios = listOf(16f / 9f, ContinuousPageGeometry.DEFAULT_PAGE_RATIO)
+        for (ratio in ratios) {
+            val history = InkHistory(PageLayerStack.base())
+            val st = ContinuousStroke(
+                CanvasTool.PEN,
+                0xFF224466.toInt(),
+                0.01f,
+                points = mutableListOf(
+                    InkPoint(0.45f, 0.50f, 0.01f),
+                    InkPoint(0.55f, 0.50f, 0.01f)
+                )
+            )
+            val op = InkOp.Stroke(st, null, layer())
+            history.commit(op)
+
+            val before = st.points.map { InkPoint(it.x, it.y, it.w, it.tilt) }
+            val after = ContinuousStrokeTransformMath.rotatePoints(
+                points = before,
+                deltaRad = (PI / 2.0).toFloat(),
+                pivotXNorm = 0.5f,
+                pivotYNorm = 0.5f,
+                boxRatio = ratio,
+                margin = 1f,
+                clampToBounds = true
+            )
+            st.points.clear()
+            st.points.addAll(after)
+            history.commitTransform(listOf(StrokeTransformSnapshot(op, before, after, null, null)))
+
+            val encoded = ContinuousOpCodec.encode(history.ops)
+            val decoded = ContinuousOpCodec.decode(encoded)
+            assertNotNull(decoded)
+            val decodedStroke = decoded?.singleOrNull() as? InkOp.Stroke
+            assertNotNull(decodedStroke)
+            val decPts = decodedStroke?.stroke?.points ?: emptyList()
+            assertEquals(2, decPts.size)
+            assertEquals(after[0].x, decPts[0].x, 1e-6f)
+            assertEquals(after[0].y, decPts[0].y, 1e-6f)
+            assertEquals(after[1].x, decPts[1].x, 1e-6f)
+            assertEquals(after[1].y, decPts[1].y, 1e-6f)
+
+            assertTrue(history.undo({ _, _ -> }, { _, _ -> }, onTransform = ::applyTransformSnapshots))
+            assertEquals(before[0].x, st.points[0].x, 1e-6f)
+            assertEquals(before[1].y, st.points[1].y, 1e-6f)
+
+            assertTrue(history.redo({ _, _ -> }, { _, _ -> }, onTransform = ::applyTransformSnapshots))
+            assertEquals(after[0].x, st.points[0].x, 1e-6f)
+            assertEquals(after[1].y, st.points[1].y, 1e-6f)
+        }
+    }
+
+    @Test
+    fun mirrorAndEdgeStretchTransformUndoRedoRestoreExactPoints() {
+        val history = InkHistory(PageLayerStack.base())
+        val st = ContinuousStroke(
+            CanvasTool.PEN,
+            0xFF000000.toInt(),
+            0.01f,
+            points = mutableListOf(
+                InkPoint(0.2f, 0.3f, 0.01f),
+                InkPoint(0.5f, 0.6f, 0.01f)
+            )
+        )
+        val op = InkOp.Stroke(st, null, layer())
+        history.commit(op)
+
+        val beforeMirror = st.points.map { InkPoint(it.x, it.y, it.w, it.tilt) }
+        val afterMirror = ContinuousStrokeTransformMath.mirrorHorizontalPoints(
+            points = beforeMirror,
+            centerXNorm = 0.35f,
+            margin = 0f,
+            clampToBounds = true
+        )
+        st.points.clear()
+        st.points.addAll(afterMirror)
+        history.commitTransform(listOf(StrokeTransformSnapshot(op, beforeMirror, afterMirror, null, null)))
+
+        val afterStretch = ContinuousStrokeTransformMath.scalePoints(
+            points = afterMirror,
+            scaleX = 1.5f,
+            scaleY = 1f,
+            anchorXNorm = 0.2f,
+            anchorYNorm = 0.45f,
+            margin = 0f,
+            clampToBounds = true
+        )
+        st.points.clear()
+        st.points.addAll(afterStretch)
+        history.commitTransform(listOf(StrokeTransformSnapshot(op, afterMirror, afterStretch, null, null)))
+
+        assertTrue(history.undo({ _, _ -> }, { _, _ -> }, onTransform = ::applyTransformSnapshots))
+        assertEquals(afterMirror[0].x, st.points[0].x, 1e-6f)
+        assertTrue(history.undo({ _, _ -> }, { _, _ -> }, onTransform = ::applyTransformSnapshots))
+        assertEquals(beforeMirror[0].x, st.points[0].x, 1e-6f)
+        assertTrue(history.redo({ _, _ -> }, { _, _ -> }, onTransform = ::applyTransformSnapshots))
+        assertEquals(afterMirror[0].x, st.points[0].x, 1e-6f)
+        assertTrue(history.redo({ _, _ -> }, { _, _ -> }, onTransform = ::applyTransformSnapshots))
+        assertEquals(afterStretch[0].x, st.points[0].x, 1e-6f)
+    }
+
+    @Test
+    fun clampedRigidMoveUndoRedoAtPdfAndA4Bounds() {
+        val history = InkHistory(PageLayerStack.base())
+        val st = ContinuousStroke(
+            CanvasTool.PEN,
+            0xFF000000.toInt(),
+            0.01f,
+            points = mutableListOf(
+                InkPoint(0.3f, 0.4f, 0.01f),
+                InkPoint(0.5f, 0.6f, 0.01f)
+            )
+        )
+        val op = InkOp.Stroke(st, null, layer())
+        history.commit(op)
+
+        val pb = ContinuousStrokeTransformMath.pointsBounds(listOf(st))
+        assertNotNull(pb)
+        val (cdx, cdy) = ContinuousStrokeTransformMath.clampTranslationDelta(
+            pb ?: personal.notes.touch.ui.canvas.NormRect(0f, 0f, 0f, 0f),
+            dxNorm = -5f,
+            dyNorm = 0.2f,
+            margin = ContinuousPageGeometry.marginFor("pdf")
+        )
+        val moved = ContinuousStrokeTransformMath.translatePoints(st.points, cdx, cdy, margin = 1f, clampToBounds = true)
+        st.points.clear()
+        st.points.addAll(moved)
+        history.commitMove(listOf(op), cdx, cdy)
+
+        assertEquals(-1f, st.points[0].x, 1e-6f)
+        assertEquals(-0.8f, st.points[1].x, 1e-6f)
+
+        val applyMove: (List<InkOp.Stroke>, Float, Float) -> Unit = { ops, dx, dy ->
+            for (movedOp in ops) {
+                val res = ContinuousStrokeTransformMath.translatePoints(
+                    movedOp.stroke.points, dx, dy, margin = 1f, clampToBounds = false
+                )
+                movedOp.stroke.points.clear()
+                movedOp.stroke.points.addAll(res)
+            }
+        }
+
+        assertTrue(history.undo({ _, _ -> }, { _, _ -> }, onMove = applyMove))
+        assertEquals(0.3f, st.points[0].x, 1e-6f)
+        assertEquals(0.4f, st.points[0].y, 1e-6f)
+        assertEquals(0.5f, st.points[1].x, 1e-6f)
+
+        assertTrue(history.redo({ _, _ -> }, { _, _ -> }, onMove = applyMove))
+        assertEquals(-1f, st.points[0].x, 1e-6f)
+        assertEquals(-0.8f, st.points[1].x, 1e-6f)
+    }
+
+    @Test
+    fun copyWithOffsetAndDeleteIntegrateWithAddBatchAndClearUndoRedo() {
+        val history = InkHistory(PageLayerStack.base())
+        val baseLayer = layer()
+        val orig = InkOp.Stroke(stroke(), null, baseLayer)
+        history.commit(orig)
+
+        val copiedStrokes = ContinuousStrokeTransformMath.copyStrokesWithOffset(
+            strokes = listOf(orig.stroke),
+            offsetXNorm = 0.05f,
+            offsetYNorm = 0.05f,
+            margin = ContinuousPageGeometry.marginFor("pdf"),
+            clampToBounds = true
+        )
+        val copyOp = InkOp.Stroke(copiedStrokes.single(), null, baseLayer)
+        history.ops.add(copyOp)
+        history.commitAddBatch(listOf(copyOp))
+        assertEquals(2, history.ops.size)
+        assertEquals(0.15f, copyOp.stroke.points[0].x, 1e-6f)
+
+        history.commitClear(emptyList(), listOf(OpEntry(1, copyOp)))
+        assertEquals(1, history.ops.size)
+
+        // Undo delete -> restores copy at index 1
+        assertTrue(history.undo({ _, _ -> }, { _, _ -> }))
+        assertEquals(2, history.ops.size)
+        assertTrue(history.ops[1] === copyOp)
+
+        // Undo copy -> removes copy only
+        assertTrue(history.undo({ _, _ -> }, { _, _ -> }))
+        assertEquals(1, history.ops.size)
+        assertTrue(history.ops[0] === orig)
+
+        // Redo copy -> restores copy
+        assertTrue(history.redo({ _, _ -> }, { _, _ -> }))
+        assertEquals(2, history.ops.size)
     }
 }

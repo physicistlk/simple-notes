@@ -1035,7 +1035,7 @@ fun SettingsScreen(
                             Spacer(modifier = Modifier.width(10.dp))
                             Column {
                                 Text(
-                                    text = "Simple Notes v0.1.0",
+                                    text = "Simple Notes v0.2.0",
                                     fontWeight = FontWeight.SemiBold,
                                     fontSize = 15.sp
                                 )

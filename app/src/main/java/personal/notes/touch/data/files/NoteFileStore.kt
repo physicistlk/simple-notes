@@ -3,15 +3,30 @@ package personal.notes.touch.data.files
 import android.content.Context
 import android.net.Uri
 import personal.notes.touch.ui.canvas.LayerTileGrid
+import personal.notes.touch.ui.canvas.MiniJson
+import personal.notes.touch.ui.canvas.TocItem
 import java.io.File
+import java.util.UUID
 
-class NoteFileStore(private val context: Context) {
+class NoteFileStore private constructor(
+    private val context: Context?,
+    private val filesDirOverride: File?
+) {
+    constructor(context: Context) : this(context, null)
+    internal constructor(filesDir: File) : this(null, filesDir)
+
+    private fun baseFilesDir(): File =
+        filesDirOverride ?: context?.filesDir ?: File(".")
+
     private val notesDir: File
-        get() = File(context.filesDir, "note").apply { if (!exists()) mkdirs() }
+        get() = File(baseFilesDir(), "note").apply { if (!exists()) mkdirs() }
 
     fun getNoteDir(noteId: String): File {
         return File(notesDir, noteId).apply { if (!exists()) mkdirs() }
     }
+
+    /** Resolves a path stored relative to `context.filesDir` (e.g. `note/<id>/pdf_<ts>.pdf`). */
+    fun resolveRelativeFile(relativePath: String): File = File(baseFilesDir(), relativePath)
 
     fun getPageFile(noteId: String, pageIndex: Int): File {
         return File(getNoteDir(noteId), "page_${pageIndex}.png")
@@ -25,7 +40,7 @@ class NoteFileStore(private val context: Context) {
      */
     fun saveNoteImage(noteId: String, source: Uri): String? {
         return try {
-            val resolver = context.contentResolver
+            val resolver = context?.contentResolver ?: return null
             val extension = when (resolver.getType(source)?.lowercase()) {
                 "image/png" -> "png"
                 "image/webp" -> "webp"
@@ -59,7 +74,7 @@ class NoteFileStore(private val context: Context) {
     fun getNoteAsset(noteId: String, relativeName: String): File? {
         val name = relativeName.trim()
         if (name.isEmpty()) return null
-        if (name.contains('/') || name.contains('\\') || name.contains("..")) return null
+        if (name.contains('/') || name.contains('\\') || name == "." || name == "..") return null
         val file = File(getNoteDir(noteId), name)
         return file.takeIf { it.isFile }
     }
@@ -83,17 +98,21 @@ class NoteFileStore(private val context: Context) {
      * @return true if the final page file is in place.
      */
     fun writePageFileAtomically(noteId: String, pageIndex: Int, writeBlock: (File) -> Unit): Boolean {
+        var tempFile: File? = null
         return try {
             val tmpDir = getTmpDir(noteId)
-            val tempFile = File(tmpDir, "temp_page_${pageIndex}.png")
+            val tmp = File(tmpDir, "temp_page_${pageIndex}.png")
+            tempFile = tmp
             val targetFile = getPageFile(noteId, pageIndex)
-            writeBlock(tempFile)
-            if (!tempFile.exists()) return false
-            if (targetFile.exists() && !targetFile.delete()) {
-                // Fall back to rename-only if delete is not permitted.
-            }
-            tempFile.renameTo(targetFile)
+            writeBlock(tmp)
+            if (!tmp.exists()) return false
+            if (tmp.renameTo(targetFile)) return true
+            if (targetFile.exists()) targetFile.delete()
+            if (tmp.renameTo(targetFile)) return true
+            tmp.delete()
+            false
         } catch (e: Exception) {
+            tempFile?.let { if (it.exists()) it.delete() }
             e.printStackTrace()
             false
         }
@@ -116,6 +135,7 @@ class NoteFileStore(private val context: Context) {
         // The page background and the margin ink belong to this page too.
         getPageBackgroundFile(noteId, pageIndex).delete()
         getBeyondInkFile(noteId, pageIndex).delete()
+        getLayerInfoFile(noteId, pageIndex).delete()
         getLayersDir(noteId).listFiles()?.forEach { f ->
             if (f.name.startsWith("beyond_${pageIndex}_") && f.name.endsWith(".png")) f.delete()
             // The layers of the page (the annotation layer and the floating
@@ -198,12 +218,23 @@ class NoteFileStore(private val context: Context) {
             }
         }
         if (oldBeyond.exists()) {
-            if (newBeyond.exists()) newBeyond.delete()
-            oldBeyond.renameTo(newBeyond)
+            if (!oldBeyond.renameTo(newBeyond)) {
+                if (newBeyond.exists()) newBeyond.delete()
+                oldBeyond.renameTo(newBeyond)
+            }
+        }
+        val oldLayerInfo = getLayerInfoFile(noteId, oldIndex)
+        val newLayerInfo = getLayerInfoFile(noteId, newIndex)
+        if (oldLayerInfo.exists()) {
+            if (!oldLayerInfo.renameTo(newLayerInfo)) {
+                if (newLayerInfo.exists()) newLayerInfo.delete()
+                oldLayerInfo.renameTo(newLayerInfo)
+            }
         }
         val oldFile = getPageFile(noteId, oldIndex)
         val newFile = getPageFile(noteId, newIndex)
         if (oldFile.exists()) {
+            if (oldFile.renameTo(newFile)) return true
             if (newFile.exists()) newFile.delete()
             return oldFile.renameTo(newFile)
         }
@@ -273,11 +304,13 @@ class NoteFileStore(private val context: Context) {
             "page_${pageIndex}_annot_${layerIndex}_${LayerTileGrid.tileName(tx, ty)}.png"
         )
 
-    /** Workspace preferences (tab bar state, dock orientation) live beside the notes. */
-    fun getUiPrefsFile(): File = File(context.filesDir, "ui_prefs.json")
+    private val uiPrefsInstance: UiPrefs by lazy { UiPrefs(getUiPrefsFile()) }
 
-    /** Convenience accessor for the workspace preferences. */
-    fun uiPrefs(): UiPrefs = UiPrefs(getUiPrefsFile())
+    /** Workspace preferences (tab bar state, dock orientation) live beside the notes. */
+    fun getUiPrefsFile(): File = File(baseFilesDir(), "ui_prefs.json")
+
+    /** Convenience accessor for the workspace preferences (shared lock per store). */
+    fun uiPrefs(): UiPrefs = uiPrefsInstance
 
     /**
      * Optional raster background of a page (a page picked out of a PDF).
@@ -297,6 +330,98 @@ class NoteFileStore(private val context: Context) {
      */
     fun getBeyondInkFile(noteId: String, pageIndex: Int): File =
         File(getLayersDir(noteId), "beyond_$pageIndex.json")
+
+    fun getCatalogFile(noteId: String): File =
+        File(getNoteDir(noteId), "catalog.json")
+
+    fun getPdfTextIndexFile(noteId: String): File =
+        File(getNoteDir(noteId), "pdf_text.json")
+
+    fun readCatalogToc(noteId: String): List<TocItem> {
+        val catFile = getCatalogFile(noteId)
+        if (!catFile.isFile) return emptyList()
+        return try {
+            val arr = MiniJson.parse(catFile.readText()) as? List<*> ?: return emptyList()
+            val out = ArrayList<TocItem>(arr.size)
+            for (entry in arr) {
+                val obj = entry as? Map<*, *> ?: continue
+                val title = (obj["title"] as? String)?.trim().orEmpty()
+                if (title.isEmpty()) continue
+                val id = (obj["id"] as? String)?.takeIf { it.isNotBlank() } ?: UUID.randomUUID().toString()
+                val pageIndex = ((obj["pageIndex"] as? Number)?.toInt() ?: 0).coerceAtLeast(0)
+                val level = ((obj["level"] as? Number)?.toInt() ?: 0).coerceAtLeast(0)
+                val source = (obj["source"] as? String)?.takeIf { it.isNotBlank() } ?: "user"
+                out.add(
+                    TocItem(
+                        id = id,
+                        title = title,
+                        pageIndex = pageIndex,
+                        level = level,
+                        source = source
+                    )
+                )
+            }
+            out.sortedBy { it.pageIndex }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            emptyList()
+        }
+    }
+
+    fun writeCatalogToc(noteId: String, items: List<TocItem>): Boolean {
+        var tmp: File? = null
+        return try {
+            val sb = StringBuilder()
+            sb.append('[')
+            items.forEachIndexed { idx, item ->
+                if (idx > 0) sb.append(',')
+                sb.append("{\"id\":")
+                appendJsonString(sb, item.id)
+                sb.append(",\"title\":")
+                appendJsonString(sb, item.title)
+                sb.append(",\"pageIndex\":").append(item.pageIndex)
+                sb.append(",\"level\":").append(item.level)
+                sb.append(",\"source\":")
+                appendJsonString(sb, item.source)
+                sb.append('}')
+            }
+            sb.append(']')
+            val target = getCatalogFile(noteId)
+            val tmpFile = File(getTmpDir(noteId), "catalog_${System.nanoTime()}.tmp")
+            tmp = tmpFile
+            tmpFile.writeText(sb.toString())
+            if (!tmpFile.renameTo(target)) {
+                if (target.exists()) target.delete()
+                if (!tmpFile.renameTo(target)) {
+                    tmpFile.delete()
+                    return false
+                }
+            }
+            true
+        } catch (e: Exception) {
+            tmp?.let { if (it.exists()) it.delete() }
+            e.printStackTrace()
+            false
+        }
+    }
+
+    private fun appendJsonString(sb: StringBuilder, value: String) {
+        sb.append('"')
+        for (c in value) {
+            when {
+                c == '"' -> sb.append("\\\"")
+                c == '\\' -> sb.append("\\\\")
+                c == '\b' -> sb.append("\\b")
+                c == '\u000C' -> sb.append("\\f")
+                c == '\n' -> sb.append("\\n")
+                c == '\r' -> sb.append("\\r")
+                c == '\t' -> sb.append("\\t")
+                c.code < 0x20 -> sb.append("\\u").append(c.code.toString(16).padStart(4, '0'))
+                else -> sb.append(c)
+            }
+        }
+        sb.append('"')
+    }
 
     fun deleteNoteFiles(noteId: String): Boolean {
         val dir = File(notesDir, noteId)

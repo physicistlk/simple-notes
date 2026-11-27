@@ -13,8 +13,8 @@ android {
         applicationId "personal.notes.touch"
         minSdk 21
         targetSdk 35
-        versionCode 1
-        versionName "0.1.0"
+        versionCode 2
+        versionName "0.2.0"
 
         // F-10 vector PDF import: our thin JNI bridge compiles per ABI;
         // the prebuilt pdfium engine ships as jniLibs/<abi>/libpdfium.so.

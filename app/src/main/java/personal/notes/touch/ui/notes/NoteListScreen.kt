@@ -164,16 +164,28 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import personal.notes.touch.TouchNotesApp
+import personal.notes.touch.data.db.entity.PageEntity
+import personal.notes.touch.data.files.NoteFileStore
+import personal.notes.touch.ui.canvas.ImportProgressDialog
+import personal.notes.touch.ui.canvas.PdfImportProgressState
 import personal.notes.touch.util.BitmapUtils
+import personal.notes.touch.util.PageAspectCache
+import personal.notes.touch.util.PdfDocumentCache
 import personal.notes.touch.util.PdfVectorImporter
+import personal.notes.touch.util.ThumbnailPolicy
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -285,38 +297,73 @@ fun NoteListScreen(
         }
     }
 
+    val importProgressFlow = remember { MutableStateFlow(PdfImportProgressState()) }
+    val importProgressState by importProgressFlow.collectAsState()
+    var importCancelFlag by remember { mutableStateOf<AtomicBoolean?>(null) }
+
     val pdfPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
         uri?.let {
+            val cancelFlag = AtomicBoolean(false)
+            importCancelFlag = cancelFlag
+            importProgressFlow.value = PdfImportProgressState(
+                active = true,
+                done = 0,
+                total = 0,
+                cancelling = false
+            )
             scope.launch {
-                val imported = try {
-                    withContext(Dispatchers.IO) { PdfVectorImporter.readDocument(context, it) }
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                    null
-                }
-                if (imported == null) {
-                    android.widget.Toast.makeText(context, "Could not open PDF", android.widget.Toast.LENGTH_SHORT).show()
-                    return@launch
-                }
-                val pdfTitle = withContext(Dispatchers.IO) {
-                    var name: String? = null
-                    context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-                        val idx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
-                        if (idx >= 0 && cursor.moveToFirst()) name = cursor.getString(idx)
-                    }
-                    val base = (name ?: uri.lastPathSegment).orEmpty()
-                    val stripped = base.substringBeforeLast('.')
-                    if (stripped.isBlank()) "Imported PDF" else stripped
-                }
+                var imported: PdfVectorImporter.ImportedPdf? = null
+                var createdNoteId: String? = null
+                var importCommitted = false
                 try {
+                    imported = try {
+                        withContext(Dispatchers.IO) {
+                            PdfVectorImporter.readDocument(
+                                context = context,
+                                uri = it,
+                                isCancelled = { cancelFlag.get() }
+                            )
+                        }
+                    } catch (e: Exception) {
+                        if (e is CancellationException) throw e
+                        e.printStackTrace()
+                        null
+                    }
+                    if (cancelFlag.get()) {
+                        return@launch
+                    }
+                    if (imported == null) {
+                        android.widget.Toast.makeText(context, "Could not open PDF", android.widget.Toast.LENGTH_SHORT).show()
+                        return@launch
+                    }
+                    importProgressFlow.value = PdfImportProgressState(
+                        active = true,
+                        done = 0,
+                        total = imported.pageCount,
+                        cancelling = cancelFlag.get()
+                    )
+                    val pdfTitle = withContext(Dispatchers.IO) {
+                        var name: String? = null
+                        context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                            val idx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                            if (idx >= 0 && cursor.moveToFirst()) name = cursor.getString(idx)
+                        }
+                        val base = (name ?: uri.lastPathSegment).orEmpty()
+                        val stripped = base.substringBeforeLast('.')
+                        if (stripped.isBlank()) "Imported PDF" else stripped
+                    }
+                    if (cancelFlag.get()) {
+                        return@launch
+                    }
                     val note = viewModel.repository.createNote(
                         title = pdfTitle,
                         folderId = uiState.selectedFolderId,
                         pageType = "pdf"
                     )
                     val noteId = note.id
+                    createdNoteId = noteId
                     val fileStore = viewModel.repository.fileStore
                     // Per-page render error toast: Toast.show() must run on a
                     // thread with a Looper, so bounce back to Main.
@@ -325,11 +372,9 @@ fun NoteListScreen(
                             android.widget.Toast.makeText(context, msg, android.widget.Toast.LENGTH_LONG).show()
                         }
                     }
-                    // F-10 vector import: renders each page from pdfium and
-                    // records the source PDF so pages re-render sharply at any
-                    // zoom. The whole loop (render, PNG compression, file
-                    // writes) runs on Dispatchers.IO.
-                    withContext(Dispatchers.IO) {
+                    // F-10 vector import + PDF-QOL-2 streaming import: writes source
+                    // directly to note dir, batches Room pages, renders page 0 thumb only.
+                    val result = withContext(Dispatchers.IO) {
                         PdfVectorImporter.importIntoNote(
                             context = context,
                             imported = imported,
@@ -339,21 +384,52 @@ fun NoteListScreen(
                             targetWidth = 2160,
                             targetHeight = 3056,
                             reuseFirstPage = true,
-                            onPageError = { msg -> showPageError(msg) }
+                            onPageError = { msg -> showPageError(msg) },
+                            onProgress = { done, total ->
+                                importProgressFlow.value = PdfImportProgressState(
+                                    active = true,
+                                    done = done,
+                                    total = total,
+                                    cancelling = cancelFlag.get()
+                                )
+                            },
+                            isCancelled = { cancelFlag.get() }
                         )
                     }
-                    // Update note page count
-                    viewModel.repository.updateNotePageCount(note.id, imported.pageCount)
-                    onNoteClick(noteId)
+                    result.firstPageBitmap?.let { bmp ->
+                        if (!bmp.isRecycled) bmp.recycle()
+                    }
+                    if (!result.cancelled && result.importedPages > 0) {
+                        viewModel.repository.updateNotePageCount(note.id, result.importedPages)
+                        importCommitted = true
+                        onNoteClick(noteId)
+                    }
                 } catch (e: Exception) {
+                    val orphanId = createdNoteId
+                    if (orphanId != null && !importCommitted) {
+                        withContext(NonCancellable + Dispatchers.IO) {
+                            viewModel.repository.permanentlyDeleteNote(orphanId)
+                        }
+                    }
+                    if (e is CancellationException) throw e
                     e.printStackTrace()
                     android.widget.Toast.makeText(context, "PDF import error: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
                 } finally {
-                    imported.document.close()
+                    imported?.close()
+                    importCancelFlag = null
+                    importProgressFlow.value = PdfImportProgressState()
                 }
             }
         }
     }
+
+    ImportProgressDialog(
+        state = importProgressState,
+        onCancel = {
+            importCancelFlag?.set(true)
+            importProgressFlow.value = importProgressFlow.value.copy(cancelling = true)
+        }
+    )
 
     // Formatter matching screenshot: "2026-10-23 10:36"
     val dateFormatter = remember { SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()) }
@@ -728,7 +804,7 @@ fun NoteListScreen(
             title = { Text("About Simple Notes") },
             text = {
                 Column {
-                    Text("Simple Notes v0.1.0", fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                    Text("Simple Notes v0.2.0", fontWeight = FontWeight.Bold, fontSize = 15.sp)
                     Spacer(modifier = Modifier.height(6.dp))
                     Text("100% Private & Offline-first notebook with Room SQLite persistence, native hardware canvas acceleration, and zero network tracking.", fontSize = 13.sp, color = Color.Gray)
                 }
@@ -2004,66 +2080,73 @@ fun DrawerMenuItem(
     }
 }
 
-/**
- * Draws the page's saved ink (a transparent, full-page PNG) onto the page
- * thumbnail. Both images share the page aspect ratio. Returns [base] when the
- * ink cannot be decoded.
- */
-private suspend fun composeThumbnailWithInk(
-    base: android.graphics.Bitmap,
-    strokesFile: File
-): android.graphics.Bitmap {
-    val strokes = BitmapUtils.loadAlphaThumbnail(strokesFile, 360, 500) ?: return base
-    val composite = base.copy(android.graphics.Bitmap.Config.ARGB_8888, true) ?: return base
-    android.graphics.Canvas(composite).drawBitmap(
-        strokes,
-        null,
-        android.graphics.Rect(0, 0, composite.width, composite.height),
-        android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG)
-    )
-    return composite
-}
-
 @Composable
 fun NoteInsidePreview(
     note: NoteEntity,
     modifier: Modifier = Modifier
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
-    val firstPageFile = remember(note.id) {
-        File(File(context.filesDir, "note"), "${note.id}/page_0.png")
-    }
-    // Vector PDF pages keep the clean page render in page_0.png and the ink in
-    // strokes_0.png, so the card has to compose them (the original shows the
-    // annotated page). Raster pages have no strokes file: their page PNG
-    // already contains the writing.
-    val firstStrokesFile = remember(note.id) {
-        File(File(context.filesDir, "note"), "${note.id}/strokes_0.png")
-    }
-    val targetFile = remember(note.id, note.coverPath) {
-        val cover = note.coverPath?.let { File(it) }
-        if (cover != null && cover.exists()) {
-            cover
-        } else {
-            firstPageFile
-        }
+    val app = remember(context) { context.applicationContext as? TouchNotesApp }
+    val fileStore = remember(app, context) { app?.fileStore ?: NoteFileStore(context) }
+    val seedKey = remember(note.id, note.updatedAt, note.coverPath, note.pageType) {
+        ThumbnailPolicy.homePreviewSeedKey(note.id, note.updatedAt, note.coverPath, note.pageType)
     }
 
-    var thumbnailBitmap by remember(note.id, note.updatedAt) {
-        val cached = if (targetFile.exists()) {
-            BitmapUtils.getCachedThumbnail("${targetFile.absolutePath}:${targetFile.lastModified()}")
-        } else null
-        mutableStateOf(cached)
+    var thumbnailBitmap by remember(note.id, note.updatedAt, note.coverPath, note.pageType) {
+        mutableStateOf(BitmapUtils.getCachedThumbnail(seedKey))
     }
 
-    LaunchedEffect(note.id, note.updatedAt) {
-        val base = BitmapUtils.loadThumbnail(targetFile, targetWidth = 360, targetHeight = 500)
-            ?: return@LaunchedEffect
-        thumbnailBitmap = if (targetFile == firstPageFile && firstStrokesFile.exists()) {
-            composeThumbnailWithInk(base, firstStrokesFile)
-        } else {
-            base
+    LaunchedEffect(note.id, note.updatedAt, note.coverPath, note.pageType) {
+        val coverFile = note.coverPath?.let { File(it) }?.takeIf { it.isFile }
+        val pageFile = fileStore.getPageFile(note.id, 0)
+        val rendered = withContext(Dispatchers.IO) {
+            val needVectorFallback = coverFile == null && !pageFile.isFile &&
+                note.pageType != "text" && note.pageType != "infinite"
+            val page0 = if (needVectorFallback) {
+                app?.noteRepository?.getPage(note.id, 0)
+            } else {
+                null
+            } ?: PageEntity(
+                id = "${note.id}_p0",
+                noteId = note.id,
+                index = 0,
+                bitmapPath = pageFile.absolutePath,
+                updatedAt = note.updatedAt
+            )
+            if (needVectorFallback && page0.pdfSourcePath.isNotEmpty() && page0.pdfPageIndex >= 0) {
+                PdfDocumentCache(context).use { docCache ->
+                    BitmapUtils.loadOrRenderPageThumbnail(
+                        noteId = note.id,
+                        fileStore = fileStore,
+                        page = page0,
+                        pdfDocCache = docCache,
+                        aspectCache = PageAspectCache.default,
+                        pageType = note.pageType,
+                        longSidePx = 500,
+                        savedGeneration = 0,
+                        coverFile = coverFile,
+                        noteUpdatedAt = note.updatedAt
+                    ).first
+                }
+            } else {
+                BitmapUtils.loadOrRenderPageThumbnail(
+                    noteId = note.id,
+                    fileStore = fileStore,
+                    page = page0,
+                    pdfDocCache = null,
+                    aspectCache = PageAspectCache.default,
+                    pageType = note.pageType,
+                    longSidePx = 500,
+                    savedGeneration = 0,
+                    coverFile = coverFile,
+                    noteUpdatedAt = note.updatedAt
+                ).first
+            }
         }
+        if (rendered != null && !rendered.isRecycled) {
+            BitmapUtils.putCachedThumbnail(seedKey, rendered)
+        }
+        thumbnailBitmap = rendered
     }
 
     Box(

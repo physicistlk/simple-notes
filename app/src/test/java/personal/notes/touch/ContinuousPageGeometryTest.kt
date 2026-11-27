@@ -262,4 +262,35 @@ class ContinuousPageGeometryTest {
         val scaleY = rect.height * boxHeight / 3840f
         assertEquals(scaleX, scaleY, scaleX * 0.001f)
     }
+
+    @Test
+    fun layerSizeClampsSubnormalRatioWhileKeepingA4Intact() {
+        val a4Size = ContinuousPageGeometry.layerSize("a4", ContinuousPageGeometry.DEFAULT_PAGE_RATIO)
+        assertEquals(2160, a4Size.width)
+        assertEquals(3056, a4Size.height)
+
+        val subnormalSize = ContinuousPageGeometry.layerSize("pdf", 1e-38f)
+        assertEquals(6480, subnormalSize.width)
+        assertTrue(
+            "expected bounded height <= 16384, got ${subnormalSize.height}",
+            subnormalSize.height in 1..16384
+        )
+    }
+
+    @Test
+    fun pageRectAndLayerRectReturnFiniteFallbackForNonFiniteBoxDimensions() {
+        val inputs = listOf(
+            Float.NaN to Float.NaN,
+            Float.NaN to 1000f,
+            Float.POSITIVE_INFINITY to 1000f,
+            1000f to Float.POSITIVE_INFINITY,
+            Float.POSITIVE_INFINITY to 1.4e-45f
+        )
+        for ((bw, bh) in inputs) {
+            val pr = ContinuousPageGeometry.pageRect("pdf", 16f / 9f, bw, bh)
+            assertTrue("pageRect non-finite for ($bw, $bh): $pr", pr.left.isFinite() && pr.top.isFinite() && pr.right.isFinite() && pr.bottom.isFinite())
+            val lr = ContinuousPageGeometry.layerRect("pdf", 16f / 9f, bw, bh)
+            assertTrue("layerRect non-finite for ($bw, $bh): $lr", lr.left.isFinite() && lr.top.isFinite() && lr.right.isFinite() && lr.bottom.isFinite())
+        }
+    }
 }

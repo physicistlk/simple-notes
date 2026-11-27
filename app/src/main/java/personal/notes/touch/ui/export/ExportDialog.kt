@@ -10,6 +10,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -22,7 +23,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Description
@@ -44,10 +47,13 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -58,12 +64,23 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import personal.notes.touch.data.db.entity.NoteEntity
 import personal.notes.touch.data.files.NoteFileStore
+import personal.notes.touch.data.files.UiPrefs
 import personal.notes.touch.data.repo.NoteRepository
 import personal.notes.touch.ui.canvas.ImageLayer
 import personal.notes.touch.ui.theme.LocalThemeColor
 import personal.notes.touch.util.ExportManager
+import personal.notes.touch.util.MarginExportMath
+import java.util.concurrent.atomic.AtomicLong
+
+private data class ExportPreviewState(
+    val includeMargins: Boolean,
+    val ready: Boolean,
+    val bitmap: Bitmap?
+)
 
 enum class ExportTarget {
     PDF,
@@ -82,6 +99,8 @@ fun ExportDialog(
     imageLayers: List<ImageLayer> = emptyList(),
     currentPageIndex: Int = 0,
     initialTarget: ExportTarget? = null,
+    includeMargins: Boolean? = null,
+    onIncludeMarginsChange: ((Boolean) -> Unit)? = null,
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
@@ -90,6 +109,38 @@ fun ExportDialog(
 
     var isExporting by remember { mutableStateOf(false) }
     var exportStatusText by remember { mutableStateOf("") }
+
+    val supportsMarginExport = remember(note.pageType) {
+        MarginExportMath.supportsMarginExport(note.pageType)
+    }
+    var selectedIncludeMargins by remember(note.id) {
+        mutableStateOf(includeMargins ?: false)
+    }
+    var marginsPrefReady by remember(note.id, includeMargins, supportsMarginExport) {
+        mutableStateOf(includeMargins != null || !supportsMarginExport)
+    }
+    var userEditedMargins by remember(note.id) {
+        mutableStateOf(false)
+    }
+    val marginPersistMutex = remember(fileStore) { Mutex() }
+    val marginWriteSeq = remember(fileStore) { AtomicLong(0L) }
+    LaunchedEffect(note.id, includeMargins) {
+        if (includeMargins != null) {
+            selectedIncludeMargins = includeMargins
+            marginsPrefReady = true
+        }
+    }
+    LaunchedEffect(note.id, fileStore, includeMargins == null, supportsMarginExport) {
+        if (includeMargins == null && supportsMarginExport) {
+            val saved = withContext(Dispatchers.IO) {
+                fileStore.uiPrefs().getBoolean(UiPrefs.KEY_EXPORT_INCLUDE_MARGINS, false)
+            }
+            if (!userEditedMargins) {
+                selectedIncludeMargins = saved
+            }
+            marginsPrefReady = true
+        }
+    }
 
     val safeFilename = remember(note.title) { ExportManager.sanitizeFilename(note.title) }
 
@@ -100,19 +151,73 @@ fun ExportDialog(
 
     // Produces the composite flattened bitmap (including PDF background, image layers, and white paper bed)
     // for single-page PNG export across both Single-Page and Continuous Modes.
-    val effectivePageBitmap by produceState<Bitmap?>(
-        initialValue = null,
-        note.id, currentPageIndex, currentBitmap, backgroundBitmap, imageLayers
+    val previewState by produceState(
+        initialValue = ExportPreviewState(
+            includeMargins = selectedIncludeMargins,
+            ready = false,
+            bitmap = null
+        ),
+        note.id, currentPageIndex, currentBitmap, backgroundBitmap, imageLayers, selectedIncludeMargins, marginsPrefReady
     ) {
+        if (!marginsPrefReady) return@produceState
+        val oldBitmap = value.bitmap
+        value = ExportPreviewState(
+            includeMargins = selectedIncludeMargins,
+            ready = false,
+            bitmap = null
+        )
+        if (oldBitmap != null &&
+            oldBitmap !== currentBitmap &&
+            oldBitmap !== backgroundBitmap &&
+            !oldBitmap.isRecycled
+        ) {
+            oldBitmap.recycle()
+        }
         val loaded = withContext(Dispatchers.IO) {
             if (currentBitmap != null && !currentBitmap.isRecycled) {
-                ExportManager.flattenBitmap(currentBitmap, backgroundBitmap, imageLayers)
+                ExportManager.flattenCurrentPageForExport(
+                    note = note,
+                    repository = repository,
+                    fileStore = fileStore,
+                    pageIndex = currentPageIndex,
+                    currentEditingBitmap = currentBitmap,
+                    currentEditingBackground = backgroundBitmap,
+                    currentEditingImageLayers = imageLayers,
+                    includeMargins = selectedIncludeMargins
+                )
             } else {
-                ExportManager.loadFlattenedPageBitmap(fileStore, note.id, currentPageIndex, includeLayers = true, pageType = note.pageType)
+                ExportManager.loadFlattenedPageBitmap(
+                    fileStore = fileStore,
+                    noteId = note.id,
+                    pageIndex = currentPageIndex,
+                    includeLayers = true,
+                    pageType = note.pageType,
+                    repository = repository,
+                    includeMargins = selectedIncludeMargins
+                )
             }
         }
-        value = loaded
+        value = ExportPreviewState(
+            includeMargins = selectedIncludeMargins,
+            ready = true,
+            bitmap = loaded
+        )
     }
+    val latestPreviewBitmap by rememberUpdatedState(previewState.bitmap)
+    DisposableEffect(note.id) {
+        onDispose {
+            val bmp = latestPreviewBitmap
+            if (bmp != null &&
+                bmp !== currentBitmap &&
+                bmp !== backgroundBitmap &&
+                !bmp.isRecycled
+            ) {
+                bmp.recycle()
+            }
+        }
+    }
+    val pngReady = marginsPrefReady && previewState.ready && previewState.includeMargins == selectedIncludeMargins
+    val effectivePageBitmap = previewState.bitmap?.takeIf { pngReady && !it.isRecycled }
 
     // Text notes get the markdown-rendering exporters (HTML / paginated PDF);
     // drawing notes keep the rasterised page exporter.
@@ -143,7 +248,8 @@ fun ExportDialog(
                                 currentPageIndex = currentPageIndex,
                                 outputStream = out,
                                 currentEditingBackground = backgroundBitmap,
-                                currentEditingImageLayers = imageLayers
+                                currentEditingImageLayers = imageLayers,
+                                includeMargins = selectedIncludeMargins
                             )
                         }
                     }
@@ -277,7 +383,9 @@ fun ExportDialog(
                 }
             } else {
                 Column(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     Text(
@@ -286,7 +394,67 @@ fun ExportDialog(
                         color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
                     )
 
-                    Spacer(modifier = Modifier.height(4.dp))
+                    if (supportsMarginExport) {
+                        val onSelectMargins: (Boolean) -> Unit = { next ->
+                            userEditedMargins = true
+                            selectedIncludeMargins = next
+                            if (onIncludeMarginsChange != null) {
+                                onIncludeMarginsChange(next)
+                            } else {
+                                val seq = marginWriteSeq.incrementAndGet()
+                                scope.launch {
+                                    marginPersistMutex.withLock {
+                                        if (seq == marginWriteSeq.get()) {
+                                            withContext(Dispatchers.IO) {
+                                                fileStore.uiPrefs().putBoolean(
+                                                    UiPrefs.KEY_EXPORT_INCLUDE_MARGINS,
+                                                    next
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Surface(
+                            shape = RoundedCornerShape(10.dp),
+                            color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Text(
+                                    text = "Margin notes",
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    MarginOptionChip(
+                                        label = "Page only",
+                                        selected = !selectedIncludeMargins,
+                                        accentColor = themeColor,
+                                        onClick = { onSelectMargins(false) },
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    MarginOptionChip(
+                                        label = "Include margins",
+                                        selected = selectedIncludeMargins,
+                                        accentColor = themeColor,
+                                        onClick = { onSelectMargins(true) },
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(2.dp))
 
                     // Option 1: PDF Document
                     ExportOptionCard(
@@ -319,7 +487,8 @@ fun ExportDialog(
                                             currentEditingBitmap = currentBitmap,
                                             currentPageIndex = currentPageIndex,
                                             currentEditingBackground = backgroundBitmap,
-                                            currentEditingImageLayers = imageLayers
+                                            currentEditingImageLayers = imageLayers,
+                                            includeMargins = selectedIncludeMargins
                                         )
                                     }
                                     ExportManager.shareFile(context, file, "application/pdf", "Share PDF Note")
@@ -336,16 +505,22 @@ fun ExportDialog(
                         }
                     )
 
-                    // Option 2: PNG Image (When current page bitmap exists)
+                    // Option 2: PNG Image (When current page bitmap exists or is preparing)
                     val exportBmp = effectivePageBitmap
-                    if (exportBmp != null) {
+                    if (exportBmp != null || (!isTextNote && !pngReady)) {
                         ExportOptionCard(
                             title = "Current Page Image (.png)",
-                            subtitle = "Lossless PNG picture of page ${currentPageIndex + 1}",
+                            subtitle = if (!pngReady) {
+                                "Preparing page image..."
+                            } else {
+                                "Lossless PNG picture of page ${currentPageIndex + 1}"
+                            },
                             icon = Icons.Default.Image,
                             iconTint = Color(0xFF1976D2),
                             isSelected = initialTarget == ExportTarget.PNG_CURRENT_PAGE,
+                            enabled = pngReady && exportBmp != null,
                             onShareClick = {
+                                val targetBmp = exportBmp ?: return@ExportOptionCard
                                 scope.launch {
                                     isExporting = true
                                     exportStatusText = "Exporting PNG..."
@@ -354,7 +529,7 @@ fun ExportDialog(
                                             context = context,
                                             noteTitle = note.title,
                                             pageIndex = currentPageIndex,
-                                            bitmap = exportBmp,
+                                            bitmap = targetBmp,
                                             backgroundBitmap = null,
                                             imageLayers = emptyList()
                                         )
@@ -368,7 +543,9 @@ fun ExportDialog(
                                 }
                             },
                             onSaveClick = {
-                                createPngLauncher.launch("${safeFilename}_p${currentPageIndex + 1}.png")
+                                if (pngReady && exportBmp != null) {
+                                    createPngLauncher.launch("${safeFilename}_p${currentPageIndex + 1}.png")
+                                }
                             }
                         )
                     }
@@ -450,12 +627,46 @@ fun ExportDialog(
 }
 
 @Composable
+private fun MarginOptionChip(
+    label: String,
+    selected: Boolean,
+    accentColor: Color,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        shape = RoundedCornerShape(8.dp),
+        color = if (selected) accentColor.copy(alpha = 0.14f) else MaterialTheme.colorScheme.surface,
+        border = BorderStroke(
+            width = if (selected) 1.5.dp else 1.dp,
+            color = if (selected) accentColor else MaterialTheme.colorScheme.outline.copy(alpha = 0.25f)
+        ),
+        modifier = modifier
+            .clip(RoundedCornerShape(8.dp))
+            .clickable(onClick = onClick)
+    ) {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 7.dp)
+        ) {
+            Text(
+                text = label,
+                fontSize = 12.sp,
+                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+                color = if (selected) accentColor else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f)
+            )
+        }
+    }
+}
+
+@Composable
 private fun ExportOptionCard(
     title: String,
     subtitle: String,
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     iconTint: Color,
     isSelected: Boolean = false,
+    enabled: Boolean = true,
     onShareClick: () -> Unit,
     onSaveClick: () -> Unit
 ) {
@@ -524,10 +735,10 @@ private fun ExportOptionCard(
             ) {
                 Surface(
                     shape = RoundedCornerShape(8.dp),
-                    color = MaterialTheme.colorScheme.surface,
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = if (enabled) 1f else 0.45f),
                     modifier = Modifier
                         .clip(RoundedCornerShape(8.dp))
-                        .clickable(onClick = onShareClick)
+                        .clickable(enabled = enabled, onClick = onShareClick)
                 ) {
                     Row(
                         modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
@@ -537,14 +748,14 @@ private fun ExportOptionCard(
                             imageVector = Icons.Default.Share,
                             contentDescription = "Share",
                             modifier = Modifier.size(14.dp),
-                            tint = MaterialTheme.colorScheme.primary
+                            tint = MaterialTheme.colorScheme.primary.copy(alpha = if (enabled) 1f else 0.45f)
                         )
                         Spacer(modifier = Modifier.width(4.dp))
                         Text(
                             text = "Share",
                             fontSize = 12.sp,
                             fontWeight = FontWeight.Medium,
-                            color = MaterialTheme.colorScheme.primary
+                            color = MaterialTheme.colorScheme.primary.copy(alpha = if (enabled) 1f else 0.45f)
                         )
                     }
                 }
@@ -553,10 +764,10 @@ private fun ExportOptionCard(
 
                 Surface(
                     shape = RoundedCornerShape(8.dp),
-                    color = MaterialTheme.colorScheme.primary,
+                    color = MaterialTheme.colorScheme.primary.copy(alpha = if (enabled) 1f else 0.45f),
                     modifier = Modifier
                         .clip(RoundedCornerShape(8.dp))
-                        .clickable(onClick = onSaveClick)
+                        .clickable(enabled = enabled, onClick = onSaveClick)
                 ) {
                     Row(
                         modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),

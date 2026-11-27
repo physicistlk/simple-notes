@@ -20,10 +20,13 @@
 #include <malloc.h>
 #include <math.h>
 #include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <android/bitmap.h>
 #include <android/log.h>
 
+#include "fpdf_doc.h"
 #include "fpdf_text.h"
 #include "fpdfview.h"
 
@@ -136,6 +139,53 @@ Java_personal_notes_touch_util_PdfiumBridge_openDocument(JNIEnv *env, jobject th
     e->doc = doc;
     e->buffer = buf;
     e->bufferSize = (size_t) len;
+    e->pageIndex = -1;
+    pthread_mutex_unlock(&g_lock);
+    return (jlong) (slot + 1);
+}
+
+JNIEXPORT jlong JNICALL
+Java_personal_notes_touch_util_PdfiumBridge_openDocumentFromPath(JNIEnv *env, jobject thiz,
+                                                                 jstring path) {
+    (void) thiz;
+    if (path == NULL) return 0;
+    const char *pathStr = (*env)->GetStringUTFChars(env, path, NULL);
+    if (pathStr == NULL) return 0;
+    if (pathStr[0] == '\0') {
+        (*env)->ReleaseStringUTFChars(env, path, pathStr);
+        return 0;
+    }
+
+    pthread_mutex_lock(&g_lock);
+    ensure_library();
+    int slot = -1;
+    for (int i = 0; i < MAX_DOCS; i++) {
+        if (!g_docs[i].inUse) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        pthread_mutex_unlock(&g_lock);
+        LOGE("openDocumentFromPath: document table full");
+        (*env)->ReleaseStringUTFChars(env, path, pathStr);
+        return 0;
+    }
+    FPDF_DOCUMENT doc = FPDF_LoadDocument(pathStr, NULL);
+    if (doc == NULL) {
+        unsigned long err = FPDF_GetLastError();
+        pthread_mutex_unlock(&g_lock);
+        LOGE("FPDF_LoadDocument failed for %s (error %lu)", pathStr, err);
+        (*env)->ReleaseStringUTFChars(env, path, pathStr);
+        return 0;
+    }
+    (*env)->ReleaseStringUTFChars(env, path, pathStr);
+    DocEntry *e = &g_docs[slot];
+    memset(e, 0, sizeof(*e));
+    e->inUse = 1;
+    e->doc = doc;
+    e->buffer = NULL;
+    e->bufferSize = 0;
     e->pageIndex = -1;
     pthread_mutex_unlock(&g_lock);
     return (jlong) (slot + 1);
@@ -270,7 +320,7 @@ Java_personal_notes_touch_util_PdfiumBridge_textGetChars(JNIEnv *env, jobject th
                                                          jlong handle, jint pageIndex,
                                                          jint start, jint count) {
     (void) thiz;
-    if (count <= 0) return NULL;
+    if (start < 0 || count <= 0) return NULL;
     jstring result = NULL;
 
     pthread_mutex_lock(&g_lock);
@@ -370,13 +420,13 @@ Java_personal_notes_touch_util_PdfiumBridge_textCharBox(JNIEnv *env, jobject thi
                                                         jlong handle, jint pageIndex,
                                                         jint charIndex) {
     (void) thiz;
-    (void) pageIndex;
     jfloat values[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     pthread_mutex_lock(&g_lock);
     DocEntry *e = entry_for(handle);
-    if (e != NULL && e->textPage != NULL) {
+    FPDF_TEXTPAGE text = e != NULL ? ensure_text_page(e, pageIndex) : NULL;
+    if (text != NULL) {
         double left = 0, right = 0, bottom = 0, top = 0;
-        if (FPDFText_GetCharBox(e->textPage, charIndex, &left, &right, &bottom, &top)) {
+        if (FPDFText_GetCharBox(text, charIndex, &left, &right, &bottom, &top)) {
             values[0] = (jfloat) left;
             values[1] = (jfloat) top;
             values[2] = (jfloat) right;
@@ -386,5 +436,179 @@ Java_personal_notes_touch_util_PdfiumBridge_textCharBox(JNIEnv *env, jobject thi
     pthread_mutex_unlock(&g_lock);
     jfloatArray out = (*env)->NewFloatArray(env, 4);
     if (out != NULL) (*env)->SetFloatArrayRegion(env, out, 0, 4, values);
+    return out;
+}
+
+#define MAX_OUTLINE_NODES 500
+#define MAX_OUTLINE_DEPTH 16
+
+typedef struct {
+    jchar *title;
+    jsize titleLen;
+    int pageIndex;
+    int level;
+} OutlineItemC;
+
+typedef struct {
+    FPDF_DOCUMENT doc;
+    FPDF_BOOKMARK visited[MAX_OUTLINE_NODES];
+    int visitedCount;
+    OutlineItemC items[MAX_OUTLINE_NODES];
+    int itemCount;
+} OutlineWalkState;
+
+static void extract_title_utf16(FPDF_BOOKMARK bm, jchar **outTitle, jsize *outLen) {
+    *outTitle = NULL;
+    *outLen = 0;
+    unsigned long bytes = FPDFBookmark_GetTitle(bm, NULL, 0);
+    if (bytes <= 2) return;
+    size_t wcharCount = (size_t) ((bytes + 1) / 2);
+    uint16_t *buf = (uint16_t *) calloc(wcharCount, sizeof(uint16_t));
+    if (buf == NULL) return;
+    unsigned long written = FPDFBookmark_GetTitle(
+            bm, buf, (unsigned long) (wcharCount * sizeof(uint16_t)));
+    size_t maxChars = (size_t) (written / sizeof(uint16_t));
+    if (maxChars > wcharCount) maxChars = wcharCount;
+    size_t len = 0;
+    while (len < maxChars && buf[len] != 0) len++;
+    if (len == 0) {
+        free(buf);
+        return;
+    }
+    *outTitle = (jchar *) buf;
+    *outLen = (jsize) len;
+}
+
+static int resolve_page_index(FPDF_DOCUMENT doc, FPDF_BOOKMARK bm) {
+    FPDF_DEST dest = FPDFBookmark_GetDest(doc, bm);
+    if (dest == NULL) {
+        FPDF_ACTION action = FPDFBookmark_GetAction(bm);
+        if (action != NULL && FPDFAction_GetType(action) == PDFACTION_GOTO) {
+            dest = FPDFAction_GetDest(doc, action);
+        }
+    }
+    if (dest == NULL) return -1;
+    return FPDFDest_GetDestPageIndex(doc, dest);
+}
+
+static void walk_bookmarks(OutlineWalkState *st, FPDF_BOOKMARK first, int level) {
+    if (level > MAX_OUTLINE_DEPTH || st->itemCount >= MAX_OUTLINE_NODES) return;
+    for (FPDF_BOOKMARK bm = first;
+         bm != NULL && st->itemCount < MAX_OUTLINE_NODES && st->visitedCount < MAX_OUTLINE_NODES;
+         bm = FPDFBookmark_GetNextSibling(st->doc, bm)) {
+        int alreadyVisited = 0;
+        for (int i = 0; i < st->visitedCount; i++) {
+            if (st->visited[i] == bm) {
+                alreadyVisited = 1;
+                break;
+            }
+        }
+        if (alreadyVisited) break;
+        st->visited[st->visitedCount++] = bm;
+
+        OutlineItemC *item = &st->items[st->itemCount++];
+        extract_title_utf16(bm, &item->title, &item->titleLen);
+        item->pageIndex = resolve_page_index(st->doc, bm);
+        item->level = level;
+
+        FPDF_BOOKMARK child = FPDFBookmark_GetFirstChild(st->doc, bm);
+        if (child != NULL && level + 1 <= MAX_OUTLINE_DEPTH) {
+            walk_bookmarks(st, child, level + 1);
+        }
+    }
+}
+
+/*
+ * Returns a flat String[] of stride 3: [title, pageIndex, level, ...] for the
+ * document's bookmark outline, or null if the document has no outline.
+ */
+JNIEXPORT jobjectArray JNICALL
+Java_personal_notes_touch_util_PdfiumBridge_getOutline(JNIEnv *env, jobject thiz, jlong handle) {
+    (void) thiz;
+    OutlineWalkState st;
+    memset(&st, 0, sizeof(st));
+
+    pthread_mutex_lock(&g_lock);
+    DocEntry *e = entry_for(handle);
+    if (e != NULL && e->doc != NULL) {
+        st.doc = e->doc;
+        FPDF_BOOKMARK first = FPDFBookmark_GetFirstChild(e->doc, NULL);
+        if (first != NULL) {
+            walk_bookmarks(&st, first, 0);
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+
+    if (st.itemCount <= 0) {
+        return NULL;
+    }
+
+    jclass strCls = (*env)->FindClass(env, "java/lang/String");
+    if (strCls == NULL) {
+        for (int i = 0; i < st.itemCount; i++) free(st.items[i].title);
+        return NULL;
+    }
+    jstring empty = (*env)->NewStringUTF(env, "");
+    if (empty == NULL) {
+        (*env)->DeleteLocalRef(env, strCls);
+        for (int i = 0; i < st.itemCount; i++) free(st.items[i].title);
+        return NULL;
+    }
+    jobjectArray out = (*env)->NewObjectArray(env, st.itemCount * 3, strCls, empty);
+    (*env)->DeleteLocalRef(env, empty);
+    (*env)->DeleteLocalRef(env, strCls);
+    if (out == NULL) {
+        for (int i = 0; i < st.itemCount; i++) free(st.items[i].title);
+        return NULL;
+    }
+
+    for (int i = 0; i < st.itemCount; i++) {
+        OutlineItemC *item = &st.items[i];
+        jstring sTitle = (item->title != NULL && item->titleLen > 0)
+                ? (*env)->NewString(env, item->title, item->titleLen)
+                : (*env)->NewStringUTF(env, "");
+        free(item->title);
+        item->title = NULL;
+        if ((*env)->ExceptionCheck(env) || sTitle == NULL) {
+            if (sTitle != NULL) (*env)->DeleteLocalRef(env, sTitle);
+            for (int j = i + 1; j < st.itemCount; j++) {
+                free(st.items[j].title);
+                st.items[j].title = NULL;
+            }
+            (*env)->DeleteLocalRef(env, out);
+            return NULL;
+        }
+        (*env)->SetObjectArrayElement(env, out, i * 3, sTitle);
+        (*env)->DeleteLocalRef(env, sTitle);
+
+        char numBuf[32];
+        snprintf(numBuf, sizeof(numBuf), "%d", item->pageIndex);
+        jstring sPage = (*env)->NewStringUTF(env, numBuf);
+        if ((*env)->ExceptionCheck(env) || sPage == NULL) {
+            if (sPage != NULL) (*env)->DeleteLocalRef(env, sPage);
+            for (int j = i + 1; j < st.itemCount; j++) {
+                free(st.items[j].title);
+                st.items[j].title = NULL;
+            }
+            (*env)->DeleteLocalRef(env, out);
+            return NULL;
+        }
+        (*env)->SetObjectArrayElement(env, out, i * 3 + 1, sPage);
+        (*env)->DeleteLocalRef(env, sPage);
+
+        snprintf(numBuf, sizeof(numBuf), "%d", item->level);
+        jstring sLevel = (*env)->NewStringUTF(env, numBuf);
+        if ((*env)->ExceptionCheck(env) || sLevel == NULL) {
+            if (sLevel != NULL) (*env)->DeleteLocalRef(env, sLevel);
+            for (int j = i + 1; j < st.itemCount; j++) {
+                free(st.items[j].title);
+                st.items[j].title = NULL;
+            }
+            (*env)->DeleteLocalRef(env, out);
+            return NULL;
+        }
+        (*env)->SetObjectArrayElement(env, out, i * 3 + 2, sLevel);
+        (*env)->DeleteLocalRef(env, sLevel);
+    }
     return out;
 }

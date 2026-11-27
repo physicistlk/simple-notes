@@ -18,6 +18,7 @@ import kotlin.math.roundToInt
  */
 class PdfiumDocument : AutoCloseable {
 
+    @Volatile
     private var handle: Long = 0L
     private val lock = Any()
 
@@ -30,14 +31,19 @@ class PdfiumDocument : AutoCloseable {
     val isOpen: Boolean
         get() = handle != 0L
 
-    fun open(file: File): Boolean {
-        val bytes = try {
-            file.readBytes()
-        } catch (e: Exception) {
-            e.printStackTrace()
+    /** Opens the PDF directly from [file] via native file I/O (no heap ByteArray copy). */
+    fun open(file: File): Boolean = synchronized(lock) {
+        if (!file.isFile || file.length() <= 0L) return false
+        if (handle != 0L) closeLocked()
+        val h = PdfiumBridge.openDocumentFromPath(file.absolutePath)
+        if (h == 0L) return false
+        handle = h
+        pageCount = PdfiumBridge.getPageCount(h)
+        if (pageCount <= 0) {
+            closeLocked()
             return false
         }
-        return openBytes(bytes)
+        return true
     }
 
     /** Parses the whole PDF from [bytes]; false when the document is unusable. */
@@ -159,6 +165,23 @@ class PdfiumDocument : AutoCloseable {
     fun charBox(pageIndex: Int, charIndex: Int): FloatArray = synchronized(lock) {
         if (handle == 0L || pageIndex !in 0 until pageCount) return FloatArray(4)
         PdfiumBridge.textCharBox(handle, pageIndex, charIndex) ?: FloatArray(4)
+    }
+
+    /** Document outline / bookmarks in DFS pre-order. */
+    fun outline(): List<OutlineNode> = synchronized(lock) {
+        if (handle == 0L) return emptyList()
+        val raw = PdfiumBridge.getOutline(handle) ?: return emptyList()
+        if (raw.size < 3) return emptyList()
+        val out = ArrayList<OutlineNode>(raw.size / 3)
+        var i = 0
+        while (i + 2 < raw.size) {
+            val title = raw[i]
+            val pageIndex = raw[i + 1].toIntOrNull() ?: -1
+            val level = (raw[i + 2].toIntOrNull() ?: 0).coerceAtLeast(0)
+            out.add(OutlineNode(title = title, pageIndex = pageIndex, level = level))
+            i += 3
+        }
+        out
     }
 
     override fun close() {

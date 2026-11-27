@@ -27,6 +27,9 @@ object PdfiumBridge {
     /** Parses [data] into a document. Returns 0 on failure. */
     external fun openDocument(data: ByteArray): Long
 
+    /** Opens a PDF directly from [path] without copying file bytes onto the heap. Returns 0 on failure. */
+    external fun openDocumentFromPath(path: String): Long
+
     external fun closeDocument(handle: Long)
 
     external fun getPageCount(handle: Long): Int
@@ -82,4 +85,10 @@ object PdfiumBridge {
 
     /** {left, top, right, bottom} of one character in user space. */
     external fun textCharBox(handle: Long, pageIndex: Int, charIndex: Int): FloatArray
+
+    /**
+     * Flattened bookmark outline as stride-3 string tuples `[title, pageIndex, level, ...]`.
+     * Returns null when the document has no outline or handle is invalid.
+     */
+    external fun getOutline(handle: Long): Array<String>?
 }

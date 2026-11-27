@@ -12,5 +12,6 @@ data class TocItem(
     val id: String = UUID.randomUUID().toString(),
     val title: String,
     val pageIndex: Int,
-    val level: Int = 0
+    val level: Int = 0,
+    val source: String = "user"
 )

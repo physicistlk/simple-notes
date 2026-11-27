@@ -35,7 +35,7 @@ Open-source Android notes app (clean-room clone of TouchNotes) built with **nati
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Or download the prebuilt APK from [Releases](https://github.com/physicistlk/simple-notes/releases/tag/v0.1.0-debug).
+Or download the prebuilt APK from [Releases](https://github.com/physicistlk/simple-notes/releases/latest).
 
 ## Project Structure
 

@@ -12,9 +12,12 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
@@ -23,9 +26,10 @@ import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import org.json.JSONArray
-import org.json.JSONObject
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import personal.notes.touch.data.db.entity.NoteEntity
 import personal.notes.touch.data.db.entity.PageEntity
 import personal.notes.touch.data.files.NoteFileStore
@@ -33,6 +37,9 @@ import personal.notes.touch.data.repo.NoteRepository
 import personal.notes.touch.data.repo.SettingsRepository
 import personal.notes.touch.ui.settings.parsePenDefaults
 import personal.notes.touch.util.BitmapUtils
+import personal.notes.touch.util.OutlineNode
+import personal.notes.touch.util.PdfOutlineImporter
+import personal.notes.touch.util.PdfiumDocument
 import java.io.File
 
 /**
@@ -49,6 +56,19 @@ enum class InfiniteGridPreset(val label: String) {
     ISOMETRIC("Iso"),
     TRIANGLE("Tri")
 }
+
+/**
+ * Maps the Settings "Default Paper Background Pattern" code to the closest
+ * infinite-canvas grid preset. Returns null for the unset/blank value: an
+ * infinite note keeps its own default (Graph) until the user picks a grid.
+ */
+internal fun infiniteGridPresetForPaperBackground(background: Int): InfiniteGridPreset? =
+    when (background) {
+        1 -> InfiniteGridPreset.GRAPH
+        2 -> InfiniteGridPreset.LINED
+        3 -> InfiniteGridPreset.DOTS
+        else -> null
+    }
 
 data class CanvasUiState(
     val selectedTool: CanvasTool = CanvasTool.PEN,
@@ -114,7 +134,8 @@ data class CanvasUiState(
     val autoSaveIntervalMs: Int = 1000,
     val gridSnapEnabled: Boolean = false,
     val strokeOpacity: Float = 1.0f,
-    val infiniteGridPreset: InfiniteGridPreset = InfiniteGridPreset.GRAPH
+    val infiniteGridPreset: InfiniteGridPreset = InfiniteGridPreset.GRAPH,
+    val exportIncludeMargins: Boolean = false
 )
 
 /**
@@ -165,6 +186,7 @@ class CanvasViewModel(
 
     private var defaultPaperPattern: PaperPattern = PaperPattern.BLANK
     private var lastPenDefaultsJson: String? = null
+    private val catalogMutex = Mutex()
 
     /**
      * Workspace preferences that outlive the screen (tab bar state, dock
@@ -180,8 +202,24 @@ class CanvasViewModel(
     private val KEY_STYLUS_ONLY = "stylus_only"
 
     private var pagePatternHydrated = false
+
+    /**
+     * True once the user picked the infinite-canvas grid from the canvas
+     * (the Precision HUD or the Tools > Template row). Until then the app
+     * default paper pattern seeds the grid, so the Settings screen's
+     * "Default Paper Background Pattern" also works on an infinite canvas.
+     */
+    private var infiniteGridTouched = false
+
     private val _uiState = MutableStateFlow(CanvasUiState())
     val uiState: StateFlow<CanvasUiState> = _uiState.asStateFlow()
+
+    private val _pageSavedEvents = MutableSharedFlow<Int>(extraBufferCapacity = 32)
+    val pageSavedEvents: SharedFlow<Int> = _pageSavedEvents.asSharedFlow()
+
+    fun notifyPageModified(pageIndex: Int) {
+        _pageSavedEvents.tryEmit(pageIndex)
+    }
 
     private val _currentPageIndex = MutableStateFlow(0)
     val currentPageIndex: StateFlow<Int> = _currentPageIndex.asStateFlow()
@@ -307,20 +345,36 @@ class CanvasViewModel(
         // Workspace preferences that survive the screen: the open-notes tab
         // bar state and the pen dock orientation.
         viewModelScope.launch(Dispatchers.IO) {
-            _uiState.value = _uiState.value.copy(
-                showTabs = uiPrefs.getBoolean(KEY_SHOW_TABS, true),
-                dockHorizontal = uiPrefs.getBoolean(KEY_DOCK_HORIZONTAL, false),
-                showPencase = uiPrefs.getBoolean(KEY_SHOW_PENCASE, true),
-                readingMode = uiPrefs.getBoolean(KEY_READING_MODE, false),
-                zoomLocked = uiPrefs.getBoolean(KEY_ZOOM_LOCKED, false),
-                // The stylus mode is only forced on when a stylus is actually
-                // used; without one the hand has to be able to write, and the
-                // switch has to be usable.
-                stylusOnly = uiPrefs.getBoolean(KEY_STYLUS_ONLY, false),
-                fixPreviewPage = uiPrefs.getBoolean(KEY_FIX_PREVIEW_PAGE, false),
-                horizontalResistance = uiPrefs.getFloat(KEY_HORIZONTAL_RESISTANCE, 0.4f),
-                minimalInfiniteZoom = uiPrefs.getFloat(KEY_MINIMAL_INFINITE_ZOOM, 0.20f)
+            val showTabs = uiPrefs.getBoolean(KEY_SHOW_TABS, true)
+            val dockHorizontal = uiPrefs.getBoolean(KEY_DOCK_HORIZONTAL, false)
+            val showPencase = uiPrefs.getBoolean(KEY_SHOW_PENCASE, true)
+            val readingMode = uiPrefs.getBoolean(KEY_READING_MODE, false)
+            val zoomLocked = uiPrefs.getBoolean(KEY_ZOOM_LOCKED, false)
+            val stylusOnly = uiPrefs.getBoolean(KEY_STYLUS_ONLY, false)
+            val fixPreviewPage = uiPrefs.getBoolean(KEY_FIX_PREVIEW_PAGE, false)
+            val horizontalResistance = uiPrefs.getFloat(KEY_HORIZONTAL_RESISTANCE, 0.4f)
+            val minimalInfiniteZoom = uiPrefs.getFloat(KEY_MINIMAL_INFINITE_ZOOM, 0.20f)
+            val exportIncludeMargins = uiPrefs.getBoolean(
+                personal.notes.touch.data.files.UiPrefs.KEY_EXPORT_INCLUDE_MARGINS,
+                false
             )
+            _uiState.update { state ->
+                state.copy(
+                    showTabs = showTabs,
+                    dockHorizontal = dockHorizontal,
+                    showPencase = showPencase,
+                    readingMode = readingMode,
+                    zoomLocked = zoomLocked,
+                    // The stylus mode is only forced on when a stylus is actually
+                    // used; without one the hand has to be able to write, and the
+                    // switch has to be usable.
+                    stylusOnly = stylusOnly,
+                    fixPreviewPage = fixPreviewPage,
+                    horizontalResistance = horizontalResistance,
+                    minimalInfiniteZoom = minimalInfiniteZoom,
+                    exportIncludeMargins = exportIncludeMargins
+                )
+            }
         }
         if (settingsRepository != null) {
             viewModelScope.launch {
@@ -337,40 +391,66 @@ class CanvasViewModel(
                     defaultPaperPattern = pattern
                     // Only seed from global settings until a page-owned pattern is
                     // applied (syncPagePattern); the page row wins once it's known.
-                    if (!pagePatternHydrated) {
-                        _uiState.value = _uiState.value.copy(paperPattern = pattern)
-                    }
                     val penDefaultsJson = settings.penDefaultsJson
                     val penDefaultsChanged = penDefaultsJson != lastPenDefaultsJson
-                    if (penDefaultsChanged) {
+                    val pen = if (penDefaultsChanged) {
                         lastPenDefaultsJson = penDefaultsJson
-                        val pen = parsePenDefaults(penDefaultsJson)
-                        _uiState.value = _uiState.value.copy(
-                            selectedColor = Color(pen.color),
-                            strokeWidth = pen.strokeWidth,
-                            // The reset button goes back to the setting, not to
-                            // the size that happens to be in use.
-                            defaultStrokeWidth = pen.strokeWidth,
-                            pressureSensitivity = pen.pressureSensitivity
+                        parsePenDefaults(penDefaultsJson)
+                    } else {
+                        null
+                    }
+                    _uiState.update { state ->
+                        val withPattern = if (!pagePatternHydrated) {
+                            state.copy(paperPattern = pattern)
+                        } else {
+                            state
+                        }
+                        val withPen = if (pen != null) {
+                            withPattern.copy(
+                                selectedColor = Color(pen.color),
+                                strokeWidth = pen.strokeWidth,
+                                // The reset button goes back to the setting, not to
+                                // the size that happens to be in use.
+                                defaultStrokeWidth = pen.strokeWidth,
+                                pressureSensitivity = pen.pressureSensitivity
+                            )
+                        } else {
+                            withPattern
+                        }
+                        // The infinite canvas keeps its own grid preset (it has
+                        // Iso/Tri, which the paper patterns do not). Until the
+                        // user picks one in the canvas, the app default paper
+                        // pattern is the seed, so Settings > Default Paper
+                        // Background Pattern also changes an infinite note.
+                        val seededInfiniteGrid =
+                            infiniteGridPresetForPaperBackground(settings.defaultBackground)
+                        val withInfiniteGrid = if (
+                            !infiniteGridTouched &&
+                            noteRow?.pageType == "infinite" &&
+                            seededInfiniteGrid != null
+                        ) {
+                            withPen.copy(infiniteGridPreset = seededInfiniteGrid)
+                        } else {
+                            withPen
+                        }
+                        withInfiniteGrid.copy(
+                            pressureSizeEnabled = settings.pressureSizeEnabled,
+                            autoShapeEnabled = settings.autoShapeEnabled,
+                            volumeForPageEnabled = settings.volumeForPage,
+                            penBoxEnabled = settings.showPenBox,
+                            penSlot1Color = settings.penSlot1Color,
+                            penSlot1Width = settings.penSlot1Width,
+                            penSlot2Color = settings.penSlot2Color,
+                            penSlot2Width = settings.penSlot2Width,
+                            backgroundMode = settings.backgroundMode,
+                            backgroundDensity = settings.backgroundDensity,
+                            pageTurningDirection = settings.pageTurningDirection,
+                            pageTurningMode = if (noteRow?.pageType == "pdf") settings.pdfPageTurningMode else settings.pageTurningMode,
+                            doublePageMode = settings.doublePage,
+                            autoCenter = settings.autoCenter,
+                            autoSaveIntervalMs = settings.autoSaveIntervalMs
                         )
                     }
-                    _uiState.value = _uiState.value.copy(
-                        pressureSizeEnabled = settings.pressureSizeEnabled,
-                        autoShapeEnabled = settings.autoShapeEnabled,
-                        volumeForPageEnabled = settings.volumeForPage,
-                        penBoxEnabled = settings.showPenBox,
-                        penSlot1Color = settings.penSlot1Color,
-                        penSlot1Width = settings.penSlot1Width,
-                        penSlot2Color = settings.penSlot2Color,
-                        penSlot2Width = settings.penSlot2Width,
-                        backgroundMode = settings.backgroundMode,
-                        backgroundDensity = settings.backgroundDensity,
-                        pageTurningDirection = settings.pageTurningDirection,
-                        pageTurningMode = if (noteRow?.pageType == "pdf") settings.pdfPageTurningMode else settings.pageTurningMode,
-                        doublePageMode = settings.doublePage,
-                        autoCenter = settings.autoCenter,
-                        autoSaveIntervalMs = settings.autoSaveIntervalMs
-                    )
                 }
             }
         }
@@ -507,51 +587,115 @@ class CanvasViewModel(
     }
 
     private fun getBookmarksFile(): File = File(fileStore.getNoteDir(noteId), "bookmarks.json")
-    private fun getCatalogFile(): File = File(fileStore.getNoteDir(noteId), "catalog.json")
 
-    private fun loadDrawerData() {
+    private suspend fun loadDrawerData() {
         try {
             val bmFile = getBookmarksFile()
             val bookmarks = mutableSetOf<Int>()
             if (bmFile.exists()) {
-                val jsonArr = JSONArray(bmFile.readText())
-                for (i in 0 until jsonArr.length()) {
-                    bookmarks.add(jsonArr.getInt(i))
+                val parsed = MiniJson.parse(bmFile.readText()) as? List<*>
+                if (parsed != null) {
+                    for (entry in parsed) {
+                        val pageIdx = (entry as? Number)?.toInt() ?: continue
+                        if (pageIdx >= 0) bookmarks.add(pageIdx)
+                    }
                 }
             }
 
-            val catFile = getCatalogFile()
-            val tocList = mutableListOf<TocItem>()
-            if (catFile.exists()) {
-                val jsonArr = JSONArray(catFile.readText())
-                for (i in 0 until jsonArr.length()) {
-                    val obj = jsonArr.getJSONObject(i)
-                    tocList.add(
-                        TocItem(
-                            id = obj.optString("id", java.util.UUID.randomUUID().toString()),
-                            title = obj.getString("title"),
-                            pageIndex = obj.getInt("pageIndex"),
-                            level = obj.optInt("level", 0)
+            val tocList = catalogMutex.withLock {
+                val catFile = fileStore.getCatalogFile(noteId)
+                if (catFile.exists()) {
+                    fileStore.readCatalogToc(noteId)
+                } else {
+                    val isPdfNote = repository.getNoteDirect(noteId)?.pageType == "pdf"
+                    if (isPdfNote) {
+                        val pagesList = repository.getPagesForNoteSync(noteId)
+                        val extracted = extractPdfOutlineFromPages(pagesList)
+                        fileStore.writeCatalogToc(noteId, extracted)
+                        extracted
+                    } else {
+                        listOf(
+                            TocItem(
+                                title = "Chapter 1: Overview",
+                                pageIndex = 0,
+                                level = 0,
+                                source = PdfOutlineImporter.SOURCE_USER
+                            )
                         )
-                    )
+                    }
                 }
-            } else {
-                tocList.add(
-                    TocItem(
-                        title = "Chapter 1: Overview",
-                        pageIndex = 0,
-                        level = 0
-                    )
+            }
+
+            val sortedToc = tocList.sortedBy { it.pageIndex }
+            _uiState.update { state ->
+                state.copy(
+                    bookmarkedPages = bookmarks,
+                    tocEntries = sortedToc
                 )
             }
-
-            _uiState.value = _uiState.value.copy(
-                bookmarkedPages = bookmarks,
-                tocEntries = tocList.sortedBy { it.pageIndex }
-            )
         } catch (e: Exception) {
             e.printStackTrace()
         }
+    }
+
+    fun reloadDrawerData() {
+        viewModelScope.launch(Dispatchers.IO) {
+            loadDrawerData()
+        }
+    }
+
+    fun reimportPdfOutline(onComplete: (Int) -> Unit = {}) {
+        viewModelScope.launch(Dispatchers.IO) {
+            var importedCount = 0
+            try {
+                catalogMutex.withLock {
+                    val pagesList = repository.getPagesForNoteSync(noteId)
+                    val imported = extractPdfOutlineFromPages(pagesList)
+                    importedCount = imported.size
+                    val existing = _uiState.value.tocEntries.ifEmpty {
+                        fileStore.readCatalogToc(noteId)
+                    }
+                    val merged = PdfOutlineImporter.mergeWithUserEntries(existing, imported)
+                    fileStore.writeCatalogToc(noteId, merged)
+                    _uiState.update { state -> state.copy(tocEntries = merged) }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+            withContext(Dispatchers.Main) {
+                onComplete(importedCount)
+            }
+        }
+    }
+
+    private fun extractPdfOutlineFromPages(pagesList: List<PageEntity>): List<TocItem> {
+        if (pagesList.isEmpty()) return emptyList()
+        val pdfPages = pagesList.filter { it.pdfSourcePath.isNotEmpty() && it.pdfPageIndex >= 0 }
+        if (pdfPages.isEmpty()) return emptyList()
+        val grouped = pdfPages.groupBy { it.pdfSourcePath }
+        val collected = ArrayList<OutlineNode>()
+        for ((relPath, sourcePages) in grouped) {
+            val file = fileStore.resolveRelativeFile(relPath)
+            if (!file.isFile) continue
+            val pageMap = HashMap<Int, Int>(sourcePages.size)
+            for (p in sourcePages) {
+                pageMap.putIfAbsent(p.pdfPageIndex, p.index)
+            }
+            val rawNodes = PdfiumDocument.open(file)?.use { doc ->
+                doc.outline()
+            }.orEmpty()
+            for (node in rawNodes) {
+                val mappedNoteIdx = pageMap[node.pageIndex] ?: continue
+                collected.add(
+                    OutlineNode(
+                        title = node.title,
+                        pageIndex = mappedNoteIdx,
+                        level = node.level
+                    )
+                )
+            }
+        }
+        return PdfOutlineImporter.importNodes(collected, pageCount = pagesList.size)
     }
 
     fun setDrawerTab(tab: DrawerTab) {
@@ -613,11 +757,30 @@ class CanvasViewModel(
 
     private fun saveBookmarksJson(bookmarks: Set<Int>) {
         viewModelScope.launch(Dispatchers.IO) {
+            var tmp: File? = null
             try {
-                val arr = JSONArray()
-                bookmarks.sorted().forEach { arr.put(it) }
-                getBookmarksFile().writeText(arr.toString())
+                val sorted = bookmarks.sorted()
+                val sb = StringBuilder()
+                sb.append('[')
+                sorted.forEachIndexed { idx, value ->
+                    if (idx > 0) sb.append(',')
+                    sb.append(value)
+                }
+                sb.append(']')
+                val target = getBookmarksFile()
+                target.parentFile?.mkdirs()
+                val tmpFile = File(fileStore.getTmpDir(noteId), "bookmarks_${System.nanoTime()}.tmp")
+                tmp = tmpFile
+                tmpFile.writeText(sb.toString())
+                if (!tmpFile.renameTo(target)) {
+                    if (target.exists()) target.delete()
+                    if (!tmpFile.renameTo(target)) {
+                        target.writeText(sb.toString())
+                        tmpFile.delete()
+                    }
+                }
             } catch (e: Exception) {
+                tmp?.let { if (it.exists()) it.delete() }
                 e.printStackTrace()
             }
         }
@@ -626,7 +789,12 @@ class CanvasViewModel(
     fun addTocEntry(title: String, pageIndex: Int, level: Int = 0) {
         val cleanTitle = title.trim()
         if (cleanTitle.isEmpty()) return
-        val item = TocItem(title = cleanTitle, pageIndex = pageIndex, level = level)
+        val item = TocItem(
+            title = cleanTitle,
+            pageIndex = pageIndex,
+            level = level,
+            source = PdfOutlineImporter.SOURCE_USER
+        )
         val updated = (_uiState.value.tocEntries + item).sortedBy { it.pageIndex }
         _uiState.value = _uiState.value.copy(tocEntries = updated)
         saveCatalogJson(updated)
@@ -641,17 +809,9 @@ class CanvasViewModel(
     private fun saveCatalogJson(list: List<TocItem>) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val arr = JSONArray()
-                list.forEach { item ->
-                    val obj = JSONObject().apply {
-                        put("id", item.id)
-                        put("title", item.title)
-                        put("pageIndex", item.pageIndex)
-                        put("level", item.level)
-                    }
-                    arr.put(obj)
+                catalogMutex.withLock {
+                    fileStore.writeCatalogToc(noteId, list)
                 }
-                getCatalogFile().writeText(arr.toString())
             } catch (e: Exception) {
                 e.printStackTrace()
             }
@@ -716,10 +876,12 @@ class CanvasViewModel(
     }
 
     fun setInfiniteGridPreset(preset: InfiniteGridPreset) {
+        infiniteGridTouched = true
         _uiState.value = _uiState.value.copy(infiniteGridPreset = preset)
     }
 
     fun cycleInfiniteGridPreset() {
+        infiniteGridTouched = true
         val values = InfiniteGridPreset.values()
         val next = values[(_uiState.value.infiniteGridPreset.ordinal + 1) % values.size]
         _uiState.value = _uiState.value.copy(infiniteGridPreset = next)
@@ -764,6 +926,16 @@ class CanvasViewModel(
         viewModelScope.launch(Dispatchers.IO) { uiPrefs.putFloat(KEY_MINIMAL_INFINITE_ZOOM, zoom) }
     }
 
+    fun setExportIncludeMargins(includeMargins: Boolean) {
+        _uiState.value = _uiState.value.copy(exportIncludeMargins = includeMargins)
+        viewModelScope.launch(Dispatchers.IO) {
+            uiPrefs.putBoolean(
+                personal.notes.touch.data.files.UiPrefs.KEY_EXPORT_INCLUDE_MARGINS,
+                includeMargins
+            )
+        }
+    }
+
     var isNoteDeleted: Boolean = false
         private set
 
@@ -800,7 +972,13 @@ class CanvasViewModel(
 
     /** Read-only overlay of the strokes written in continuous mode (null = none). */
     suspend fun loadCurrentAnnotationOverlay(width: Int, height: Int): Bitmap? =
-        repository.loadAnnotationOverlay(noteId, _currentPageIndex.value, width, height)
+        repository.loadAnnotationOverlay(
+            noteId,
+            _currentPageIndex.value,
+            width,
+            height,
+            pageType = note.value?.pageType ?: "a4"
+        )
 
     /**
      * True when the page bitmap currently shown in the canvas view came from
@@ -862,10 +1040,13 @@ class CanvasViewModel(
     }
 
     private suspend fun saveContentLayerDirect(index: Int, bitmap: Bitmap) {
-        if (pageIsVectorPdf(index)) {
+        val ok = if (pageIsVectorPdf(index)) {
             repository.savePageStrokes(noteId, index, bitmap)
         } else {
             repository.savePageBitmap(noteId, index, bitmap)
+        }
+        if (ok) {
+            _pageSavedEvents.tryEmit(index)
         }
     }
 
@@ -993,7 +1174,7 @@ class CanvasViewModel(
      */
     suspend fun savePageBackgroundOverride(pageIndex: Int, bitmap: Bitmap) {
         val file = fileStore.getPageBackgroundFile(noteId, pageIndex)
-        withContext(Dispatchers.IO) {
+        val ok = withContext(Dispatchers.IO) {
             try {
                 val tmp = File(file.parentFile, file.name + ".tmp")
                 java.io.FileOutputStream(tmp).use { fos ->
@@ -1003,7 +1184,12 @@ class CanvasViewModel(
                 tmp.renameTo(file)
             } catch (e: Exception) {
                 e.printStackTrace()
+                false
             }
+        }
+        if (ok) {
+            repository.touchNoteUpdatedAt(noteId)
+            _pageSavedEvents.tryEmit(pageIndex)
         }
     }
 
@@ -1044,6 +1230,7 @@ class CanvasViewModel(
             _currentPageIndex.value = index
             canvasPageIndex = index
             val newBitmap = loadContentLayer(index)
+            if (_currentPageIndex.value != index) return@launch
             // The save above guarded the OLD page with the OLD flag state;
             // from here on the flag describes the NEW page's load result.
             pageLoadedFromDisk = newBitmap != null
@@ -1094,12 +1281,16 @@ class CanvasViewModel(
             saveBookmarksJson(newBookmarks)
 
             // Shift TOC entries at or after targetIndex
-            val oldToc = _uiState.value.tocEntries
-            val newToc = oldToc.map { item ->
-                if (item.pageIndex >= targetIndex) item.copy(pageIndex = item.pageIndex + 1) else item
+            catalogMutex.withLock {
+                val oldToc = _uiState.value.tocEntries
+                val newToc = oldToc.map { item ->
+                    if (item.pageIndex >= targetIndex) item.copy(pageIndex = item.pageIndex + 1) else item
+                }
+                _uiState.value = _uiState.value.copy(tocEntries = newToc)
+                withContext(Dispatchers.IO) {
+                    fileStore.writeCatalogToc(noteId, newToc)
+                }
             }
-            _uiState.value = _uiState.value.copy(tocEntries = newToc)
-            saveCatalogJson(newToc)
 
             _currentPageIndex.value = newPage.index
             canvasPageIndex = newPage.index
@@ -1152,16 +1343,20 @@ class CanvasViewModel(
                 saveBookmarksJson(newBookmarks)
 
                 // Shift TOC entries
-                val oldToc = _uiState.value.tocEntries
-                val newToc = oldToc.mapNotNull { item ->
-                    when {
-                        item.pageIndex == pageIndex -> null
-                        item.pageIndex > pageIndex -> item.copy(pageIndex = item.pageIndex - 1)
-                        else -> item
+                catalogMutex.withLock {
+                    val oldToc = _uiState.value.tocEntries
+                    val newToc = oldToc.mapNotNull { item ->
+                        when {
+                            item.pageIndex == pageIndex -> null
+                            item.pageIndex > pageIndex -> item.copy(pageIndex = item.pageIndex - 1)
+                            else -> item
+                        }
+                    }
+                    _uiState.value = _uiState.value.copy(tocEntries = newToc)
+                    withContext(Dispatchers.IO) {
+                        fileStore.writeCatalogToc(noteId, newToc)
                     }
                 }
-                _uiState.value = _uiState.value.copy(tocEntries = newToc)
-                saveCatalogJson(newToc)
 
                 val newIndex = when {
                     _currentPageIndex.value >= totalPages - 1 -> totalPages - 2

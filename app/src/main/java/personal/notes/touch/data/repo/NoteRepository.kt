@@ -42,7 +42,10 @@ import personal.notes.touch.text.NoteTemplates
 import personal.notes.touch.text.NoteTags
 import personal.notes.touch.text.WikiLinks
 import personal.notes.touch.ui.editor.BlockPersistence
+import personal.notes.touch.util.PdfModeReconciliationPolicy
+import java.io.File
 import java.util.UUID
+import kotlin.math.roundToInt
 
 /** How many parents the breadcrumb walks up before it gives up. */
 private const val MAX_NESTING_DEPTH = 32
@@ -708,50 +711,115 @@ class NoteRepository(
     // Pages (M4)
     fun getPagesForNote(noteId: String): Flow<List<PageEntity>> = pageDao.getPagesForNote(noteId)
 
+    suspend fun getPagesForNoteSync(noteId: String): List<PageEntity> = withContext(Dispatchers.IO) {
+        pageDao.getPagesForNoteSync(noteId)
+    }
+
+    suspend fun getPage(noteId: String, pageIndex: Int): PageEntity? = withContext(Dispatchers.IO) {
+        pageDao.getPage(noteId, pageIndex)
+    }
+
+    suspend fun getNextPageIndex(noteId: String): Int = withContext(Dispatchers.IO) {
+        pageDao.getPagesForNoteSync(noteId).size
+    }
+
+    suspend fun appendPdfPagesBatch(
+        noteId: String,
+        startNotePageIndex: Int,
+        pdfSourcePath: String,
+        pdfPageOffset: Int,
+        batchCount: Int,
+        reuseFirstPage: Boolean,
+        newTotalPageCount: Int
+    ) = withContext(Dispatchers.IO) {
+        if (batchCount <= 0) return@withContext
+        val action: suspend () -> Unit = {
+            val now = System.currentTimeMillis()
+            val toInsert = ArrayList<PageEntity>(batchCount)
+            for (k in 0 until batchCount) {
+                val pdfIdx = pdfPageOffset + k
+                if (reuseFirstPage && pdfIdx == 0) {
+                    pageDao.setPdfSource(noteId, 0, pdfSourcePath, 0, now)
+                } else {
+                    val notePageIdx = if (reuseFirstPage) pdfIdx else startNotePageIndex + pdfIdx
+                    toInsert.add(
+                        PageEntity(
+                            id = UUID.randomUUID().toString(),
+                            noteId = noteId,
+                            index = notePageIdx,
+                            bitmapPath = fileStore.getPageFile(noteId, notePageIdx).absolutePath,
+                            paperPattern = 0,
+                            pdfSourcePath = pdfSourcePath,
+                            pdfPageIndex = pdfIdx,
+                            updatedAt = now
+                        )
+                    )
+                }
+            }
+            if (toInsert.isNotEmpty()) {
+                pageDao.insertAll(toInsert)
+            }
+            noteDao.updatePageCount(noteId, newTotalPageCount, now)
+        }
+        if (database != null) database.withTransaction { action() } else action()
+    }
+
+    suspend fun rollbackAppendedPdfPages(noteId: String, fromIndex: Int) = withContext(Dispatchers.IO) {
+        val safeFrom = fromIndex.coerceAtLeast(0)
+        val action: suspend () -> Unit = {
+            pageDao.deleteFromIndex(noteId, safeFrom)
+            noteDao.updatePageCount(noteId, safeFrom, System.currentTimeMillis())
+        }
+        if (database != null) database.withTransaction { action() } else action()
+        fileStore.deletePageFile(noteId, safeFrom)
+    }
+
     suspend fun insertPage(noteId: String, atIndex: Int): PageEntity = withContext(Dispatchers.IO) {
         val existing = pageDao.getPagesForNoteSync(noteId).sortedBy { it.index }
         val targetIndex = atIndex.coerceIn(0, existing.size)
+        val now = System.currentTimeMillis()
+        val inheritedPattern = existing.firstOrNull { it.index == targetIndex }?.paperPattern
+            ?: existing.lastOrNull()?.paperPattern
+            ?: 0
 
         // If targetIndex < existing.size, shift existing pages backwards
         if (targetIndex < existing.size) {
-            // 1. Shift files backwards from last down to targetIndex
-            for (idx in (existing.size - 1) downTo targetIndex) {
-                fileStore.renamePageFile(noteId, idx, idx + 1)
-            }
-            // 2. Shift database PageEntity rows backwards
+            // 1. Shift files backwards from highest existing index down to targetIndex
             for (page in existing.filter { it.index >= targetIndex }.sortedByDescending { it.index }) {
-                val shiftedIndex = page.index + 1
-                val updated = page.copy(
-                    index = shiftedIndex,
-                    bitmapPath = fileStore.getPageFile(noteId, shiftedIndex).absolutePath,
-                    updatedAt = System.currentTimeMillis()
-                )
-                pageDao.update(updated)
+                fileStore.renamePageFile(noteId, page.index, page.index + 1)
             }
         }
-
         // Clean any leftover files at targetIndex
         fileStore.deletePageFile(noteId, targetIndex)
 
-        // Create and insert the new blank page
-        val pageFile = fileStore.getPageFile(noteId, targetIndex)
         val newPage = PageEntity(
             id = UUID.randomUUID().toString(),
             noteId = noteId,
             index = targetIndex,
-            bitmapPath = pageFile.absolutePath,
+            bitmapPath = fileStore.getPageFile(noteId, targetIndex).absolutePath,
             // The new sheet looks like its neighbours: it inherits the paper
             // pattern of the page it is inserted in front of.
-            paperPattern = existing.getOrNull(targetIndex)?.paperPattern
-                ?: existing.lastOrNull()?.paperPattern
-                ?: 0,
+            paperPattern = inheritedPattern,
             pdfSourcePath = "",
             pdfPageIndex = -1,
-            updatedAt = System.currentTimeMillis()
+            updatedAt = now
         )
-        pageDao.insert(newPage)
-
-        noteDao.updatePageCount(noteId, existing.size + 1, System.currentTimeMillis())
+        val dbAction: suspend () -> Unit = {
+            if (targetIndex < existing.size) {
+                for (page in existing.filter { it.index >= targetIndex }.sortedByDescending { it.index }) {
+                    val shiftedIndex = page.index + 1
+                    val updated = page.copy(
+                        index = shiftedIndex,
+                        bitmapPath = fileStore.getPageFile(noteId, shiftedIndex).absolutePath,
+                        updatedAt = now
+                    )
+                    pageDao.update(updated)
+                }
+            }
+            pageDao.insert(newPage)
+            noteDao.updatePageCount(noteId, existing.size + 1, now)
+        }
+        if (database != null) database.withTransaction { dbAction() } else dbAction()
         newPage
     }
 
@@ -761,28 +829,35 @@ class NoteRepository(
     }
 
     suspend fun deletePage(noteId: String, pageIndex: Int): Boolean = withContext(Dispatchers.IO) {
-        val pages = pageDao.getPagesForNoteSync(noteId).toMutableList()
-        if (pages.size <= 1 || pageIndex !in pages.indices) {
+        val pages = pageDao.getPagesForNoteSync(noteId).sortedBy { it.index }.toMutableList()
+        val targetPos = pages.indexOfFirst { it.index == pageIndex }
+        if (pages.size <= 1 || targetPos < 0) {
             return@withContext false
         }
-        val target = pages.removeAt(pageIndex)
-        pageDao.delete(target.id)
-        fileStore.deletePageFile(noteId, pageIndex)
+        val target = pages.removeAt(targetPos)
+        val now = System.currentTimeMillis()
+        val dbAction: suspend () -> Unit = {
+            pageDao.delete(target.id)
+            pages.forEachIndexed { idx, page ->
+                if (page.index != idx) {
+                    val updated = page.copy(
+                        index = idx,
+                        bitmapPath = fileStore.getPageFile(noteId, idx).absolutePath,
+                        updatedAt = now
+                    )
+                    pageDao.update(updated)
+                }
+            }
+            noteDao.updatePageCount(noteId, pages.size, now)
+        }
+        if (database != null) database.withTransaction { dbAction() } else dbAction()
 
-        // Re-index remaining pages
+        fileStore.deletePageFile(noteId, target.index)
         pages.forEachIndexed { idx, page ->
             if (page.index != idx) {
                 fileStore.renamePageFile(noteId, page.index, idx)
-                val updated = page.copy(
-                    index = idx,
-                    bitmapPath = fileStore.getPageFile(noteId, idx).absolutePath,
-                    updatedAt = System.currentTimeMillis()
-                )
-                pageDao.update(updated)
             }
         }
-
-        noteDao.updatePageCount(noteId, pages.size, System.currentTimeMillis())
         true
     }
 
@@ -801,16 +876,32 @@ class NoteRepository(
         noteId: String,
         pageIndex: Int,
         width: Int,
-        height: Int
+        height: Int,
+        pageType: String = "a4"
     ): android.graphics.Bitmap? = withContext(Dispatchers.IO) {
         if (width <= 0 || height <= 0) return@withContext null
+        val metaFile = fileStore.getAnnotationMetaFile(noteId, pageIndex)
+        val stack = if (metaFile.exists()) {
+            try {
+                personal.notes.touch.ui.canvas.PageLayerMeta.decode(metaFile.readText())
+            } catch (_: Exception) {
+                null
+            }
+        } else {
+            null
+        }
+        val visibleIndices = stack?.visibleLayers()?.map { it.index }?.toSet()
         val prefix = "page_${pageIndex}_annot_"
         val annotFiles = fileStore.getLayersDir(noteId).listFiles()
-            ?.filter {
-                it.name.startsWith(prefix) && it.name.endsWith(".png") &&
-                    it.name.removePrefix(prefix).removeSuffix(".png").toIntOrNull() != null
+            ?.mapNotNull { file ->
+                if (!file.name.startsWith(prefix) || !file.name.endsWith(".png")) return@mapNotNull null
+                val layerIdx = file.name.removePrefix(prefix).removeSuffix(".png").toIntOrNull()
+                    ?: return@mapNotNull null
+                if (visibleIndices != null && layerIdx !in visibleIndices) return@mapNotNull null
+                layerIdx to file
             }
-            ?.sortedBy { it.name.removePrefix(prefix).removeSuffix(".png").toInt() }
+            ?.sortedBy { it.first }
+            ?.map { it.second }
             ?: emptyList()
         if (annotFiles.isEmpty()) return@withContext null
 
@@ -820,12 +911,12 @@ class NoteRepository(
             android.graphics.Paint.FILTER_BITMAP_FLAG or android.graphics.Paint.ANTI_ALIAS_FLAG
         )
         val dst = android.graphics.Rect(0, 0, width, height)
+        val (leftFrac, rightFrac) = PdfModeReconciliationPolicy.singlePageCropFractions(pageType)
         var drawn = false
         for (file in annotFiles) {
             val layerBmp = personal.notes.touch.util.BitmapUtils.loadBitmapFromFile(file) ?: continue
-            // A fixed page's layer is 1.5x as wide as the page (a quarter of the page on each side).
-            val srcLeft = (layerBmp.width / 6f).toInt().coerceIn(0, layerBmp.width)
-            val srcRight = (layerBmp.width * 5f / 6f).toInt().coerceIn(srcLeft, layerBmp.width)
+            val srcLeft = (layerBmp.width * leftFrac).roundToInt().coerceIn(0, layerBmp.width)
+            val srcRight = (layerBmp.width * rightFrac).roundToInt().coerceIn(srcLeft, layerBmp.width)
             canvas.drawBitmap(layerBmp, android.graphics.Rect(srcLeft, 0, srcRight, layerBmp.height), dst, paint)
             layerBmp.recycle()
             drawn = true
@@ -912,26 +1003,55 @@ class NoteRepository(
         ok
     }
 
+    suspend fun touchNoteUpdatedAt(noteId: String) = withContext(Dispatchers.IO) {
+        try {
+            noteDao.touchUpdatedAt(noteId, System.currentTimeMillis())
+        } catch (_: Exception) {
+            // Ignore if the note row is gone
+        }
+    }
+
     /**
      * Writes the metadata of the annotation layers of a page.
      *
      * The metadata names the layers of the page (their number, their name
      * and whether they are hidden) and the layer the writing goes on.
      */
+    private fun writeTextAtomically(noteId: String, target: File, content: String): Boolean {
+        var tmp: File? = null
+        return try {
+            target.parentFile?.mkdirs()
+            val tmpFile = File(fileStore.getTmpDir(noteId), "${target.name}.${System.nanoTime()}.tmp")
+            tmp = tmpFile
+            tmpFile.writeText(content)
+            if (!tmpFile.renameTo(target)) {
+                if (target.exists()) target.delete()
+                if (!tmpFile.renameTo(target)) {
+                    target.writeText(content)
+                    tmpFile.delete()
+                }
+            }
+            true
+        } catch (e: Exception) {
+            tmp?.let { if (it.exists()) it.delete() }
+            e.printStackTrace()
+            false
+        }
+    }
+
     suspend fun savePageLayerMeta(
         noteId: String,
         pageIndex: Int,
         json: String
     ): Boolean = withContext(Dispatchers.IO) {
-        try {
-            val file = fileStore.getAnnotationMetaFile(noteId, pageIndex)
-            file.parentFile?.mkdirs()
-            file.writeText(json)
-            true
-        } catch (e: Exception) {
-            e.printStackTrace()
-            false
+        val file = fileStore.getAnnotationMetaFile(noteId, pageIndex)
+        val ok = writeTextAtomically(noteId, file, json)
+        if (ok) {
+            try {
+                noteDao.touchUpdatedAt(noteId, System.currentTimeMillis())
+            } catch (_: Exception) {}
         }
+        ok
     }
 
     /**
@@ -997,15 +1117,15 @@ class NoteRepository(
         layerIndex: Int,
         ops: List<personal.notes.touch.ui.canvas.InkOp>
     ): Boolean = withContext(Dispatchers.IO) {
-        try {
-            val file = fileStore.getAnnotationLayerOpsFile(noteId, pageIndex, layerIndex)
-            file.parentFile?.mkdirs()
-            file.writeText(personal.notes.touch.ui.canvas.ContinuousOpCodec.encode(ops))
-            true
-        } catch (e: Exception) {
-            e.printStackTrace()
-            false
+        val file = fileStore.getAnnotationLayerOpsFile(noteId, pageIndex, layerIndex)
+        val encoded = personal.notes.touch.ui.canvas.ContinuousOpCodec.encode(ops)
+        val ok = writeTextAtomically(noteId, file, encoded)
+        if (ok) {
+            try {
+                noteDao.touchUpdatedAt(noteId, System.currentTimeMillis())
+            } catch (_: Exception) {}
         }
+        ok
     }
 
     internal suspend fun loadPageLayerOps(
@@ -1015,17 +1135,49 @@ class NoteRepository(
     ): List<personal.notes.touch.ui.canvas.InkOp>? = withContext(Dispatchers.IO) {
         val file = fileStore.getAnnotationLayerOpsFile(noteId, pageIndex, layerIndex)
         if (!file.exists()) return@withContext null
-        personal.notes.touch.ui.canvas.ContinuousOpCodec.decode(file.readText())
+        try {
+            personal.notes.touch.ui.canvas.ContinuousOpCodec.decode(file.readText())
+        } catch (e: Exception) {
+            e.printStackTrace()
+            null
+        }
     }
 
     internal suspend fun deletePageLayerOps(noteId: String, pageIndex: Int, layerIndex: Int): Boolean =
         withContext(Dispatchers.IO) {
             try {
-                fileStore.getAnnotationLayerOpsFile(noteId, pageIndex, layerIndex).delete()
+                val deleted = fileStore.getAnnotationLayerOpsFile(noteId, pageIndex, layerIndex).delete()
+                if (deleted) {
+                    try {
+                        noteDao.touchUpdatedAt(noteId, System.currentTimeMillis())
+                    } catch (_: Exception) {}
+                }
+                deleted
             } catch (e: Exception) {
                 false
             }
         }
+
+    suspend fun deletePageLayerTile(
+        noteId: String,
+        pageIndex: Int,
+        layerIndex: Int,
+        tx: Int,
+        ty: Int
+    ): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val file = fileStore.getAnnotationLayerTileFile(noteId, pageIndex, layerIndex, tx, ty)
+            val deleted = if (file.exists()) file.delete() else false
+            if (deleted) {
+                try {
+                    noteDao.touchUpdatedAt(noteId, System.currentTimeMillis())
+                } catch (_: Exception) {}
+            }
+            deleted
+        } catch (_: Exception) {
+            false
+        }
+    }
 
     /**
      * Deletes the tile files of a layer (C50).
@@ -1038,10 +1190,20 @@ class NoteRepository(
             val dir = fileStore.getLayersDir(noteId)
             val prefix = "page_${pageIndex}_annot_${layerIndex}_t"
             var ok = true
+            var anyDeleted = false
             dir.listFiles()?.forEach { file ->
                 if (file.name.startsWith(prefix) && file.name.endsWith(".png")) {
-                    if (!file.delete()) ok = false
+                    if (file.delete()) {
+                        anyDeleted = true
+                    } else {
+                        ok = false
+                    }
                 }
+            }
+            if (anyDeleted) {
+                try {
+                    noteDao.touchUpdatedAt(noteId, System.currentTimeMillis())
+                } catch (_: Exception) {}
             }
             ok
         }
@@ -1049,8 +1211,7 @@ class NoteRepository(
     /** Persist the per-page paper pattern (PaperPattern.code) to the page row. */
     suspend fun savePagePattern(noteId: String, pageIndex: Int, patternCode: Int): Boolean = withContext(Dispatchers.IO) {
         try {
-            val pages = pageDao.getPagesForNoteSync(noteId)
-            val page = pages.getOrNull(pageIndex) ?: return@withContext false
+            val page = pageDao.getPage(noteId, pageIndex) ?: return@withContext false
             pageDao.update(page.copy(paperPattern = patternCode, updatedAt = System.currentTimeMillis()))
             true
         } catch (e: Exception) {
@@ -1062,7 +1223,7 @@ class NoteRepository(
     /** Read the persisted per-page paper pattern (0 = unset → app default applies). */
     suspend fun loadPagePattern(noteId: String, pageIndex: Int): Int = withContext(Dispatchers.IO) {
         try {
-            pageDao.getPagesForNoteSync(noteId).getOrNull(pageIndex)?.paperPattern ?: 0
+            pageDao.getPage(noteId, pageIndex)?.paperPattern ?: 0
         } catch (e: Exception) {
             e.printStackTrace()
             0

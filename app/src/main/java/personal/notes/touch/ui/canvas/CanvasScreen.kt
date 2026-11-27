@@ -141,8 +141,15 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.withFrameNanos
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
+import personal.notes.touch.util.PdfOutlineImporter
+import personal.notes.touch.util.PdfTextIndex
+import personal.notes.touch.util.PdfiumDocument
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -151,6 +158,12 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.layout.onSizeChanged
+import personal.notes.touch.util.MarginExportMath
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
@@ -211,21 +224,32 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupPositionProvider
 import androidx.compose.ui.window.PopupProperties
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.roundToInt
 import personal.notes.touch.R
 import personal.notes.touch.TouchNotesApp
 import personal.notes.touch.data.db.entity.PageEntity
 import personal.notes.touch.ui.theme.OrangePrimary
 import personal.notes.touch.util.ClipboardHelper
+import personal.notes.touch.util.PageAspectCache
 import personal.notes.touch.util.PdfDocumentCache
 import personal.notes.touch.util.PdfImportManager
+import personal.notes.touch.util.PdfModeReconciliationPolicy
 import personal.notes.touch.util.PdfPageGeometry
+import personal.notes.touch.util.PdfTextSelectActivation
 import personal.notes.touch.util.PdfTextSelectionInfo
+import personal.notes.touch.util.PdfTextToolPolicy
 import personal.notes.touch.util.PdfVectorImporter
+import personal.notes.touch.util.TextDockTapAction
 
 val TouchNotesColors = listOf(
     Color(0xFF000000), // Black
@@ -371,25 +395,6 @@ fun CanvasScreen(
 
     var canvasViewRef by remember { mutableStateOf<DrawingCanvasView?>(null) }
 
-    /**
-     * Loads the ink a page carries outside its paper (the margins of an
-     * imported PDF). Reading the crops is file I/O, so it runs off the main
-     * thread; the view is updated back on it.
-     */
-    val loadBeyondPageInk: (Int) -> Unit = { pageIdx ->
-        val view = canvasViewRef
-        if (view != null) {
-            // The count is the guard: if the user drew in the margin while the
-            // file was read, those strokes are newer and must not be dropped.
-            val countAtStart = view.beyondPageInkCount()
-            scope.launch {
-                val crops = withContext(Dispatchers.IO) {
-                    view.readBeyondPageInk(viewModel.fileStore, viewModel.noteId, pageIdx)
-                }
-                view.applyBeyondPageInk(crops, forPageIndex = pageIdx, expectedCount = countAtStart)
-            }
-        }
-    }
     var selectedImageIndex by remember { mutableStateOf(-1) }
     var showRenameDialog by remember { mutableStateOf(false) }
     var showClearDialog by remember { mutableStateOf(false) }
@@ -405,6 +410,9 @@ fun CanvasScreen(
     var pdfImportAsBackground by remember { mutableStateOf(false) }
     var pendingPdfPageCount by remember { mutableStateOf(0) }
     var pendingPdfPageIndex by remember { mutableStateOf("1") }
+    val importProgressFlow = remember { MutableStateFlow(PdfImportProgressState()) }
+    val importProgressState by importProgressFlow.collectAsState()
+    var importCancelFlag by remember { mutableStateOf<AtomicBoolean?>(null) }
     var showCustomColorDialog by remember { mutableStateOf(false) }
     var showShapesMenu by remember { mutableStateOf(false) }
     var showLayersPanel by remember { mutableStateOf(false) }
@@ -428,7 +436,26 @@ fun CanvasScreen(
     var liveTextSizeSp by remember { mutableFloatStateOf(20f) }
     var liveTextColor by remember { mutableStateOf(Color.Black) }
     val liveTextFocusRequester = remember { FocusRequester() }
-    var showGoToPageDialog by remember { mutableStateOf(false) }
+    var showSearchSheet by remember { mutableStateOf(false) }
+    var isSearchSheetExpanded by remember { mutableStateOf(true) }
+    var searchQuery by remember { mutableStateOf("") }
+    var pdfIndexData by remember(viewModel.noteId) { mutableStateOf<PdfTextIndex.PdfTextIndexData?>(null) }
+    var isIndexingPdf by remember { mutableStateOf(false) }
+    var pdfIndexDone by remember { mutableIntStateOf(0) }
+    var pdfIndexTotal by remember { mutableIntStateOf(0) }
+    var activeSearchHitIndex by remember { mutableIntStateOf(-1) }
+    var searchHighlightTarget by remember { mutableStateOf<SearchHighlightTarget?>(null) }
+    var searchHighlightRevision by remember { mutableIntStateOf(0) }
+    var singlePageApplyRevision by remember { mutableIntStateOf(0) }
+    var singlePageAppliedPageIndex by remember { mutableIntStateOf(-1) }
+    val singlePageOverlayLoadSeq = remember { java.util.concurrent.atomic.AtomicInteger(0) }
+    var isScrubbing by remember { mutableStateOf(false) }
+    var isScrubSettling by remember { mutableStateOf(false) }
+    var scrubJumpToken by remember { mutableIntStateOf(0) }
+    var scrubJumpJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+    var continuousVisibleIndex by remember { mutableIntStateOf(0) }
+    var settledProgrammaticFirstVis by remember { mutableIntStateOf(-1) }
+    var settledProgrammaticPage by remember { mutableIntStateOf(-1) }
     var pageToDeleteIndex by remember { mutableStateOf<Int?>(null) }
     /** Which sticker the Tools menu drops next. */
     var stickerIndex by remember { mutableIntStateOf(0) }
@@ -476,15 +503,28 @@ fun CanvasScreen(
         }
     }
 
-    val showTabsState = uiState.showTabs
-    val fixPreviewPageState = uiState.fixPreviewPage
-    val horizontalResistance = uiState.horizontalResistance
-    val minimalInfiniteZoom = uiState.minimalInfiniteZoom
-
     val configuration = LocalConfiguration.current
     val density = LocalDensity.current
     val screenWidthPx = with(density) { configuration.screenWidthDp.dp.toPx() }
     val screenHeightPx = with(density) { configuration.screenHeightDp.dp.toPx() }
+
+    var readerViewportWidthPx by remember { mutableFloatStateOf(screenWidthPx) }
+    var marginLabelActive by remember { mutableStateOf(false) }
+    var marginLabelActivityTick by remember { mutableIntStateOf(0) }
+    val hasMarginGuides = !isInfiniteNote &&
+        ContinuousPageGeometry.marginFor(note?.pageType) > 0f
+    val marginLabelAlpha by androidx.compose.animation.core.animateFloatAsState(
+        targetValue = if (marginLabelActive) 1f else 0f,
+        animationSpec = androidx.compose.animation.core.tween(
+            durationMillis = if (marginLabelActive) 150 else 500
+        ),
+        label = "marginLabelAlpha"
+    )
+
+    val showTabsState = uiState.showTabs
+    val fixPreviewPageState = uiState.fixPreviewPage
+    val horizontalResistance = uiState.horizontalResistance
+    val minimalInfiniteZoom = uiState.minimalInfiniteZoom
 
     var infiniteItems by remember(viewModel.noteId) {
         mutableStateOf<List<InfiniteCanvasItem>>(emptyList())
@@ -511,6 +551,25 @@ fun CanvasScreen(
     var pdfTextAvailable by remember { mutableStateOf(false) }
     var pdfTextMode by remember { mutableStateOf(false) }
     var pdfSelection by remember { mutableStateOf<PdfTextSelectionInfo?>(null) }
+    var showTextMenuHoriz by remember { mutableStateOf(false) }
+    var showTextMenuVert by remember { mutableStateOf(false) }
+    var pendingSwitchForPdfText by remember { mutableStateOf(false) }
+
+    val exitPdfTextMode: () -> Unit = {
+        if (pdfTextMode || pdfSelection != null) {
+            pdfTextMode = false
+            pdfSelection = null
+            canvasViewRef?.setPdfTextSelectionMode(false)
+        }
+    }
+    val openLiveTextOverlay: () -> Unit = {
+        exitPdfTextMode()
+        liveTextContent = ""
+        liveTextOffsetX = 0f
+        liveTextOffsetY = 0f
+        liveTextColor = if (uiState.selectedColor == Color.White) Color.Black else uiState.selectedColor
+        isLiveTextActive = true
+    }
 
     val totalPages = note?.pageCount ?: pages.size.coerceAtLeast(1)
 
@@ -522,6 +581,8 @@ fun CanvasScreen(
         viewModel.dismissCanvasMenus()
         showLayersPanel = false
         showShapesMenu = false
+        showTextMenuHoriz = false
+        showTextMenuVert = false
         showLayerPanel = false
         layerActionIndex = -1
         // The width and colour popups are floating windows: a touch in the
@@ -547,10 +608,28 @@ fun CanvasScreen(
     // Saved generation map to re-render pages when continuous inking finishes writing to disk
     val savedPageGenerations = remember { mutableStateMapOf<Int, Int>() }
 
+    LaunchedEffect(viewModel) {
+        viewModel.pageSavedEvents.collect { savedIdx ->
+            savedPageGenerations[savedIdx] = (savedPageGenerations[savedIdx] ?: 0) + 1
+        }
+    }
+
     // Read-only layer cache of the continuous reader: decodes the same page
     // layer files the single-page engine writes, off the main thread.
     val readerLayers = remember(viewModel.noteId) {
-        ReaderLayerCache(viewModel.fileStore, viewModel.noteId)
+        ReaderLayerCache(viewModel.fileStore, viewModel.noteId) { pageIdx ->
+            val vp = viewModel.pages.value.getOrNull(pageIdx)
+                ?.takeIf { it.pdfSourcePath.isNotEmpty() && it.pdfPageIndex >= 0 }
+                ?: return@ReaderLayerCache null
+            val aspect = PageAspectCache.default.getOrLoad(
+                vp.pdfSourcePath,
+                vp.pdfPageIndex,
+                fallback = PdfPageGeometry.DEFAULT_ASPECT
+            ) {
+                pdfDocCache.document(vp.pdfSourcePath)?.pageSize(vp.pdfPageIndex)
+            }
+            PdfModeReconciliationPolicy.pagePixelSize(aspect)
+        }
     }
 
     /**
@@ -693,6 +772,30 @@ fun CanvasScreen(
                 viewModel.updateUndoRedo(canUndo, canRedo)
             }
         )
+    }
+
+    LaunchedEffect(marginLabelActivityTick, marginLabelActive, inkController.isDrawing) {
+        if (marginLabelActive && !inkController.isDrawing) {
+            kotlinx.coroutines.delay(1500L)
+            marginLabelActive = false
+        }
+    }
+    LaunchedEffect(
+        inkController.isDrawing,
+        inkController.revision,
+        inkController.marginPresenceRevision,
+        hasMarginGuides,
+        currentPageIndex
+    ) {
+        if (hasMarginGuides) {
+            val presence = inkController.marginInkPresence(currentPageIndex)
+            if ((inkController.isDrawing && presence.hasAnyMarginInk) ||
+                (presence.hasAnyMarginInk && marginLabelActivityTick == 0)
+            ) {
+                marginLabelActive = true
+                marginLabelActivityTick++
+            }
+        }
     }
 
     if (isInfiniteNote) {
@@ -979,10 +1082,12 @@ fun CanvasScreen(
             canvas.setPdfTextSource(null)
             return
         }
-        // Same base geometry the import used, so pages keep their size/aspect.
-        val pageTypeName = note?.pageType ?: "infinite"
-        val targetHeight = if (pageTypeName == "a4" || pageTypeName == "pdf") 3056f else 3840f
+        // Same base geometry the import used, so pages keep their true aspect.
+        val pageAspect = PageAspectCache.default.put(
+            relPath, pdfPageIndex, size[0], size[1], fallback = PdfPageGeometry.DEFAULT_ASPECT
+        )
         val targetWidth = 2160f
+        val targetHeight = (2160f / pageAspect).coerceIn(1f, 4096f)
         val scale = minOf(targetWidth / size[0], targetHeight / size[1])
         val baseOutWidth = (size[0] * scale).roundToInt().coerceAtLeast(1)
         val basePxPerPt = scale
@@ -993,12 +1098,15 @@ fun CanvasScreen(
         // (top-left origin), the same space the background and annotations use.
         val pageW = size[0]
         val pageH = size[1]
-        val rectWidth = canvas.pageCanvasWidth().takeIf { it > 0f } ?: baseOutWidth.toFloat()
-        val pxPerPt = rectWidth / pageW
+        fun currentPxPerPt(): Float {
+            val rectWidth = canvas.pageCanvasWidth().takeIf { it > 0f } ?: baseOutWidth.toFloat()
+            return rectWidth / pageW
+        }
         canvas.setPdfTextSource(object : DrawingCanvasView.PdfTextSource {
             override fun charCount(): Int = document.textCharCount(pdfPageIndex)
 
             override fun charIndexAt(x: Float, y: Float, tolerance: Float): Int {
+                val pxPerPt = currentPxPerPt()
                 val user = PdfPageGeometry.canvasToUserPoint(x, y, pageH, pxPerPt)
                 return document.charIndexAt(
                     pdfPageIndex, user[0], user[1], tolerance / pxPerPt
@@ -1007,12 +1115,14 @@ fun CanvasScreen(
 
             override fun charBox(index: Int): FloatArray =
                 PdfPageGeometry.userRectToCanvas(
-                    document.charBox(pdfPageIndex, index), pageH, pxPerPt
+                    document.charBox(pdfPageIndex, index), pageH, currentPxPerPt()
                 )
 
-            override fun selectionRects(start: Int, count: Int): List<FloatArray> =
-                document.selectionRects(pdfPageIndex, start, count)
+            override fun selectionRects(start: Int, count: Int): List<FloatArray> {
+                val pxPerPt = currentPxPerPt()
+                return document.selectionRects(pdfPageIndex, start, count)
                     .map { PdfPageGeometry.userRectToCanvas(it, pageH, pxPerPt) }
+            }
 
             override fun text(start: Int, count: Int): String =
                 document.text(pdfPageIndex, start, count)
@@ -1034,21 +1144,98 @@ fun CanvasScreen(
         }
     }
 
+    // Shared single-page overlay + margin-ink + floating-layers reload, guarded by
+    // monotonic [singlePageOverlayLoadSeq] so an older async load never overwrites a newer page.
+    suspend fun reloadSinglePageOverlaysAndLayers(
+        canvas: DrawingCanvasView,
+        pageIndex: Int,
+        vectorPage: PageEntity?,
+        seq: Int
+    ) {
+        if (singlePageOverlayLoadSeq.get() != seq || isContinuous || canvasViewRef !== canvas) return
+        val targetW = canvas.getBackingBitmap()?.width ?: 2160
+        val targetH = canvas.getBackingBitmap()?.height ?: 3056
+        val overlay = if (PdfModeReconciliationPolicy.shouldLoadAnnotationOverlay(
+                note?.pageType, vectorPage != null
+            )
+        ) {
+            inkController.composeAllLayersForSinglePage(
+                pageIndex = pageIndex,
+                targetWidth = targetW,
+                targetHeight = targetH,
+                page = vectorPage
+            )
+        } else null
+        if (singlePageOverlayLoadSeq.get() != seq ||
+            isContinuous ||
+            canvasViewRef !== canvas ||
+            canvas.pageIndex != pageIndex
+        ) {
+            overlay?.recycle()
+            return
+        }
+        canvas.annotationOverlay = overlay
+        canvas.baseLayerVisible = if (vectorPage != null) {
+            inkController.layerStack(pageIndex)
+                .layerAt(PageLayerStack.BASE_LAYER_INDEX)?.visible != false
+        } else {
+            true
+        }
+        val countAtStart = canvas.beyondPageInkCount()
+        val crops = withContext(Dispatchers.IO) {
+            canvas.readBeyondPageInk(viewModel.fileStore, viewModel.noteId, pageIndex)
+        }
+        if (singlePageOverlayLoadSeq.get() != seq ||
+            isContinuous ||
+            canvasViewRef !== canvas ||
+            canvas.pageIndex != pageIndex
+        ) {
+            for (crop in crops) {
+                if (!crop.bitmap.isRecycled) crop.bitmap.recycle()
+            }
+            return
+        }
+        canvas.applyBeyondPageInk(crops, forPageIndex = pageIndex, expectedCount = countAtStart)
+        try {
+            // Layer PNG decode is file I/O: read on Dispatchers.IO, apply on
+            // main. A page without a manifest has no layers, so the apply
+            // clears the previous page's list instead of leaking it.
+            canvas.reloadLayersFromDisk(viewModel.fileStore, viewModel.noteId)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
     // Shared page apply for every navigation callback: stroke layer of the
-    // loaded page + (for vector PDF pages) the live vector background.
+    // loaded page + (for vector PDF pages) the live vector background + continuous overlays.
     fun applyLoadedPage(pageIndex: Int, bitmap: Bitmap?) {
         val canvas = canvasViewRef ?: return
+        if (isContinuous || pageIndex != viewModel.currentPageIndex.value) return
+        val seq = singlePageOverlayLoadSeq.incrementAndGet()
+        viewModel.setCanvasPageIndex(pageIndex)
+        canvas.pageIndex = pageIndex
+        selectedImageIndex = -1
+        canvas.selectedImageIndex = -1
+        engineLayerPage = -1
+        canvas.backgroundBitmap = null
+        canvas.annotationOverlay = null
         val page = vectorPdfPage(pageIndex)
         if (page != null) {
+            viewModel.setPageLoadedFromDisk(true)
             applyPdfBackground(canvas, page)
             canvas.setPageContent(bitmap)
         } else {
             canvas.setPdfBackground(0f, 0f, 0f, null)
             canvas.setPdfTextSource(null)
             pdfTextAvailable = false
-            pdfTextMode = false
-            pdfSelection = null
+            exitPdfTextMode()
             canvas.setPageContent(bitmap)
+            viewModel.setPageLoadedFromDisk(bitmap != null)
+        }
+        singlePageAppliedPageIndex = pageIndex
+        singlePageApplyRevision++
+        scope.launch {
+            reloadSinglePageOverlaysAndLayers(canvas, pageIndex, page, seq)
         }
     }
 
@@ -1057,6 +1244,80 @@ fun CanvasScreen(
      * included), so this is the single definition the screen uses.
      */
     val continuousMode = isContinuous
+
+    // PDF-03: probe text availability in Continuous mode (where applyPdfBackground is skipped)
+    LaunchedEffect(currentPageIndex, isContinuous, pages) {
+        if (!isContinuous) return@LaunchedEffect
+        val vp = vectorPdfPage(currentPageIndex)
+        if (vp == null) {
+            pdfTextAvailable = false
+            return@LaunchedEffect
+        }
+        val count = withContext(Dispatchers.IO) {
+            try {
+                pdfDocCache.document(vp.pdfSourcePath)?.textCharCount(vp.pdfPageIndex) ?: 0
+            } catch (_: Exception) {
+                0
+            }
+        }
+        pdfTextAvailable = PdfTextToolPolicy.isAvailable(true, count)
+    }
+
+    // PDF-03: sync pdfTextSelectionMode after applyPdfBackground installs PdfTextSource,
+    // and exit pdfTextMode when readingMode or continuous mode is entered without pending switch.
+    LaunchedEffect(pdfTextMode, singlePageApplyRevision, isContinuous, uiState.readingMode) {
+        if (!isContinuous) {
+            pendingSwitchForPdfText = false
+            if (PdfTextToolPolicy.shouldExitPdfTextMode(
+                    pdfTextMode = pdfTextMode,
+                    readingMode = uiState.readingMode,
+                    isContinuous = false,
+                    switchingToSinglePage = false
+                )
+            ) {
+                exitPdfTextMode()
+            } else {
+                canvasViewRef?.setPdfTextSelectionMode(pdfTextMode)
+            }
+        } else if (PdfTextToolPolicy.shouldExitPdfTextMode(
+                pdfTextMode = pdfTextMode,
+                readingMode = uiState.readingMode,
+                isContinuous = true,
+                switchingToSinglePage = pendingSwitchForPdfText
+            )
+        ) {
+            exitPdfTextMode()
+        }
+    }
+
+    LaunchedEffect(uiState.selectedTool) {
+        exitPdfTextMode()
+        if (uiState.selectedTool != CanvasTool.LASSO && uiState.selectedTool != CanvasTool.SELECT) {
+            inkController.lassoClear()
+        }
+    }
+
+    LaunchedEffect(isContinuous, uiState.readingMode) {
+        inkController.lassoClear()
+    }
+
+    // PDF-05: flush dirty continuous session or single-page canvas before drawer thumbnails render.
+    LaunchedEffect(uiState.isThumbnailDrawerOpen) {
+        if (!uiState.isThumbnailDrawerOpen) return@LaunchedEffect
+        if (isContinuous) {
+            inkController.flushCurrentSuspend()
+        } else {
+            val canvas = canvasViewRef
+            if (canvas != null) {
+                canvas.getBackingBitmap()?.let { bmp ->
+                    viewModel.saveCurrentPageBitmapDirect(bmp)
+                }
+                if (canvas.layersDirty) {
+                    canvas.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                }
+            }
+        }
+    }
 
 
     // Load/save layers on page change. The INITIAL page/layer load lives in
@@ -1070,6 +1331,7 @@ fun CanvasScreen(
     LaunchedEffect(currentPageIndex) {
         selectedImageIndex = -1
         canvasViewRef?.selectedImageIndex = -1
+        inkController.clearLassoIfNotOnPage(currentPageIndex)
     }
 
     var pageEffectFirstRun by remember { mutableStateOf(true) }
@@ -1083,12 +1345,20 @@ fun CanvasScreen(
         // twice, so leave the canvas alone until the reader returns to single
         // page mode (P1 audit).
         val continuousReading = continuousMode
-        if (continuousReading) return@LaunchedEffect
+        if (continuousReading) {
+            singlePageOverlayLoadSeq.incrementAndGet()
+            singlePageAppliedPageIndex = -1
+            return@LaunchedEffect
+        }
 
         // When leaving continuous mode to single-page mode, flush and release
         // any active continuous session first so the latest strokes are on disk
         // before loadPageStrokes / loadCurrentPageBitmap reads them.
+        val seq = singlePageOverlayLoadSeq.incrementAndGet()
         inkController.releaseSessionSuspend()
+        if (singlePageOverlayLoadSeq.get() != seq || continuousMode || viewModel.currentPageIndex.value != currentPageIndex) {
+            return@LaunchedEffect
+        }
 
         // From here the canvas holds currentPageIndex, so saves triggered
         // before the next page flip must be filed under this index.
@@ -1105,7 +1375,13 @@ fun CanvasScreen(
         val vectorPage = vectorPdfPage(currentPageIndex)
         if (vectorPage != null) {
             preloadPdfSource(vectorPage.pdfSourcePath)
+            if (singlePageOverlayLoadSeq.get() != seq || continuousMode || viewModel.currentPageIndex.value != currentPageIndex) {
+                return@LaunchedEffect
+            }
             val strokes = withContext(Dispatchers.IO) { viewModel.loadPageStrokes(currentPageIndex) }
+            if (singlePageOverlayLoadSeq.get() != seq || continuousMode || viewModel.currentPageIndex.value != currentPageIndex) {
+                return@LaunchedEffect
+            }
             val canvas = canvasViewRef
             if (canvas != null) {
                 canvas.backgroundBitmap = null
@@ -1113,31 +1389,30 @@ fun CanvasScreen(
                 viewModel.setPageLoadedFromDisk(true)
                 applyPdfBackground(canvas, vectorPage)
                 canvas.setPageContent(strokes)
+                singlePageAppliedPageIndex = currentPageIndex
+                singlePageApplyRevision++
+                reloadSinglePageOverlaysAndLayers(canvas, currentPageIndex, vectorPage, seq)
             }
         } else {
             val savedBitmap = viewModel.loadCurrentPageBitmap()
-            canvasViewRef?.setPageContent(savedBitmap)
-            canvasViewRef?.backgroundBitmap = null
-            canvasViewRef?.let { v ->
-                v.annotationOverlay = if (note?.pageType == "a4") {
-                    inkController.composeAllLayersForSinglePage(
-                        pageIndex = currentPageIndex,
-                        targetWidth = v.getBackingBitmap()?.width ?: 2160,
-                        targetHeight = v.getBackingBitmap()?.height ?: 3056
-                    )
-                } else null
+            if (singlePageOverlayLoadSeq.get() != seq || continuousMode || viewModel.currentPageIndex.value != currentPageIndex) {
+                return@LaunchedEffect
             }
-            viewModel.setPageLoadedFromDisk(savedBitmap != null)
-            // The margins of the page carry their own ink.
-            loadBeyondPageInk(currentPageIndex)
-        }
-        try {
-            // Layer PNG decode is file I/O: read on Dispatchers.IO, apply on
-            // main. A page without a manifest has no layers, so the apply
-            // clears the previous page's list instead of leaking it.
-            canvasViewRef?.reloadLayersFromDisk(viewModel.fileStore, viewModel.noteId)
-        } catch (e: Exception) {
-            e.printStackTrace()
+            val canvas = canvasViewRef
+            if (canvas != null) {
+                canvas.setPdfBackground(0f, 0f, 0f, null)
+                canvas.setPdfTextSource(null)
+                pdfTextAvailable = false
+                exitPdfTextMode()
+                canvas.setPageContent(savedBitmap)
+                canvas.backgroundBitmap = null
+                viewModel.setPageLoadedFromDisk(savedBitmap != null)
+                singlePageAppliedPageIndex = currentPageIndex
+                singlePageApplyRevision++
+                reloadSinglePageOverlaysAndLayers(canvas, currentPageIndex, null, seq)
+            } else {
+                viewModel.setPageLoadedFromDisk(savedBitmap != null)
+            }
         }
     }
 
@@ -1161,20 +1436,33 @@ fun CanvasScreen(
         }
     }
 
-    val selectLassoTool: () -> Unit = {
-        if (isContinuous && !isInfiniteNote) {
-            scope.launch {
-                inkController.flushCurrentSuspend()
-                viewModel.setPageTurningMode(1)
-                viewModel.selectTool(CanvasTool.LASSO)
-                android.widget.Toast.makeText(context, "Switched to Single-Page Mode for Lasso", android.widget.Toast.LENGTH_SHORT).show()
+    val activatePdfTextSelect: () -> Unit = {
+        when (PdfTextToolPolicy.selectPdfTextAction(pdfTextAvailable, isContinuous)) {
+            PdfTextSelectActivation.UNAVAILABLE -> Unit
+            PdfTextSelectActivation.ACTIVATE_IN_SINGLE_PAGE -> {
+                isLiveTextActive = false
+                pdfTextMode = true
+                canvasViewRef?.setPdfTextSelectionMode(true)
             }
-        } else {
-            viewModel.selectTool(CanvasTool.LASSO)
+            PdfTextSelectActivation.SWITCH_TO_SINGLE_AND_ACTIVATE -> {
+                isLiveTextActive = false
+                scope.launch {
+                    inkController.flushCurrentSuspend()
+                    pendingSwitchForPdfText = true
+                    pdfTextMode = true
+                    viewModel.setPageTurningModeTransient(1)
+                }
+            }
         }
     }
 
+    val selectLassoTool: () -> Unit = {
+        exitPdfTextMode()
+        viewModel.selectTool(CanvasTool.LASSO)
+    }
+
     val selectArrowTool: () -> Unit = {
+        exitPdfTextMode()
         viewModel.selectTool(CanvasTool.SELECT)
     }
 
@@ -1202,10 +1490,23 @@ fun CanvasScreen(
             if (pageBitmap != null) {
                 view.setPageContent(pageBitmap)
             } else {
-                // A page that has never been rasterised: the continuous
-                // reader's page box is A4-like, so use that page space.
+                val vp = vectorPdfPage(page)
+                val (fallbackW, fallbackH) = if (vp != null) {
+                    val aspect = withContext(Dispatchers.IO) {
+                        PageAspectCache.default.getOrLoad(
+                            vp.pdfSourcePath,
+                            vp.pdfPageIndex,
+                            fallback = PdfPageGeometry.DEFAULT_ASPECT
+                        ) {
+                            pdfDocCache.document(vp.pdfSourcePath)?.pageSize(vp.pdfPageIndex)
+                        }
+                    }
+                    PdfModeReconciliationPolicy.pagePixelSize(aspect)
+                } else {
+                    2160 to 3056
+                }
                 val blank = withContext(Dispatchers.IO) {
-                    personal.notes.touch.util.BitmapUtils.createSafeBitmap(2160, 3056)
+                    personal.notes.touch.util.BitmapUtils.createSafeBitmap(fallbackW, fallbackH)
                 }
                 view.setPageContent(blank)
             }
@@ -1336,6 +1637,7 @@ fun CanvasScreen(
                         withContext(Dispatchers.IO) {
                             InfiniteItemsStore.save(viewModel.fileStore, viewModel.noteId, updated)
                             inkController.generateAndSavePagePreview(targetPageIdx)
+                            viewModel.repository.touchNoteUpdatedAt(viewModel.noteId)
                         }
                         savedPageGenerations[targetPageIdx] = (savedPageGenerations[targetPageIdx] ?: 0) + 1
                     } else {
@@ -1385,10 +1687,16 @@ fun CanvasScreen(
                 val pdfFile = viewModel.fileStore.getNoteAsset(viewModel.noteId, pdfFileName)
                     ?: return@withContext emptyList<InfiniteCanvasItem.PdfPageItem>()
                 val doc = personal.notes.touch.util.PdfiumDocument.open(pdfFile)
-                    ?: return@withContext emptyList<InfiniteCanvasItem.PdfPageItem>()
+                if (doc == null) {
+                    pdfFile.delete()
+                    return@withContext emptyList<InfiniteCanvasItem.PdfPageItem>()
+                }
                 try {
                     val count = doc.pageCount
-                    if (count <= 0) return@withContext emptyList<InfiniteCanvasItem.PdfPageItem>()
+                    if (count <= 0) {
+                        pdfFile.delete()
+                        return@withContext emptyList<InfiniteCanvasItem.PdfPageItem>()
+                    }
                     val cols = minOf(count, requestedCols.coerceIn(1, 4)).coerceAtLeast(1)
                     val cellW = 1440f
                     val gap = 96f
@@ -1438,6 +1746,7 @@ fun CanvasScreen(
                 withContext(Dispatchers.IO) {
                     InfiniteItemsStore.save(viewModel.fileStore, viewModel.noteId, updated)
                     inkController.generateAndSavePagePreview(targetPageIdx)
+                    viewModel.repository.touchNoteUpdatedAt(viewModel.noteId)
                 }
                 savedPageGenerations[targetPageIdx] = (savedPageGenerations[targetPageIdx] ?: 0) + 1
                 android.widget.Toast.makeText(
@@ -1460,52 +1769,84 @@ fun CanvasScreen(
     val pdfPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
-        uri?.let {
+        val asBackground = pdfImportAsBackground
+        pdfImportAsBackground = false
+        if (uri == null) return@rememberLauncherForActivityResult
+        uri.let {
             if (isInfiniteNote) {
-                pdfImportAsBackground = false
                 pendingInfinitePdfUri = it
                 showInfinitePdfColumnPicker = true
                 return@let
             }
-            if (pdfImportAsBackground) {
+            if (asBackground) {
                 // "Set page background": the picked PDF is not imported, the
                 // user chooses one of its pages for the current page.
-                pdfImportAsBackground = false
                 scope.launch {
-                    val imported = try {
-                        withContext(Dispatchers.IO) { PdfVectorImporter.readDocument(context, it) }
+                    val pageCount = try {
+                        withContext(Dispatchers.IO) {
+                            PdfVectorImporter.readDocument(context, it)?.use { imported ->
+                                imported.pageCount
+                            }
+                        }
                     } catch (e: Exception) {
                         e.printStackTrace()
                         null
+                    }
+                    if (pageCount == null || pageCount <= 0) {
+                        android.widget.Toast.makeText(context, "Could not open PDF", android.widget.Toast.LENGTH_SHORT).show()
+                        return@launch
+                    }
+                    pendingPdfUri = it
+                    pendingPdfPageCount = pageCount
+                    pendingPdfPageIndex = "1"
+                    showPdfPagePicker = true
+                }
+                return@let
+            }
+            val cancelFlag = AtomicBoolean(false)
+            importCancelFlag = cancelFlag
+            importProgressFlow.value = PdfImportProgressState(
+                active = true,
+                done = 0,
+                total = 0,
+                cancelling = false
+            )
+            scope.launch {
+                val noteId = viewModel.noteId
+                val destFile = File(
+                    viewModel.fileStore.getNoteDir(noteId),
+                    "pdf_${System.currentTimeMillis()}.pdf"
+                )
+                var imported: PdfVectorImporter.ImportedPdf? = null
+                var importCommitted = false
+                try {
+                    imported = try {
+                        withContext(Dispatchers.IO) {
+                            PdfVectorImporter.readDocument(
+                                context = context,
+                                uri = it,
+                                destFile = destFile,
+                                isCancelled = { cancelFlag.get() }
+                            )
+                        }
+                    } catch (e: Exception) {
+                        if (e is CancellationException) throw e
+                        e.printStackTrace()
+                        null
+                    }
+                    if (cancelFlag.get()) {
+                        return@launch
                     }
                     if (imported == null) {
                         android.widget.Toast.makeText(context, "Could not open PDF", android.widget.Toast.LENGTH_SHORT).show()
                         return@launch
                     }
-                    try {
-                        pendingPdfUri = it
-                        pendingPdfPageCount = imported.pageCount
-                        pendingPdfPageIndex = "1"
-                        showPdfPagePicker = true
-                    } finally {
-                        imported.document.close()
-                    }
-                }
-                return@let
-            }
-            scope.launch {
-                val imported = try {
-                    withContext(Dispatchers.IO) { PdfVectorImporter.readDocument(context, it) }
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                    null
-                }
-                if (imported == null) {
-                    android.widget.Toast.makeText(context, "Could not open PDF", android.widget.Toast.LENGTH_SHORT).show()
-                    return@launch
-                }
-                try {
-                    val noteId = viewModel.noteId
+                    importProgressFlow.value = PdfImportProgressState(
+                        active = true,
+                        done = 0,
+                        total = imported.pageCount,
+                        cancelling = cancelFlag.get()
+                    )
                     // Per-page render error toast: Toast.show() must run on a
                     // thread with a Looper, so bounce back to Main.
                     suspend fun showPageError(msg: String) {
@@ -1513,12 +1854,7 @@ fun CanvasScreen(
                             android.widget.Toast.makeText(context, msg, android.widget.Toast.LENGTH_LONG).show()
                         }
                     }
-                    // Append one page per PDF page. Rendering, PNG compression
-                    // and the atomic file write all run on Dispatchers.IO; the
-                    // loop no longer blocks the main thread (no progress UI
-                    // exists, so nothing is posted per page except the error
-                    // toast above).
-                    val firstPageBitmap = withContext(Dispatchers.IO) {
+                    val result = withContext(Dispatchers.IO) {
                         PdfVectorImporter.importIntoNote(
                             context = context,
                             imported = imported,
@@ -1528,28 +1864,52 @@ fun CanvasScreen(
                             targetWidth = 2160,
                             targetHeight = if ((note?.pageType ?: "infinite").let { it == "a4" || it == "pdf" }) 3056 else 3840,
                             reuseFirstPage = false,
-                            onPageError = { msg -> showPageError(msg) }
+                            onPageError = { msg -> showPageError(msg) },
+                            onProgress = { done, total ->
+                                importProgressFlow.value = PdfImportProgressState(
+                                    active = true,
+                                    done = done,
+                                    total = total,
+                                    cancelling = cancelFlag.get()
+                                )
+                            },
+                            isCancelled = { cancelFlag.get() }
                         )
                     }
+                    if (result.cancelled || result.importedPages <= 0) {
+                        result.firstPageBitmap?.let { bmp -> if (!bmp.isRecycled) bmp.recycle() }
+                        return@launch
+                    }
+                    importCommitted = true
+                    viewModel.reloadDrawerData()
                     val canvas = canvasViewRef
                     val curIdx = viewModel.currentPageIndex.value
                     val curPage = vectorPdfPage(curIdx)
                     if (curPage != null) preloadPdfSource(curPage.pdfSourcePath)
                     if (canvas != null && curPage != null) {
+                        result.firstPageBitmap?.let { bmp -> if (!bmp.isRecycled) bmp.recycle() }
                         applyPdfBackground(canvas, curPage)
-                    } else if (firstPageBitmap != null) {
-                        canvas?.backgroundBitmap = firstPageBitmap
+                    } else if (result.firstPageBitmap != null) {
+                        canvas?.backgroundBitmap = result.firstPageBitmap
                     }
                     android.widget.Toast.makeText(
                         context,
-                        "Imported ${imported.pageCount} PDF page(s)",
+                        "Imported ${result.importedPages} PDF page(s)",
                         android.widget.Toast.LENGTH_SHORT
                     ).show()
                 } catch (e: Exception) {
+                    if (e is CancellationException) throw e
                     e.printStackTrace()
                     android.widget.Toast.makeText(context, "PDF import error: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
                 } finally {
-                    imported.document.close()
+                    imported?.close()
+                    if (!importCommitted && destFile.exists()) {
+                        withContext(NonCancellable + Dispatchers.IO) {
+                            if (destFile.exists()) destFile.delete()
+                        }
+                    }
+                    importCancelFlag = null
+                    importProgressFlow.value = PdfImportProgressState()
                 }
             }
         }
@@ -1654,6 +2014,7 @@ fun CanvasScreen(
         if (inkCanvas != null && inkCanvas.hasBeyondPageInk()) {
             withContext(Dispatchers.IO) {
                 inkCanvas.saveBeyondPageInkNow(viewModel.fileStore, viewModel.noteId)
+                viewModel.repository.touchNoteUpdatedAt(viewModel.noteId)
             }
         }
     }
@@ -1671,30 +2032,227 @@ fun CanvasScreen(
     }
 
 
+    suspend fun animateScrollToContinuousPage(
+        targetIndex: Int,
+        horizontal: Boolean? = null,
+        doublePage: Boolean? = null
+    ): Int {
+        val safeIndex = targetIndex.coerceAtLeast(0)
+        if (safeIndex >= pages.size) {
+            // Yield for Room emission & Compose layout of newly added page
+            kotlinx.coroutines.delay(60)
+        }
+        val resolvedHorizontal = horizontal ?: (uiState.pageTurningDirection == 1)
+        val resolvedDoublePage = doublePage ?: uiState.doublePageMode
+        val maxIdx = (pages.size - 1).coerceAtLeast(0)
+        val finalIndex = safeIndex.coerceIn(0, maxIdx)
+        if (resolvedHorizontal) {
+            continuousRowState.animateScrollToItem(finalIndex)
+        } else if (resolvedDoublePage) {
+            continuousColState.animateScrollToItem(finalIndex / 2)
+        } else {
+            continuousColState.animateScrollToItem(finalIndex)
+        }
+        val firstVis = if (resolvedHorizontal) {
+            continuousRowState.firstVisibleItemIndex
+        } else {
+            continuousColState.firstVisibleItemIndex
+        }
+        settledProgrammaticFirstVis = firstVis
+        settledProgrammaticPage = finalIndex
+        continuousVisibleIndex = firstVis
+        return finalIndex
+    }
+
     val scrollToContinuousPage: (Int) -> Unit = { targetIndex ->
-        scope.launch {
-            val safeIndex = targetIndex.coerceAtLeast(0)
-            if (safeIndex >= pages.size) {
-                // Yield for Room emission & Compose layout of newly added page
-                kotlinx.coroutines.delay(60)
+        val token = ++scrubJumpToken
+        isScrubSettling = true
+        scrubJumpJob?.cancel()
+        scrubJumpJob = scope.launch {
+            try {
+                val finalIndex = animateScrollToContinuousPage(targetIndex)
+                viewModel.setCurrentPageIndex(finalIndex)
+            } finally {
+                if (scrubJumpToken == token) {
+                    isScrubSettling = false
+                }
             }
-            val maxIdx = (pages.size - 1).coerceAtLeast(0)
-            val finalIndex = safeIndex.coerceIn(0, maxIdx)
-            if (isHorizontal) {
-                continuousRowState.animateScrollToItem(finalIndex)
-            } else if (uiState.doublePageMode) {
-                continuousColState.animateScrollToItem(finalIndex / 2)
-            } else {
-                continuousColState.animateScrollToItem(finalIndex)
+        }
+    }
+
+    val hasPdfPages = remember(note?.pageType, pages) {
+        note?.pageType == "pdf" || pages.any { it.pdfSourcePath.isNotEmpty() && it.pdfPageIndex >= 0 }
+    }
+    val pdfPagesSignature = remember(pages) {
+        pages.map { Triple(it.index, it.pdfSourcePath, it.pdfPageIndex) }
+    }
+    LaunchedEffect(pdfPagesSignature) {
+        pdfIndexData = null
+    }
+    LaunchedEffect(showSearchSheet, pdfPagesSignature) {
+        if (!showSearchSheet || pdfIndexData != null) return@LaunchedEffect
+        val descriptors = pages.map { p ->
+            PdfTextIndex.PdfPageDescriptor(
+                notePageIndex = p.index,
+                pdfSourcePath = p.pdfSourcePath,
+                pdfPageIndex = p.pdfPageIndex
+            )
+        }
+        val pdfOnlyCount = descriptors.count { it.pdfSourcePath.isNotEmpty() && it.pdfPageIndex >= 0 }
+        if (pdfOnlyCount == 0) return@LaunchedEffect
+        isIndexingPdf = true
+        pdfIndexDone = 0
+        pdfIndexTotal = pdfOnlyCount
+        try {
+            val built = withContext(Dispatchers.IO) {
+                var openPath: String? = null
+                var openDoc: PdfiumDocument? = null
+                try {
+                    val coroutineCtx = currentCoroutineContext()
+                    PdfTextIndex.buildNoteIndex(
+                        pages = descriptors,
+                        cacheFile = viewModel.fileStore.getPdfTextIndexFile(viewModel.noteId),
+                        sourceMetaProvider = { sourcePath ->
+                            val f = viewModel.fileStore.resolveRelativeFile(sourcePath)
+                            if (f.isFile) {
+                                PdfTextIndex.PdfSourceMeta(sourcePath, f.length(), f.lastModified())
+                            } else {
+                                null
+                            }
+                        },
+                        pageTextProvider = { sourcePath, pdfPageIdx ->
+                            if (sourcePath != openPath) {
+                                openDoc?.close()
+                                val f = viewModel.fileStore.resolveRelativeFile(sourcePath)
+                                openDoc = if (f.isFile) PdfiumDocument.open(f) else null
+                                openPath = sourcePath
+                            }
+                            openDoc?.text(pdfPageIdx).orEmpty()
+                        },
+                        onProgress = { done, total ->
+                            pdfIndexDone = done
+                            pdfIndexTotal = total
+                        },
+                        isCancelled = { !coroutineCtx.isActive || !showSearchSheet }
+                    )
+                } finally {
+                    openDoc?.close()
+                }
             }
+            if (built != null) {
+                pdfIndexData = built
+            }
+        } finally {
+            isIndexingPdf = false
+        }
+    }
+
+    val searchHits = remember(pdfIndexData, searchQuery) {
+        val idx = pdfIndexData
+        if (idx == null || searchQuery.isBlank()) emptyList()
+        else PdfTextIndex.search(idx, searchQuery)
+    }
+    LaunchedEffect(searchHits) {
+        activeSearchHitIndex = if (searchHits.isNotEmpty()) 0 else -1
+    }
+
+    val jumpToPageFromUi: (Int) -> Unit = { targetPage ->
+        val clamped = targetPage.coerceIn(0, (totalPages - 1).coerceAtLeast(0))
+        if (isContinuous) {
+            viewModel.setCurrentPageIndex(clamped)
+            scrollToContinuousPage(clamped)
+        } else {
+            scope.launch {
+                canvasViewRef?.getBackingBitmap()?.let { bmp ->
+                    viewModel.saveCurrentPageBitmap(bmp)
+                }
+                if (canvasViewRef?.layersDirty == true) {
+                    canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                }
+                viewModel.goToPage(clamped, canvasViewRef?.getBackingBitmap()) { newBmp ->
+                    applyLoadedPage(clamped, newBmp)
+                }
+            }
+        }
+    }
+
+    val navigateToSearchHit: (Int, PdfTextIndex.PdfSearchHit) -> Unit = { idx, hit ->
+        activeSearchHitIndex = idx
+        searchHighlightRevision++
+        searchHighlightTarget = SearchHighlightTarget(
+            notePageIndex = hit.pageIndex,
+            startOffset = hit.startOffset,
+            length = hit.length,
+            revision = searchHighlightRevision
+        )
+        jumpToPageFromUi(hit.pageIndex)
+    }
+
+    LaunchedEffect(searchHighlightTarget, currentPageIndex, isContinuous, pages, singlePageApplyRevision) {
+        val canvas = canvasViewRef ?: return@LaunchedEffect
+        val target = searchHighlightTarget
+        if (isContinuous || target == null || target.notePageIndex != currentPageIndex) {
+            canvas.setSearchHighlightRects(emptyList())
+            return@LaunchedEffect
+        }
+        val page = vectorPdfPage(currentPageIndex)
+        if (page == null) {
+            canvas.setSearchHighlightRects(emptyList())
+            return@LaunchedEffect
+        }
+        if (canvas.pageIndex != page.index || singlePageAppliedPageIndex != page.index) {
+            canvas.setSearchHighlightRects(emptyList())
+            return@LaunchedEffect
+        }
+        val rects = withContext(Dispatchers.IO) {
+            val doc = pdfDocCache.document(page.pdfSourcePath) ?: return@withContext emptyList()
+            val size = doc.pageSize(page.pdfPageIndex)
+            val pageW = size[0]
+            val pageH = size[1]
+            if (pageW <= 0f || pageH <= 0f) return@withContext emptyList()
+            val canvasW = canvas.pageCanvasWidth().takeIf { it > 0f } ?: 2160f
+            val pxPerPt = canvasW / pageW
+            doc.selectionRects(page.pdfPageIndex, target.startOffset, target.length)
+                .map { PdfPageGeometry.userRectToCanvas(it, pageH, pxPerPt) }
+        }
+        if (searchHighlightTarget?.revision == target.revision &&
+            !isContinuous &&
+            viewModel.currentPageIndex.value == target.notePageIndex
+        ) {
+            canvas.setSearchHighlightRects(rects)
+        }
+    }
+
+    LaunchedEffect(showSearchSheet, searchHighlightTarget?.revision) {
+        if (!showSearchSheet && searchHighlightTarget != null) {
+            kotlinx.coroutines.delay(5000L)
+            searchHighlightTarget = null
+            canvasViewRef?.setSearchHighlightRects(emptyList())
+        }
+    }
+
+    LaunchedEffect(inkController.isDrawing) {
+        if (inkController.isDrawing && searchHighlightTarget != null) {
+            searchHighlightTarget = null
+            canvasViewRef?.setSearchHighlightRects(emptyList())
         }
     }
 
     androidx.activity.compose.BackHandler(onBack = {
         when {
+            showSearchSheet -> {
+                showSearchSheet = false
+                searchHighlightTarget = null
+                canvasViewRef?.setSearchHighlightRects(emptyList())
+            }
+            pdfTextMode -> exitPdfTextMode()
             uiState.isThumbnailDrawerOpen -> viewModel.toggleThumbnailDrawer(false)
             uiState.isToolsPanelOpen -> viewModel.toggleToolsPanel(false)
             showLayersPanel -> showLayersPanel = false
+            showLayerPanel -> {
+                showLayerPanel = false
+                layerActionIndex = -1
+            }
             showShapesMenu -> showShapesMenu = false
             else -> saveAndExit()
         }
@@ -1803,9 +2361,7 @@ fun CanvasScreen(
                     val idx = targetIndex
                     pageToDeleteIndex = null
                     scope.launch {
-                        if (isContinuous) {
-                            inkController.releaseSessionSuspend()
-                        }
+                        inkController.releaseSessionSuspend()
                         val currentBmp = if (isContinuous) null else canvasViewRef?.getBackingBitmap()
                         viewModel.deletePage(idx, isContinuous = isContinuous, currentBitmap = currentBmp) { newBmp ->
                             if (!isContinuous) {
@@ -1966,16 +2522,12 @@ fun CanvasScreen(
                                     // F-10: render the chosen page from the
                                     // vector source (pdfium) at the view's
                                     // pixel size instead of a one-time raster.
-                                    val imported = PdfVectorImporter.readDocument(context, uri)
-                                        ?: return@withContext null
-                                    try {
+                                    PdfVectorImporter.readDocument(context, uri)?.use { imported ->
                                         imported.document.renderPage(
                                             pageIndex = idx,
                                             targetWidth = if (w > 0) w else 2160,
                                             targetHeight = if (h > 0) h else if ((note?.pageType ?: "infinite").let { it == "a4" || it == "pdf" }) 3056 else 3840
                                         )
-                                    } finally {
-                                        imported.document.close()
                                     }
                                 }
                             } catch (e: Exception) {
@@ -2021,6 +2573,14 @@ fun CanvasScreen(
         )
     }
 
+    ImportProgressDialog(
+        state = importProgressState,
+        onCancel = {
+            importCancelFlag?.set(true)
+            importProgressFlow.value = importProgressFlow.value.copy(cancelling = true)
+        }
+    )
+
     // Dialog: Export Dialog
     val exportTargetNote = note
     if (showExportDialog && exportTargetNote != null) {
@@ -2033,6 +2593,8 @@ fun CanvasScreen(
             imageLayers = if (isContinuous) emptyList() else (canvasViewRef?.imageLayers ?: emptyList()),
             currentPageIndex = currentPageIndex,
             initialTarget = selectedExportTarget,
+            includeMargins = uiState.exportIncludeMargins,
+            onIncludeMarginsChange = { viewModel.setExportIncludeMargins(it) },
             onDismiss = {
                 showExportDialog = false
                 selectedExportTarget = null
@@ -2052,59 +2614,7 @@ fun CanvasScreen(
         }
     }
 
-    // Dialog: Go to Page / Jump
-    if (showGoToPageDialog) {
-        var pageTargetStr by remember { mutableStateOf((currentPageIndex + 1).toString()) }
-        AlertDialog(
-            onDismissRequest = { showGoToPageDialog = false },
-            title = { Text("Go to Page") },
-            text = {
-                Column {
-                    Text("Enter page number (1 to $totalPages):", fontSize = 13.sp)
-                    Spacer(modifier = Modifier.height(8.dp))
-                    OutlinedTextField(
-                        value = pageTargetStr,
-                        onValueChange = { pageTargetStr = it },
-                        singleLine = true,
-                        keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
-                            keyboardType = androidx.compose.ui.text.input.KeyboardType.Number
-                        ),
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = {
-                    val targetPage = (pageTargetStr.toIntOrNull() ?: 1) - 1
-                    val clamped = targetPage.coerceIn(0, totalPages - 1)
-                    if (isContinuous) {
-                        viewModel.setCurrentPageIndex(clamped)
-                        scrollToContinuousPage(clamped)
-                    } else {
-                        scope.launch {
-                            canvasViewRef?.getBackingBitmap()?.let { bmp ->
-                                viewModel.saveCurrentPageBitmap(bmp)
-                            }
-                            if (canvasViewRef?.layersDirty == true) {
-                                canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
-                            }
-                            viewModel.goToPage(clamped, canvasViewRef?.getBackingBitmap()) { newBmp ->
-                                applyLoadedPage(clamped, newBmp)
-                            }
-                        }
-                    }
-                    showGoToPageDialog = false
-                }) {
-                    Text("Jump", color = OrangePrimary, fontWeight = FontWeight.Bold)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showGoToPageDialog = false }) { Text("Cancel") }
-            }
-        )
-    }
-
-    // Custom Color Picker Dialog
+    // Dialog: Custom Color Picker (Go-to-page / Full-text search moved to PdfSearchSheet overlay)
     if (showCustomColorDialog) {
         AlertDialog(
             onDismissRequest = { showCustomColorDialog = false },
@@ -2392,10 +2902,7 @@ fun CanvasScreen(
                             // Insert New Page (Works for infinite, A4, and PDF; inserts a blank sheet after current page)
                             IconButton(onClick = {
                                 scope.launch {
-                                    if (isContinuous) {
-                                        inkController.flushCurrentSuspend()
-                                        inkController.releaseSessionSuspend()
-                                    }
+                                    inkController.releaseSessionSuspend()
                                     val currentBmp = if (isContinuous) null else canvasViewRef?.getBackingBitmap()
                                     viewModel.insertNewPage(
                                         atIndex = currentPageIndex + 1,
@@ -2424,11 +2931,14 @@ fun CanvasScreen(
                             }
 
                             // Search Outline / Chapters / Go to Page
-                            IconButton(onClick = { showGoToPageDialog = true }) {
+                            IconButton(onClick = {
+                                showSearchSheet = true
+                                isSearchSheetExpanded = true
+                            }) {
                                 Icon(
                                     imageVector = Icons.Default.Search,
-                                    contentDescription = "Go to Page",
-                                    tint = Color(0xFF555555)
+                                    contentDescription = "Search / Go to Page",
+                                    tint = if (showSearchSheet) OrangePrimary else Color(0xFF555555)
                                 )
                             }
 
@@ -2444,8 +2954,23 @@ fun CanvasScreen(
                             }
 
                             // Layers panel toggle
-                            IconButton(onClick = { showLayersPanel = !showLayersPanel }) {
-                                Icon(imageVector = Icons.Default.Layers, contentDescription = "Layers", tint = if (showLayersPanel) OrangePrimary else Color(0xFF555555))
+                            IconButton(onClick = {
+                                if (PdfModeReconciliationPolicy.resolveLayerEntryTarget(isInfiniteNote) ==
+                                    PdfModeReconciliationPolicy.LayerEntryTarget.INFINITE_DRAWING_ONLY
+                                ) {
+                                    showLayerPanel = !showLayerPanel
+                                    showLayersPanel = false
+                                } else {
+                                    showLayersPanel = !showLayersPanel
+                                    showLayerPanel = false
+                                }
+                                layerActionIndex = -1
+                            }) {
+                                Icon(
+                                    imageVector = Icons.Default.Layers,
+                                    contentDescription = "Layers",
+                                    tint = if (showLayersPanel || showLayerPanel) OrangePrimary else Color(0xFF555555)
+                                )
                             }
 
                             // Import Image
@@ -2704,6 +3229,14 @@ fun CanvasScreen(
                             }
                             showZoomHud = true
                             zoomHudActivityTick++
+                            if (hasMarginGuides &&
+                                (kotlin.math.abs(pan.x) > 0.5f ||
+                                    kotlin.math.abs(continuousPanX) > 2f ||
+                                    continuousScale < 0.99f)
+                            ) {
+                                marginLabelActive = true
+                                marginLabelActivityTick++
+                            }
                         }
                     }
 
@@ -2742,6 +3275,11 @@ fun CanvasScreen(
 
 
                 LaunchedEffect(isContinuous, isHorizontal, uiState.doublePageMode) {
+                    scrubJumpJob?.cancel()
+                    scrubJumpJob = null
+                    val token = ++scrubJumpToken
+                    settledProgrammaticFirstVis = -1
+                    settledProgrammaticPage = -1
                     if (isContinuous) {
                         continuousScale = 1f
                         continuousPanX = 0f
@@ -2750,14 +3288,50 @@ fun CanvasScreen(
                         // background (up to 72 MB) for the duration. Returning
                         // to single-page mode re-installs it via applyLoadedPage.
                         canvasViewRef?.backgroundBitmap = null
-                        val target = currentPageIndex.coerceIn(0, (pages.size - 1).coerceAtLeast(0))
-                        if (isHorizontal) {
-                            continuousRowState.scrollToItem(target)
-                        } else if (uiState.doublePageMode) {
-                            continuousColState.scrollToItem(target / 2)
+                        if (!isInfiniteNote && pages.isNotEmpty()) {
+                            isScrubSettling = true
+                            try {
+                                val target = currentPageIndex.coerceIn(0, pages.size - 1)
+                                val listState = if (isHorizontal) continuousRowState else continuousColState
+                                val itemIdx = if (!isHorizontal && uiState.doublePageMode) target / 2 else target
+                                val preLayoutInfo = listState.layoutInfo
+                                listState.scrollToItem(itemIdx)
+                                // Yield a frame so the newly mounted/reconfigured LazyList
+                                // commits its layout & measure pass, then confirm layoutInfo
+                                // replaced preLayoutInfo and matches expectedCount so
+                                // bottom-of-list clamping is reflected in firstVisibleItemIndex.
+                                withFrameNanos { }
+                                snapshotFlow {
+                                    val expectedCount = if (isHorizontal) {
+                                        pages.size
+                                    } else if (uiState.doublePageMode) {
+                                        (pages.size + 1) / 2
+                                    } else {
+                                        pages.size
+                                    }
+                                    note?.pageType == "infinite" ||
+                                        pages.isEmpty() ||
+                                        (listState.layoutInfo !== preLayoutInfo &&
+                                            listState.layoutInfo.visibleItemsInfo.isNotEmpty() &&
+                                            listState.layoutInfo.totalItemsCount == expectedCount)
+                                }.first { it }
+                                if (note?.pageType != "infinite" && pages.isNotEmpty()) {
+                                    val clampedTarget = target.coerceIn(0, pages.size - 1)
+                                    val firstVis = listState.firstVisibleItemIndex
+                                    settledProgrammaticFirstVis = firstVis
+                                    settledProgrammaticPage = clampedTarget
+                                    continuousVisibleIndex = firstVis
+                                }
+                            } finally {
+                                if (scrubJumpToken == token) {
+                                    isScrubSettling = false
+                                }
+                            }
                         } else {
-                            continuousColState.scrollToItem(target)
+                            isScrubSettling = false
                         }
+                    } else {
+                        isScrubSettling = false
                     }
                 }
 
@@ -2769,8 +3343,8 @@ fun CanvasScreen(
                     if (restoredPageScrolled || !isContinuous || pages.isEmpty()) {
                         return@LaunchedEffect
                     }
+                    restoredPageScrolled = true
                     if (currentPageIndex > 0) {
-                        restoredPageScrolled = true
                         scrollToContinuousPage(currentPageIndex)
                     }
                 }
@@ -2778,13 +3352,23 @@ fun CanvasScreen(
                 // The visible item index comes from a snapshotFlow: reading the
                 // list state straight in composition would recompose the whole
                 // screen on every scroll frame.
-                var continuousVisibleIndex by remember { mutableIntStateOf(0) }
                 LaunchedEffect(isContinuous, isHorizontal) {
                     if (!isContinuous) return@LaunchedEffect
                     snapshotFlow {
-                        if (isHorizontal) continuousRowState.firstVisibleItemIndex
-                        else continuousColState.firstVisibleItemIndex
-                    }.collect { continuousVisibleIndex = it }
+                        val state = if (isHorizontal) continuousRowState else continuousColState
+                        state.firstVisibleItemIndex to state.isScrollInProgress
+                    }.collect { (firstVis, scrollInProgress) ->
+                        if (
+                            settledProgrammaticFirstVis >= 0 &&
+                            !isScrubbing &&
+                            !isScrubSettling &&
+                            (scrollInProgress || firstVis != settledProgrammaticFirstVis)
+                        ) {
+                            settledProgrammaticFirstVis = -1
+                            settledProgrammaticPage = -1
+                        }
+                        continuousVisibleIndex = firstVis
+                    }
                 }
 
                 // Sync current visible item index in continuous mode to viewModel
@@ -2800,10 +3384,27 @@ fun CanvasScreen(
                 } else {
                     continuousVisibleIndex
                 }
-                LaunchedEffect(isContinuous, currentContinuousVisible) {
-                    if (isContinuous && pages.isNotEmpty()) {
-                        val validIdx = currentContinuousVisible.coerceIn(0, pages.size - 1)
-                        viewModel.setCurrentPageIndex(validIdx)
+                LaunchedEffect(isContinuous, currentContinuousVisible, isScrubbing, isScrubSettling) {
+                    if (isContinuous && pages.isNotEmpty() && !isScrubbing && !isScrubSettling) {
+                        val activeListState = if (uiState.pageTurningDirection == 1) continuousRowState else continuousColState
+                        val isProgrammaticSettledTarget =
+                            settledProgrammaticFirstVis >= 0 &&
+                            settledProgrammaticPage in pages.indices &&
+                            continuousVisibleIndex == settledProgrammaticFirstVis &&
+                            viewModel.currentPageIndex.value == settledProgrammaticPage &&
+                            !activeListState.isScrollInProgress
+                        val curIdx = viewModel.currentPageIndex.value
+                        val visibleItems = activeListState.layoutInfo.visibleItemsInfo
+                        val currentStillVisibleOnScreen = visibleItems.isNotEmpty() && if (!isHorizontal && uiState.doublePageMode) {
+                            val pairItemIdx = curIdx / 2
+                            visibleItems.any { it.index == pairItemIdx }
+                        } else {
+                            visibleItems.any { it.index == curIdx }
+                        }
+                        if (!isProgrammaticSettledTarget && !currentStillVisibleOnScreen) {
+                            val validIdx = currentContinuousVisible.coerceIn(0, pages.size - 1)
+                            viewModel.setCurrentPageIndex(validIdx)
+                        }
                     }
                 }
 
@@ -2821,8 +3422,16 @@ fun CanvasScreen(
                             )
                             // Wire the previously-dead 3-finger-tap paste hook.
                             onThreeFingerTap = { handleClipboardPaste() }
-                            // Any touch on the page closes the open menus.
-                            onCanvasTouchStart = { dismissCanvasOverlays() }
+                            // Any touch on the page closes the open menus; only genuine ink/shape interaction clears search highlight.
+                            onCanvasTouchStart = {
+                                dismissCanvasOverlays()
+                            }
+                            onInkInteractionStart = {
+                                if (searchHighlightTarget != null) {
+                                    searchHighlightTarget = null
+                                    setSearchHighlightRects(emptyList())
+                                }
+                            }
                             onImageSelectionChanged = {
                                 selectedImageIndex = it
                             }
@@ -2844,9 +3453,12 @@ fun CanvasScreen(
                                         // otherwise the last stroke is lost.
                                         try {
                                             flushCurrentNote()
+                                            inkController.releaseSessionSuspend()
                                         } catch (e: Exception) {
                                             e.printStackTrace()
                                         }
+                                        val cur = viewModel.currentPageIndex.value
+                                        savedPageGenerations[cur] = (savedPageGenerations[cur] ?: 0) + 1
                                         viewModel.setPageTurningMode(0)
                                     }
                                 }
@@ -2864,6 +3476,9 @@ fun CanvasScreen(
                                     glassViewportTick++
                                 }
                             }
+                            onImageLayersSaved = { savedPageIdx ->
+                                viewModel.notifyPageModified(savedPageIdx)
+                            }
                             onStrokeFinishedListener = {
                                 glassViewportTick++
                                 getBackingBitmap()?.let { bmp ->
@@ -2874,8 +3489,11 @@ fun CanvasScreen(
                                 // stroke, not only when a layer changes.
                                 val canvas = canvasViewRef
                                 if (canvas != null && canvas.hasBeyondPageInk()) {
+                                    val bpPage = canvas.pageIndex
                                     scope.launch(Dispatchers.IO) {
                                         canvas.saveBeyondPageInkNow(viewModel.fileStore, viewModel.noteId)
+                                        viewModel.repository.touchNoteUpdatedAt(viewModel.noteId)
+                                        viewModel.notifyPageModified(bpPage)
                                     }
                                 }
                             }
@@ -2903,35 +3521,33 @@ fun CanvasScreen(
                                         reloadLayersFromDisk(viewModel.fileStore, viewModel.noteId)
                                         return@launch
                                     }
+                                    val seq = singlePageOverlayLoadSeq.incrementAndGet()
                                     val pageIdx = viewModel.currentPageIndex.value
                                     viewModel.setCanvasPageIndex(pageIdx)
                                     pageIndex = pageIdx
                                     val vectorPage = vectorPdfPage(pageIdx)
                                     if (vectorPage != null) {
                                         preloadPdfSource(vectorPage.pdfSourcePath)
-                                        backgroundBitmap = null
-                                        viewModel.setPageLoadedFromDisk(true)
-                                        applyPdfBackground(this@apply, vectorPage)
+                                        if (singlePageOverlayLoadSeq.get() != seq) return@launch
                                         val strokes = withContext(Dispatchers.IO) {
                                             viewModel.loadPageStrokes(pageIdx)
                                         }
+                                        if (singlePageOverlayLoadSeq.get() != seq) return@launch
+                                        backgroundBitmap = null
+                                        annotationOverlay = null
+                                        viewModel.setPageLoadedFromDisk(true)
+                                        applyPdfBackground(this@apply, vectorPage)
                                         setPageContent(strokes)
-                                        loadBeyondPageInk(pageIdx)
                                     } else {
                                         val savedBitmap = viewModel.loadCurrentPageBitmap()
+                                        if (singlePageOverlayLoadSeq.get() != seq) return@launch
                                         setPageContent(savedBitmap)
                                         backgroundBitmap = null
-                                        annotationOverlay = if (note?.pageType == "a4") {
-                                            inkController.composeAllLayersForSinglePage(
-                                                pageIndex = pageIdx,
-                                                targetWidth = getBackingBitmap()?.width ?: 2160,
-                                                targetHeight = getBackingBitmap()?.height ?: 3056
-                                            )
-                                        } else null
                                         viewModel.setPageLoadedFromDisk(savedBitmap != null)
-                                        loadBeyondPageInk(pageIdx)
                                     }
-                                    reloadLayersFromDisk(viewModel.fileStore, viewModel.noteId)
+                                    singlePageAppliedPageIndex = pageIdx
+                                    singlePageApplyRevision++
+                                    reloadSinglePageOverlaysAndLayers(this@apply, pageIdx, vectorPage, seq)
                                 } catch (e: Exception) {
                                     e.printStackTrace()
                                 }
@@ -2978,6 +3594,9 @@ fun CanvasScreen(
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
+                            .onSizeChanged { size ->
+                                if (size.width > 0) readerViewportWidthPx = size.width.toFloat()
+                            }
                             .onGloballyPositioned { canvasOriginInRoot = it.positionInRoot() }
                     ) {
                         Box(
@@ -3000,14 +3619,20 @@ fun CanvasScreen(
                                     // the gesture has to see them first
                                     // (PointerEventPass.Initial) - and it may
                                     // only take over when a SECOND finger
-                                    // arrives, so a one finger scroll still
-                                    // scrolls the list.
+                                    // arrives (never 1 palm + 1 stylus), so a
+                                    // one finger scroll still scrolls the list.
                                     awaitEachGesture {
                                         awaitFirstDown(requireUnconsumed = false)
                                         var twoFingers = false
                                         while (true) {
                                             val event = awaitPointerEvent(PointerEventPass.Initial)
-                                            if (event.changes.count { it.pressed } >= 2) {
+                                            val hasStylus = event.changes.any {
+                                                it.pressed && (it.type == PointerType.Stylus || it.type == PointerType.Eraser)
+                                            }
+                                            val touchCount = event.changes.count {
+                                                it.pressed && it.type == PointerType.Touch
+                                            }
+                                            if (!hasStylus && touchCount >= 2 && event.changes.count { it.pressed } >= 2) {
                                                 twoFingers = true
                                                 break
                                             }
@@ -3019,7 +3644,15 @@ fun CanvasScreen(
                                         var previousDistance = 0f
                                         while (true) {
                                             val event = awaitPointerEvent(PointerEventPass.Initial)
-                                            val pressed = event.changes.filter { it.pressed }
+                                            if (event.changes.any {
+                                                    it.pressed && (it.type == PointerType.Stylus || it.type == PointerType.Eraser)
+                                                }
+                                            ) {
+                                                break
+                                            }
+                                            val pressed = event.changes.filter {
+                                                it.pressed && it.type == PointerType.Touch
+                                            }
                                             if (pressed.size < 2) break
                                             var sumX = 0f
                                             var sumY = 0f
@@ -3047,79 +3680,6 @@ fun CanvasScreen(
                                                 currentHandleReaderTransform(centroid, pan, zoom)
                                             }
                                         }
-                                    }
-                                }
-                                .pointerInput(note?.pageType, currentPageIndex, inkSettings, continuousZoomBucket, pages) {
-                                    if (isInfiniteNote || note?.pageType == "a4") return@pointerInput
-                                    if (inkSettings.readingMode) return@pointerInput
-                                    try {
-                                        awaitEachGesture {
-                                            val down = awaitFirstDown(requireUnconsumed = false)
-                                            if (down.isConsumed) return@awaitEachGesture
-                                            val isStylus = down.type == PointerType.Stylus || down.type == PointerType.Eraser
-                                            if (isStylus) viewModel.onStylusDetected()
-                                            val isAllowedPointer = isStylus || (!inkSettings.stylusOnly && down.type == PointerType.Touch)
-                                            if (!isAllowedPointer || !inkSettings.isWritingTool || inkSettings.isLaserPointer) {
-                                                return@awaitEachGesture
-                                            }
-                                            val box = continuousPageMap.pageBox ?: return@awaitEachGesture
-                                            if (box.width <= 0 || box.height <= 0) return@awaitEachGesture
-                                            val targetIndex = if (pages.getOrNull(box.pageIndex) != null) box.pageIndex else currentPageIndex
-                                            val targetPage = pages.getOrNull(targetIndex) ?: return@awaitEachGesture
-                                            val boxW = box.width.toFloat()
-                                            val boxH = box.height.toFloat()
-                                            fun toNorm(pos: androidx.compose.ui.geometry.Offset): Pair<Float, Float> {
-                                                val rx = canvasOriginInRoot.x + pos.x
-                                                val ry = canvasOriginInRoot.y + pos.y
-                                                return ((rx - box.originX) / boxW) to ((ry - box.originY) / boxH)
-                                            }
-                                            val (sx, sy) = toNorm(down.position)
-                                            down.consume()
-                                            val renderW = (boxW * continuousZoomBucket).roundToInt().coerceIn(1, MAX_PAGE_RENDER_WIDTH_PX)
-                                            inkController.beginStroke(
-                                                page = targetPage,
-                                                pageIndex = targetIndex,
-                                                x = sx,
-                                                y = sy,
-                                                pressure = down.pressure,
-                                                boxWidth = boxW,
-                                                boxHeight = boxH,
-                                                renderWidthPx = renderW,
-                                                settings = inkSettings,
-                                                tilt = personal.notes.touch.StylusTiltTracker.currentTiltRad
-                                            )
-                                            while (true) {
-                                                val event = awaitPointerEvent()
-                                                if (event.changes.count { it.pressed } > 1) {
-                                                    inkController.cancelStroke()
-                                                    break
-                                                }
-                                                val change = event.changes.firstOrNull { it.id == down.id }
-                                                if (change == null) {
-                                                    inkController.cancelStroke()
-                                                    break
-                                                }
-                                                val (cx, cy) = toNorm(change.position)
-                                                val tiltNow = personal.notes.touch.StylusTiltTracker.currentTiltRad
-                                                @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
-                                                fun processHistory(c: androidx.compose.ui.input.pointer.PointerInputChange) {
-                                                    for (hp in c.historical) {
-                                                        val (hx, hy) = toNorm(hp.position)
-                                                        inkController.extendStroke(hx, hy, c.pressure, inkSettings, tiltNow)
-                                                    }
-                                                }
-                                                processHistory(change)
-                                                if (change.changedToUpIgnoreConsumed()) {
-                                                    inkController.endStroke(cx, cy, change.pressure, inkSettings, tiltNow)
-                                                    change.consume()
-                                                    break
-                                                }
-                                                inkController.extendStroke(cx, cy, change.pressure, inkSettings, tiltNow)
-                                                change.consume()
-                                            }
-                                        }
-                                    } finally {
-                                        inkController.cancelStroke()
                                     }
                                 }
                         ) {
@@ -3162,6 +3722,7 @@ fun CanvasScreen(
                                         scope.launch(Dispatchers.IO) {
                                             InfiniteItemsStore.save(viewModel.fileStore, viewModel.noteId, snapshot)
                                             inkController.generateAndSavePagePreview(activeInfPageIdx)
+                                            viewModel.repository.touchNoteUpdatedAt(viewModel.noteId)
                                         }
                                         savedPageGenerations[activeInfPageIdx] = (savedPageGenerations[activeInfPageIdx] ?: 0) + 1
                                     },
@@ -3172,6 +3733,7 @@ fun CanvasScreen(
                                         scope.launch(Dispatchers.IO) {
                                             InfiniteItemsStore.save(viewModel.fileStore, viewModel.noteId, updated)
                                             inkController.generateAndSavePagePreview(activeInfPageIdx)
+                                            viewModel.repository.touchNoteUpdatedAt(viewModel.noteId)
                                         }
                                         savedPageGenerations[activeInfPageIdx] = (savedPageGenerations[activeInfPageIdx] ?: 0) + 1
                                     },
@@ -3226,10 +3788,14 @@ fun CanvasScreen(
                                     modifier = Modifier.fillMaxSize()
                                 )
                             } else if (isHorizontal) {
+                                val horizontalPanReveal = MarginExportMath.hasHorizontalPanOrZoomReveal(
+                                    continuousPanX = continuousPanX,
+                                    continuousScale = continuousScale
+                                )
                                 androidx.compose.foundation.lazy.LazyRow(
                                     state = continuousRowState,
                                     modifier = Modifier.fillMaxSize(),
-                                    userScrollEnabled = !inkController.isDrawing,
+                                    userScrollEnabled = !inkController.isDrawing && !inkController.isManipulatingLasso,
                                     verticalAlignment = Alignment.CenterVertically,
                                     horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(if (isInfiniteNote) 0.dp else 16.dp),
                                     contentPadding = if (isInfiniteNote) androidx.compose.foundation.layout.PaddingValues(0.dp) else androidx.compose.foundation.layout.PaddingValues(16.dp)
@@ -3263,12 +3829,27 @@ fun CanvasScreen(
                                                 inkSettings = inkSettings,
                                                 backgroundMode = uiState.backgroundMode,
                                                 backgroundDensity = uiState.backgroundDensity,
+                                                defaultPattern = uiState.paperPattern,
                                                 savedGeneration = savedPageGenerations[idx] ?: 0,
                                                 isCurrentPage = idx == currentPageIndex,
                                                 isInfinite = isInfiniteNote,
                                                 panOffsetX = continuousPanX,
                                                 panOffsetY = continuousPanY,
                                                 pageType = note?.pageType ?: "infinite",
+                                                viewportWidthPx = readerViewportWidthPx,
+                                                canvasOriginXProvider = { canvasOriginInRoot.x },
+                                                marginLabelAlphaProvider = { marginLabelAlpha },
+                                                allowLeftPanReveal = horizontalPanReveal,
+                                                allowRightPanReveal = horizontalPanReveal,
+                                                allowLeftMarginLabel = idx == 0 || (horizontalPanReveal && idx == currentPageIndex),
+                                                allowRightMarginLabel = idx == pages.size - 1 || (horizontalPanReveal && idx == currentPageIndex),
+                                                searchHighlightStart = if (searchHighlightTarget?.notePageIndex == idx) {
+                                                    searchHighlightTarget?.startOffset ?: -1
+                                                } else -1,
+                                                searchHighlightLength = if (searchHighlightTarget?.notePageIndex == idx) {
+                                                    searchHighlightTarget?.length ?: 0
+                                                } else 0,
+                                                searchHighlightRevision = searchHighlightTarget?.revision ?: 0,
                                                 modifier = androidx.compose.ui.Modifier.then(
                                                     if (isInfiniteNote) {
                                                         Modifier.fillMaxSize()
@@ -3276,12 +3857,14 @@ fun CanvasScreen(
                                                         Modifier.fillMaxHeight()
                                                     }
                                                 ),
+                                                onStylusDetected = { viewModel.onStylusDetected() },
                                                 onPageBitmap = { idx, bmp ->
                                                     if (idx == currentPageIndex) {
                                                         glassReaderBitmap = bmp
                                                         glassReaderBitmapPage = idx
                                                     }
                                                 },
+                                                onActivatePage = { viewModel.setCurrentPageIndex(idx) },
                                                 onClick = {
                                                     viewModel.setCurrentPageIndex(idx)
                                                     dismissCanvasOverlays()
@@ -3294,7 +3877,7 @@ fun CanvasScreen(
                                 androidx.compose.foundation.lazy.LazyColumn(
                                     state = continuousColState,
                                     modifier = Modifier.fillMaxSize(),
-                                    userScrollEnabled = !inkController.isDrawing,
+                                    userScrollEnabled = !inkController.isDrawing && !inkController.isManipulatingLasso,
                                     verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(if (isInfiniteNote) 0.dp else 16.dp),
                                     contentPadding = if (isInfiniteNote) androidx.compose.foundation.layout.PaddingValues(0.dp) else androidx.compose.foundation.layout.PaddingValues(vertical = 16.dp, horizontal = 16.dp),
                                     horizontalAlignment = Alignment.CenterHorizontally
@@ -3311,7 +3894,7 @@ fun CanvasScreen(
                                                 .offset { IntOffset(continuousPanX.roundToInt(), continuousPanY.roundToInt()) },
                                             horizontalArrangement = Arrangement.spacedBy(16.dp)
                                         ) {
-                                            for (idx in pair) {
+                                            for ((posInPair, idx) in pair.withIndex()) {
                                                 val page = pages[idx]
                                                 Box(
                                                     modifier = Modifier
@@ -3333,12 +3916,27 @@ fun CanvasScreen(
                                                         inkSettings = inkSettings,
                                                         backgroundMode = uiState.backgroundMode,
                                                         backgroundDensity = uiState.backgroundDensity,
+                                                        defaultPattern = uiState.paperPattern,
                                                         savedGeneration = savedPageGenerations[idx] ?: 0,
                                                         isCurrentPage = idx == currentPageIndex,
                                                         isInfinite = isInfiniteNote,
                                                         panOffsetX = continuousPanX,
                                                         panOffsetY = continuousPanY,
                                                         pageType = note?.pageType ?: "infinite",
+                                                        viewportWidthPx = readerViewportWidthPx,
+                                                        canvasOriginXProvider = { canvasOriginInRoot.x },
+                                                        marginLabelAlphaProvider = { marginLabelAlpha },
+                                                        allowLeftPanReveal = posInPair == 0,
+                                                        allowRightPanReveal = posInPair == 1 || pair.size == 1,
+                                                        allowLeftMarginLabel = posInPair == 0,
+                                                        allowRightMarginLabel = posInPair == 1 || pair.size == 1,
+                                                        searchHighlightStart = if (searchHighlightTarget?.notePageIndex == idx) {
+                                                            searchHighlightTarget?.startOffset ?: -1
+                                                        } else -1,
+                                                        searchHighlightLength = if (searchHighlightTarget?.notePageIndex == idx) {
+                                                            searchHighlightTarget?.length ?: 0
+                                                        } else 0,
+                                                        searchHighlightRevision = searchHighlightTarget?.revision ?: 0,
                                                         modifier = androidx.compose.ui.Modifier.then(
                                                             if (isInfiniteNote) {
                                                                 Modifier.fillMaxSize()
@@ -3346,12 +3944,14 @@ fun CanvasScreen(
                                                                 Modifier.fillMaxWidth()
                                                             }
                                                         ),
+                                                        onStylusDetected = { viewModel.onStylusDetected() },
                                                         onPageBitmap = { idx, bmp ->
                                                             if (idx == currentPageIndex) {
                                                                 glassReaderBitmap = bmp
                                                                 glassReaderBitmapPage = idx
                                                             }
                                                         },
+                                                        onActivatePage = { viewModel.setCurrentPageIndex(idx) },
                                                         onClick = {
                                                             viewModel.setCurrentPageIndex(idx)
                                                             dismissCanvasOverlays()
@@ -3366,10 +3966,14 @@ fun CanvasScreen(
                                     }
                                 }
                             } else {
+                                val horizontalPanReveal = MarginExportMath.hasHorizontalPanOrZoomReveal(
+                                    continuousPanX = continuousPanX,
+                                    continuousScale = continuousScale
+                                )
                                 androidx.compose.foundation.lazy.LazyColumn(
                                     state = continuousColState,
                                     modifier = Modifier.fillMaxSize(),
-                                    userScrollEnabled = !inkController.isDrawing,
+                                    userScrollEnabled = !inkController.isDrawing && !inkController.isManipulatingLasso,
                                     verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(if (isInfiniteNote) 0.dp else 16.dp),
                                     contentPadding = if (isInfiniteNote) androidx.compose.foundation.layout.PaddingValues(0.dp) else androidx.compose.foundation.layout.PaddingValues(vertical = 16.dp, horizontal = 16.dp),
                                     horizontalAlignment = Alignment.CenterHorizontally
@@ -3403,12 +4007,27 @@ fun CanvasScreen(
                                                 inkSettings = inkSettings,
                                                 backgroundMode = uiState.backgroundMode,
                                                 backgroundDensity = uiState.backgroundDensity,
+                                                defaultPattern = uiState.paperPattern,
                                                 savedGeneration = savedPageGenerations[idx] ?: 0,
                                                 isCurrentPage = idx == currentPageIndex,
                                                 isInfinite = isInfiniteNote,
                                                 panOffsetX = continuousPanX,
                                                 panOffsetY = continuousPanY,
                                                 pageType = note?.pageType ?: "infinite",
+                                                viewportWidthPx = readerViewportWidthPx,
+                                                canvasOriginXProvider = { canvasOriginInRoot.x },
+                                                marginLabelAlphaProvider = { marginLabelAlpha },
+                                                allowLeftPanReveal = horizontalPanReveal,
+                                                allowRightPanReveal = horizontalPanReveal,
+                                                allowLeftMarginLabel = true,
+                                                allowRightMarginLabel = true,
+                                                searchHighlightStart = if (searchHighlightTarget?.notePageIndex == idx) {
+                                                    searchHighlightTarget?.startOffset ?: -1
+                                                } else -1,
+                                                searchHighlightLength = if (searchHighlightTarget?.notePageIndex == idx) {
+                                                    searchHighlightTarget?.length ?: 0
+                                                } else 0,
+                                                searchHighlightRevision = searchHighlightTarget?.revision ?: 0,
                                                 modifier = androidx.compose.ui.Modifier.then(
                                                     if (isInfiniteNote) {
                                                         Modifier.fillMaxSize()
@@ -3423,6 +4042,7 @@ fun CanvasScreen(
                                                         glassReaderBitmapPage = idx
                                                     }
                                                 },
+                                                onActivatePage = { viewModel.setCurrentPageIndex(idx) },
                                                 onClick = {
                                                     viewModel.setCurrentPageIndex(idx)
                                                     dismissCanvasOverlays()
@@ -3430,6 +4050,141 @@ fun CanvasScreen(
                                             )
                                         }
                                     }
+                                }
+                            }
+                        }
+
+                        if (hasMarginGuides) {
+                            androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
+                                val _rev = inkController.revision
+                                val _layerRev = inkController.layersRevision
+                                val _marginRev = inkController.marginPresenceRevision
+                                val _pageIdx = currentPageIndex
+                                val _panX = continuousPanX
+                                val _scale = continuousScale
+                                val _colOffset = continuousColState.firstVisibleItemScrollOffset
+                                val _rowOffset = continuousRowState.firstVisibleItemScrollOffset
+                                val vpW = if (readerViewportWidthPx > 0f) readerViewportWidthPx else size.width
+                                if (vpW <= 0f || size.height <= 0f) return@Canvas
+
+                                val pageBox = continuousPageMap.pageBox?.takeIf {
+                                    it.valid && it.pageIndex == _pageIdx
+                                }
+                                val pageLeftPx: Float
+                                val pageWidthPx: Float
+                                if (pageBox != null) {
+                                    pageLeftPx = pageBox.originX - canvasOriginInRoot.x
+                                    pageWidthPx = pageBox.width.toFloat()
+                                } else {
+                                    val padPx = 16.dp.toPx()
+                                    val approxW = if (uiState.doublePageMode && !isHorizontal) {
+                                        ((screenWidthPx * _scale - padPx * 3f) / 2f).coerceAtLeast(1f)
+                                    } else {
+                                        (screenWidthPx * _scale - padPx * 2f).coerceAtLeast(1f)
+                                    }
+                                    pageWidthPx = approxW
+                                    pageLeftPx = (vpW - approxW) / 2f + _panX
+                                }
+
+                                val presence = inkController.marginInkPresence(_pageIdx)
+                                val outerPanReveal = MarginExportMath.hasHorizontalPanOrZoomReveal(
+                                    continuousPanX = _panX,
+                                    continuousScale = _scale
+                                )
+                                val allowOuterPanReveal = if (uiState.doublePageMode && !isHorizontal) true else outerPanReveal
+                                val guideState = MarginExportMath.computeGuideState(
+                                    pageType = note?.pageType,
+                                    pageLeftInViewportPx = pageLeftPx,
+                                    pageWidthPx = pageWidthPx,
+                                    viewportWidthPx = vpW,
+                                    presence = presence,
+                                    allowLeftPanReveal = allowOuterPanReveal,
+                                    allowRightPanReveal = allowOuterPanReveal
+                                )
+                                if (!guideState.showLeftOffscreenChevron &&
+                                    !guideState.showRightOffscreenChevron
+                                ) {
+                                    return@Canvas
+                                }
+
+                                val pillW = 22.dp.toPx()
+                                val pillH = 28.dp.toPx()
+                                val cornerR = 8.dp.toPx()
+                                val marginPad = 4.dp.toPx()
+                                val chevronY = if (uiState.dockHorizontal &&
+                                    uiState.showPencase &&
+                                    !uiState.readingMode
+                                ) {
+                                    84.dp.toPx()
+                                } else {
+                                    20.dp.toPx()
+                                }
+                                val bgColor = Color.White.copy(alpha = 0.90f)
+                                val borderColor = Color(0xFFE2E8F0)
+                                val iconColor = OrangePrimary
+                                val chevronStroke = 2.dp.toPx()
+
+                                fun drawChevronPill(x: Float, pointLeft: Boolean) {
+                                    val topLeft = androidx.compose.ui.geometry.Offset(x, chevronY)
+                                    val pillSize = androidx.compose.ui.geometry.Size(pillW, pillH)
+                                    drawRoundRect(
+                                        color = bgColor,
+                                        topLeft = topLeft,
+                                        size = pillSize,
+                                        cornerRadius = androidx.compose.ui.geometry.CornerRadius(
+                                            cornerR,
+                                            cornerR
+                                        )
+                                    )
+                                    drawRoundRect(
+                                        color = borderColor,
+                                        topLeft = topLeft,
+                                        size = pillSize,
+                                        cornerRadius = androidx.compose.ui.geometry.CornerRadius(
+                                            cornerR,
+                                            cornerR
+                                        ),
+                                        style = Stroke(width = 1.dp.toPx())
+                                    )
+                                    val cx = x + pillW / 2f
+                                    val cy = chevronY + pillH / 2f
+                                    val dx = 3.5.dp.toPx()
+                                    val dy = 5.dp.toPx()
+                                    val path = androidx.compose.ui.graphics.Path().apply {
+                                        if (pointLeft) {
+                                            moveTo(cx + dx * 0.6f, cy - dy)
+                                            lineTo(cx - dx * 0.8f, cy)
+                                            lineTo(cx + dx * 0.6f, cy + dy)
+                                        } else {
+                                            moveTo(cx - dx * 0.6f, cy - dy)
+                                            lineTo(cx + dx * 0.8f, cy)
+                                            lineTo(cx - dx * 0.6f, cy + dy)
+                                        }
+                                    }
+                                    drawPath(
+                                        path = path,
+                                        color = iconColor,
+                                        style = Stroke(
+                                            width = chevronStroke,
+                                            cap = StrokeCap.Round,
+                                            join = StrokeJoin.Round
+                                        )
+                                    )
+                                }
+
+                                if (guideState.showLeftOffscreenChevron) {
+                                    val maxX = (vpW - pillW - marginPad).coerceAtLeast(marginPad)
+                                    val leftX = kotlin.math.max(marginPad, pageLeftPx + marginPad)
+                                        .coerceIn(marginPad, maxX)
+                                    drawChevronPill(leftX, pointLeft = true)
+                                }
+                                if (guideState.showRightOffscreenChevron) {
+                                    val maxX = (vpW - pillW - marginPad).coerceAtLeast(marginPad)
+                                    val rightX = kotlin.math.min(
+                                        vpW - pillW - marginPad,
+                                        pageLeftPx + pageWidthPx - pillW - marginPad
+                                    ).coerceIn(marginPad, maxX)
+                                    drawChevronPill(rightX, pointLeft = false)
                                 }
                             }
                         }
@@ -3677,15 +4432,46 @@ fun CanvasScreen(
                     }
                 }
 
-                // Layers panel
-                if (showLayersPanel) {
+                // Unified Layers panel for PDF & A4 notes (Drawing Layers 1-3 + Floating Image/Text Layers 0-3)
+                if (showLayersPanel && !isInfiniteNote) {
                     val _tick = layersTick
-                    // The reader draws its own decoded copy of the page's
-                    // layers; single-page mode reads the engine directly.
+                    val _drawingTick = inkController.layersRevision
+                    val panelPage = pages.getOrNull(currentPageIndex)
+                    LaunchedEffect(currentPageIndex, panelPage?.id) {
+                        if (panelPage != null) {
+                            inkController.ensureSessionForPage(panelPage, currentPageIndex)
+                        }
+                    }
+                    val drawingStack = inkController.layerStack(currentPageIndex)
                     val layers = if (isContinuous) {
                         readerLayers.layers(currentPageIndex)
                     } else {
                         canvasViewRef?.imageLayers ?: emptyList()
+                    }
+                    val syncSinglePageAfterLayerEdit: suspend () -> Unit = {
+                        inkController.flushCurrentSuspend()
+                        val canvas = canvasViewRef
+                        if (!isContinuous && canvas != null) {
+                            val vp = vectorPdfPage(currentPageIndex)
+                            canvas.baseLayerVisible = inkController.layerStack(currentPageIndex)
+                                .layerAt(PageLayerStack.BASE_LAYER_INDEX)?.visible != false
+                            val bmp = canvas.getBackingBitmap()
+                            val tw = bmp?.width ?: 2160
+                            val th = bmp?.height ?: 3056
+                            canvas.annotationOverlay = if (PdfModeReconciliationPolicy.shouldLoadAnnotationOverlay(
+                                    note?.pageType, vp != null
+                                )
+                            ) {
+                                inkController.composeAllLayersForSinglePage(
+                                    pageIndex = currentPageIndex,
+                                    targetWidth = tw,
+                                    targetHeight = th,
+                                    page = vp
+                                )
+                            } else null
+                            canvas.invalidate()
+                            savedPageGenerations[currentPageIndex] = (savedPageGenerations[currentPageIndex] ?: 0) + 1
+                        }
                     }
                     Surface(
                         shape = RoundedCornerShape(14.dp),
@@ -3699,23 +4485,27 @@ fun CanvasScreen(
                             // dock hides its header and its buttons.
                             .zIndex(3f)
                             .padding(top = 10.dp, end = 12.dp)
-                            .widthIn(min = 220.dp, max = 280.dp)
+                            .widthIn(min = 240.dp, max = 300.dp)
                     ) {
-                        Column(modifier = Modifier.padding(12.dp)) {
+                        Column(
+                            modifier = Modifier
+                                .padding(12.dp)
+                                .verticalScroll(rememberScrollState())
+                        ) {
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Text(
-                                    text = "Layers (${layers.size}/3)",
+                                    text = "Layers",
                                     fontWeight = FontWeight.Bold,
-                                    fontSize = 13.sp,
+                                    fontSize = 14.sp,
                                     color = Color(0xFF222222)
                                 )
                                 IconButton(
                                     onClick = { showLayersPanel = false },
-                                    modifier = Modifier.size(36.dp)
+                                    modifier = Modifier.size(32.dp)
                                 ) {
                                     Icon(
                                         imageVector = Icons.Default.Close,
@@ -3726,8 +4516,133 @@ fun CanvasScreen(
                                 }
                             }
 
+                            Spacer(Modifier.height(4.dp))
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Drawing Layers (${drawingStack.size}/3)",
+                                    fontWeight = FontWeight.SemiBold,
+                                    fontSize = 11.sp,
+                                    color = Color.Gray
+                                )
+                                if (drawingStack.canAdd) {
+                                    TextButton(
+                                        onClick = {
+                                            scope.launch {
+                                                val targetPage = panelPage ?: return@launch
+                                                inkController.ensureSessionReady(targetPage, currentPageIndex)
+                                                inkController.addLayer(currentPageIndex)
+                                                syncSinglePageAfterLayerEdit()
+                                            }
+                                        },
+                                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
+                                        modifier = Modifier.height(26.dp)
+                                    ) {
+                                        Text("+ Drawing", fontSize = 11.sp, color = OrangePrimary)
+                                    }
+                                }
+                            }
+
+                            drawingStack.layers.forEach { dLayer ->
+                                val isCurrentDrawing = dLayer.index == drawingStack.currentIndex
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 2.dp)
+                                        .clickable {
+                                            scope.launch {
+                                                val targetPage = panelPage ?: return@launch
+                                                inkController.ensureSessionReady(targetPage, currentPageIndex)
+                                                inkController.selectLayer(currentPageIndex, dLayer.index)
+                                                if (!isContinuous) {
+                                                    inkController.flushCurrentSuspend()
+                                                }
+                                            }
+                                        }
+                                ) {
+                                    IconButton(
+                                        onClick = {
+                                            scope.launch {
+                                                val targetPage = panelPage ?: return@launch
+                                                inkController.ensureSessionReady(targetPage, currentPageIndex)
+                                                inkController.setLayerVisible(currentPageIndex, dLayer.index, !dLayer.visible)
+                                                syncSinglePageAfterLayerEdit()
+                                            }
+                                        },
+                                        modifier = Modifier.size(32.dp)
+                                    ) {
+                                        Icon(
+                                            if (dLayer.visible) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                                            contentDescription = "visibility",
+                                            tint = if (dLayer.visible) Color.DarkGray else Color.LightGray,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                    }
+                                    Spacer(Modifier.width(4.dp))
+                                    Text(
+                                        text = buildString {
+                                            append(dLayer.name)
+                                            if (isCurrentDrawing) append(" · active")
+                                        },
+                                        fontSize = 12.sp,
+                                        fontWeight = if (isCurrentDrawing) FontWeight.SemiBold else FontWeight.Normal,
+                                        color = if (dLayer.visible) Color(0xFF222222) else Color(0xFF999999),
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    if (dLayer.index != PageLayerStack.BASE_LAYER_INDEX) {
+                                        TextButton(
+                                            onClick = {
+                                                scope.launch {
+                                                    val targetPage = panelPage ?: return@launch
+                                                    inkController.ensureSessionReady(targetPage, currentPageIndex)
+                                                    inkController.mergeLayer(currentPageIndex, dLayer.index)
+                                                    syncSinglePageAfterLayerEdit()
+                                                }
+                                            },
+                                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
+                                            modifier = Modifier.height(28.dp)
+                                        ) {
+                                            Text("Merge", fontSize = 11.sp, color = Color(0xFF444444))
+                                        }
+                                        IconButton(
+                                            onClick = {
+                                                scope.launch {
+                                                    val targetPage = panelPage ?: return@launch
+                                                    inkController.ensureSessionReady(targetPage, currentPageIndex)
+                                                    inkController.deleteLayer(currentPageIndex, dLayer.index)
+                                                    syncSinglePageAfterLayerEdit()
+                                                }
+                                            },
+                                            modifier = Modifier.size(30.dp)
+                                        ) {
+                                            Icon(
+                                                Icons.Default.Delete,
+                                                contentDescription = "delete drawing layer",
+                                                tint = Color.Red,
+                                                modifier = Modifier.size(15.dp)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+
+                            Spacer(Modifier.height(6.dp))
+                            Divider(color = Color(0xFFEEEEEE))
+                            Spacer(Modifier.height(6.dp))
+
+                            Text(
+                                text = "Floating Layers (${layers.size}/3)",
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 11.sp,
+                                color = Color.Gray
+                            )
+
                             if (layers.isEmpty()) {
-                                Spacer(Modifier.height(6.dp))
+                                Spacer(Modifier.height(4.dp))
                                 Text(
                                     text = "No floating layers on this page.",
                                     fontSize = 11.sp,
@@ -3767,7 +4682,7 @@ fun CanvasScreen(
                                                     }
                                                 }
                                             },
-                                            modifier = Modifier.size(36.dp)
+                                            modifier = Modifier.size(32.dp)
                                         ) {
                                             Icon(
                                                 if (layer.visible) Icons.Default.Visibility else Icons.Default.VisibilityOff,
@@ -3803,7 +4718,7 @@ fun CanvasScreen(
                                                 }
                                             },
                                             enabled = idx > 0,
-                                            modifier = Modifier.size(36.dp)
+                                            modifier = Modifier.size(30.dp)
                                         ) {
                                             Icon(Icons.Default.KeyboardArrowUp, contentDescription = "move up", modifier = Modifier.size(16.dp))
                                         }
@@ -3818,7 +4733,7 @@ fun CanvasScreen(
                                                 }
                                             },
                                             enabled = idx < layers.size - 1,
-                                            modifier = Modifier.size(36.dp)
+                                            modifier = Modifier.size(30.dp)
                                         ) {
                                             Icon(Icons.Default.KeyboardArrowDown, contentDescription = "move down", modifier = Modifier.size(16.dp))
                                         }
@@ -3830,9 +4745,9 @@ fun CanvasScreen(
                                                     }
                                                 }
                                             },
-                                            modifier = Modifier.size(36.dp)
+                                            modifier = Modifier.size(30.dp)
                                         ) {
-                                            Icon(Icons.Default.Delete, contentDescription = "delete", tint = Color.Red, modifier = Modifier.size(16.dp))
+                                            Icon(Icons.Default.Delete, contentDescription = "delete", tint = Color.Red, modifier = Modifier.size(15.dp))
                                         }
                                     }
                                 }
@@ -3860,11 +4775,7 @@ fun CanvasScreen(
                                 }
                                 OutlinedButton(
                                     onClick = {
-                                        liveTextContent = ""
-                                        liveTextOffsetX = 0f
-                                        liveTextOffsetY = 0f
-                                        liveTextColor = if (uiState.selectedColor == Color.White) Color.Black else uiState.selectedColor
-                                        isLiveTextActive = true
+                                        openLiveTextOverlay()
                                     },
                                     modifier = Modifier.weight(1f).height(32.dp),
                                     contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp)
@@ -3880,28 +4791,42 @@ fun CanvasScreen(
                                         scope.launch {
                                             val page = viewModel.currentPageIndex.value
                                             if (isContinuous) {
-                                                // The reader owns the page image,
-                                                // so the merge has to write the
-                                                // flattened pixels itself - it
-                                                // must never just delete the
-                                                // layer files.
                                                 inkController.flushCurrentSuspend()
                                                 val view = canvasViewRef
                                                 if (view != null) {
                                                     view.pageIndex = page
-                                                    val pageBitmap = withContext(Dispatchers.IO) {
-                                                        viewModel.repository.loadPageBitmap(viewModel.noteId, page)
-                                                    }
-                                                    val base = pageBitmap ?: withContext(Dispatchers.IO) {
-                                                        personal.notes.touch.util.BitmapUtils
-                                                            .createSafeBitmap(2160, 3056)
+                                                    val vp = vectorPdfPage(page)
+                                                    val mergeTarget = PdfModeReconciliationPolicy.resolveMergeTarget(vp != null)
+                                                    val base: Bitmap = when (mergeTarget) {
+                                                        PdfModeReconciliationPolicy.MergeTarget.STROKES_FILE -> {
+                                                            val aspect = if (vp != null) {
+                                                                withContext(Dispatchers.IO) {
+                                                                    PageAspectCache.default.getOrLoad(
+                                                                        vp.pdfSourcePath,
+                                                                        vp.pdfPageIndex,
+                                                                        fallback = PdfPageGeometry.DEFAULT_ASPECT
+                                                                    ) {
+                                                                        pdfDocCache.document(vp.pdfSourcePath)
+                                                                            ?.pageSize(vp.pdfPageIndex)
+                                                                    }
+                                                                }
+                                                            } else PdfPageGeometry.DEFAULT_ASPECT
+                                                            val (pw, ph) = PdfModeReconciliationPolicy.pagePixelSize(aspect)
+                                                            withContext(Dispatchers.IO) {
+                                                                viewModel.loadPageStrokes(page)
+                                                            } ?: withContext(Dispatchers.IO) {
+                                                                personal.notes.touch.util.BitmapUtils.createSafeBitmap(pw, ph)
+                                                            }
+                                                        }
+                                                        PdfModeReconciliationPolicy.MergeTarget.PAGE_BITMAP -> {
+                                                            withContext(Dispatchers.IO) {
+                                                                viewModel.repository.loadPageBitmap(viewModel.noteId, page)
+                                                            } ?: withContext(Dispatchers.IO) {
+                                                                personal.notes.touch.util.BitmapUtils.createSafeBitmap(2160, 3056)
+                                                            }
+                                                        }
                                                     }
                                                     view.setPageContent(base)
-                                                    // The in-memory margin crops may
-                                                    // belong to another page; the
-                                                    // save below files whatever is
-                                                    // in memory under this page,
-                                                    // so install this page's own.
                                                     val ownInk = withContext(Dispatchers.IO) {
                                                         view.readBeyondPageInk(
                                                             viewModel.fileStore,
@@ -3918,9 +4843,12 @@ fun CanvasScreen(
                                                     val merged = view.getBackingBitmap()
                                                     if (merged != null) {
                                                         withContext(Dispatchers.IO) {
-                                                            viewModel.repository.savePageBitmap(
-                                                                viewModel.noteId, page, merged
-                                                            )
+                                                            when (mergeTarget) {
+                                                                PdfModeReconciliationPolicy.MergeTarget.STROKES_FILE ->
+                                                                    viewModel.repository.savePageStrokes(viewModel.noteId, page, merged)
+                                                                PdfModeReconciliationPolicy.MergeTarget.PAGE_BITMAP ->
+                                                                    viewModel.repository.savePageBitmap(viewModel.noteId, page, merged)
+                                                            }
                                                         }
                                                     }
                                                     view.saveImageLayers(viewModel.fileStore, viewModel.noteId)
@@ -3931,12 +4859,15 @@ fun CanvasScreen(
                                                         merged?.height ?: 0
                                                     )
                                                     engineLayerPage = page
-                                                    // The ink session's bitmap
-                                                    // predates the merge: drop
-                                                    // it and let the reader
-                                                    // reload the page.
-                                                    if (inkController.getSession(page) != null) {
-                                                        inkController.releaseSessionSuspend()
+                                                    when (mergeTarget) {
+                                                        PdfModeReconciliationPolicy.MergeTarget.STROKES_FILE -> {
+                                                            inkController.reloadSinglePageStrokes(page)
+                                                        }
+                                                        PdfModeReconciliationPolicy.MergeTarget.PAGE_BITMAP -> {
+                                                            if (inkController.getSession(page) != null) {
+                                                                inkController.releaseSessionSuspend()
+                                                            }
+                                                        }
                                                     }
                                                     savedPageGenerations[page] =
                                                         (savedPageGenerations[page] ?: 0) + 1
@@ -3951,6 +4882,15 @@ fun CanvasScreen(
                                                 } catch (e: Exception) {
                                                     e.printStackTrace()
                                                 }
+                                                if (inkController.getSession(page) != null) {
+                                                    if (vectorPdfPage(page) != null) {
+                                                        inkController.reloadSinglePageStrokes(page)
+                                                    } else {
+                                                        inkController.releaseSessionSuspend()
+                                                    }
+                                                }
+                                                savedPageGenerations[page] =
+                                                    (savedPageGenerations[page] ?: 0) + 1
                                             }
                                         }
                                     },
@@ -4371,7 +5311,10 @@ fun CanvasScreen(
                                     drawableRes = R.drawable.ic_tool_fountain_pen,
                                     label = "Fountain Pen",
                                     isSelected = uiState.selectedTool == CanvasTool.FOUNTAIN_PEN,
-                                    onClick = { viewModel.selectTool(CanvasTool.FOUNTAIN_PEN) }
+                                    onClick = {
+                                        exitPdfTextMode()
+                                        viewModel.selectTool(CanvasTool.FOUNTAIN_PEN)
+                                    }
                                 )
 
                                 // Fineliner / Pen
@@ -4379,7 +5322,10 @@ fun CanvasScreen(
                                     drawableRes = R.drawable.ic_tool_fineliner,
                                     label = "Pen",
                                     isSelected = uiState.selectedTool == CanvasTool.PEN,
-                                    onClick = { viewModel.selectTool(CanvasTool.PEN) }
+                                    onClick = {
+                                        exitPdfTextMode()
+                                        viewModel.selectTool(CanvasTool.PEN)
+                                    }
                                 )
 
                                 // Graphite Pencil (abrasion + stylus tilt)
@@ -4388,7 +5334,10 @@ fun CanvasScreen(
                                     label = "Pencil",
                                     isSelected = uiState.selectedTool == CanvasTool.PENCIL,
                                     selectedTint = Color(0xFF475569),
-                                    onClick = { viewModel.selectTool(CanvasTool.PENCIL) }
+                                    onClick = {
+                                        exitPdfTextMode()
+                                        viewModel.selectTool(CanvasTool.PENCIL)
+                                    }
                                 )
 
                                 // Shape Draw + Fill (live closed curve fill)
@@ -4397,7 +5346,10 @@ fun CanvasScreen(
                                     label = "Fill",
                                     isSelected = uiState.selectedTool == CanvasTool.SHAPE_FILL,
                                     selectedTint = OrangePrimary,
-                                    onClick = { viewModel.selectTool(CanvasTool.SHAPE_FILL) }
+                                    onClick = {
+                                        exitPdfTextMode()
+                                        viewModel.selectTool(CanvasTool.SHAPE_FILL)
+                                    }
                                 )
 
                                 // Yellow Highlighter
@@ -4406,7 +5358,10 @@ fun CanvasScreen(
                                     label = "Highlighter",
                                     isSelected = uiState.selectedTool == CanvasTool.HIGHLIGHTER,
                                     selectedTint = Color(0xFFFFD600),
-                                    onClick = { viewModel.selectTool(CanvasTool.HIGHLIGHTER) }
+                                    onClick = {
+                                        exitPdfTextMode()
+                                        viewModel.selectTool(CanvasTool.HIGHLIGHTER)
+                                    }
                                 )
 
                                 // Pink Eraser
@@ -4415,22 +5370,59 @@ fun CanvasScreen(
                                     label = "Eraser",
                                     isSelected = uiState.selectedTool == CanvasTool.ERASER,
                                     selectedTint = Color(0xFFFF4081),
-                                    onClick = { viewModel.selectTool(CanvasTool.ERASER) }
-                                )
-
-                                // Text Tool [T] (OneNote-style live text preview)
-                                PencaseToolIcon(
-                                    icon = Icons.Default.TextFields,
-                                    label = "Text",
-                                    isSelected = isLiveTextActive || pdfTextMode,
                                     onClick = {
-                                        liveTextContent = ""
-                                        liveTextOffsetX = 0f
-                                        liveTextOffsetY = 0f
-                                        liveTextColor = if (uiState.selectedColor == Color.White) Color.Black else uiState.selectedColor
-                                        isLiveTextActive = true
+                                        exitPdfTextMode()
+                                        viewModel.selectTool(CanvasTool.ERASER)
                                     }
                                 )
+
+                                // Text Tool [T] (OneNote-style live text preview or F-10 PDF text select)
+                                Box {
+                                    PencaseToolIcon(
+                                        icon = Icons.Default.TextFields,
+                                        label = "Text",
+                                        isSelected = isLiveTextActive || pdfTextMode,
+                                        onClick = {
+                                            when (PdfTextToolPolicy.dockTapAction(pdfTextAvailable, pdfTextMode)) {
+                                                TextDockTapAction.OPEN_LIVE_TEXT -> openLiveTextOverlay()
+                                                TextDockTapAction.OPEN_TEXT_MENU,
+                                                TextDockTapAction.EXIT_PDF_TEXT_MODE -> showTextMenuHoriz = true
+                                            }
+                                        }
+                                    )
+                                    DropdownMenu(
+                                        expanded = showTextMenuHoriz,
+                                        onDismissRequest = { showTextMenuHoriz = false }
+                                    ) {
+                                        DropdownMenuItem(
+                                            text = { Text("Add Text Box") },
+                                            leadingIcon = { Icon(Icons.Default.TextFields, null) },
+                                            onClick = {
+                                                showTextMenuHoriz = false
+                                                openLiveTextOverlay()
+                                            }
+                                        )
+                                        if (pdfTextMode) {
+                                            DropdownMenuItem(
+                                                text = { Text("Exit PDF Text Select") },
+                                                leadingIcon = { Icon(Icons.Default.Close, null) },
+                                                onClick = {
+                                                    showTextMenuHoriz = false
+                                                    exitPdfTextMode()
+                                                }
+                                            )
+                                        } else if (pdfTextAvailable) {
+                                            DropdownMenuItem(
+                                                text = { Text("Select PDF Text") },
+                                                leadingIcon = { Icon(Icons.Default.TextFields, null) },
+                                                onClick = {
+                                                    showTextMenuHoriz = false
+                                                    activatePdfTextSelect()
+                                                }
+                                            )
+                                        }
+                                    }
+                                }
 
                                 // Shapes Tool
                                 val shapeIconHoriz = when (uiState.selectedTool) {
@@ -4458,6 +5450,7 @@ fun CanvasScreen(
                                             text = { Text("Rectangle") },
                                             leadingIcon = { Icon(Icons.Default.CropSquare, null) },
                                             onClick = {
+                                                exitPdfTextMode()
                                                 viewModel.selectTool(CanvasTool.SHAPE_RECT)
                                                 showShapesMenu = false
                                             }
@@ -4466,6 +5459,7 @@ fun CanvasScreen(
                                             text = { Text("Circle / Ellipse") },
                                             leadingIcon = { Icon(Icons.Default.RadioButtonUnchecked, null) },
                                             onClick = {
+                                                exitPdfTextMode()
                                                 viewModel.selectTool(CanvasTool.SHAPE_CIRCLE)
                                                 showShapesMenu = false
                                             }
@@ -4474,6 +5468,7 @@ fun CanvasScreen(
                                             text = { Text("Straight Line") },
                                             leadingIcon = { Icon(Icons.Default.Timeline, null) },
                                             onClick = {
+                                                exitPdfTextMode()
                                                 viewModel.selectTool(CanvasTool.SHAPE_LINE)
                                                 showShapesMenu = false
                                             }
@@ -4834,7 +5829,10 @@ fun CanvasScreen(
                                     drawableRes = R.drawable.ic_tool_fountain_pen,
                                     label = "Fountain Pen",
                                     isSelected = uiState.selectedTool == CanvasTool.FOUNTAIN_PEN,
-                                    onClick = { viewModel.selectTool(CanvasTool.FOUNTAIN_PEN) }
+                                    onClick = {
+                                        exitPdfTextMode()
+                                        viewModel.selectTool(CanvasTool.FOUNTAIN_PEN)
+                                    }
                                 )
 
                                 // Fineliner / Pen
@@ -4842,7 +5840,10 @@ fun CanvasScreen(
                                     drawableRes = R.drawable.ic_tool_fineliner,
                                     label = "Pen",
                                     isSelected = uiState.selectedTool == CanvasTool.PEN,
-                                    onClick = { viewModel.selectTool(CanvasTool.PEN) }
+                                    onClick = {
+                                        exitPdfTextMode()
+                                        viewModel.selectTool(CanvasTool.PEN)
+                                    }
                                 )
 
                                 // Graphite Pencil (abrasion + stylus tilt)
@@ -4851,7 +5852,10 @@ fun CanvasScreen(
                                     label = "Pencil",
                                     isSelected = uiState.selectedTool == CanvasTool.PENCIL,
                                     selectedTint = Color(0xFF475569),
-                                    onClick = { viewModel.selectTool(CanvasTool.PENCIL) }
+                                    onClick = {
+                                        exitPdfTextMode()
+                                        viewModel.selectTool(CanvasTool.PENCIL)
+                                    }
                                 )
 
                                 // Shape Draw + Fill (live closed curve fill)
@@ -4860,7 +5864,10 @@ fun CanvasScreen(
                                     label = "Fill",
                                     isSelected = uiState.selectedTool == CanvasTool.SHAPE_FILL,
                                     selectedTint = OrangePrimary,
-                                    onClick = { viewModel.selectTool(CanvasTool.SHAPE_FILL) }
+                                    onClick = {
+                                        exitPdfTextMode()
+                                        viewModel.selectTool(CanvasTool.SHAPE_FILL)
+                                    }
                                 )
 
                                 // Yellow Highlighter
@@ -4869,7 +5876,10 @@ fun CanvasScreen(
                                     label = "Highlighter",
                                     isSelected = uiState.selectedTool == CanvasTool.HIGHLIGHTER,
                                     selectedTint = Color(0xFFFFD600),
-                                    onClick = { viewModel.selectTool(CanvasTool.HIGHLIGHTER) }
+                                    onClick = {
+                                        exitPdfTextMode()
+                                        viewModel.selectTool(CanvasTool.HIGHLIGHTER)
+                                    }
                                 )
 
                                 // Pink Eraser
@@ -4878,22 +5888,59 @@ fun CanvasScreen(
                                     label = "Eraser",
                                     isSelected = uiState.selectedTool == CanvasTool.ERASER,
                                     selectedTint = Color(0xFFFF4081),
-                                    onClick = { viewModel.selectTool(CanvasTool.ERASER) }
-                                )
-
-                                // Text Tool [T] (OneNote-style live text preview)
-                                PencaseToolIcon(
-                                    icon = Icons.Default.TextFields,
-                                    label = "Text",
-                                    isSelected = isLiveTextActive || pdfTextMode,
                                     onClick = {
-                                        liveTextContent = ""
-                                        liveTextOffsetX = 0f
-                                        liveTextOffsetY = 0f
-                                        liveTextColor = if (uiState.selectedColor == Color.White) Color.Black else uiState.selectedColor
-                                        isLiveTextActive = true
+                                        exitPdfTextMode()
+                                        viewModel.selectTool(CanvasTool.ERASER)
                                     }
                                 )
+
+                                // Text Tool [T] (OneNote-style live text preview or F-10 PDF text select)
+                                Box {
+                                    PencaseToolIcon(
+                                        icon = Icons.Default.TextFields,
+                                        label = "Text",
+                                        isSelected = isLiveTextActive || pdfTextMode,
+                                        onClick = {
+                                            when (PdfTextToolPolicy.dockTapAction(pdfTextAvailable, pdfTextMode)) {
+                                                TextDockTapAction.OPEN_LIVE_TEXT -> openLiveTextOverlay()
+                                                TextDockTapAction.OPEN_TEXT_MENU,
+                                                TextDockTapAction.EXIT_PDF_TEXT_MODE -> showTextMenuVert = true
+                                            }
+                                        }
+                                    )
+                                    DropdownMenu(
+                                        expanded = showTextMenuVert,
+                                        onDismissRequest = { showTextMenuVert = false }
+                                    ) {
+                                        DropdownMenuItem(
+                                            text = { Text("Add Text Box") },
+                                            leadingIcon = { Icon(Icons.Default.TextFields, null) },
+                                            onClick = {
+                                                showTextMenuVert = false
+                                                openLiveTextOverlay()
+                                            }
+                                        )
+                                        if (pdfTextMode) {
+                                            DropdownMenuItem(
+                                                text = { Text("Exit PDF Text Select") },
+                                                leadingIcon = { Icon(Icons.Default.Close, null) },
+                                                onClick = {
+                                                    showTextMenuVert = false
+                                                    exitPdfTextMode()
+                                                }
+                                            )
+                                        } else if (pdfTextAvailable) {
+                                            DropdownMenuItem(
+                                                text = { Text("Select PDF Text") },
+                                                leadingIcon = { Icon(Icons.Default.TextFields, null) },
+                                                onClick = {
+                                                    showTextMenuVert = false
+                                                    activatePdfTextSelect()
+                                                }
+                                            )
+                                        }
+                                    }
+                                }
 
                                 // Shapes Tool
                                 val shapeIconHoriz = when (uiState.selectedTool) {
@@ -4921,6 +5968,7 @@ fun CanvasScreen(
                                             text = { Text("Rectangle") },
                                             leadingIcon = { Icon(Icons.Default.CropSquare, null) },
                                             onClick = {
+                                                exitPdfTextMode()
                                                 viewModel.selectTool(CanvasTool.SHAPE_RECT)
                                                 showShapesMenu = false
                                             }
@@ -4929,6 +5977,7 @@ fun CanvasScreen(
                                             text = { Text("Circle") },
                                             leadingIcon = { Icon(Icons.Default.RadioButtonUnchecked, null) },
                                             onClick = {
+                                                exitPdfTextMode()
                                                 viewModel.selectTool(CanvasTool.SHAPE_CIRCLE)
                                                 showShapesMenu = false
                                             }
@@ -4937,6 +5986,7 @@ fun CanvasScreen(
                                             text = { Text("Line") },
                                             leadingIcon = { Icon(Icons.Default.Timeline, null) },
                                             onClick = {
+                                                exitPdfTextMode()
                                                 viewModel.selectTool(CanvasTool.SHAPE_LINE)
                                                 showShapesMenu = false
                                             }
@@ -5192,8 +6242,77 @@ fun CanvasScreen(
                 }
 
                 // ==========================================
-                // 4. FLOATING VERTICAL PAGE STRIP (Right Edge)
+                // 4. FLOATING VERTICAL PAGE STRIP (Right Edge) + SCRUBBER & BOOKMARK TOGGLE
                 // ==========================================
+                val scrubberEnabled = PageScrubberMath.isScrubberEnabled(totalPages)
+                var scrubFraction by remember { mutableFloatStateOf(0f) }
+                var scrubTargetPage by remember { mutableIntStateOf(0) }
+                var capsuleSizePx by remember { mutableStateOf(androidx.compose.ui.unit.IntSize.Zero) }
+                var lastThrottledJumpMs by remember { mutableStateOf(0L) }
+                var lastJumpedPage by remember { mutableIntStateOf(-1) }
+                var scrubFlushJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+
+                val latestTotalPages by rememberUpdatedState(totalPages)
+                val latestCurrentPageIndex by rememberUpdatedState(currentPageIndex)
+                val latestIsContinuous by rememberUpdatedState(isContinuous)
+                val latestIsHorizontal by rememberUpdatedState(isHorizontal)
+                val latestDirection by rememberUpdatedState(uiState.pageTurningDirection)
+                val latestDoublePage by rememberUpdatedState(uiState.doublePageMode)
+                val latestContinuousVisible by rememberUpdatedState(currentContinuousVisible)
+                val latestDensity by rememberUpdatedState(density)
+
+                fun performScrubJump(targetPage: Int, animate: Boolean) {
+                    val clamped = targetPage.coerceIn(0, (latestTotalPages - 1).coerceAtLeast(0))
+                    if (latestIsContinuous) {
+                        val token = ++scrubJumpToken
+                        isScrubSettling = true
+                        scrubJumpJob?.cancel()
+                        scrubJumpJob = scope.launch {
+                            try {
+                                val finalIndex = if (animate) {
+                                    animateScrollToContinuousPage(
+                                        targetIndex = clamped,
+                                        horizontal = latestIsHorizontal,
+                                        doublePage = latestDoublePage
+                                    )
+                                } else {
+                                    val maxIdx = (pages.size - 1).coerceAtLeast(0)
+                                    val resolved = clamped.coerceIn(0, maxIdx)
+                                    val horizontal = latestIsHorizontal
+                                    val doublePage = latestDoublePage
+                                    if (horizontal) {
+                                        continuousRowState.scrollToItem(resolved)
+                                    } else if (doublePage) {
+                                        continuousColState.scrollToItem(resolved / 2)
+                                    } else {
+                                        continuousColState.scrollToItem(resolved)
+                                    }
+                                    val firstVis = if (horizontal) {
+                                        continuousRowState.firstVisibleItemIndex
+                                    } else {
+                                        continuousColState.firstVisibleItemIndex
+                                    }
+                                    settledProgrammaticFirstVis = firstVis
+                                    settledProgrammaticPage = resolved
+                                    continuousVisibleIndex = firstVis
+                                    resolved
+                                }
+                                viewModel.setCurrentPageIndex(finalIndex)
+                            } finally {
+                                if (scrubJumpToken == token) {
+                                    isScrubSettling = false
+                                }
+                            }
+                        }
+                    } else {
+                        scrubJumpJob?.cancel()
+                        scrubJumpJob = scope.launch {
+                            scrubFlushJob?.join()
+                            viewModel.setCurrentPageIndex(clamped)
+                        }
+                    }
+                }
+
                 if (!uiState.isToolsPanelOpen && !uiState.readingMode) {
                     Surface(
                     shape = RoundedCornerShape(16.dp),
@@ -5203,17 +6322,113 @@ fun CanvasScreen(
                         .align(Alignment.CenterEnd)
                         .padding(end = 12.dp)
                         .border(1.dp, Color(0xFFEEEEEE), RoundedCornerShape(16.dp))
+                        .onSizeChanged { capsuleSizePx = it }
+                        .pointerInput(scrubberEnabled) {
+                            if (!scrubberEnabled) return@pointerInput
+                            detectDragGestures(
+                                onDragStart = {
+                                    val startPage = latestCurrentPageIndex.coerceIn(
+                                        0,
+                                        (latestTotalPages - 1).coerceAtLeast(0)
+                                    )
+                                    scrubFraction = PageScrubberMath.pageToScrubFraction(
+                                        startPage,
+                                        latestTotalPages
+                                    )
+                                    scrubTargetPage = startPage
+                                    lastJumpedPage = startPage
+                                    lastThrottledJumpMs = android.os.SystemClock.uptimeMillis()
+                                    isScrubbing = true
+                                    if (latestIsContinuous) {
+                                        scrubJumpJob?.cancel()
+                                        scrubJumpJob = null
+                                        scrubJumpToken++
+                                        isScrubSettling = false
+                                        settledProgrammaticFirstVis = -1
+                                        settledProgrammaticPage = -1
+                                        scrubFlushJob = scope.launch {
+                                            try {
+                                                inkController.flushCurrentSuspend()
+                                            } catch (e: Exception) {
+                                                e.printStackTrace()
+                                            }
+                                        }
+                                    } else {
+                                        scrubFlushJob = scope.launch {
+                                            try {
+                                                val canvas = canvasViewRef
+                                                if (canvas != null) {
+                                                    canvas.getBackingBitmap()?.let { bmp ->
+                                                        viewModel.saveCurrentPageBitmapDirect(bmp)
+                                                    }
+                                                    if (canvas.layersDirty) {
+                                                        canvas.saveImageLayers(viewModel.fileStore, viewModel.noteId)
+                                                    }
+                                                    if (canvas.hasBeyondPageInk()) {
+                                                        withContext(Dispatchers.IO) {
+                                                            canvas.saveBeyondPageInkNow(viewModel.fileStore, viewModel.noteId)
+                                                        }
+                                                    }
+                                                }
+                                            } catch (e: Exception) {
+                                                e.printStackTrace()
+                                            }
+                                        }
+                                    }
+                                },
+                                onDrag = { change, dragAmount ->
+                                    change.consume()
+                                    val minSpan = with(latestDensity) { 160.dp.toPx() }
+                                    val trackSpan = maxOf(capsuleSizePx.height.toFloat(), minSpan)
+                                    scrubFraction = PageScrubberMath.applyScrubDelta(
+                                        currentFraction = scrubFraction,
+                                        deltaX = dragAmount.x,
+                                        deltaY = dragAmount.y,
+                                        pageTurningDirection = latestDirection,
+                                        trackSpanPx = trackSpan
+                                    )
+                                    val nextTarget = PageScrubberMath.scrubFractionToPage(
+                                        scrubFraction,
+                                        latestTotalPages
+                                    )
+                                    scrubTargetPage = nextTarget
+                                    val now = android.os.SystemClock.uptimeMillis()
+                                    if (nextTarget != lastJumpedPage && (now - lastThrottledJumpMs) >= 80L) {
+                                        lastThrottledJumpMs = now
+                                        lastJumpedPage = nextTarget
+                                        performScrubJump(nextTarget, animate = false)
+                                    }
+                                },
+                                onDragEnd = {
+                                    val finalTarget = scrubTargetPage
+                                    isScrubbing = false
+                                    if (finalTarget != lastJumpedPage || !latestIsContinuous || (settledProgrammaticPage != finalTarget && finalTarget != latestContinuousVisible)) {
+                                        performScrubJump(finalTarget, animate = true)
+                                    }
+                                },
+                                onDragCancel = {
+                                    val finalTarget = scrubTargetPage
+                                    isScrubbing = false
+                                    if (finalTarget != lastJumpedPage || (latestIsContinuous && settledProgrammaticPage != finalTarget && finalTarget != latestContinuousVisible)) {
+                                        performScrubJump(finalTarget, animate = true)
+                                    }
+                                }
+                            )
+                        }
                 ) {
                     Column(
                         modifier = Modifier.padding(vertical = 8.dp, horizontal = 4.dp),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        // Drag handle pill
+                        // Drag handle pill (highlighted when scrubber is active)
                         Box(
                             modifier = Modifier
                                 .width(14.dp)
                                 .height(3.dp)
-                                .background(Color(0xFFCCCCCC), RoundedCornerShape(1.5.dp))
+                                .background(
+                                    if (isScrubbing) OrangePrimary else Color(0xFFCCCCCC),
+                                    RoundedCornerShape(1.5.dp)
+                                )
                         )
 
                         Spacer(modifier = Modifier.height(4.dp))
@@ -5325,18 +6540,33 @@ fun CanvasScreen(
                             color = Color.LightGray
                         )
 
+                        // One-tap Bookmark Toggle on the right-edge capsule
+                        val isCurrentPageBookmarked = uiState.bookmarkedPages.contains(currentPageIndex)
+                        IconButton(
+                            onClick = { viewModel.toggleBookmark(currentPageIndex) },
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Icon(
+                                imageVector = if (isCurrentPageBookmarked) Icons.Default.Bookmark else Icons.Default.BookmarkBorder,
+                                contentDescription = if (isCurrentPageBookmarked) "Remove Bookmark" else "Bookmark Page",
+                                tint = if (isCurrentPageBookmarked) OrangePrimary else Color.DarkGray,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+
                         // Layers popover toggle inside right-edge capsule
                         IconButton(
                             onClick = {
-                                // The reader opens the drawing layers of the
-                                // page (the layer panel); the single page
-                                // mode opens the floating images.
-                                if (isContinuous) {
+                                if (PdfModeReconciliationPolicy.resolveLayerEntryTarget(isInfiniteNote) ==
+                                    PdfModeReconciliationPolicy.LayerEntryTarget.INFINITE_DRAWING_ONLY
+                                ) {
                                     showLayerPanel = !showLayerPanel
-                                    layerActionIndex = -1
+                                    showLayersPanel = false
                                 } else {
                                     showLayersPanel = !showLayersPanel
+                                    showLayerPanel = false
                                 }
+                                layerActionIndex = -1
                             },
                             modifier = Modifier.size(32.dp)
                         ) {
@@ -5350,13 +6580,129 @@ fun CanvasScreen(
                     }
                 }
 
+                // Floating scrubber preview bubble (thumbnail + page badge)
+                AnimatedVisibility(
+                    visible = isScrubbing && scrubberEnabled,
+                    enter = fadeIn(androidx.compose.animation.core.tween(100)),
+                    exit = fadeOut(androidx.compose.animation.core.tween(150)),
+                    modifier = Modifier
+                        .align(Alignment.CenterEnd)
+                        .padding(end = 68.dp)
+                        .zIndex(15f)
+                ) {
+                    val previewPage = pages.getOrNull(scrubTargetPage)
+                    val previewGen = savedPageGenerations[scrubTargetPage] ?: 0
+                    val previewPageType = note?.pageType ?: "a4"
+                    val initialPreviewBmp = remember(previewPage?.id, scrubTargetPage, previewGen, previewPageType) {
+                        if (previewPage != null) {
+                            personal.notes.touch.util.BitmapUtils.getCachedPageThumbnailIfPresent(
+                                noteId = viewModel.noteId,
+                                fileStore = viewModel.fileStore,
+                                page = previewPage,
+                                pageType = previewPageType,
+                                longSidePx = 340,
+                                savedGeneration = previewGen
+                            )
+                        } else null
+                    }
+                    var loadedPreviewPair by remember(previewPage?.id, scrubTargetPage, previewGen, previewPageType) {
+                        val aspect = if (previewPage != null &&
+                            previewPage.pdfSourcePath.isNotEmpty() &&
+                            previewPage.pdfPageIndex >= 0
+                        ) {
+                            PageAspectCache.default.get(
+                                previewPage.pdfSourcePath,
+                                previewPage.pdfPageIndex
+                            ) ?: PdfPageGeometry.DEFAULT_ASPECT
+                        } else {
+                            PdfPageGeometry.DEFAULT_ASPECT
+                        }
+                        mutableStateOf(initialPreviewBmp to aspect)
+                    }
+                    LaunchedEffect(isScrubbing, scrubTargetPage, previewPage?.id, previewGen, previewPageType) {
+                        if (!isScrubbing || previewPage == null) return@LaunchedEffect
+                        if (loadedPreviewPair.first == null) {
+                            kotlinx.coroutines.delay(40)
+                            loadedPreviewPair = personal.notes.touch.util.BitmapUtils.loadOrRenderPageThumbnail(
+                                noteId = viewModel.noteId,
+                                fileStore = viewModel.fileStore,
+                                page = previewPage,
+                                pdfDocCache = pdfDocCache,
+                                aspectCache = PageAspectCache.default,
+                                pageType = previewPageType,
+                                longSidePx = 340,
+                                savedGeneration = previewGen
+                            )
+                        }
+                    }
+                    val previewBmp = loadedPreviewPair.first
+                    val previewAspect = loadedPreviewPair.second
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = Color.White,
+                        shadowElevation = 8.dp,
+                        border = BorderStroke(1.dp, Color(0xFFE0E0E0))
+                    ) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                            modifier = Modifier.padding(8.dp)
+                        ) {
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier
+                                    .width(88.dp)
+                                    .height((88f / previewAspect).coerceIn(48f, 124f).dp)
+                                    .background(Color(0xFFF5F5F5), RoundedCornerShape(6.dp))
+                                    .border(0.5.dp, Color(0xFFE0E0E0), RoundedCornerShape(6.dp))
+                            ) {
+                                if (previewBmp != null && !previewBmp.isRecycled) {
+                                    androidx.compose.foundation.Image(
+                                        bitmap = previewBmp.asImageBitmap(),
+                                        contentDescription = "Page ${scrubTargetPage + 1} preview",
+                                        modifier = Modifier.fillMaxSize(),
+                                        contentScale = androidx.compose.ui.layout.ContentScale.Fit
+                                    )
+                                } else {
+                                    Text(
+                                        text = "${scrubTargetPage + 1}",
+                                        fontSize = 16.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color.LightGray
+                                    )
+                                }
+                            }
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                if (uiState.bookmarkedPages.contains(scrubTargetPage)) {
+                                    Icon(
+                                        imageVector = Icons.Default.Bookmark,
+                                        contentDescription = null,
+                                        tint = OrangePrimary,
+                                        modifier = Modifier.size(13.dp)
+                                    )
+                                }
+                                Text(
+                                    text = "Page ${scrubTargetPage + 1} / $totalPages",
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = Color(0xFF212529)
+                                )
+                            }
+                        }
+                    }
+                }
+
                 // ==========================================
                 // 4b. THE LAYER PANEL OF THE PAGE
                 // ==========================================
                 // The floating card of the original: the layers of the
                 // current page, the eye that masks a layer and the menu
                 // with the actions of a layer.
-                if (showLayerPanel && isContinuous) {
+                // Dedicated drawing LayerPanel is retained for Infinite notes; PDF/A4 use Unified showLayersPanel.
+                if (showLayerPanel && isContinuous && isInfiniteNote) {
                     val panelPage = pages.getOrNull(currentPageIndex)
                     // The layer stack of a page lives in its ink session, so
                     // the panel needs one.
@@ -5401,6 +6747,7 @@ fun CanvasScreen(
                                 if (isInfiniteNote) {
                                     scope.launch(Dispatchers.IO) {
                                         inkController.generateAndSavePagePreview(currentPageIndex)
+                                        viewModel.repository.touchNoteUpdatedAt(viewModel.noteId)
                                     }
                                     savedPageGenerations[currentPageIndex] = (savedPageGenerations[currentPageIndex] ?: 0) + 1
                                 }
@@ -5420,6 +6767,7 @@ fun CanvasScreen(
                                     scope.launch(Dispatchers.IO) {
                                         InfiniteItemsStore.save(viewModel.fileStore, viewModel.noteId, updated)
                                         inkController.generateAndSavePagePreview(currentPageIndex)
+                                        viewModel.repository.touchNoteUpdatedAt(viewModel.noteId)
                                     }
                                 }
                             }
@@ -5438,6 +6786,7 @@ fun CanvasScreen(
                                     scope.launch(Dispatchers.IO) {
                                         InfiniteItemsStore.save(viewModel.fileStore, viewModel.noteId, updated)
                                         inkController.generateAndSavePagePreview(currentPageIndex)
+                                        viewModel.repository.touchNoteUpdatedAt(viewModel.noteId)
                                     }
                                 }
                             }
@@ -5473,6 +6822,62 @@ fun CanvasScreen(
                 }
             }
 
+                // Full-text Search / Go-to-Page sheet overlay (PDF-QOL-3)
+                if (showSearchSheet) {
+                    PdfSearchSheet(
+                        query = searchQuery,
+                        onQueryChange = { searchQuery = it },
+                        totalPages = totalPages,
+                        hasPdfPages = hasPdfPages,
+                        isExpanded = isSearchSheetExpanded,
+                        onExpandedChange = { isSearchSheetExpanded = it },
+                        isIndexing = isIndexingPdf,
+                        indexDone = pdfIndexDone,
+                        indexTotal = pdfIndexTotal,
+                        isScannedPdf = pdfIndexData?.isScannedPdf == true,
+                        hits = searchHits,
+                        activeHitIndex = activeSearchHitIndex,
+                        onJumpToPage = { targetIdx ->
+                            searchHighlightTarget = null
+                            canvasViewRef?.setSearchHighlightRects(emptyList())
+                            jumpToPageFromUi(targetIdx)
+                        },
+                        onSelectHit = { idx, hit ->
+                            navigateToSearchHit(idx, hit)
+                        },
+                        onPrevHit = {
+                            if (searchHits.isNotEmpty()) {
+                                val nextIdx = if (activeSearchHitIndex <= 0) {
+                                    searchHits.lastIndex
+                                } else {
+                                    activeSearchHitIndex - 1
+                                }
+                                navigateToSearchHit(nextIdx, searchHits[nextIdx])
+                            }
+                        },
+                        onNextHit = {
+                            if (searchHits.isNotEmpty()) {
+                                val nextIdx = if (activeSearchHitIndex !in searchHits.indices ||
+                                    activeSearchHitIndex >= searchHits.lastIndex
+                                ) {
+                                    0
+                                } else {
+                                    activeSearchHitIndex + 1
+                                }
+                                navigateToSearchHit(nextIdx, searchHits[nextIdx])
+                            }
+                        },
+                        onDismiss = {
+                            showSearchSheet = false
+                            searchHighlightTarget = null
+                            canvasViewRef?.setSearchHighlightRects(emptyList())
+                        },
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .zIndex(20f)
+                    )
+                }
+
                 // ==========================================
                 // 5b. FLOATING PEN BOX
                 // ==========================================
@@ -5503,6 +6908,7 @@ fun CanvasScreen(
                                     .clip(RoundedCornerShape(8.dp))
                                     .background(Color(uiState.penSlot1Color))
                                     .clickable {
+                                        exitPdfTextMode()
                                         viewModel.selectColor(Color(uiState.penSlot1Color))
                                         viewModel.setStrokeWidth(uiState.penSlot1Width)
                                         viewModel.selectTool(CanvasTool.PEN)
@@ -5515,6 +6921,7 @@ fun CanvasScreen(
                                     .clip(RoundedCornerShape(8.dp))
                                     .background(Color(uiState.penSlot2Color))
                                     .clickable {
+                                        exitPdfTextMode()
                                         viewModel.selectColor(Color(uiState.penSlot2Color))
                                         viewModel.setStrokeWidth(uiState.penSlot2Width)
                                         viewModel.selectTool(CanvasTool.PEN)
@@ -5561,10 +6968,7 @@ fun CanvasScreen(
                                             IconButton(
                                                 onClick = {
                                                     scope.launch {
-                                                        if (isContinuous) {
-                                                            inkController.flushCurrentSuspend()
-                                                            inkController.releaseSessionSuspend()
-                                                        }
+                                                        inkController.releaseSessionSuspend()
                                                         val currentBmp = if (isContinuous) null else canvasViewRef?.getBackingBitmap()
                                                         viewModel.insertNewPage(
                                                             atIndex = currentPageIndex + 1,
@@ -5631,6 +7035,7 @@ fun CanvasScreen(
                                                         noteId = viewModel.noteId,
                                                         fileStore = viewModel.fileStore,
                                                         pageItem = pageItem,
+                                                        pageType = note?.pageType ?: "a4",
                                                         pdfDocCache = pdfDocCache,
                                                         isSelected = isSelected,
                                                         isBookmarked = isBookmarked,
@@ -5733,6 +7138,7 @@ fun CanvasScreen(
                                                             noteId = viewModel.noteId,
                                                             fileStore = viewModel.fileStore,
                                                             pageItem = pageItem,
+                                                            pageType = note?.pageType ?: "a4",
                                                             pdfDocCache = pdfDocCache,
                                                             isSelected = isSelected,
                                                             isBookmarked = true,
@@ -5750,6 +7156,7 @@ fun CanvasScreen(
                                     }
 
                                     DrawerTab.OUTLINE -> {
+                                        var showOutlineMenu by remember { mutableStateOf(false) }
                                         // Outline (TOC) Header
                                         Row(
                                             modifier = Modifier.fillMaxWidth(),
@@ -5760,7 +7167,8 @@ fun CanvasScreen(
                                                 text = "Outline (TOC)",
                                                 fontWeight = FontWeight.Bold,
                                                 fontSize = 16.sp,
-                                                color = Color(0xFF212529)
+                                                color = Color(0xFF212529),
+                                                modifier = Modifier.weight(1f)
                                             )
                                             IconButton(
                                                 onClick = {
@@ -5774,6 +7182,49 @@ fun CanvasScreen(
                                                     contentDescription = "Add Chapter",
                                                     tint = OrangePrimary
                                                 )
+                                            }
+                                            if (hasPdfPages) {
+                                                Box {
+                                                    IconButton(
+                                                        onClick = { showOutlineMenu = true },
+                                                        modifier = Modifier.size(32.dp)
+                                                    ) {
+                                                        Icon(
+                                                            imageVector = Icons.Default.MoreVert,
+                                                            contentDescription = "Outline Options",
+                                                            tint = Color.DarkGray
+                                                        )
+                                                    }
+                                                    DropdownMenu(
+                                                        expanded = showOutlineMenu,
+                                                        onDismissRequest = { showOutlineMenu = false }
+                                                    ) {
+                                                        DropdownMenuItem(
+                                                            text = { Text("Re-import PDF outline") },
+                                                            leadingIcon = {
+                                                                Icon(
+                                                                    imageVector = Icons.Default.Refresh,
+                                                                    contentDescription = null
+                                                                )
+                                                            },
+                                                            onClick = {
+                                                                showOutlineMenu = false
+                                                                viewModel.reimportPdfOutline { count ->
+                                                                    val msg = if (count > 0) {
+                                                                        "Imported $count outline entries"
+                                                                    } else {
+                                                                        "No outline found in PDF"
+                                                                    }
+                                                                    android.widget.Toast.makeText(
+                                                                        context,
+                                                                        msg,
+                                                                        android.widget.Toast.LENGTH_SHORT
+                                                                    ).show()
+                                                                }
+                                                            }
+                                                        )
+                                                    }
+                                                }
                                             }
                                         }
 
@@ -5802,20 +7253,53 @@ fun CanvasScreen(
                                                         color = Color.DarkGray
                                                     )
                                                     Text(
-                                                        text = "Tap + to add document chapters and sections.",
+                                                        text = if (hasPdfPages) {
+                                                            "No PDF outline found. Tap + to add chapters or re-import from the menu."
+                                                        } else {
+                                                            "Tap + to add document chapters and sections."
+                                                        },
                                                         fontSize = 12.sp,
                                                         color = Color.Gray,
                                                         textAlign = androidx.compose.ui.text.style.TextAlign.Center
                                                     )
+                                                    if (hasPdfPages) {
+                                                        TextButton(
+                                                            onClick = {
+                                                                viewModel.reimportPdfOutline { count ->
+                                                                    val msg = if (count > 0) {
+                                                                        "Imported $count outline entries"
+                                                                    } else {
+                                                                        "No outline found in PDF"
+                                                                    }
+                                                                    android.widget.Toast.makeText(
+                                                                        context,
+                                                                        msg,
+                                                                        android.widget.Toast.LENGTH_SHORT
+                                                                    ).show()
+                                                                }
+                                                            }
+                                                        ) {
+                                                            Text(
+                                                                text = "Re-import PDF outline",
+                                                                color = OrangePrimary,
+                                                                fontWeight = FontWeight.SemiBold,
+                                                                fontSize = 12.sp
+                                                            )
+                                                        }
+                                                    }
                                                 }
                                             }
                                         } else {
+                                            val activeTocId = remember(uiState.tocEntries, currentPageIndex) {
+                                                PdfOutlineImporter.activeEntryId(uiState.tocEntries, currentPageIndex)
+                                            }
                                             LazyColumn(
                                                 modifier = Modifier.fillMaxSize(),
                                                 verticalArrangement = Arrangement.spacedBy(8.dp)
                                             ) {
                                                 items(uiState.tocEntries, key = { it.id }) { tocEntry ->
-                                                    val isCurrentPage = tocEntry.pageIndex == currentPageIndex
+                                                    val isCurrentPage = tocEntry.id == activeTocId
+                                                    val indentDp = (tocEntry.level.coerceIn(0, 6) * 12).dp
                                                     Surface(
                                                         shape = RoundedCornerShape(8.dp),
                                                         color = if (isCurrentPage) OrangePrimary.copy(alpha = 0.08f) else Color(0xFFFAFAFA),
@@ -5826,17 +7310,21 @@ fun CanvasScreen(
                                                         modifier = Modifier
                                                             .fillMaxWidth()
                                                             .clickable {
-                                                                if (tocEntry.pageIndex != currentPageIndex) {
+                                                                val targetPage = tocEntry.pageIndex.coerceIn(
+                                                                    0,
+                                                                    (totalPages - 1).coerceAtLeast(0)
+                                                                )
+                                                                if (targetPage != currentPageIndex) {
                                                                     if (isContinuous) {
-                                                                        viewModel.setCurrentPageIndex(tocEntry.pageIndex)
-                                                                        scrollToContinuousPage(tocEntry.pageIndex)
+                                                                        viewModel.setCurrentPageIndex(targetPage)
+                                                                        scrollToContinuousPage(targetPage)
                                                                     } else {
                                                                         scope.launch {
                                                                             if (canvasViewRef?.layersDirty == true) {
                                                                                 canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
                                                                             }
                                                                             val currentBmp = canvasViewRef?.getBackingBitmap()
-                                                                            viewModel.goToPage(tocEntry.pageIndex, currentBmp) { newBmp ->
+                                                                            viewModel.goToPage(targetPage, currentBmp) { newBmp ->
                                                                                 applyLoadedPage(viewModel.currentPageIndex.value, newBmp)
                                                                             }
                                                                         }
@@ -5848,7 +7336,12 @@ fun CanvasScreen(
                                                         Row(
                                                             modifier = Modifier
                                                                 .fillMaxWidth()
-                                                                .padding(horizontal = 12.dp, vertical = 12.dp),
+                                                                .padding(
+                                                                    start = 12.dp + indentDp,
+                                                                    end = 12.dp,
+                                                                    top = 10.dp,
+                                                                    bottom = 10.dp
+                                                                ),
                                                             verticalAlignment = Alignment.CenterVertically,
                                                             horizontalArrangement = Arrangement.SpaceBetween
                                                         ) {
@@ -5867,7 +7360,9 @@ fun CanvasScreen(
                                                                     text = tocEntry.title,
                                                                     fontSize = 13.sp,
                                                                     fontWeight = if (isCurrentPage) FontWeight.Bold else FontWeight.Medium,
-                                                                    color = if (isCurrentPage) OrangePrimary else Color(0xFF212529)
+                                                                    color = if (isCurrentPage) OrangePrimary else Color(0xFF212529),
+                                                                    maxLines = 2,
+                                                                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
                                                                 )
                                                             }
 
@@ -6223,10 +7718,7 @@ fun CanvasScreen(
                                                     Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 2.dp)) {
                                                         ToolsPanelItem(Icons.Default.Add, "Add Page") {
                                                             scope.launch {
-                                                                if (isContinuous) {
-                                                                    inkController.flushCurrentSuspend()
-                                                                    inkController.releaseSessionSuspend()
-                                                                }
+                                                                inkController.releaseSessionSuspend()
                                                                 val currentBmp = if (isContinuous) null else canvasViewRef?.getBackingBitmap()
                                                                 viewModel.insertNewPage(
                                                                     atIndex = currentPageIndex + 1,
@@ -6244,19 +7736,46 @@ fun CanvasScreen(
                                                             viewModel.toggleToolsPanel(false)
                                                         }
                                                         Divider(color = Color(0xFFEEEEEE), thickness = 0.5.dp)
-                                                        ToolsPanelItem(Icons.Default.GridOn, "Template (${uiState.paperPattern.name})") {
-                                                            val nextPattern = when (uiState.paperPattern) {
-                                                                PaperPattern.BLANK -> PaperPattern.GRID
-                                                                PaperPattern.GRID -> PaperPattern.LINES
-                                                                PaperPattern.LINES -> PaperPattern.DOTTED
-                                                                PaperPattern.DOTTED -> PaperPattern.BLANK
+                                                        val templateLabel = if (isInfiniteNote) {
+                                                            uiState.infiniteGridPreset.label
+                                                        } else {
+                                                            uiState.paperPattern.name
+                                                        }
+                                                        ToolsPanelItem(Icons.Default.GridOn, "Template ($templateLabel)") {
+                                                            if (isInfiniteNote) {
+                                                                // The infinite canvas draws its own
+                                                                // grid presets (Graph/Lined/Dots/Iso/
+                                                                // Tri). The paper pattern is the A4
+                                                                // page template, so on an infinite
+                                                                // note this row has to drive the same
+                                                                // state the Precision HUD drives.
+                                                                val values = InfiniteGridPreset.values()
+                                                                val next = values[(uiState.infiniteGridPreset.ordinal + 1) % values.size]
+                                                                viewModel.setInfiniteGridPreset(next)
+                                                                android.widget.Toast.makeText(context, "Grid: ${next.label}", android.widget.Toast.LENGTH_SHORT).show()
+                                                            } else {
+                                                                val nextPattern = when (uiState.paperPattern) {
+                                                                    PaperPattern.BLANK -> PaperPattern.GRID
+                                                                    PaperPattern.GRID -> PaperPattern.LINES
+                                                                    PaperPattern.LINES -> PaperPattern.DOTTED
+                                                                    PaperPattern.DOTTED -> PaperPattern.BLANK
+                                                                }
+                                                                viewModel.setPaperPattern(nextPattern)
+                                                                android.widget.Toast.makeText(context, "Paper pattern: ${nextPattern.name}", android.widget.Toast.LENGTH_SHORT).show()
                                                             }
-                                                            viewModel.setPaperPattern(nextPattern)
-                                                            android.widget.Toast.makeText(context, "Paper pattern: ${nextPattern.name}", android.widget.Toast.LENGTH_SHORT).show()
                                                         }
                                                         Divider(color = Color(0xFFEEEEEE), thickness = 0.5.dp)
                                                         ToolsPanelItem(Icons.Default.Layers, "Layer") {
-                                                            showLayersPanel = true
+                                                            if (PdfModeReconciliationPolicy.resolveLayerEntryTarget(isInfiniteNote) ==
+                                                                PdfModeReconciliationPolicy.LayerEntryTarget.INFINITE_DRAWING_ONLY
+                                                            ) {
+                                                                showLayerPanel = true
+                                                                showLayersPanel = false
+                                                            } else {
+                                                                showLayersPanel = true
+                                                                showLayerPanel = false
+                                                            }
+                                                            layerActionIndex = -1
                                                             viewModel.toggleToolsPanel(false)
                                                         }
                                                     }
@@ -6293,6 +7812,7 @@ fun CanvasScreen(
                                                         ToolsPanelItem(Icons.Default.Highlight, "Laser Pointer") {
                                                             // The laser pointer shows a red dot
                                                             // where the pen is; it writes nothing.
+                                                            exitPdfTextMode()
                                                             viewModel.selectTool(CanvasTool.LASER_POINTER)
                                                             viewModel.toggleToolsPanel(false)
                                                             android.widget.Toast.makeText(context, "Laser pointer: move the pen to point", android.widget.Toast.LENGTH_SHORT).show()
@@ -6488,6 +8008,14 @@ fun CanvasScreen(
                                                                 if (canvasViewRef?.layersDirty == true) {
                                                                     canvasViewRef?.saveImageLayers(viewModel.fileStore, viewModel.noteId)
                                                                 }
+                                                                val inkCanvas = canvasViewRef
+                                                                if (inkCanvas != null && inkCanvas.hasBeyondPageInk()) {
+                                                                    withContext(Dispatchers.IO) {
+                                                                        inkCanvas.saveBeyondPageInkNow(viewModel.fileStore, viewModel.noteId)
+                                                                        viewModel.repository.touchNoteUpdatedAt(viewModel.noteId)
+                                                                    }
+                                                                }
+                                                                inkController.releaseSessionSuspend()
                                                                 viewModel.setPageTurningMode(0)
                                                                 val cur = viewModel.currentPageIndex.value
                                                                 savedPageGenerations[cur] = (savedPageGenerations[cur] ?: 0) + 1
@@ -6496,17 +8024,45 @@ fun CanvasScreen(
                                                     },
                                                     onSelectRight = {
                                                         if (!isSingleMode) {
-                                                            val targetIdx = (if (uiState.pageTurningDirection == 1) {
-                                                                continuousRowState.firstVisibleItemIndex
-                                                            } else if (uiState.doublePageMode) {
+                                                            val maxIdx = (pages.size - 1).coerceAtLeast(0)
+                                                            val isHoriz = uiState.pageTurningDirection == 1
+                                                            val isDouble = !isHoriz && uiState.doublePageMode
+                                                            val activeListState = if (isHoriz) continuousRowState else continuousColState
+                                                            val visibleItems = activeListState.layoutInfo.visibleItemsInfo
+                                                            val isSettledTarget =
+                                                                settledProgrammaticPage in pages.indices &&
+                                                                continuousVisibleIndex == settledProgrammaticFirstVis &&
+                                                                currentPageIndex == settledProgrammaticPage
+                                                            val isCurrentVisible = currentPageIndex in pages.indices && visibleItems.any { item ->
+                                                                if (isDouble) {
+                                                                    val start = item.index * 2
+                                                                    val end = minOf(pages.lastIndex, start + 1)
+                                                                    currentPageIndex in start..end
+                                                                } else {
+                                                                    item.index == currentPageIndex
+                                                                }
+                                                            }
+                                                            val targetIdx = if (isSettledTarget || isCurrentVisible) {
+                                                                currentPageIndex.coerceIn(0, maxIdx)
+                                                            } else if (isHoriz) {
+                                                                continuousRowState.firstVisibleItemIndex.coerceIn(0, maxIdx)
+                                                            } else if (isDouble) {
                                                                 val pairIdx = continuousColState.firstVisibleItemIndex
                                                                 val first = pairIdx * 2
-                                                                if (currentPageIndex == first || currentPageIndex == first + 1) currentPageIndex else first
+                                                                if (currentPageIndex == first || currentPageIndex == first + 1) {
+                                                                    currentPageIndex.coerceIn(0, maxIdx)
+                                                                } else {
+                                                                    first.coerceIn(0, maxIdx)
+                                                                }
                                                             } else {
-                                                                continuousColState.firstVisibleItemIndex
-                                                            }).coerceIn(0, (pages.size - 1).coerceAtLeast(0))
-                                                            viewModel.setCurrentPageIndex(targetIdx)
-                                                            viewModel.setPageTurningMode(1)
+                                                                continuousColState.firstVisibleItemIndex.coerceIn(0, maxIdx)
+                                                            }
+                                                            scope.launch {
+                                                                inkController.flushCurrentSuspend()
+                                                                inkController.releaseSessionSuspend()
+                                                                viewModel.setCurrentPageIndex(targetIdx)
+                                                                viewModel.setPageTurningMode(1)
+                                                            }
                                                         }
                                                     },
                                                     modifier = Modifier
@@ -8293,7 +9849,12 @@ fun InfiniteCanvasView(
                             native.restoreToCount(itemSave)
                         }
 
-                        val hasErase = ink.layerHasErase(pageIndex, layer)
+                        val liveErase = ink.liveEraserStroke(pageIndex, layer)
+                        if (liveErase != null) {
+                            @Suppress("UNUSED_EXPRESSION")
+                            ink.previewRevision
+                        }
+                        val hasErase = ink.layerHasErase(pageIndex, layer) || liveErase != null
                         val layerSave = if (hasErase) {
                             native.saveLayer(
                                 viewLeft,
@@ -8349,7 +9910,11 @@ fun InfiniteCanvasView(
                 .pointerInput(page.id, pageIndex) {
                     try {
                         awaitEachGesture {
-                            val down = awaitFirstDown(requireUnconsumed = false)
+                            var pendingDown: androidx.compose.ui.input.pointer.PointerInputChange? =
+                                awaitFirstDown(requireUnconsumed = false)
+                            while (pendingDown != null) {
+                            val down = pendingDown
+                            pendingDown = null
                             // Read latest ink settings AFTER awaitFirstDown so tool/color/width
                             // changes made while idle take effect immediately on the first stroke.
                             val settings = currentInkSettings
@@ -8380,8 +9945,9 @@ fun InfiniteCanvasView(
                                     activeHandle = h
                                 }
                             }
+                            val preHitLassoHandle = ink.hitTestLassoHandle(downWorldX, downWorldY, currentScale)
                             if (activeHandle == InfiniteItemHandle.NONE && settings.tool == CanvasTool.SELECT &&
-                                ink.hitTestLassoHandle(downWorldX, downWorldY, currentScale) == LassoHandle.NONE
+                                preHitLassoHandle == LassoHandle.NONE
                             ) {
                                 val hit = hitTestInfiniteItems(
                                     downWorldX,
@@ -8443,7 +10009,7 @@ fun InfiniteCanvasView(
                                 var movedDist = 0f
                                 while (true) {
                                     val event = awaitPointerEvent()
-                                    if (event.changes.count { it.pressed } > 1) break
+                                    if (!isStylus && event.changes.count { it.pressed && it.type == PointerType.Touch } > 1) break
                                     val change = event.changes.firstOrNull { it.id == down.id } ?: break
                                     val curWx = (change.position.x - currentPanX) / currentScale.coerceAtLeast(0.1f)
                                     val curWy = (change.position.y - currentPanY) / currentScale.coerceAtLeast(0.1f)
@@ -8533,12 +10099,15 @@ fun InfiniteCanvasView(
                                 return@awaitEachGesture
                             }
 
-                            if ((settings.tool == CanvasTool.LASSO || settings.tool == CanvasTool.SELECT) && isAllowedPointer) {
+                            val isSelectionTool = settings.tool == CanvasTool.LASSO || settings.tool == CanvasTool.SELECT
+                            if (isSelectionTool && (isAllowedPointer || preHitLassoHandle != LassoHandle.NONE)) {
                                 down.consume()
                                 suspend fun androidx.compose.ui.input.pointer.AwaitPointerEventScope.handleStrokeSelectionHandle(
                                     handle: LassoHandle
                                 ) {
-                                    val b = ink.lassoBounds() ?: return
+                                    val b = ink.lassoBounds(pageIndex, 2160f, 2160f, currentScale) ?: return
+                                    ink.isManipulatingLasso = true
+                                    try {
                                     when (handle) {
                                         LassoHandle.DELETE -> {
                                             ink.lassoDelete(pageIndex)
@@ -8564,7 +10133,7 @@ fun InfiniteCanvasView(
                                                 var movedDist = 0f
                                                 while (true) {
                                                     val event = awaitPointerEvent()
-                                                    if (event.changes.count { it.pressed } > 1) break
+                                                    if (!isStylus && event.changes.count { it.pressed && it.type == PointerType.Touch } > 1) break
                                                     val change = event.changes.firstOrNull { it.id == down.id } ?: break
                                                     val delta = change.position - lastPos
                                                     lastPos = change.position
@@ -8594,7 +10163,7 @@ fun InfiniteCanvasView(
                                             ink.lassoBeginTransform()
                                             while (true) {
                                                 val event = awaitPointerEvent()
-                                                if (event.changes.count { it.pressed } > 1) break
+                                                if (!isStylus && event.changes.count { it.pressed && it.type == PointerType.Touch } > 1) break
                                                 val change = event.changes.firstOrNull { it.id == down.id } ?: break
                                                 val curWx = (change.position.x - currentPanX) / currentScale.coerceAtLeast(0.1f)
                                                 val curWy = (change.position.y - currentPanY) / currentScale.coerceAtLeast(0.1f)
@@ -8611,22 +10180,23 @@ fun InfiniteCanvasView(
                                         LassoHandle.SCALE_CORNER_BR -> {
                                             val ax = b.left
                                             val ay = b.top
-                                            val startDiag = kotlin.math.hypot(
-                                                (downWorldX - ax).toDouble(),
-                                                (downWorldY - ay).toDouble()
-                                            ).toFloat().coerceAtLeast(16f)
+                                            val baseW = 2160f
                                             ink.lassoBeginTransform()
                                             while (true) {
                                                 val event = awaitPointerEvent()
-                                                if (event.changes.count { it.pressed } > 1) break
+                                                if (!isStylus && event.changes.count { it.pressed && it.type == PointerType.Touch } > 1) break
                                                 val change = event.changes.firstOrNull { it.id == down.id } ?: break
                                                 val curWx = (change.position.x - currentPanX) / currentScale.coerceAtLeast(0.1f)
                                                 val curWy = (change.position.y - currentPanY) / currentScale.coerceAtLeast(0.1f)
-                                                val curDiag = kotlin.math.hypot(
-                                                    (curWx - ax).toDouble(),
-                                                    (curWy - ay).toDouble()
-                                                ).toFloat().coerceAtLeast(8f)
-                                                val f = (curDiag / startDiag).coerceIn(0.15f, 8.0f)
+                                                val f = ContinuousStrokeTransformMath.proportionalScaleFactor(
+                                                    startXNorm = downWorldX / baseW,
+                                                    startYNorm = downWorldY / baseW,
+                                                    curXNorm = curWx / baseW,
+                                                    curYNorm = curWy / baseW,
+                                                    anchorXNorm = ax / baseW,
+                                                    anchorYNorm = ay / baseW,
+                                                    boxRatio = 1f
+                                                )
                                                 ink.lassoScaleTo(pageIndex, f, f, ax, ay)
                                                 change.consume()
                                                 if (change.changedToUpIgnoreConsumed()) break
@@ -8637,40 +10207,37 @@ fun InfiniteCanvasView(
                                         LassoHandle.SCALE_RIGHT,
                                         LassoHandle.SCALE_TOP,
                                         LassoHandle.SCALE_BOTTOM -> {
-                                            val ax = when (handle) {
-                                                LassoHandle.SCALE_LEFT -> b.right
-                                                LassoHandle.SCALE_RIGHT -> b.left
-                                                else -> b.centerX()
-                                            }
-                                            val ay = when (handle) {
-                                                LassoHandle.SCALE_TOP -> b.bottom
-                                                LassoHandle.SCALE_BOTTOM -> b.top
-                                                else -> b.centerY()
-                                            }
-                                            val startSpanX = (downWorldX - ax).let {
-                                                if (kotlin.math.abs(it) < 16f) 16f else it
-                                            }
-                                            val startSpanY = (downWorldY - ay).let {
-                                                if (kotlin.math.abs(it) < 16f) 16f else it
-                                            }
+                                            val baseW = 2160f
+                                            val normBounds = NormRect(
+                                                b.left / baseW,
+                                                b.top / baseW,
+                                                b.right / baseW,
+                                                b.bottom / baseW
+                                            )
                                             ink.lassoBeginTransform()
                                             while (true) {
                                                 val event = awaitPointerEvent()
-                                                if (event.changes.count { it.pressed } > 1) break
+                                                if (!isStylus && event.changes.count { it.pressed && it.type == PointerType.Touch } > 1) break
                                                 val change = event.changes.firstOrNull { it.id == down.id } ?: break
                                                 val curWx = (change.position.x - currentPanX) / currentScale.coerceAtLeast(0.1f)
                                                 val curWy = (change.position.y - currentPanY) / currentScale.coerceAtLeast(0.1f)
-                                                val sx = if (handle == LassoHandle.SCALE_LEFT || handle == LassoHandle.SCALE_RIGHT) {
-                                                    ((curWx - ax) / startSpanX).coerceIn(0.15f, 8.0f)
-                                                } else {
-                                                    1f
+                                                val spec = ContinuousStrokeTransformMath.edgeScaleFactors(
+                                                    handle = handle,
+                                                    bounds = normBounds,
+                                                    startXNorm = downWorldX / baseW,
+                                                    startYNorm = downWorldY / baseW,
+                                                    curXNorm = curWx / baseW,
+                                                    curYNorm = curWy / baseW
+                                                )
+                                                if (spec != null) {
+                                                    ink.lassoScaleTo(
+                                                        pageIndex,
+                                                        spec.scaleX,
+                                                        spec.scaleY,
+                                                        spec.anchorXNorm * baseW,
+                                                        spec.anchorYNorm * baseW
+                                                    )
                                                 }
-                                                val sy = if (handle == LassoHandle.SCALE_TOP || handle == LassoHandle.SCALE_BOTTOM) {
-                                                    ((curWy - ay) / startSpanY).coerceIn(0.15f, 8.0f)
-                                                } else {
-                                                    1f
-                                                }
-                                                ink.lassoScaleTo(pageIndex, sx, sy, ax, ay)
                                                 change.consume()
                                                 if (change.changedToUpIgnoreConsumed()) break
                                             }
@@ -8680,7 +10247,7 @@ fun InfiniteCanvasView(
                                             var lastPos = down.position
                                             while (true) {
                                                 val event = awaitPointerEvent()
-                                                if (event.changes.count { it.pressed } > 1) break
+                                                if (!isStylus && event.changes.count { it.pressed && it.type == PointerType.Touch } > 1) break
                                                 val change = event.changes.firstOrNull { it.id == down.id } ?: break
                                                 val delta = change.position - lastPos
                                                 lastPos = change.position
@@ -8696,11 +10263,13 @@ fun InfiniteCanvasView(
                                         }
                                         LassoHandle.NONE -> Unit
                                     }
+                                    } finally {
+                                        ink.isManipulatingLasso = false
+                                    }
                                 }
 
-                                val hitHandle = ink.hitTestLassoHandle(downWorldX, downWorldY, currentScale)
-                                if (hitHandle != LassoHandle.NONE) {
-                                    handleStrokeSelectionHandle(hitHandle)
+                                if (preHitLassoHandle != LassoHandle.NONE) {
+                                    handleStrokeSelectionHandle(preHitLassoHandle)
                                     return@awaitEachGesture
                                 }
 
@@ -8714,10 +10283,11 @@ fun InfiniteCanvasView(
                                 }
 
                                 ink.lassoClear()
+                                ink.isManipulatingLasso = true
                                 val loop = mutableListOf(Pair(downWorldX, downWorldY))
                                 while (true) {
                                     val event = awaitPointerEvent()
-                                    if (event.changes.count { it.pressed } > 1) break
+                                    if (!isStylus && event.changes.count { it.pressed && it.type == PointerType.Touch } > 1) break
                                     val change = event.changes.firstOrNull { it.id == down.id } ?: break
                                     loop.add(
                                         Pair(
@@ -8725,10 +10295,11 @@ fun InfiniteCanvasView(
                                             (change.position.y - currentPanY) / currentScale.coerceAtLeast(0.1f)
                                         )
                                     )
-                                    ink.lassoUpdatePath(loop)
+                                    ink.lassoUpdatePath(pageIndex, loop)
                                     change.consume()
                                     if (change.changedToUpIgnoreConsumed()) break
                                 }
+                                ink.isManipulatingLasso = false
                                 val picked = ink.lassoFinish(pageIndex, loop)
                                 if (picked == 0) ink.lassoClear()
                                 return@awaitEachGesture
@@ -8739,7 +10310,14 @@ fun InfiniteCanvasView(
                                 var lastPos = down.position
                                 while (true) {
                                     val event = awaitPointerEvent()
-                                    if (event.changes.count { it.pressed } > 1) break
+                                    val stylusDown = event.changes.firstOrNull {
+                                        it.pressed && (it.type == PointerType.Stylus || it.type == PointerType.Eraser)
+                                    }
+                                    if (stylusDown != null) {
+                                        pendingDown = stylusDown
+                                        break
+                                    }
+                                    if (event.changes.count { it.pressed && it.type == PointerType.Touch } > 1) break
                                     val change = event.changes.firstOrNull { it.id == down.id } ?: break
                                     val delta = change.position - lastPos
                                     lastPos = change.position
@@ -8747,6 +10325,7 @@ fun InfiniteCanvasView(
                                     change.consume()
                                     if (change.changedToUpIgnoreConsumed()) break
                                 }
+                                if (pendingDown != null) continue
                                 return@awaitEachGesture
                             }
 
@@ -8787,7 +10366,7 @@ fun InfiniteCanvasView(
 
                             while (true) {
                                 val event = awaitPointerEvent()
-                                if (event.changes.count { it.pressed } > 1) {
+                                if (!isStylus && event.changes.count { it.pressed && it.type == PointerType.Touch } > 1) {
                                     ink.cancelStroke()
                                     break
                                 }
@@ -8871,9 +10450,11 @@ fun InfiniteCanvasView(
                                     break
                                 }
                             }
+                            }
                         }
-                    } catch (e: Exception) {
+                    } finally {
                         ink.cancelStroke()
+                        ink.cancelLassoGesture()
                     }
                 }
         )
@@ -8911,6 +10492,14 @@ fun ContinuousPageView(
     inkSettings: InkToolSettings,
     backgroundMode: Int = 0,
     backgroundDensity: Int = 40,
+    /**
+     * The pattern the canvas should use when the page row has no pattern of
+     * its own. This is [CanvasUiState.paperPattern]: it carries the app
+     * default and the in-canvas Template tap, so a pattern change is visible
+     * immediately in continuous mode (the page row catches up through the
+     * database).
+     */
+    defaultPattern: PaperPattern = PaperPattern.BLANK,
     savedGeneration: Int = 0,
     isCurrentPage: Boolean = false,
     /** An infinite canvas has no page edge: no frame, no desk. */
@@ -8924,15 +10513,38 @@ fun ContinuousPageView(
     panOffsetY: Float = 0f,
     /** The type of the note's pages ("infinite", "a4", "pdf"). */
     pageType: String = if (isInfinite) "infinite" else "a4",
+    viewportWidthPx: Float = 0f,
+    canvasOriginXProvider: () -> Float = { 0f },
+    marginLabelAlphaProvider: () -> Float = { 0f },
+    allowLeftPanReveal: Boolean = true,
+    allowRightPanReveal: Boolean = true,
+    allowLeftMarginLabel: Boolean = true,
+    allowRightMarginLabel: Boolean = true,
+    searchHighlightStart: Int = -1,
+    searchHighlightLength: Int = 0,
+    searchHighlightRevision: Int = 0,
     modifier: Modifier = Modifier,
     onStylusDetected: () -> Unit = {},
     onPageMapping: (ContinuousPageMap) -> Unit = {},
     onImageMapping: (ContinuousImageMap) -> Unit = {},
     onPageBox: (ReaderPageBox) -> Unit = {},
     onPageBitmap: (Int, android.graphics.Bitmap?) -> Unit = { _, _ -> },
+    onActivatePage: () -> Unit = {},
     onClick: () -> Unit
 ) {
     val isVector = page.pdfSourcePath.isNotEmpty() && page.pdfPageIndex >= 0
+    val coroutineScope = rememberCoroutineScope()
+    val latestInkSettings by rememberUpdatedState(inkSettings)
+
+    LaunchedEffect(page.id, pageIndex, noteId) {
+        ink.prewarmSessionForPage(page, pageIndex)
+    }
+
+    LaunchedEffect(page.id, pageIndex, isCurrentPage, inkSettings.tool) {
+        if (isCurrentPage && (inkSettings.tool == CanvasTool.LASSO || inkSettings.tool == CanvasTool.SELECT)) {
+            ink.ensureSessionReady(page, pageIndex)
+        }
+    }
 
     // Where the page sits on screen: the live text box is placed in screen
     // coordinates, so its commit needs the page's on-screen rect. Kept out of
@@ -8951,17 +10563,27 @@ fun ContinuousPageView(
     var pageImageHeight by remember(page.id) { mutableIntStateOf(0) }
 
     // Opening the PDF (read + parse in pdfium) has to happen off the main
-    // thread, so the page lays out at the A4 ratio until the real one arrives.
+    // thread, so seed from PageAspectCache or fall back to A4 until it arrives.
+    val initialAspect = if (!isVector) {
+        PdfPageGeometry.DEFAULT_ASPECT
+    } else {
+        PageAspectCache.default.get(page.pdfSourcePath, page.pdfPageIndex) ?: PdfPageGeometry.DEFAULT_ASPECT
+    }
     val pageRatio by produceState(
-        initialValue = 0.707f,
+        initialValue = initialAspect,
         page.id, page.pdfSourcePath, page.pdfPageIndex
     ) {
         value = withContext(Dispatchers.IO) {
             if (!isVector) {
-                0.707f
+                PdfPageGeometry.DEFAULT_ASPECT
             } else {
-                val size = pdfDocCache.document(page.pdfSourcePath)?.pageSize(page.pdfPageIndex)
-                if (size != null && size[0] > 0f && size[1] > 0f) size[0] / size[1] else 0.707f
+                PageAspectCache.default.getOrLoad(
+                    page.pdfSourcePath,
+                    page.pdfPageIndex,
+                    fallback = PdfPageGeometry.DEFAULT_ASPECT
+                ) {
+                    pdfDocCache.document(page.pdfSourcePath)?.pageSize(page.pdfPageIndex)
+                }
             }
         }
     }
@@ -9138,26 +10760,48 @@ fun ContinuousPageView(
         var savedLayers by remember(page.id, noteId) {
             mutableStateOf<Map<Int, android.graphics.Bitmap?>>(emptyMap())
         }
+        var savedSinglePageStrokes by remember(page.id, noteId) {
+            mutableStateOf<android.graphics.Bitmap?>(null)
+        }
+        LaunchedEffect(page.id, noteId, savedGeneration, activeSessionReady, isVector) {
+            if (!isVector) {
+                savedSinglePageStrokes = null
+                return@LaunchedEffect
+            }
+            if (activeSessionReady) {
+                return@LaunchedEffect
+            }
+            val strokesFile = repository.fileStore.getStrokesFile(noteId, pageIndex)
+            val targetW = desiredWidthPx.coerceAtLeast(720)
+            val targetH = (targetW / pageRatio.coerceAtLeast(0.1f)).roundToInt().coerceAtLeast(1)
+            val loaded = if (strokesFile.exists()) {
+                personal.notes.touch.util.BitmapUtils.loadAlphaThumbnail(
+                    strokesFile,
+                    targetWidth = targetW,
+                    targetHeight = targetH
+                )
+            } else null
+            if (!ink.isActiveSession(pageIndex)) {
+                savedSinglePageStrokes = loaded
+            }
+        }
         LaunchedEffect(page.id, noteId, savedGeneration, activeSessionReady, layerTick) {
+            if (!isInfinite && ContinuousPageGeometry.marginFor(pageType) > 0f) {
+                ink.refreshMarginInkPresence(pageIndex)
+            }
             if (activeSessionReady) {
                 return@LaunchedEffect
             }
             val loaded = ink.composeDisplayLayers(
-                pageIndex, displayWidthPx.roundToInt()
+                pageIndex, displayWidthPx.roundToInt(), page = page
             )
             if (!ink.isActiveSession(pageIndex)) {
                 savedLayers = loaded
             }
         }
 
-        LaunchedEffect(page.id, page.updatedAt, renderWidthKey, noteId, activeSessionReady, savedGeneration) {
+        LaunchedEffect(page.id, page.updatedAt, renderWidthKey, noteId, savedGeneration) {
             ink.refreshBackground(page, pageIndex, desiredWidthPx)
-            if (activeSessionReady && isVector) {
-                // A vector page is drawn by the session (the clean pdfium
-                // render under the layer), so the page is not rendered twice.
-                loadCompleted = true
-                return@LaunchedEffect
-            }
             // Let a pinch settle on its final bucket before allocating a
             // full-page bitmap; an intermediate key cancels this coroutine
             // while it is still cancellable (a native pdfium render is not).
@@ -9166,7 +10810,8 @@ fun ContinuousPageView(
                 try {
                     if (isVector) {
                         renderContinuousPage(
-                            page, pageIndex, noteId, pdfDocCache, repository, desiredWidthPx
+                            page, pageIndex, noteId, pdfDocCache, repository, desiredWidthPx,
+                            includeInk = PdfModeReconciliationPolicy.continuousPdfRenderIncludesInk()
                         )
                     } else {
                         // Legacy raster page: decode at the width actually
@@ -9184,7 +10829,7 @@ fun ContinuousPageView(
         }
 
         val shown = when {
-            sessionReady && inkSession?.isVector == true -> inkSession.background
+            sessionReady && inkSession?.isVector == true && inkSession.background != null -> inkSession.background
             else -> pageBitmap
         }
 
@@ -9226,17 +10871,16 @@ fun ContinuousPageView(
 
         // Draw paper pattern for non-vector pages (or vector pages with no background)
         if (!isVector) {
-            val effectivePattern = when (PaperPattern.fromCode(page.paperPattern)) {
-                PaperPattern.GRID -> PaperPattern.GRID
-                PaperPattern.LINES -> PaperPattern.LINES
-                PaperPattern.DOTTED -> PaperPattern.DOTTED
-                PaperPattern.BLANK -> when (backgroundMode) {
-                    1 -> PaperPattern.LINES
-                    2 -> PaperPattern.GRID
-                    3 -> PaperPattern.DOTTED
-                    else -> PaperPattern.BLANK
-                }
-            }
+            // The page on screen follows the canvas state (the app default or
+            // the Template tap) so the pattern changes on the next frame; the
+            // page row is written in the background and is the source of truth
+            // for the other pages of the reader.
+            val patternCode = PaperPattern.effectiveContinuousCode(
+                pagePatternCode = page.paperPattern,
+                isCurrentPage = isCurrentPage,
+                defaultPatternCode = defaultPattern.code
+            )
+            val effectivePattern = PaperPattern.resolve(patternCode, backgroundMode)
             if (effectivePattern != PaperPattern.BLANK) {
                 androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
                     // The pattern belongs to the paper: on a fixed page it
@@ -9248,8 +10892,7 @@ fun ContinuousPageView(
                     val top = rect?.top?.times(size.height) ?: 0f
                     val w = rect?.width?.times(size.width) ?: size.width
                     val h = rect?.height?.times(size.height) ?: size.height
-                    val density = backgroundDensity.coerceIn(20, 80).toFloat()
-                    val step = (density * (w / 2160f)).coerceAtLeast(8f)
+                    val step = PaperPattern.stepPx(backgroundDensity, w)
                     val gridColor = Color(0xFFE0E0E0)
                     clipRect(left, top, left + w, top + h) {
                         when (effectivePattern) {
@@ -9337,6 +10980,127 @@ fun ContinuousPageView(
             }
         }
 
+        // Non-destructive Single-Page strokes (`strokes_<i>.png`) over clean PDF render,
+        // gated by Layer1 visibility in PageLayerStack.
+        val shownSinglePageStrokes = if (sessionReady && inkSession?.isVector == true) {
+            inkSession.singlePageStrokes
+        } else {
+            savedSinglePageStrokes
+        }
+        val baseLayerObj = layerStack.layerAt(PageLayerStack.BASE_LAYER_INDEX)
+        val baseLayerVisible = baseLayerObj?.visible != false
+        val liveBaseEraser = baseLayerObj?.let { ink.liveEraserStroke(pageIndex, it) }
+        if (isVector && PdfModeReconciliationPolicy.shouldDrawSinglePageStrokes(
+                hasStrokes = shownSinglePageStrokes != null && !shownSinglePageStrokes.isRecycled,
+                baseLayerVisible = baseLayerVisible
+            )
+        ) {
+            val spBmp = shownSinglePageStrokes
+            if (spBmp != null && !spBmp.isRecycled) {
+                androidx.compose.foundation.Canvas(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .then(
+                            if (liveBaseEraser != null) {
+                                Modifier.graphicsLayer(
+                                    compositingStrategy = androidx.compose.ui.graphics.CompositingStrategy.Offscreen
+                                )
+                            } else {
+                                Modifier
+                            }
+                        )
+                ) {
+                    val _rev = ink.revision
+                    val _previewRev = if (liveBaseEraser != null && ink.livePageIndex == pageIndex) ink.previewRevision else 0
+                    val rect = pageRectOf(pageIndex, size.width, size.height)
+                    if (rect.empty) return@Canvas
+                    val dest = android.graphics.RectF(
+                        rect.left * size.width,
+                        rect.top * size.height,
+                        rect.right * size.width,
+                        rect.bottom * size.height
+                    )
+                    drawIntoCanvas { canvas ->
+                        val native = canvas.nativeCanvas
+                        native.drawBitmap(spBmp, null, dest, layerPaint)
+                        if (liveBaseEraser != null) {
+                            val save = native.save()
+                            native.clipRect(dest)
+                            ink.drawLiveEraserCut(native, liveBaseEraser, size.width, size.height)
+                            native.restoreToCount(save)
+                        }
+                    }
+                }
+            }
+        }
+
+        // PDF-QOL-3: Transient full-text search hit highlight overlay in Continuous mode.
+        val hasActiveSearchHighlight = isVector && searchHighlightStart >= 0 && searchHighlightLength > 0
+        val searchHighlightUserRects by produceState<List<FloatArray>>(
+            initialValue = emptyList(),
+            hasActiveSearchHighlight,
+            page.pdfSourcePath,
+            page.pdfPageIndex,
+            searchHighlightStart,
+            searchHighlightLength,
+            searchHighlightRevision
+        ) {
+            value = if (!hasActiveSearchHighlight) {
+                emptyList()
+            } else {
+                withContext(Dispatchers.IO) {
+                    pdfDocCache.document(page.pdfSourcePath)
+                        ?.selectionRects(page.pdfPageIndex, searchHighlightStart, searchHighlightLength)
+                        .orEmpty()
+                }
+            }
+        }
+        var searchPagePts by remember(page.id, page.pdfSourcePath, page.pdfPageIndex) {
+            mutableStateOf<Pair<Float, Float>?>(null)
+        }
+        LaunchedEffect(hasActiveSearchHighlight, page.pdfSourcePath, page.pdfPageIndex) {
+            if (hasActiveSearchHighlight && searchPagePts == null) {
+                searchPagePts = withContext(Dispatchers.IO) {
+                    val s = pdfDocCache.document(page.pdfSourcePath)?.pageSize(page.pdfPageIndex)
+                    if (s != null && s.size >= 2 && s[0] > 0f && s[1] > 0f) s[0] to s[1] else null
+                }
+            }
+        }
+        val ptsForHighlight = searchPagePts
+        if (searchHighlightUserRects.isNotEmpty() && ptsForHighlight != null) {
+            androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
+                val rect = if (isInfinite) {
+                    ContinuousPageGeometry.BoxRect(0f, 0f, 1f, 1f)
+                } else {
+                    pageRectOf(pageIndex, size.width, size.height)
+                }
+                if (rect.empty) return@Canvas
+                val boxRects = PdfTextIndex.userRectsToBoxCanvasRects(
+                    userRects = searchHighlightUserRects,
+                    pageWidthPts = ptsForHighlight.first,
+                    pageHeightPts = ptsForHighlight.second,
+                    pageLeftPx = rect.left * size.width,
+                    pageTopPx = rect.top * size.height,
+                    pageWidthPx = rect.width * size.width
+                )
+                for (r in boxRects) {
+                    val w = (r[2] - r[0]).coerceAtLeast(1f)
+                    val h = (r[3] - r[1]).coerceAtLeast(1f)
+                    drawRect(
+                        color = Color(0x66FF9800),
+                        topLeft = androidx.compose.ui.geometry.Offset(r[0], r[1]),
+                        size = androidx.compose.ui.geometry.Size(w, h)
+                    )
+                    drawRect(
+                        color = Color(0xCCEF6C00),
+                        topLeft = androidx.compose.ui.geometry.Offset(r[0], r[1]),
+                        size = androidx.compose.ui.geometry.Size(w, h),
+                        style = androidx.compose.ui.graphics.drawscope.Stroke(width = 2f)
+                    )
+                }
+            }
+        }
+
         // Floating layers, composited in the page's own pixel space so they
         // land exactly where the single-page engine placed them. The page is
         // drawn into the page rect, so the same rect is used here.
@@ -9412,6 +11176,7 @@ fun ContinuousPageView(
         // all: that is the mask of the eye button.
         layerStack.layers.forEach { layer ->
             if (!layer.visible) return@forEach
+            val liveEraser = ink.liveEraserStroke(pageIndex, layer)
             // The layer of the session is a grid of tiles: every tile is
             // drawn into its own part of the layer's rect. Without a session
             // (the user only reads) the layer comes from the disk as one
@@ -9429,8 +11194,21 @@ fun ContinuousPageView(
             val ops = ink.layerOps(pageIndex, layer)
             if (placements.isEmpty() && saved.isEmpty() && ops.isEmpty()) return@forEach
             if (placements.isNotEmpty() || saved.isNotEmpty()) {
-                androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
+                androidx.compose.foundation.Canvas(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .then(
+                            if (liveEraser != null) {
+                                Modifier.graphicsLayer(
+                                    compositingStrategy = androidx.compose.ui.graphics.CompositingStrategy.Offscreen
+                                )
+                            } else {
+                                Modifier
+                            }
+                        )
+                ) {
                     val _revision = ink.revision
+                    val _previewRev = if (liveEraser != null && ink.livePageIndex == pageIndex) ink.previewRevision else 0
                     val rect = ink.layerRectFor(pageIndex, size.width, size.height, pageRatioOf())
                     if (rect.empty) return@Canvas
                     val dest = android.graphics.RectF(
@@ -9468,6 +11246,9 @@ fun ContinuousPageView(
                                 )
                             }
                         }
+                        if (liveEraser != null) {
+                            ink.drawLiveEraserCut(native, liveEraser, size.width, size.height)
+                        }
                     }
                 }
             }
@@ -9481,7 +11262,7 @@ fun ContinuousPageView(
             // wipe must cut the strokes of this layer, never the page image
             // (the PDF text) or the layer below it.
             if (ops.isNotEmpty()) {
-                val eraseLayer = ink.layerHasErase(pageIndex, layer)
+                val eraseLayer = ink.layerHasErase(pageIndex, layer) || liveEraser != null
                 androidx.compose.foundation.Canvas(
                     modifier = Modifier
                         .fillMaxSize()
@@ -9496,6 +11277,7 @@ fun ContinuousPageView(
                         )
                 ) {
                     val _revision = ink.revision
+                    val _previewRev = if (liveEraser != null && ink.livePageIndex == pageIndex) ink.previewRevision else 0
                     drawIntoCanvas { canvas ->
                         if (pageType == "a4") {
                             canvas.save()
@@ -9523,6 +11305,7 @@ fun ContinuousPageView(
             val _revision = ink.revision
             val _previewRevision = if (ink.livePageIndex == pageIndex) ink.previewRevision else 0
             val _laserRevision = ink.laserRevision
+            val _lassoRevision = if (ink.lassoPageIndex == pageIndex || ink.lassoPageIndex == -1) ink.lassoRevision else 0
             // The strokes are normalised to the box: the session has to know
             // the size of the box (the zoom changed it).
             ink.updateGeometry(pageIndex, size.width, size.height)
@@ -9530,10 +11313,123 @@ fun ContinuousPageView(
                 if (pageType == "a4") {
                     canvas.save()
                     canvas.clipRect(0f, 0f, size.width, size.height)
-                    ink.drawPreview(canvas.nativeCanvas, pageIndex, size.width, size.height)
+                    ink.drawPreview(canvas.nativeCanvas, pageIndex, size.width, size.height, includeLasso = false)
                     canvas.restore()
+                    ink.drawLassoOverlayForPage(canvas.nativeCanvas, pageIndex, size.width, size.height, scale = 1f)
                 } else {
                     ink.drawPreview(canvas.nativeCanvas, pageIndex, size.width, size.height)
+                }
+            }
+        }
+
+        if (!isInfinite && ContinuousPageGeometry.marginFor(pageType) > 0f) {
+            val localDensity = LocalDensity.current
+            val guideLineColor = Color(0xFF94A3B8).copy(alpha = 0.38f)
+            val labelBgColor = Color(0xFF1E293B)
+            val labelPaint = remember(localDensity) {
+                android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                    textSize = with(localDensity) { 10.sp.toPx() }
+                    typeface = android.graphics.Typeface.DEFAULT
+                    isFakeBoldText = true
+                    color = android.graphics.Color.WHITE
+                }
+            }
+            androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
+                val _rev = ink.revision
+                val _layerRev = ink.layersRevision
+                val _marginRev = ink.marginPresenceRevision
+                val _pan = panOffsetX
+                val _zoom = zoom
+                val vpW = if (viewportWidthPx > 0f) viewportWidthPx else size.width
+                val pageLeftInViewport = if (pageBox.valid) {
+                    pageBox.originX - canvasOriginXProvider()
+                } else {
+                    (vpW - size.width) / 2f + _pan
+                }
+                val presence = ink.marginInkPresence(pageIndex)
+                val guideState = MarginExportMath.computeGuideState(
+                    pageType = pageType,
+                    pageLeftInViewportPx = pageLeftInViewport,
+                    pageWidthPx = size.width,
+                    viewportWidthPx = vpW,
+                    presence = presence,
+                    allowLeftPanReveal = allowLeftPanReveal,
+                    allowRightPanReveal = allowRightPanReveal
+                )
+                val dashPx = 6.dp.toPx()
+                val dashEffect = PathEffect.dashPathEffect(floatArrayOf(dashPx, dashPx), 0f)
+                val strokePx = 1.dp.toPx()
+                if (guideState.showLeftGuide) {
+                    drawLine(
+                        color = guideLineColor,
+                        start = androidx.compose.ui.geometry.Offset(0f, 0f),
+                        end = androidx.compose.ui.geometry.Offset(0f, size.height),
+                        strokeWidth = strokePx,
+                        pathEffect = dashEffect
+                    )
+                }
+                if (guideState.showRightGuide) {
+                    drawLine(
+                        color = guideLineColor,
+                        start = androidx.compose.ui.geometry.Offset(size.width, 0f),
+                        end = androidx.compose.ui.geometry.Offset(size.width, size.height),
+                        strokeWidth = strokePx,
+                        pathEffect = dashEffect
+                    )
+                }
+                val labelAlpha = marginLabelAlphaProvider().coerceIn(0f, 1f)
+                if (labelAlpha > 0.01f) {
+                    val minReveal = 44.dp.toPx()
+                    val padX = 6.dp.toPx()
+                    val padY = 3.dp.toPx()
+                    val gap = 8.dp.toPx()
+                    val topY = 20.dp.toPx()
+                    val text = "margin"
+                    val textW = labelPaint.measureText(text)
+                    val fm = labelPaint.fontMetrics
+                    val textH = fm.descent - fm.ascent
+                    val pillW = textW + padX * 2f
+                    val pillH = textH + padY * 2f
+                    val cornerR = 6.dp.toPx()
+                    labelPaint.alpha = (230 * labelAlpha).roundToInt().coerceIn(0, 255)
+                    if (guideState.showLeftGuide && allowLeftMarginLabel &&
+                        guideState.leftRevealedPx >= minReveal
+                    ) {
+                        val pillLeft = -gap - pillW
+                        drawRoundRect(
+                            color = labelBgColor.copy(alpha = 0.65f * labelAlpha),
+                            topLeft = androidx.compose.ui.geometry.Offset(pillLeft, topY),
+                            size = androidx.compose.ui.geometry.Size(pillW, pillH),
+                            cornerRadius = androidx.compose.ui.geometry.CornerRadius(cornerR, cornerR)
+                        )
+                        drawIntoCanvas { canvas ->
+                            canvas.nativeCanvas.drawText(
+                                text,
+                                pillLeft + padX,
+                                topY + padY - fm.ascent,
+                                labelPaint
+                            )
+                        }
+                    }
+                    if (guideState.showRightGuide && allowRightMarginLabel &&
+                        guideState.rightRevealedPx >= minReveal
+                    ) {
+                        val pillLeft = size.width + gap
+                        drawRoundRect(
+                            color = labelBgColor.copy(alpha = 0.65f * labelAlpha),
+                            topLeft = androidx.compose.ui.geometry.Offset(pillLeft, topY),
+                            size = androidx.compose.ui.geometry.Size(pillW, pillH),
+                            cornerRadius = androidx.compose.ui.geometry.CornerRadius(cornerR, cornerR)
+                        )
+                        drawIntoCanvas { canvas ->
+                            canvas.nativeCanvas.drawText(
+                                text,
+                                pillLeft + padX,
+                                topY + padY - fm.ascent,
+                                labelPaint
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -9568,11 +11464,15 @@ fun ContinuousPageView(
         Box(
             modifier = Modifier
                 .matchParentSize()
-                .pointerInput(page.id, inkSettings) {
+                .pointerInput(page.id, pageIndex, inkSettings) {
                     if (inkSettings.readingMode) return@pointerInput
                     try {
                     awaitEachGesture {
-                        val down = awaitFirstDown(requireUnconsumed = false)
+                        var pendingDown: androidx.compose.ui.input.pointer.PointerInputChange? =
+                            awaitFirstDown(requireUnconsumed = false)
+                        while (pendingDown != null) {
+                        val down = pendingDown
+                        pendingDown = null
                         val isStylus = down.type == PointerType.Stylus || down.type == PointerType.Eraser
                         if (isStylus) onStylusDetected()
                         val isAllowedPointer = isStylus || (!inkSettings.stylusOnly && down.type == PointerType.Touch)
@@ -9599,19 +11499,337 @@ fun ContinuousPageView(
                             ink.clearLaser()
                             return@awaitEachGesture
                         }
-                        // Stylus mode: the hand may scroll, pinch and use the
-                        // tools, but it does not write.
-                        if (!isAllowedPointer) return@awaitEachGesture
+
+                        val preHitLassoHandle = if (inkSettings.tool == CanvasTool.LASSO || inkSettings.tool == CanvasTool.SELECT) {
+                            val bw = size.width.toFloat()
+                            val bh = size.height.toFloat()
+                            ink.updateGeometry(pageIndex, bw, bh)
+                            ink.hitTestLassoHandle(pageIndex, down.position.x, down.position.y, bw, bh, scale = 1f)
+                        } else {
+                            LassoHandle.NONE
+                        }
+
+                        // Stylus mode: the hand may scroll, pinch and manipulate
+                        // active Lasso handles, while watching for a stylus touchdown
+                        // even if the palm rested on the screen first.
+                        if (!isAllowedPointer && preHitLassoHandle == LassoHandle.NONE) {
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                val stylusDown = event.changes.firstOrNull {
+                                    it.pressed && (it.type == PointerType.Stylus || it.type == PointerType.Eraser)
+                                }
+                                if (stylusDown != null) {
+                                    pendingDown = stylusDown
+                                    break
+                                }
+                                if (event.changes.none { it.pressed }) break
+                            }
+                            continue
+                        }
+
+                        if (inkSettings.tool == CanvasTool.LASSO || inkSettings.tool == CanvasTool.SELECT) {
+                            val boxW = size.width.toFloat()
+                            val boxH = size.height.toFloat()
+                            val downX = down.position.x
+                            val downY = down.position.y
+                            ink.updateGeometry(pageIndex, boxW, boxH)
+
+                            suspend fun androidx.compose.ui.input.pointer.AwaitPointerEventScope.handleContinuousStrokeSelectionHandle(
+                                handle: LassoHandle
+                            ) {
+                                val b = ink.lassoBounds(pageIndex, boxW, boxH, 1f) ?: return
+                                val boundsNorm = NormRect(
+                                    b.left / boxW,
+                                    b.top / boxH,
+                                    b.right / boxW,
+                                    b.bottom / boxH
+                                )
+                                ink.isManipulatingLasso = true
+                                try {
+                                    when (handle) {
+                                        LassoHandle.DELETE -> {
+                                            ink.lassoDelete(pageIndex)
+                                            while (true) {
+                                                val event = awaitPointerEvent()
+                                                if (!isStylus) {
+                                                    if (event.changes.count { it.pressed } > 1) break
+                                                }
+                                                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                                change.consume()
+                                                if (change.changedToUpIgnoreConsumed()) break
+                                            }
+                                        }
+                                        LassoHandle.MIRROR -> {
+                                            ink.lassoMirrorHorizontal(pageIndex, boxW, boxH)
+                                            while (true) {
+                                                val event = awaitPointerEvent()
+                                                if (!isStylus) {
+                                                    if (event.changes.count { it.pressed } > 1) break
+                                                }
+                                                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                                change.consume()
+                                                if (change.changedToUpIgnoreConsumed()) break
+                                            }
+                                        }
+                                        LassoHandle.COPY -> {
+                                            if (ink.lassoStartCopy(pageIndex)) {
+                                                var lastPos = down.position
+                                                var movedDist = 0f
+                                                while (true) {
+                                                    val event = awaitPointerEvent()
+                                                    if (!isStylus) {
+                                                        if (event.changes.count { it.pressed } > 1) break
+                                                    }
+                                                    val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                                    val delta = change.position - lastPos
+                                                    lastPos = change.position
+                                                    movedDist += delta.getDistance()
+                                                    ink.lassoMove(pageIndex, delta.x, delta.y, boxW, boxH)
+                                                    change.consume()
+                                                    if (change.changedToUpIgnoreConsumed()) break
+                                                }
+                                                if (movedDist < 8f) {
+                                                    ink.lassoMove(pageIndex, 28f, 28f, boxW, boxH)
+                                                }
+                                                ink.lassoCommitMove(pageIndex)
+                                            }
+                                        }
+                                        LassoHandle.ROTATE -> {
+                                            val cx = b.centerX()
+                                            val cy = b.centerY()
+                                            val startAngle = kotlin.math.atan2(
+                                                (downY - cy).toDouble(),
+                                                (downX - cx).toDouble()
+                                            ).toFloat()
+                                            ink.lassoBeginTransform()
+                                            while (true) {
+                                                val event = awaitPointerEvent()
+                                                if (!isStylus) {
+                                                    if (event.changes.count { it.pressed } > 1) break
+                                                }
+                                                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                                val curAngle = kotlin.math.atan2(
+                                                    (change.position.y - cy).toDouble(),
+                                                    (change.position.x - cx).toDouble()
+                                                ).toFloat()
+                                                ink.lassoRotateTo(
+                                                    pageIndex,
+                                                    curAngle - startAngle,
+                                                    cx,
+                                                    cy,
+                                                    boxW,
+                                                    boxH
+                                                )
+                                                change.consume()
+                                                if (change.changedToUpIgnoreConsumed()) break
+                                            }
+                                            ink.lassoCommitTransform(pageIndex)
+                                        }
+                                        LassoHandle.SCALE_CORNER_BR -> {
+                                            val boxRatio = ContinuousStrokeTransformMath.safeBoxRatio(boxW / boxH)
+                                            ink.lassoBeginTransform()
+                                            while (true) {
+                                                val event = awaitPointerEvent()
+                                                if (!isStylus) {
+                                                    if (event.changes.count { it.pressed } > 1) break
+                                                }
+                                                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                                val f = ContinuousStrokeTransformMath.proportionalScaleFactor(
+                                                    startXNorm = downX / boxW,
+                                                    startYNorm = downY / boxH,
+                                                    curXNorm = change.position.x / boxW,
+                                                    curYNorm = change.position.y / boxH,
+                                                    anchorXNorm = boundsNorm.left,
+                                                    anchorYNorm = boundsNorm.top,
+                                                    boxRatio = boxRatio
+                                                )
+                                                ink.lassoScaleTo(pageIndex, f, f, b.left, b.top, boxW, boxH)
+                                                change.consume()
+                                                if (change.changedToUpIgnoreConsumed()) break
+                                            }
+                                            ink.lassoCommitTransform(pageIndex)
+                                        }
+                                        LassoHandle.SCALE_LEFT,
+                                        LassoHandle.SCALE_RIGHT,
+                                        LassoHandle.SCALE_TOP,
+                                        LassoHandle.SCALE_BOTTOM -> {
+                                            ink.lassoBeginTransform()
+                                            while (true) {
+                                                val event = awaitPointerEvent()
+                                                if (!isStylus) {
+                                                    if (event.changes.count { it.pressed } > 1) break
+                                                }
+                                                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                                val spec = ContinuousStrokeTransformMath.edgeScaleFactors(
+                                                    handle = handle,
+                                                    bounds = boundsNorm,
+                                                    startXNorm = downX / boxW,
+                                                    startYNorm = downY / boxH,
+                                                    curXNorm = change.position.x / boxW,
+                                                    curYNorm = change.position.y / boxH
+                                                )
+                                                if (spec != null) {
+                                                    ink.lassoScaleTo(
+                                                        pageIndex,
+                                                        spec.scaleX,
+                                                        spec.scaleY,
+                                                        spec.anchorXNorm * boxW,
+                                                        spec.anchorYNorm * boxH,
+                                                        boxW,
+                                                        boxH
+                                                    )
+                                                }
+                                                change.consume()
+                                                if (change.changedToUpIgnoreConsumed()) break
+                                            }
+                                            ink.lassoCommitTransform(pageIndex)
+                                        }
+                                        LassoHandle.MOVE -> {
+                                            var lastPos = down.position
+                                            while (true) {
+                                                val event = awaitPointerEvent()
+                                                if (!isStylus) {
+                                                    if (event.changes.count { it.pressed } > 1) break
+                                                }
+                                                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                                val delta = change.position - lastPos
+                                                lastPos = change.position
+                                                ink.lassoMove(pageIndex, delta.x, delta.y, boxW, boxH)
+                                                change.consume()
+                                                if (change.changedToUpIgnoreConsumed()) break
+                                            }
+                                            ink.lassoCommitMove(pageIndex)
+                                        }
+                                        LassoHandle.NONE -> Unit
+                                    }
+                                } finally {
+                                    ink.isManipulatingLasso = false
+                                }
+                            }
+
+                            val hitHandle = preHitLassoHandle
+                            if (hitHandle != LassoHandle.NONE) {
+                                down.consume()
+                                onActivatePage()
+                                onClick()
+                                handleContinuousStrokeSelectionHandle(hitHandle)
+                                return@awaitEachGesture
+                            }
+
+                            if (inkSettings.tool == CanvasTool.SELECT) {
+                                val activeSession = ink.getSession(pageIndex)
+                                if (activeSession != null && activeSession.ready) {
+                                    if (ink.selectSingleStrokeAt(pageIndex, downX, downY, 1f, boxW, boxH)) {
+                                        down.consume()
+                                        onActivatePage()
+                                        onClick()
+                                        handleContinuousStrokeSelectionHandle(LassoHandle.MOVE)
+                                    } else {
+                                        ink.lassoClear()
+                                    }
+                                } else {
+                                    var dragged = false
+                                    while (true) {
+                                        val event = awaitPointerEvent()
+                                        if (!isStylus) {
+                                            if (event.changes.count { it.pressed } > 1) {
+                                                dragged = true
+                                                break
+                                            }
+                                        }
+                                        val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                        if ((change.position - down.position).getDistance() >= 12f) {
+                                            dragged = true
+                                            break
+                                        }
+                                        if (change.changedToUpIgnoreConsumed()) break
+                                    }
+                                    if (!dragged) {
+                                        onActivatePage()
+                                        coroutineScope.launch {
+                                            val ready = ink.ensureSessionReady(page, pageIndex) ?: return@launch
+                                            if (!ready.ready ||
+                                                latestInkSettings.readingMode ||
+                                                latestInkSettings.tool != CanvasTool.SELECT
+                                            ) {
+                                                return@launch
+                                            }
+                                            ink.updateGeometry(pageIndex, boxW, boxH)
+                                            ink.selectSingleStrokeAt(pageIndex, downX, downY, 1f, boxW, boxH)
+                                        }
+                                    }
+                                }
+                                return@awaitEachGesture
+                            }
+
+                            down.consume()
+                            onActivatePage()
+                            onClick()
+                            ink.lassoClear()
+                            ink.ensureSessionForPage(page, pageIndex)
+                            ink.updateGeometry(pageIndex, boxW, boxH)
+                            val loop = mutableListOf(Pair(downX, downY))
+                            var aborted = false
+                            ink.isManipulatingLasso = true
+                            try {
+                                while (true) {
+                                    val event = awaitPointerEvent()
+                                    if (!isStylus) {
+                                        if (event.changes.count { it.pressed } > 1) {
+                                            aborted = true
+                                            break
+                                        }
+                                    }
+                                    val change = event.changes.firstOrNull { it.id == down.id }
+                                    if (change == null) {
+                                        aborted = true
+                                        break
+                                    }
+                                    loop.add(Pair(change.position.x, change.position.y))
+                                    ink.lassoUpdatePath(pageIndex, loop, boxW, boxH)
+                                    change.consume()
+                                    if (change.changedToUpIgnoreConsumed()) break
+                                }
+                            } finally {
+                                ink.isManipulatingLasso = false
+                            }
+                            if (aborted) {
+                                ink.lassoClear()
+                            } else if (ink.getSession(pageIndex)?.ready == true) {
+                                val picked = ink.lassoFinish(pageIndex, loop, boxW, boxH)
+                                if (picked == 0) ink.lassoClear()
+                            } else {
+                                val finalLoop = loop.toList()
+                                coroutineScope.launch {
+                                    val ready = ink.ensureSessionReady(page, pageIndex)
+                                    if (ready == null ||
+                                        !ready.ready ||
+                                        latestInkSettings.readingMode ||
+                                        latestInkSettings.tool != CanvasTool.LASSO
+                                    ) {
+                                        if (ink.lassoPageIndex == pageIndex) ink.lassoClear()
+                                        return@launch
+                                    }
+                                    ink.updateGeometry(pageIndex, boxW, boxH)
+                                    val picked = ink.lassoFinish(pageIndex, finalLoop, boxW, boxH)
+                                    if (picked == 0) ink.lassoClear()
+                                }
+                            }
+                            return@awaitEachGesture
+                        }
+
                         if (!inkSettings.isWritingTool) return@awaitEachGesture
                         
                         down.consume()
+                        onActivatePage()
+                        onClick()
                         val boxW = size.width.toFloat()
                         val boxH = size.height.toFloat()
                         // The enclosing container is already offset on screen by continuousPanX/Y,
                         // so down.position is already in this page box's local coordinate space.
                         val x = down.position.x / boxW
                         val y = down.position.y / boxH
-                        ink.beginStroke(
+                        val started = ink.beginStroke(
                             page = page,
                             pageIndex = pageIndex,
                             x = x,
@@ -9623,13 +11841,17 @@ fun ContinuousPageView(
                             settings = inkSettings,
                             tilt = personal.notes.touch.StylusTiltTracker.currentTiltRad
                         )
+                        if (!started) return@awaitEachGesture
                         while (true) {
                             val event = awaitPointerEvent()
                             // If a second finger lands (pinch-to-zoom / multi-touch pan gesture),
                             // abort the stroke immediately so gestures take over smoothly.
-                            if (event.changes.count { it.pressed } > 1) {
-                                ink.cancelStroke()
-                                break
+                            // Stylus strokes ignore palm contacts.
+                            if (!isStylus) {
+                                if (event.changes.count { it.pressed } > 1) {
+                                    ink.cancelStroke()
+                                    break
+                                }
                             }
                             val change = event.changes.firstOrNull { it.id == down.id }
                             if (change == null) {
@@ -9656,6 +11878,7 @@ fun ContinuousPageView(
                             ink.extendStroke(curX, curY, change.pressure, inkSettings, tiltNow)
                             change.consume()
                         }
+                        }
                     }
                     } finally {
                         // The gesture handler can be cancelled (the tool
@@ -9663,6 +11886,7 @@ fun ContinuousPageView(
                         // not stay in the "drawing" state, or it would refuse
                         // to scroll.
                         ink.cancelStroke()
+                        ink.cancelLassoGesture()
                     }
                 }
         )
@@ -9798,6 +12022,7 @@ private fun PageThumbnailCard(
     noteId: String,
     fileStore: personal.notes.touch.data.files.NoteFileStore,
     pageItem: personal.notes.touch.data.db.entity.PageEntity,
+    pageType: String = "a4",
     pdfDocCache: personal.notes.touch.util.PdfDocumentCache,
     isSelected: Boolean,
     isBookmarked: Boolean,
@@ -9809,59 +12034,43 @@ private fun PageThumbnailCard(
 ) {
     var showMenu by remember { mutableStateOf(false) }
 
-    val pageFile = remember(noteId, pageItem.index) {
-        fileStore.getPageFile(noteId, pageItem.index)
-    }
-    val strokesFile = remember(noteId, pageItem.index) {
-        fileStore.getStrokesFile(noteId, pageItem.index)
-    }
-
-    val thumbnailBmp by produceState<Bitmap?>(initialValue = null, noteId, pageItem.index, pageItem.updatedAt, savedGeneration) {
-        value = withContext(Dispatchers.IO) {
-            val base = if (pageItem.pdfSourcePath.isNotEmpty() && pageItem.pdfPageIndex >= 0) {
-                try {
-                    val doc = pdfDocCache.document(pageItem.pdfSourcePath)
-                    doc?.renderPage(pageItem.pdfPageIndex, targetWidth = 240, targetHeight = 340)
-                } catch (e: Exception) {
-                    null
-                }
-            } else if (pageFile.exists()) {
-                personal.notes.touch.util.BitmapUtils.loadThumbnail(pageFile, targetWidth = 240, targetHeight = 340)
-            } else null
-
-            val strokes = if (strokesFile.exists()) {
-                personal.notes.touch.util.BitmapUtils.loadAlphaThumbnail(strokesFile, targetWidth = 240, targetHeight = 340)
-            } else null
-
-            when {
-                base != null && strokes != null -> {
-                    val comp = base.copy(Bitmap.Config.ARGB_8888, true)
-                    if (comp != null) {
-                        android.graphics.Canvas(comp).drawBitmap(
-                            strokes,
-                            null,
-                            android.graphics.Rect(0, 0, comp.width, comp.height),
-                            android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG)
-                        )
-                        comp
-                    } else base
-                }
-                base != null -> base
-                strokes != null -> strokes
-                else -> null
-            }
+    val isVector = pageItem.pdfSourcePath.isNotEmpty() && pageItem.pdfPageIndex >= 0
+    val initialAspect = remember(pageItem.id, pageItem.pdfSourcePath, pageItem.pdfPageIndex) {
+        if (isVector) {
+            PageAspectCache.default.get(pageItem.pdfSourcePath, pageItem.pdfPageIndex)
+                ?: PdfPageGeometry.DEFAULT_ASPECT
+        } else {
+            PdfPageGeometry.DEFAULT_ASPECT
         }
     }
+
+    val thumbnailResult by produceState<Pair<Bitmap?, Float>>(
+        initialValue = null to initialAspect,
+        noteId, pageItem.index, pageItem.updatedAt, pageItem.pdfSourcePath, pageItem.pdfPageIndex, pageType, savedGeneration
+    ) {
+        value = personal.notes.touch.util.BitmapUtils.loadOrRenderPageThumbnail(
+            noteId = noteId,
+            fileStore = fileStore,
+            page = pageItem,
+            pdfDocCache = pdfDocCache,
+            aspectCache = PageAspectCache.default,
+            pageType = pageType,
+            longSidePx = 340,
+            savedGeneration = savedGeneration
+        )
+    }
+    val thumbnailBmp = thumbnailResult.first
+    val pageAspect = thumbnailResult.second
 
     Column(
         modifier = modifier.padding(6.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        // Page preview box (portrait aspect ratio 0.707f)
+        // Page preview box matching the page's true aspect ratio
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .aspectRatio(0.707f)
+                .aspectRatio(pageAspect)
                 .background(Color.White, RoundedCornerShape(4.dp))
                 .border(0.5.dp, Color(0xFFEAEAEA), RoundedCornerShape(4.dp)),
             contentAlignment = Alignment.Center
@@ -9954,3 +12163,10 @@ private fun PageThumbnailCard(
         }
     }
 }
+
+private data class SearchHighlightTarget(
+    val notePageIndex: Int,
+    val startOffset: Int,
+    val length: Int,
+    val revision: Int
+)

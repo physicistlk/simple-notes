@@ -108,7 +108,7 @@ object ContinuousPageGeometry {
      * so its shape is the shape of the screen.
      */
     fun boxRatio(pageType: String?, pageRatio: Float): Float {
-        val ratio = if (pageRatio > 0f) pageRatio else defaultRatio(pageType)
+        val ratio = if (pageRatio.isFinite() && pageRatio > 0f) pageRatio else defaultRatio(pageType)
         // The box of a page is the page: the document fills the screen and the
         // margin of the annotation layer reaches past it - the page is pulled
         // aside to write in it.
@@ -127,8 +127,10 @@ object ContinuousPageGeometry {
         boxWidth: Float,
         boxHeight: Float
     ): BoxRect {
-        if (boxWidth <= 0f || boxHeight <= 0f) return BoxRect(0f, 0f, 1f, 1f)
-        val ratio = if (pageRatio > 0f) pageRatio else defaultRatio(pageType)
+        if (!boxWidth.isFinite() || !boxHeight.isFinite() || boxWidth <= 0f || boxHeight <= 0f) {
+            return BoxRect(0f, 0f, 1f, 1f)
+        }
+        val ratio = if (pageRatio.isFinite() && pageRatio > 0f) pageRatio else defaultRatio(pageType)
         return if (isInfinite(pageType)) {
             infiniteRect(ratio, boxWidth, boxHeight)
         } else {
@@ -190,9 +192,9 @@ object ContinuousPageGeometry {
         pageRatio: Float,
         pageWidth: Int = PAGE_WIDTH
     ): LayerSize {
-        val ratio = if (pageRatio > 0f) pageRatio else defaultRatio(pageType)
+        val ratio = if (pageRatio.isFinite() && pageRatio > 0f) pageRatio else defaultRatio(pageType)
         val width = (pageWidth * (1f + 2f * marginFor(pageType))).roundToInt()
-        val height = (pageWidth / ratio).roundToInt().coerceAtLeast(1)
+        val height = (pageWidth / ratio).roundToInt().coerceIn(1, 16384)
         return LayerSize(width.coerceAtLeast(1), height)
     }
 
@@ -265,22 +267,34 @@ object ContinuousPageGeometry {
         boxWidth: Float,
         boxHeight: Float,
         padFactor: Float,
-        extraPx: Float
+        extraPx: Float,
+        minWidthNorm: Float = 0f
     ): BoxRect? {
-        if (points.isEmpty() || boxWidth <= 0f || boxHeight <= 0f) return null
+        if (points.isEmpty() || !boxWidth.isFinite() || !boxHeight.isFinite() ||
+            boxWidth <= 0f || boxHeight <= 0f
+        ) {
+            return null
+        }
+        val safePadFactor = if (padFactor.isFinite() && padFactor >= 0f) padFactor else 0f
+        val safeExtraPx = if (extraPx.isFinite() && extraPx >= 0f) extraPx else 0f
         var minX = Float.MAX_VALUE
         var minY = Float.MAX_VALUE
         var maxX = -Float.MAX_VALUE
         var maxY = -Float.MAX_VALUE
-        var widest = 0f
+        var widest = if (minWidthNorm.isFinite() && minWidthNorm > 0f) minWidthNorm else 0f
+        var hasFinitePoint = false
         for (p in points) {
+            if (!p.x.isFinite() || !p.y.isFinite()) continue
+            hasFinitePoint = true
             minX = min(minX, p.x); maxX = max(maxX, p.x)
             minY = min(minY, p.y); maxY = max(maxY, p.y)
-            if (p.w > widest) widest = p.w
+            if (p.w.isFinite() && p.w > widest) widest = p.w
         }
-        val pad = widest * boxWidth * padFactor + extraPx
+        if (!hasFinitePoint) return null
+        val pad = widest * boxWidth * safePadFactor + safeExtraPx
         val padX = pad / boxWidth
         val padY = pad / boxHeight
+        if (!padX.isFinite() || !padY.isFinite()) return null
         return BoxRect(minX - padX, minY - padY, maxX + padX, maxY + padY)
     }
 }

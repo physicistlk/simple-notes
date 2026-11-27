@@ -315,6 +315,41 @@ enum class PaperPattern {
 
     companion object {
         fun fromCode(code: Int): PaperPattern = entries.firstOrNull { it.ordinal == code } ?: BLANK
+
+        fun resolve(pagePatternCode: Int, backgroundMode: Int): PaperPattern =
+            when (fromCode(pagePatternCode)) {
+                GRID -> GRID
+                LINES -> LINES
+                DOTTED -> DOTTED
+                BLANK -> when (backgroundMode) {
+                    1 -> LINES
+                    2 -> GRID
+                    3 -> DOTTED
+                    else -> BLANK
+                }
+            }
+
+        /**
+         * Which pattern code the continuous reader should draw for a page.
+         *
+         * The page on screen follows the live canvas state (the app default or
+         * the Template tap) so a change is visible on the next frame; the other
+         * pages keep the pattern stored in their row. Without this, the
+         * continuous renderer only read `pages.paperPattern`, so the Settings
+         * "Default Paper Background Pattern" (and the Template row) appeared to
+         * do nothing until the row was re-read.
+         */
+        fun effectiveContinuousCode(
+            pagePatternCode: Int,
+            isCurrentPage: Boolean,
+            defaultPatternCode: Int
+        ): Int = if (isCurrentPage) defaultPatternCode else pagePatternCode
+
+        fun stepPx(density: Int, width: Float): Float {
+            val d = density.coerceIn(20, 80).toFloat()
+            val safeWidth = if (width.isFinite() && width > 0f) width else 0f
+            return (d * (safeWidth / 2160f)).coerceAtLeast(8f)
+        }
     }
 }
 
@@ -410,7 +445,8 @@ private const val DEFAULT_PAGE_HEIGHT = 3056
  */
 class ReaderLayerCache(
     private val fileStore: personal.notes.touch.data.files.NoteFileStore,
-    private val noteId: String
+    private val noteId: String,
+    private val pageSizeResolver: (suspend (Int) -> Pair<Int, Int>?)? = null
 ) {
     private val entries = mutableStateMapOf<Int, PageLayerEntry>()
     private val revisions = mutableStateMapOf<Int, Int>()
@@ -472,13 +508,15 @@ class ReaderLayerCache(
             if (pageFile.exists()) {
                 android.graphics.BitmapFactory.decodeFile(pageFile.absolutePath, bounds)
             }
+            val resolvedSize = if (bounds.outWidth > 0 && bounds.outHeight > 0) {
+                bounds.outWidth to bounds.outHeight
+            } else {
+                pageSizeResolver?.invoke(pageIndex) ?: (DEFAULT_PAGE_WIDTH to DEFAULT_PAGE_HEIGHT)
+            }
             PageLayerEntry(
                 layers = layers,
-                // A page that has never been rasterised has no PNG to take
-                // the size from, yet its layers are still positioned in the
-                // A4 pixel space layer insertion uses for it (2160×3056).
-                pageWidth = if (bounds.outWidth > 0) bounds.outWidth else DEFAULT_PAGE_WIDTH,
-                pageHeight = if (bounds.outHeight > 0) bounds.outHeight else DEFAULT_PAGE_HEIGHT
+                pageWidth = resolvedSize.first,
+                pageHeight = resolvedSize.second
             )
         }
         if (revision(pageIndex) != revisionAtStart || entries.containsKey(pageIndex)) return
@@ -643,6 +681,17 @@ class DrawingCanvasView @JvmOverloads constructor(
     var annotationOverlay: Bitmap? = null
         set(value) { field = value; invalidate() }
 
+    /** Visibility of Layer1 (`strokes_<i>.png`) on vector PDF pages, synced with [PageLayerStack]. */
+    var baseLayerVisible: Boolean = true
+        set(value) {
+            if (field != value) {
+                field = value
+                invalidate()
+            }
+        }
+
+    var onImageLayersSaved: ((pageIndex: Int) -> Unit)? = null
+
     // ---- F-10: live vector PDF background --------------------------------
     // The page is rendered from its source document at the current zoom level
     // instead of upscaling the import-time raster. The stroke layer
@@ -700,6 +749,21 @@ class DrawingCanvasView @JvmOverloads constructor(
         color = 0x5533B5E5
         style = Paint.Style.FILL
     }
+    private var searchHighlightRects: List<FloatArray> = emptyList()
+    private val searchHighlightPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0x66FF9800
+        style = Paint.Style.FILL
+    }
+    private val searchHighlightBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xCCEF6C00.toInt()
+        style = Paint.Style.STROKE
+        strokeWidth = 2f
+    }
+
+    fun setSearchHighlightRects(rects: List<FloatArray>) {
+        searchHighlightRects = rects
+        invalidate()
+    }
 
     /** Notified whenever the PDF text selection changes (null = nothing selected). */
     var onPdfSelectionChanged: ((PdfTextSelectionInfo?) -> Unit)? = null
@@ -722,7 +786,10 @@ class DrawingCanvasView @JvmOverloads constructor(
      */
     fun setPdfTextSource(source: PdfTextSource?) {
         pdfTextSource = source
-        if (source == null) pdfTextSelectionMode = false
+        if (source == null) {
+            pdfTextSelectionMode = false
+            searchHighlightRects = emptyList()
+        }
         clearPdfSelection()
         invalidate()
     }
@@ -1013,6 +1080,13 @@ class DrawingCanvasView @JvmOverloads constructor(
      * writing again.
      */
     var onCanvasTouchStart: (() -> Unit)? = null
+
+    /**
+     * Fired when single-pointer writing, erasing, shape, or lasso interaction
+     * actually begins (never on reading mode, stylus-only finger pan/pinch, or
+     * multi-touch gestures). Used to clear transient search highlights.
+     */
+    var onInkInteractionStart: (() -> Unit)? = null
 
     /**
      * Called whenever the page moves or zooms.
@@ -2017,25 +2091,31 @@ class DrawingCanvasView @JvmOverloads constructor(
                 arr.put(obj)
             }
             }
-            // The manifest is written atomically as well: a truncated one
-            // makes the whole layer list unreadable.
-            val manifestTmp = java.io.File(layersDir, "${infoFile.name}.tmp")
-            manifestTmp.writeText(arr.toString())
-            if (!manifestTmp.renameTo(infoFile)) {
-                if (!infoFile.delete() || !manifestTmp.renameTo(infoFile)) manifestTmp.delete()
-            }
-            layersDir.listFiles()?.forEach { file ->
-                // Only this page's files are cleaned up: the layers of the
-                // other pages must stay.
-                if (file.name.startsWith("page_${layerPage}_layer_") &&
-                    file.name.endsWith(".png") &&
-                    !writtenFiles.contains(file.name)
-                ) {
-                    file.delete()
+            withContext(Dispatchers.IO) {
+                // The manifest is written atomically as well: a truncated one
+                // makes the whole layer list unreadable.
+                val manifestTmp = java.io.File(layersDir, "${infoFile.name}.tmp")
+                manifestTmp.writeText(arr.toString())
+                if (!manifestTmp.renameTo(infoFile)) {
+                    if (!infoFile.delete() || !manifestTmp.renameTo(infoFile)) manifestTmp.delete()
                 }
+                layersDir.listFiles()?.forEach { file ->
+                    // Only this page's files are cleaned up: the layers of the
+                    // other pages must stay.
+                    if (file.name.startsWith("page_${layerPage}_layer_") &&
+                        file.name.endsWith(".png") &&
+                        !writtenFiles.contains(file.name)
+                    ) {
+                        file.delete()
+                    }
+                }
+                writeBeyondPageInk(layersDir, fileStore, noteId)
+                (context.applicationContext as? personal.notes.touch.TouchNotesApp)
+                    ?.noteRepository
+                    ?.touchNoteUpdatedAt(noteId)
             }
-            writeBeyondPageInk(layersDir, fileStore, noteId)
             layersDirty = false
+            onImageLayersSaved?.invoke(layerPage)
         } catch (e: Exception) {
             e.printStackTrace()
         }
@@ -2383,9 +2463,11 @@ class DrawingCanvasView @JvmOverloads constructor(
             canvas.clipRect(0f, 0f, pageW, pageH)
         }
 
-        // 3. Draw committed bitmap
-        backingBitmap?.let { bmp ->
-            canvas.drawBitmap(bmp, 0f, 0f, bitmapPaint)
+        // 3. Draw committed bitmap (for vector PDFs, Layer1 visibility gates strokes_<i>.png)
+        if (baseLayerVisible || pdfPageWidthPts <= 0f) {
+            backingBitmap?.let { bmp ->
+                canvas.drawBitmap(bmp, 0f, 0f, bitmapPaint)
+            }
         }
         annotationOverlay?.let { ov ->
             if (!ov.isRecycled) canvas.drawBitmap(ov, 0f, 0f, bitmapPaint)
@@ -2396,6 +2478,16 @@ class DrawingCanvasView @JvmOverloads constructor(
         if (pdfTextSelectionMode && selRects.isNotEmpty()) {
             for (r in selRects) {
                 canvas.drawRect(r[0], r[1], r[2], r[3], pdfSelectionPaint)
+            }
+        }
+
+        // 3a-2. PDF-QOL-3: Transient full-text search hit highlight.
+        if (searchHighlightRects.isNotEmpty()) {
+            for (r in searchHighlightRects) {
+                if (r.size >= 4) {
+                    canvas.drawRect(r[0], r[1], r[2], r[3], searchHighlightPaint)
+                    canvas.drawRect(r[0], r[1], r[2], r[3], searchHighlightBorderPaint)
+                }
             }
         }
 
@@ -2932,21 +3024,27 @@ class DrawingCanvasView @JvmOverloads constructor(
 
         // Multi-touch gestures (2-finger pinch zoom and pan):
         // Always allowed in drawing mode, stylus-only mode, and reading mode!
-        val pointerToolType = event.getToolType(0)
-        if (pointerToolType == MotionEvent.TOOL_TYPE_STYLUS ||
-            pointerToolType == MotionEvent.TOOL_TYPE_ERASER
-        ) {
+        var stylusIndex = -1
+        for (pIdx in 0 until event.pointerCount) {
+            val tt = event.getToolType(pIdx)
+            if (tt == MotionEvent.TOOL_TYPE_STYLUS || tt == MotionEvent.TOOL_TYPE_ERASER) {
+                stylusIndex = pIdx
+                break
+            }
+        }
+        if (stylusIndex >= 0) {
             onStylusDetected?.invoke()
         }
 
         // The laser pointer: it points with any pointer (finger or stylus),
         // in every mode, and never writes.
-        if (currentTool == CanvasTool.LASER_POINTER && event.pointerCount < 2) {
+        if (currentTool == CanvasTool.LASER_POINTER && (stylusIndex >= 0 || event.pointerCount < 2)) {
             handleLaserTouch(event)
             return true
         }
 
-        if (event.pointerCount >= 2) {
+        if (event.pointerCount >= 2 && stylusIndex < 0) {
+            pendingInkInteractionNotify = false
             if (event.actionMasked == MotionEvent.ACTION_POINTER_DOWN) {
                 // Pinch-zoom / two-finger pan: cancel any drawing
                 // interaction started by the first finger alone so the
@@ -2962,27 +3060,35 @@ class DrawingCanvasView @JvmOverloads constructor(
         // This has to happen before the drawing check below: in stylus mode a
         // finger touch never draws, and it used to return early - so the
         // menus stayed open and the tap did nothing.
-        if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+        if (event.actionMasked == MotionEvent.ACTION_DOWN ||
+            (stylusIndex >= 0 && event.actionMasked == MotionEvent.ACTION_POINTER_DOWN && event.actionIndex == stylusIndex)
+        ) {
             onCanvasTouchStart?.invoke()
             multiTouchCancelsStroke = false
         }
 
+        val activeIdx = if (stylusIndex >= 0) stylusIndex else 0
+        val pts = floatArrayOf(event.getX(activeIdx), event.getY(activeIdx))
+        pageInverseMatrix.mapPoints(pts)
+        val x = pts[0]
+        val y = pts[1]
+
+        val hasActiveLassoOrImage =
+            lassoState in listOf(LassoState.SELECTED, LassoState.DRAGGING, LassoState.RESIZING) ||
+                selectedImageIndex >= 0
+
         // Check if drawing / single-pointer editing is blocked (reading mode or non-stylus finger)
-        // Stylus mode: only the pen writes. The hand may still pinch, pan and
-        // use the tools - it just cannot draw.
-        val pointerType = event.getToolType(0)
+        // Stylus mode: only the pen writes. The hand may still pinch, pan, manipulate an active
+        // selection, and use the tools - it just cannot start raw ink strokes.
+        val pointerType = event.getToolType(activeIdx)
         val isDrawingBlocked = readingMode ||
-            (stylusOnly && pointerType != MotionEvent.TOOL_TYPE_STYLUS &&
+            (!hasActiveLassoOrImage && stylusOnly &&
+                pointerType != MotionEvent.TOOL_TYPE_STYLUS &&
                 pointerType != MotionEvent.TOOL_TYPE_ERASER)
         if (isDrawingBlocked) {
             // Return true on ACTION_DOWN and moves so multi-touch pinch/pan or tap up is delivered
             return true
         }
-
-        val pts = floatArrayOf(event.x, event.y)
-        pageInverseMatrix.mapPoints(pts)
-        val x = pts[0]
-        val y = pts[1]
 
         // F-10: PDF text selection intercepts single-pointer gestures while
         // the Text tool is active on a vector page (two-finger zoom/pan above
@@ -3031,7 +3137,44 @@ class DrawingCanvasView @JvmOverloads constructor(
         }
 
         // Image layer interaction (tap/drag/pinch)
-        if (handleImageLayerTouchEvent(event, x, y)) return true
+        if (handleImageLayerTouchEvent(event, x, y)) {
+            pendingInkInteractionNotify = false
+            return true
+        }
+
+        // Notify once single-pointer writing/erasing/shape/lasso actually begins
+        // (and has not been superseded by a multi-touch pinch/pan).
+        val isInkOrShapeTool = currentTool != CanvasTool.SELECT && currentTool != CanvasTool.LASER_POINTER
+        if (isInkOrShapeTool) {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    pendingInkInteractionNotify = true
+                    inkInteractionDownX = event.x
+                    inkInteractionDownY = event.y
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    if (pendingInkInteractionNotify && !multiTouchCancelsStroke) {
+                        val dx = Math.abs(event.x - inkInteractionDownX)
+                        val dy = Math.abs(event.y - inkInteractionDownY)
+                        if (dx > touchSlopPx || dy > touchSlopPx) {
+                            pendingInkInteractionNotify = false
+                            onInkInteractionStart?.invoke()
+                        }
+                    }
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (pendingInkInteractionNotify && !multiTouchCancelsStroke) {
+                        pendingInkInteractionNotify = false
+                        onInkInteractionStart?.invoke()
+                    }
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    pendingInkInteractionNotify = false
+                }
+            }
+        } else {
+            pendingInkInteractionNotify = false
+        }
 
         // A4 pages are strictly bounded to the paper; unlike PDFs, strokes cannot
         // start or spill outside the page into the surrounding desk.
@@ -3883,6 +4026,9 @@ class DrawingCanvasView @JvmOverloads constructor(
     // so that snapshot is popped and the later single-pointer UP/CANCEL
     // commits nothing.
     private var multiTouchCancelsStroke = false
+    private var pendingInkInteractionNotify = false
+    private var inkInteractionDownX = 0f
+    private var inkInteractionDownY = 0f
 
     private fun isDrawingInteractionInProgress(): Boolean {
         return !currentPath.isEmpty ||
@@ -3893,6 +4039,7 @@ class DrawingCanvasView @JvmOverloads constructor(
     }
 
     private fun cancelDrawingInteractionForMultiTouch() {
+        pendingInkInteractionNotify = false
         if (!isDrawingInteractionInProgress()) return
         multiTouchCancelsStroke = true
         currentPath.reset()

@@ -8,7 +8,6 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
-import android.graphics.Path
 import android.graphics.Rect
 import android.graphics.pdf.PdfDocument
 import android.net.Uri
@@ -16,14 +15,17 @@ import androidx.core.content.FileProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import personal.notes.touch.data.db.entity.NoteEntity
+import personal.notes.touch.data.db.entity.PageEntity
 import personal.notes.touch.data.files.NoteFileStore
 import personal.notes.touch.data.repo.NoteRepository
 import personal.notes.touch.text.MarkdownExport
+import personal.notes.touch.ui.canvas.ContinuousPageGeometry
 import personal.notes.touch.ui.canvas.ImageLayer
 import personal.notes.touch.ui.canvas.InkCrop
 import java.io.File
 import java.io.FileOutputStream
 import java.io.OutputStream
+import kotlin.math.roundToInt
 
 object ExportManager {
 
@@ -57,11 +59,18 @@ object ExportManager {
         backgroundBitmap: Bitmap? = null,
         imageLayers: List<ImageLayer> = emptyList()
     ): File = withContext(Dispatchers.IO) {
-        val flattened = flattenBitmap(bitmap, backgroundBitmap, imageLayers)
+        val flattened = if (backgroundBitmap == null && imageLayers.isEmpty()) {
+            bitmap
+        } else {
+            flattenBitmap(bitmap, backgroundBitmap, imageLayers)
+        }
         val safeTitle = sanitizeFilename(noteTitle)
         val file = File(getExportCacheDir(context), "${safeTitle}_page_${pageIndex + 1}.png")
         FileOutputStream(file).use { out ->
             flattened.compress(Bitmap.CompressFormat.PNG, 100, out)
+        }
+        if (flattened !== bitmap && !flattened.isRecycled) {
+            flattened.recycle()
         }
         file
     }
@@ -75,9 +84,16 @@ object ExportManager {
         backgroundBitmap: Bitmap? = null,
         imageLayers: List<ImageLayer> = emptyList()
     ) = withContext(Dispatchers.IO) {
-        val flattened = flattenBitmap(bitmap, backgroundBitmap, imageLayers)
+        val flattened = if (backgroundBitmap == null && imageLayers.isEmpty()) {
+            bitmap
+        } else {
+            flattenBitmap(bitmap, backgroundBitmap, imageLayers)
+        }
         outputStream.use { out ->
             flattened.compress(Bitmap.CompressFormat.PNG, 100, out)
+        }
+        if (flattened !== bitmap && !flattened.isRecycled) {
+            flattened.recycle()
         }
     }
 
@@ -92,12 +108,23 @@ object ExportManager {
         currentEditingBitmap: Bitmap? = null,
         currentPageIndex: Int = 0,
         currentEditingBackground: Bitmap? = null,
-        currentEditingImageLayers: List<ImageLayer> = emptyList()
+        currentEditingImageLayers: List<ImageLayer> = emptyList(),
+        includeMargins: Boolean = false
     ): File = withContext(Dispatchers.IO) {
         val safeTitle = sanitizeFilename(note.title)
         val pdfFile = File(getExportCacheDir(context), "$safeTitle.pdf")
         FileOutputStream(pdfFile).use { out ->
-            exportNoteToPdfStream(note, repository, fileStore, currentEditingBitmap, currentPageIndex, out, currentEditingBackground, currentEditingImageLayers)
+            exportNoteToPdfStream(
+                note = note,
+                repository = repository,
+                fileStore = fileStore,
+                currentEditingBitmap = currentEditingBitmap,
+                currentPageIndex = currentPageIndex,
+                outputStream = out,
+                currentEditingBackground = currentEditingBackground,
+                currentEditingImageLayers = currentEditingImageLayers,
+                includeMargins = includeMargins
+            )
         }
         pdfFile
     }
@@ -113,84 +140,139 @@ object ExportManager {
         currentPageIndex: Int,
         outputStream: OutputStream,
         currentEditingBackground: Bitmap? = null,
-        currentEditingImageLayers: List<ImageLayer> = emptyList()
+        currentEditingImageLayers: List<ImageLayer> = emptyList(),
+        includeMargins: Boolean = false
     ) = withContext(Dispatchers.IO) {
         val document = PdfDocument()
         val pageCount = note.pageCount.coerceAtLeast(1)
+        val pagesByIndex = repository.getPagesForNoteSync(note.id).associateBy { it.index }
+        val pdfDocs = HashMap<String, PdfiumDocument>()
 
         val hasTextContent = !note.content.isNullOrBlank()
 
-        // Standard A4 dimensions in Points (72 dpi): 595 x 842 pt
-        val pdfPageWidth = 595
-        val pdfPageHeight = 842
+        // Standard A4 dimensions in Points (72 dpi) for rich-text cover page
+        val coverWidth = 595
+        val coverHeight = 842
 
         var pdfPageNumber = 1
 
-        // If rich text note exists, render text cover/first page
-        if (hasTextContent) {
-            val pageInfo = PdfDocument.PageInfo.Builder(pdfPageWidth, pdfPageHeight, pdfPageNumber++).create()
-            val page = document.startPage(pageInfo)
-            val canvas = page.canvas
+        try {
+            // If rich text note exists, render text cover/first page
+            if (hasTextContent) {
+                val pageInfo = PdfDocument.PageInfo.Builder(coverWidth, coverHeight, pdfPageNumber++).create()
+                val page = document.startPage(pageInfo)
+                val canvas = page.canvas
 
-            renderTextContentToCanvas(
-                canvas = canvas,
-                title = note.title,
-                content = note.content ?: "",
-                width = pdfPageWidth,
-                height = pdfPageHeight
-            )
-
-            document.finishPage(page)
-        }
-
-        // Render each canvas page
-        for (pageIdx in 0 until pageCount) {
-            val bitmap = if (pageIdx == currentPageIndex && currentEditingBitmap != null) {
-                flattenBitmap(currentEditingBitmap, currentEditingBackground, currentEditingImageLayers)
-            } else {
-                loadFlattenedPageBitmap(fileStore, note.id, pageIdx, pageType = note.pageType)
-            }
-
-            val pageInfo = PdfDocument.PageInfo.Builder(pdfPageWidth, pdfPageHeight, pdfPageNumber++).create()
-            val page = document.startPage(pageInfo)
-            val canvas = page.canvas
-
-            // Fill page background white
-            canvas.drawColor(Color.WHITE)
-
-            if (bitmap != null) {
-                val (scaledW, scaledH) = calculateScaledDimensions(
-                    bitmap.width,
-                    bitmap.height,
-                    pdfPageWidth,
-                    pdfPageHeight
+                renderTextContentToCanvas(
+                    canvas = canvas,
+                    title = note.title,
+                    content = note.content ?: "",
+                    width = coverWidth,
+                    height = coverHeight
                 )
-                val left = (pdfPageWidth - scaledW) / 2
-                val top = (pdfPageHeight - scaledH) / 2
-                val destRect = Rect(left, top, left + scaledW, top + scaledH)
-                val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
-                canvas.drawBitmap(bitmap, null, destRect, paint)
-            } else {
-                // If page is blank, draw page number footer
-                val footerPaint = Paint().apply {
-                    color = Color.GRAY
-                    textSize = 12f
-                    isAntiAlias = true
-                    textAlign = Paint.Align.CENTER
+
+                document.finishPage(page)
+            }
+
+            // Render each canvas page
+            for (pageIdx in 0 until pageCount) {
+                val pageEntity = pagesByIndex[pageIdx]
+                val bitmap = if (pageIdx == currentPageIndex && currentEditingBitmap != null) {
+                    flattenCurrentPageForExport(
+                        note = note,
+                        repository = repository,
+                        fileStore = fileStore,
+                        pageIndex = pageIdx,
+                        currentEditingBitmap = currentEditingBitmap,
+                        currentEditingBackground = currentEditingBackground,
+                        currentEditingImageLayers = currentEditingImageLayers,
+                        pageEntity = pageEntity,
+                        pdfDocuments = pdfDocs,
+                        includeMargins = includeMargins
+                    )
+                } else {
+                    loadFlattenedPageBitmap(
+                        fileStore = fileStore,
+                        noteId = note.id,
+                        pageIndex = pageIdx,
+                        pageType = note.pageType,
+                        pageEntity = pageEntity,
+                        pdfDocuments = pdfDocs,
+                        repository = repository,
+                        includeMargins = includeMargins
+                    )
                 }
-                canvas.drawText("- Page ${pageIdx + 1} -", pdfPageWidth / 2f, pdfPageHeight - 30f, footerPaint)
+
+                val pdfSource = pageEntity?.let {
+                    if (it.pdfSourcePath.isNotBlank() && it.pdfPageIndex >= 0) {
+                        PdfExportPolicy.PdfPageSource(it.pdfSourcePath, it.pdfPageIndex)
+                    } else {
+                        null
+                    }
+                }
+                val pdfPts = if (pdfSource != null) {
+                    getOrOpenPdfDocument(fileStore, pdfSource.pdfSourcePath, pdfDocs)
+                        ?.pageSize(pdfSource.pdfPageIndex)
+                } else {
+                    null
+                }
+                val (pdfPageWidth, pdfPageHeight) = if (bitmap != null) {
+                    PdfExportPolicy.resolveExportPageSizePts(
+                        bitmapWidth = bitmap.width,
+                        bitmapHeight = bitmap.height,
+                        pdfPageWidthPts = pdfPts?.getOrNull(0) ?: 0f,
+                        pdfPageHeightPts = pdfPts?.getOrNull(1) ?: 0f
+                    )
+                } else if (pdfPts != null && pdfPts.size >= 2 && pdfPts[0] > 0f && pdfPts[1] > 0f) {
+                    MarginExportMath.exportPdfPageSizePts(
+                        pageAspect = PdfPageGeometry.aspect(pdfPts[0], pdfPts[1]),
+                        margin = ContinuousPageGeometry.marginFor(note.pageType),
+                        includeMargins = includeMargins
+                    )
+                } else {
+                    PdfExportPolicy.resolveExportPageSizePts(
+                        bitmapWidth = 0,
+                        bitmapHeight = 0,
+                        pdfPageWidthPts = 0f,
+                        pdfPageHeightPts = 0f
+                    )
+                }
+
+                val pageInfo = PdfDocument.PageInfo.Builder(pdfPageWidth, pdfPageHeight, pdfPageNumber++).create()
+                val page = document.startPage(pageInfo)
+                val canvas = page.canvas
+
+                // Fill page background white
+                canvas.drawColor(Color.WHITE)
+
+                if (bitmap != null) {
+                    val destRect = Rect(0, 0, pdfPageWidth, pdfPageHeight)
+                    val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
+                    canvas.drawBitmap(bitmap, null, destRect, paint)
+                } else {
+                    // If page is blank, draw page number footer
+                    val footerPaint = Paint().apply {
+                        color = Color.GRAY
+                        textSize = 12f
+                        isAntiAlias = true
+                        textAlign = Paint.Align.CENTER
+                    }
+                    canvas.drawText("- Page ${pageIdx + 1} -", pdfPageWidth / 2f, pdfPageHeight - 30f, footerPaint)
+                }
+
+                document.finishPage(page)
+                if (bitmap !== currentEditingBitmap && bitmap?.isRecycled == false) {
+                    bitmap.recycle()
+                }
             }
 
-            document.finishPage(page)
-            if (bitmap !== currentEditingBitmap && bitmap?.isRecycled == false) {
-                bitmap.recycle()
+            outputStream.use { out ->
+                document.writeTo(out)
             }
+        } finally {
+            pdfDocs.values.forEach { it.close() }
+            document.close()
         }
-
-        outputStream.use { out ->
-            document.writeTo(out)
-        }
-        document.close()
     }
 
     /**
@@ -323,19 +405,6 @@ object ExportManager {
         }
     }
 
-    private fun calculateScaledDimensions(srcW: Int, srcH: Int, maxW: Int, maxH: Int): Pair<Int, Int> {
-        val aspect = srcW.toFloat() / srcH.toFloat()
-        return if (aspect > (maxW.toFloat() / maxH.toFloat())) {
-            val w = maxW
-            val h = (maxW / aspect).toInt()
-            w to h
-        } else {
-            val h = maxH
-            val w = (maxH * aspect).toInt()
-            w to h
-        }
-    }
-
 
     /**
      * The ink a page carries outside its paper (the margins of an imported
@@ -436,16 +505,159 @@ object ExportManager {
         return layers
     }
 
+    private fun getOrOpenPdfDocument(
+        fileStore: NoteFileStore,
+        pdfSourcePath: String,
+        pdfDocs: MutableMap<String, PdfiumDocument>
+    ): PdfiumDocument? {
+        if (pdfSourcePath.isBlank()) return null
+        val cached = pdfDocs[pdfSourcePath]
+        if (cached != null && cached.isOpen) return cached
+        val file = fileStore.resolveRelativeFile(pdfSourcePath)
+        val opened = PdfiumDocument.open(file) ?: return null
+        pdfDocs[pdfSourcePath] = opened
+        return opened
+    }
+
+    suspend fun flattenCurrentPageForExport(
+        note: NoteEntity,
+        repository: NoteRepository,
+        fileStore: NoteFileStore,
+        pageIndex: Int,
+        currentEditingBitmap: Bitmap,
+        currentEditingBackground: Bitmap? = null,
+        currentEditingImageLayers: List<ImageLayer> = emptyList(),
+        pageEntity: PageEntity? = null,
+        pdfDocuments: MutableMap<String, PdfiumDocument>? = null,
+        includeMargins: Boolean = false
+    ): Bitmap = withContext(Dispatchers.IO) {
+        if (ContinuousPageGeometry.isInfinite(note.pageType)) {
+            return@withContext loadInfiniteExportBitmap(
+                fileStore = fileStore,
+                noteId = note.id,
+                pageIndex = pageIndex,
+                currentEditingBitmap = currentEditingBitmap
+            )
+        }
+        val effectivePage = pageEntity ?: repository.getPage(note.id, pageIndex)
+        val source = effectivePage?.let {
+            if (it.pdfSourcePath.isNotBlank() && it.pdfPageIndex >= 0) {
+                PdfExportPolicy.PdfPageSource(it.pdfSourcePath, it.pdfPageIndex)
+            } else null
+        }
+        val backgroundOverride = loadPageBackgroundOverride(fileStore, note.id, pageIndex)
+        val localDocs = if (pdfDocuments == null) HashMap<String, PdfiumDocument>() else null
+        val docsMap = pdfDocuments ?: localDocs
+        var pdfBackground: Bitmap? = null
+        var pageAspect = ContinuousPageGeometry.defaultRatio(note.pageType)
+
+        try {
+            if (PdfExportPolicy.shouldUseVectorPdfBackground(source, backgroundOverride != null) &&
+                source != null && docsMap != null
+            ) {
+                val doc = getOrOpenPdfDocument(fileStore, source.pdfSourcePath, docsMap)
+                val pts = doc?.pageSize(source.pdfPageIndex)
+                if (doc != null && pts != null && pts.size >= 2 && pts[0] > 0f && pts[1] > 0f) {
+                    pageAspect = PdfPageGeometry.aspect(pts[0], pts[1], pageAspect)
+                    val (targetW, targetH) = PdfExportPolicy.exportRenderTargetSize(pts[0], pts[1])
+                    pdfBackground = doc.renderPage(source.pdfPageIndex, targetW, targetH)
+                }
+            } else if (backgroundOverride != null && !backgroundOverride.isRecycled &&
+                backgroundOverride.width > 0 && backgroundOverride.height > 0
+            ) {
+                pageAspect = PdfPageGeometry.aspect(
+                    backgroundOverride.width.toFloat(),
+                    backgroundOverride.height.toFloat(),
+                    pageAspect
+                )
+            } else if (currentEditingBackground != null && !currentEditingBackground.isRecycled &&
+                currentEditingBackground.width > 0 && currentEditingBackground.height > 0
+            ) {
+                pageAspect = PdfPageGeometry.aspect(
+                    currentEditingBackground.width.toFloat(),
+                    currentEditingBackground.height.toFloat(),
+                    pageAspect
+                )
+            } else if (!currentEditingBitmap.isRecycled &&
+                currentEditingBitmap.width > 0 && currentEditingBitmap.height > 0
+            ) {
+                pageAspect = PdfPageGeometry.aspect(
+                    currentEditingBitmap.width.toFloat(),
+                    currentEditingBitmap.height.toFloat(),
+                    pageAspect
+                )
+            }
+        } finally {
+            localDocs?.values?.forEach { it.close() }
+        }
+
+        val stack = readAnnotationStack(fileStore, note.id, pageIndex)
+        val baseLayerVisible = stack.layerAt(
+            personal.notes.touch.ui.canvas.PageLayerStack.BASE_LAYER_INDEX
+        )?.visible != false
+        val isVectorPdf = source != null
+        val effectiveEditingBitmap = if (isVectorPdf && !baseLayerVisible) {
+            Bitmap.createBitmap(
+                currentEditingBitmap.width.coerceAtLeast(1),
+                currentEditingBitmap.height.coerceAtLeast(1),
+                Bitmap.Config.ARGB_8888
+            )
+        } else {
+            currentEditingBitmap
+        }
+        val beyondInk = readDiskBeyondInk(fileStore, note.id, pageIndex)
+        val annotationLayer = loadAnnotationLayer(fileStore, note.id, pageIndex, note.pageType, pageAspect)
+        val effectiveBg = backgroundOverride ?: pdfBackground ?: currentEditingBackground
+        val flat = flattenBitmap(
+            bitmap = effectiveEditingBitmap,
+            backgroundBitmap = effectiveBg,
+            imageLayers = currentEditingImageLayers,
+            beyondInk = beyondInk,
+            annotationLayer = annotationLayer,
+            pageType = note.pageType,
+            includeMargins = includeMargins
+        )
+        if (effectiveEditingBitmap !== currentEditingBitmap &&
+            effectiveEditingBitmap !== flat &&
+            !effectiveEditingBitmap.isRecycled
+        ) {
+            effectiveEditingBitmap.recycle()
+        }
+        for (crop in beyondInk) {
+            if (!crop.bitmap.isRecycled) crop.bitmap.recycle()
+        }
+        if (annotationLayer != null && annotationLayer !== flat && !annotationLayer.isRecycled) {
+            annotationLayer.recycle()
+        }
+        if (pdfBackground != null && pdfBackground !== flat && !pdfBackground.isRecycled) {
+            pdfBackground.recycle()
+        }
+        if (backgroundOverride != null && backgroundOverride !== flat && !backgroundOverride.isRecycled) {
+            backgroundOverride.recycle()
+        }
+        flat
+    }
+
     suspend fun loadFlattenedPageBitmap(
         fileStore: personal.notes.touch.data.files.NoteFileStore,
         noteId: String,
         pageIndex: Int,
         // The layers are page scoped, so every page has its own.
         includeLayers: Boolean = true,
-        pageType: String = "a4"
+        pageType: String = "a4",
+        pageEntity: PageEntity? = null,
+        pdfDocuments: MutableMap<String, PdfiumDocument>? = null,
+        repository: NoteRepository? = null,
+        includeMargins: Boolean = false
     ): Bitmap? {
         if (pageType == "infinite") {
             return loadInfiniteExportBitmap(fileStore, noteId, pageIndex)
+        }
+        val effectivePage = pageEntity ?: repository?.getPage(noteId, pageIndex)
+        val source = effectivePage?.let {
+            if (it.pdfSourcePath.isNotBlank() && it.pdfPageIndex >= 0) {
+                PdfExportPolicy.PdfPageSource(it.pdfSourcePath, it.pdfPageIndex)
+            } else null
         }
         val pageFile = fileStore.getPageFile(noteId, pageIndex)
         val strokesFile = fileStore.getStrokesFile(noteId, pageIndex)
@@ -454,35 +666,121 @@ object ExportManager {
         // to the page and have to be part of the export as well.
         val beyondInk = readDiskBeyondInk(fileStore, noteId, pageIndex)
         val backgroundOverride = loadPageBackgroundOverride(fileStore, noteId, pageIndex)
+
+        val localDocs = if (pdfDocuments == null) HashMap<String, PdfiumDocument>() else null
+        val docsMap = pdfDocuments ?: localDocs
+        var pdfBackground: Bitmap? = null
+        var pageAspect = ContinuousPageGeometry.defaultRatio(pageType)
+        try {
+            if (PdfExportPolicy.shouldUseVectorPdfBackground(source, backgroundOverride != null) &&
+                source != null && docsMap != null
+            ) {
+                val doc = getOrOpenPdfDocument(fileStore, source.pdfSourcePath, docsMap)
+                val pts = doc?.pageSize(source.pdfPageIndex)
+                if (doc != null && pts != null && pts.size >= 2 && pts[0] > 0f && pts[1] > 0f) {
+                    pageAspect = PdfPageGeometry.aspect(pts[0], pts[1], pageAspect)
+                    val (targetW, targetH) = PdfExportPolicy.exportRenderTargetSize(pts[0], pts[1])
+                    pdfBackground = doc.renderPage(source.pdfPageIndex, targetW, targetH)
+                }
+            } else if (backgroundOverride != null && !backgroundOverride.isRecycled &&
+                backgroundOverride.width > 0 && backgroundOverride.height > 0
+            ) {
+                pageAspect = PdfPageGeometry.aspect(
+                    backgroundOverride.width.toFloat(),
+                    backgroundOverride.height.toFloat(),
+                    pageAspect
+                )
+            } else if (pageFile.exists()) {
+                val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                android.graphics.BitmapFactory.decodeFile(pageFile.absolutePath, bounds)
+                if (bounds.outWidth > 0 && bounds.outHeight > 0) {
+                    pageAspect = PdfPageGeometry.aspect(
+                        bounds.outWidth.toFloat(),
+                        bounds.outHeight.toFloat(),
+                        pageAspect
+                    )
+                }
+            }
+        } finally {
+            localDocs?.values?.forEach { it.close() }
+        }
+
+        val stack = readAnnotationStack(fileStore, noteId, pageIndex)
+        val baseLayerVisible = stack.layerAt(
+            personal.notes.touch.ui.canvas.PageLayerStack.BASE_LAYER_INDEX
+        )?.visible != false
+        val isVectorPdf = source != null
+        val allowStrokesFile = strokesFile.exists() && (!isVectorPdf || baseLayerVisible)
+
         // The annotation layer of the page (layer 1): the writing of the user,
         // also the notes in the margin beside the page.
-        val annotationLayer = loadAnnotationLayer(fileStore, noteId, pageIndex)
-        val result = if (strokesFile.exists()) {
+        val annotationLayer = loadAnnotationLayer(fileStore, noteId, pageIndex, pageType, pageAspect)
+        val result = if (pdfBackground != null) {
+            val strokeBmp = if (allowStrokesFile) BitmapUtils.loadBitmapFromFile(strokesFile) else null
+            if (strokeBmp != null) {
+                val flat = flattenBitmap(
+                    strokeBmp, pdfBackground, layers, beyondInk, annotationLayer, pageType, includeMargins
+                )
+                if (strokeBmp !== flat && !strokeBmp.isRecycled) strokeBmp.recycle()
+                flat
+            } else {
+                flattenBitmap(
+                    pdfBackground, null, layers, beyondInk, annotationLayer, pageType, includeMargins
+                )
+            }
+        } else if (allowStrokesFile) {
             val baseBmp = BitmapUtils.loadBitmapFromFile(pageFile)
             val strokeBmp = BitmapUtils.loadBitmapFromFile(strokesFile)
             if (baseBmp != null && strokeBmp != null) {
-                val flat = flattenBitmap(strokeBmp, backgroundOverride ?: baseBmp, layers, beyondInk, annotationLayer)
+                val flat = flattenBitmap(
+                    strokeBmp, backgroundOverride ?: baseBmp, layers, beyondInk, annotationLayer, pageType, includeMargins
+                )
                 if (baseBmp !== flat && !baseBmp.isRecycled) baseBmp.recycle()
                 if (strokeBmp !== flat && !strokeBmp.isRecycled) strokeBmp.recycle()
                 flat
             } else if (strokeBmp != null) {
-                val flat = flattenBitmap(strokeBmp, backgroundOverride, layers, beyondInk, annotationLayer)
+                val flat = flattenBitmap(
+                    strokeBmp, backgroundOverride, layers, beyondInk, annotationLayer, pageType, includeMargins
+                )
                 if (strokeBmp !== flat && !strokeBmp.isRecycled) strokeBmp.recycle()
                 flat
             } else if (baseBmp != null) {
-                val flat = flattenBitmap(baseBmp, backgroundOverride, layers, beyondInk, annotationLayer)
+                val flat = flattenBitmap(
+                    baseBmp, backgroundOverride, layers, beyondInk, annotationLayer, pageType, includeMargins
+                )
                 if (baseBmp !== flat && !baseBmp.isRecycled) baseBmp.recycle()
                 flat
             } else null
         } else {
             val base = BitmapUtils.loadBitmapFromFile(pageFile)
             if (base != null) {
-                val flat = flattenBitmap(base, backgroundOverride, layers, beyondInk, annotationLayer)
+                val flat = flattenBitmap(
+                    base, backgroundOverride, layers, beyondInk, annotationLayer, pageType, includeMargins
+                )
                 if (base !== flat && !base.isRecycled) base.recycle()
                 flat
-            } else if (layers.isNotEmpty() || annotationLayer != null) {
-                val blank = Bitmap.createBitmap(2160, 3056, Bitmap.Config.ARGB_8888)
-                val flat = flattenBitmap(blank, backgroundOverride, layers, beyondInk, annotationLayer)
+            } else if (backgroundOverride != null || layers.isNotEmpty() ||
+                annotationLayer != null || beyondInk.isNotEmpty()
+            ) {
+                val safeAspect = if (pageAspect.isFinite() && pageAspect > 0f) {
+                    pageAspect
+                } else {
+                    PdfPageGeometry.DEFAULT_ASPECT
+                }
+                val blankW = if (backgroundOverride != null && !backgroundOverride.isRecycled && backgroundOverride.width > 0) {
+                    backgroundOverride.width
+                } else {
+                    2160
+                }
+                val blankH = if (backgroundOverride != null && !backgroundOverride.isRecycled && backgroundOverride.height > 0) {
+                    backgroundOverride.height
+                } else {
+                    (2160f / safeAspect).roundToInt().coerceIn(1, 4096)
+                }
+                val blank = Bitmap.createBitmap(blankW, blankH, Bitmap.Config.ARGB_8888)
+                val flat = flattenBitmap(
+                    blank, backgroundOverride, layers, beyondInk, annotationLayer, pageType, includeMargins
+                )
                 if (blank !== flat && !blank.isRecycled) blank.recycle()
                 flat
             } else null
@@ -497,8 +795,9 @@ object ExportManager {
         for (crop in beyondInk) {
             if (!crop.bitmap.isRecycled) crop.bitmap.recycle()
         }
-        if (annotationLayer != null && !annotationLayer.isRecycled) annotationLayer.recycle()
-        if (backgroundOverride != null && !backgroundOverride.isRecycled) backgroundOverride.recycle()
+        if (pdfBackground != null && pdfBackground !== result && !pdfBackground.isRecycled) pdfBackground.recycle()
+        if (annotationLayer != null && annotationLayer !== result && !annotationLayer.isRecycled) annotationLayer.recycle()
+        if (backgroundOverride != null && backgroundOverride !== result && !backgroundOverride.isRecycled) backgroundOverride.recycle()
         return result
     }
 
@@ -510,19 +809,40 @@ object ExportManager {
      * part of them. A hidden layer is not part of the export: it is not
      * drawn on the page either.
      */
+    private fun hasNonTransparentPixels(bitmap: Bitmap): Boolean {
+        if (bitmap.isRecycled || bitmap.width <= 0 || bitmap.height <= 0) return false
+        val w = bitmap.width
+        val h = bitmap.height
+        val row = IntArray(w)
+        for (y in 0 until h) {
+            bitmap.getPixels(row, 0, w, 0, y, w, 1)
+            for (x in 0 until w) {
+                if ((row[x] ushr 24) != 0) return true
+            }
+        }
+        return false
+    }
+
     private suspend fun loadInfiniteExportBitmap(
         fileStore: personal.notes.touch.data.files.NoteFileStore,
         noteId: String,
-        pageIndex: Int
+        pageIndex: Int,
+        currentEditingBitmap: Bitmap? = null
     ): Bitmap {
         val outSize = 2160
         val out = Bitmap.createBitmap(outSize, outSize, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(out)
         canvas.drawColor(Color.WHITE)
 
-        val placedItems = personal.notes.touch.ui.canvas.InfiniteItemsStore.load(fileStore, noteId)
         val stack = readAnnotationStack(fileStore, noteId, pageIndex)
-        val layerOpsList = mutableListOf<List<personal.notes.touch.ui.canvas.InkOp>>()
+        val baseLayerVisible = stack.layerAt(
+            personal.notes.touch.ui.canvas.PageLayerStack.BASE_LAYER_INDEX
+        )?.visible != false
+        val placedItems = personal.notes.touch.ui.canvas.InfiniteItemsStore.load(fileStore, noteId)
+            .filter { item ->
+                item.pageIndex == pageIndex && (stack.layerAt(item.layerIndex)?.visible != false)
+            }
+        val layerOpsMap = HashMap<Int, List<personal.notes.touch.ui.canvas.InkOp>>(stack.layers.size)
         var minX = Float.MAX_VALUE
         var minY = Float.MAX_VALUE
         var maxX = -Float.MAX_VALUE
@@ -539,9 +859,24 @@ object ExportManager {
             count++
         }
 
+        val editingBmp = if (baseLayerVisible && currentEditingBitmap != null && hasNonTransparentPixels(currentEditingBitmap)) {
+            currentEditingBitmap
+        } else {
+            null
+        }
+        if (editingBmp != null) {
+            val worldW = 2160f
+            val worldH = 2160f * editingBmp.height.toFloat() / editingBmp.width.coerceAtLeast(1).toFloat()
+            minX = minOf(minX, 0f)
+            minY = minOf(minY, 0f)
+            maxX = maxOf(maxX, worldW)
+            maxY = maxOf(maxY, worldH)
+            count++
+        }
+
         for (layer in stack.layers) {
             if (!layer.visible) {
-                layerOpsList.add(emptyList())
+                layerOpsMap[layer.index] = emptyList()
                 continue
             }
             val opsFile = fileStore.getAnnotationLayerOpsFile(noteId, pageIndex, layer.index)
@@ -554,7 +889,7 @@ object ExportManager {
             } catch (_: Exception) {
                 emptyList()
             }
-            layerOpsList.add(ops)
+            layerOpsMap[layer.index] = ops
             for (op in ops) {
                 if (op is personal.notes.touch.ui.canvas.InkOp.Stroke) {
                     for (p in op.stroke.points) {
@@ -585,92 +920,90 @@ object ExportManager {
             )
             canvas.scale(scale, scale)
 
+            if (editingBmp != null && !editingBmp.isRecycled) {
+                val worldW = 2160f
+                val worldH = 2160f * editingBmp.height.toFloat() / editingBmp.width.coerceAtLeast(1).toFloat()
+                canvas.drawBitmap(
+                    editingBmp,
+                    null,
+                    android.graphics.RectF(0f, 0f, worldW, worldH),
+                    Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
+                )
+            }
+
             val itemPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
             val pdfDocs = HashMap<String, PdfiumDocument>()
             try {
-                for (item in placedItems) {
-                    val bmp: Bitmap? = when (item) {
-                        is personal.notes.touch.ui.canvas.InfiniteCanvasItem.ImageItem -> {
-                            fileStore.getNoteAsset(noteId, item.fileName)?.let { BitmapUtils.loadBitmapFromFile(it) }
-                        }
-                        is personal.notes.touch.ui.canvas.InfiniteCanvasItem.PdfPageItem -> {
-                            val doc = pdfDocs[item.pdfFileName] ?: run {
-                                val f = fileStore.getNoteAsset(noteId, item.pdfFileName)
-                                val d = if (f != null) PdfiumDocument.open(f) else null
-                                if (d != null) pdfDocs[item.pdfFileName] = d
-                                d
+                for (layer in stack.layers) {
+                    if (!layer.visible) continue
+                    for (item in placedItems) {
+                        if (item.layerIndex != layer.index) continue
+                        val bmp: Bitmap? = when (item) {
+                            is personal.notes.touch.ui.canvas.InfiniteCanvasItem.ImageItem -> {
+                                fileStore.getNoteAsset(noteId, item.fileName)?.let { BitmapUtils.loadBitmapFromFile(it) }
                             }
-                            doc?.renderPage(item.pdfPageIndex, 2048, 2048)
+                            is personal.notes.touch.ui.canvas.InfiniteCanvasItem.PdfPageItem -> {
+                                val doc = pdfDocs[item.pdfFileName] ?: run {
+                                    val f = fileStore.getNoteAsset(noteId, item.pdfFileName)
+                                    val d = if (f != null) PdfiumDocument.open(f) else null
+                                    if (d != null) pdfDocs[item.pdfFileName] = d
+                                    d
+                                }
+                                doc?.renderPage(item.pdfPageIndex, 2048, 2048)
+                            }
+                        }
+                        if (bmp != null && !bmp.isRecycled) {
+                            val itemSave = canvas.save()
+                            canvas.translate(item.centerX, item.centerY)
+                            if (item.rotationDeg != 0f) canvas.rotate(item.rotationDeg)
+                            if (item.flipHorizontal) canvas.scale(-1f, 1f)
+                            val dst = android.graphics.RectF(-item.width / 2f, -item.height / 2f, item.width / 2f, item.height / 2f)
+                            canvas.drawBitmap(bmp, null, dst, itemPaint)
+                            canvas.restoreToCount(itemSave)
+                            bmp.recycle()
                         }
                     }
-                    if (bmp != null && !bmp.isRecycled) {
-                        val itemSave = canvas.save()
-                        canvas.translate(item.centerX, item.centerY)
-                        if (item.rotationDeg != 0f) canvas.rotate(item.rotationDeg)
-                        val dst = android.graphics.RectF(-item.width / 2f, -item.height / 2f, item.width / 2f, item.height / 2f)
-                        canvas.drawBitmap(bmp, null, dst, itemPaint)
-                        canvas.restoreToCount(itemSave)
-                        bmp.recycle()
+
+                    val ops = layerOpsMap[layer.index].orEmpty()
+                    if (ops.isEmpty()) continue
+                    val hasErase = ops.any { it is personal.notes.touch.ui.canvas.InkOp.Erase }
+                    val layerSave = if (hasErase) {
+                        canvas.saveLayer(minX - 200f, minY - 200f, maxX + 200f, maxY + 200f, null)
+                    } else {
+                        -1
+                    }
+                    for (op in ops) {
+                        when (op) {
+                            is personal.notes.touch.ui.canvas.InkOp.Stroke -> {
+                                val shape = op.shape
+                                if (shape != null) {
+                                    val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                                        style = Paint.Style.STROKE
+                                        strokeCap = Paint.Cap.ROUND
+                                        strokeJoin = Paint.Join.ROUND
+                                        color = op.stroke.color
+                                        strokeWidth = op.stroke.baseWidthNorm * 2160f
+                                    }
+                                    canvas.drawPath(shape, paint)
+                                } else {
+                                    personal.notes.touch.ui.canvas.ContinuousStrokeRenderer.drawStroke(
+                                        canvas, op.stroke, 2160f, 2160f, preview = false
+                                    )
+                                }
+                            }
+                            is personal.notes.touch.ui.canvas.InkOp.Erase -> {
+                                personal.notes.touch.ui.canvas.ContinuousStrokeRenderer.drawStroke(
+                                    canvas, op.stroke, 2160f, 2160f, preview = false
+                                )
+                            }
+                        }
+                    }
+                    if (layerSave >= 0) {
+                        canvas.restoreToCount(layerSave)
                     }
                 }
             } finally {
                 pdfDocs.values.forEach { it.close() }
-            }
-
-            for (ops in layerOpsList) {
-                if (ops.isEmpty()) continue
-                val hasErase = ops.any { it is personal.notes.touch.ui.canvas.InkOp.Erase }
-                val layerSave = if (hasErase) {
-                    canvas.saveLayer(minX - 200f, minY - 200f, maxX + 200f, maxY + 200f, null)
-                } else {
-                    -1
-                }
-                for (op in ops) {
-                    when (op) {
-                        is personal.notes.touch.ui.canvas.InkOp.Stroke -> {
-                            val shape = op.shape
-                            val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                                style = Paint.Style.STROKE
-                                strokeCap = Paint.Cap.ROUND
-                                strokeJoin = Paint.Join.ROUND
-                                color = op.stroke.color
-                                strokeWidth = op.stroke.baseWidthNorm * 2160f
-                            }
-                            if (shape != null) {
-                                canvas.drawPath(shape, paint)
-                            } else if (op.stroke.points.isNotEmpty()) {
-                                val path = Path()
-                                val pts = op.stroke.points
-                                path.moveTo(pts[0].x * 2160f, pts[0].y * 2160f)
-                                for (i in 1 until pts.size) {
-                                    path.lineTo(pts[i].x * 2160f, pts[i].y * 2160f)
-                                }
-                                canvas.drawPath(path, paint)
-                            }
-                        }
-                        is personal.notes.touch.ui.canvas.InkOp.Erase -> {
-                            if (op.stroke.points.isNotEmpty()) {
-                                val erasePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                                    style = Paint.Style.STROKE
-                                    strokeCap = Paint.Cap.ROUND
-                                    strokeJoin = Paint.Join.ROUND
-                                    xfermode = android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.CLEAR)
-                                    strokeWidth = op.stroke.baseWidthNorm * 2160f
-                                }
-                                val path = Path()
-                                val pts = op.stroke.points
-                                path.moveTo(pts[0].x * 2160f, pts[0].y * 2160f)
-                                for (i in 1 until pts.size) {
-                                    path.lineTo(pts[i].x * 2160f, pts[i].y * 2160f)
-                                }
-                                canvas.drawPath(path, erasePaint)
-                            }
-                        }
-                    }
-                }
-                if (layerSave >= 0) {
-                    canvas.restoreToCount(layerSave)
-                }
             }
             canvas.restoreToCount(save)
         }
@@ -680,7 +1013,9 @@ object ExportManager {
     private suspend fun loadAnnotationLayer(
         fileStore: personal.notes.touch.data.files.NoteFileStore,
         noteId: String,
-        pageIndex: Int
+        pageIndex: Int,
+        pageType: String = "a4",
+        pageAspect: Float = ContinuousPageGeometry.defaultRatio(pageType)
     ): Bitmap? {
         val stack = readAnnotationStack(fileStore, noteId, pageIndex)
         var result: Bitmap? = null
@@ -695,8 +1030,14 @@ object ExportManager {
             val bitmap: Bitmap = (if (file.exists()) {
                 BitmapUtils.loadBitmapFromFile(file)
             } else if ((tilesInfo != null && tilesInfo.tiles.isNotEmpty()) || !ops.isNullOrEmpty()) {
-                val layerWidth = tilesInfo?.width ?: 2160
-                val layerHeight = tilesInfo?.height ?: 3056
+                val resolvedSize = PdfExportPolicy.resolveAnnotationLayerSize(
+                    pageType = pageType,
+                    pageAspect = pageAspect,
+                    tilesWidth = tilesInfo?.width ?: 0,
+                    tilesHeight = tilesInfo?.height ?: 0
+                )
+                val layerWidth = resolvedSize.width
+                val layerHeight = resolvedSize.height
                 val target = Bitmap.createBitmap(layerWidth, layerHeight, Bitmap.Config.ARGB_8888)
                 val canvas = Canvas(target)
                 if (tilesInfo != null) {
@@ -713,24 +1054,56 @@ object ExportManager {
                     }
                 }
                 if (!ops.isNullOrEmpty()) {
-                    for (op in ops) {
-                        if (op is personal.notes.touch.ui.canvas.InkOp.Stroke) {
-                            val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                                style = Paint.Style.STROKE
-                                strokeCap = Paint.Cap.ROUND
-                                strokeJoin = Paint.Join.ROUND
-                                color = op.stroke.color
-                                strokeWidth = op.stroke.baseWidthNorm * layerWidth
-                            }
-                            val path = Path()
-                            val points = op.stroke.points
-                            if (points.isNotEmpty()) {
-                                path.moveTo(points[0].x * layerWidth, points[0].y * layerHeight)
-                                for (i in 1 until points.size) {
-                                    path.lineTo(points[i].x * layerWidth, points[i].y * layerHeight)
+                    val ratio = if (layerWidth > 0 && layerHeight > 0) {
+                        ContinuousPageGeometry.ratioOfLayer(pageType, layerWidth, layerHeight)
+                    } else {
+                        pageAspect
+                    }
+                    val boxRatio = ContinuousPageGeometry.boxRatio(pageType, ratio)
+                    val rect = ContinuousPageGeometry.layerRect(pageType, ratio, boxRatio, 1f)
+                    if (!rect.empty) {
+                        val sx = layerWidth.toFloat() / rect.width
+                        val sy = layerHeight.toFloat() / rect.height
+                        val hasErase = ops.any { it is personal.notes.touch.ui.canvas.InkOp.Erase }
+                        val eraseSave = if (hasErase) {
+                            canvas.saveLayer(0f, 0f, layerWidth.toFloat(), layerHeight.toFloat(), null)
+                        } else {
+                            -1
+                        }
+                        for (op in ops) {
+                            when (op) {
+                                is personal.notes.touch.ui.canvas.InkOp.Stroke -> {
+                                    val shape = op.shape
+                                    if (shape == null) {
+                                        val save = canvas.save()
+                                        canvas.translate(-rect.left * sx, -rect.top * sy)
+                                        personal.notes.touch.ui.canvas.ContinuousStrokeRenderer.drawStroke(
+                                            canvas, op.stroke, sx, sy, preview = false
+                                        )
+                                        canvas.restoreToCount(save)
+                                    } else {
+                                        val paint2 = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                                            style = Paint.Style.STROKE
+                                            strokeCap = Paint.Cap.ROUND
+                                            strokeJoin = Paint.Join.ROUND
+                                            color = op.stroke.color
+                                            strokeWidth = op.stroke.baseWidthNorm * sx
+                                        }
+                                        canvas.drawPath(shape, paint2)
+                                    }
+                                }
+                                is personal.notes.touch.ui.canvas.InkOp.Erase -> {
+                                    val save = canvas.save()
+                                    canvas.translate(-rect.left * sx, -rect.top * sy)
+                                    personal.notes.touch.ui.canvas.ContinuousStrokeRenderer.drawStroke(
+                                        canvas, op.stroke, sx, sy, preview = false
+                                    )
+                                    canvas.restoreToCount(save)
                                 }
                             }
-                            canvas.drawPath(path, paint)
+                        }
+                        if (eraseSave >= 0) {
+                            canvas.restoreToCount(eraseSave)
                         }
                     }
                 }
@@ -777,34 +1150,71 @@ object ExportManager {
         backgroundBitmap: Bitmap?,
         imageLayers: List<ImageLayer> = emptyList(),
         beyondInk: List<InkCrop> = emptyList(),
-        annotationLayer: Bitmap? = null
+        annotationLayer: Bitmap? = null,
+        pageType: String = "a4",
+        includeMargins: Boolean = false
     ): Bitmap {
         val bgW = backgroundBitmap?.width ?: 0
         val bgH = backgroundBitmap?.height ?: 0
         val w = bitmap.width.coerceAtLeast(bgW).coerceAtLeast(1)
         val h = bitmap.height.coerceAtLeast(bgH).coerceAtLeast(1)
-        // Ink written outside the paper enlarges the sheet, so the export
-        // keeps the margins the user wrote in.
+        val margin = ContinuousPageGeometry.marginFor(pageType)
+        val effectiveIncludeMargins = includeMargins && margin > 0f
+        // Ink written outside the paper enlarges the sheet only when margins are included.
         var minX = 0f
         var minY = 0f
         var maxX = w.toFloat()
         var maxY = h.toFloat()
-        for (crop in beyondInk) {
-            if (crop.bitmap.isRecycled) continue
-            minX = minOf(minX, crop.x)
-            minY = minOf(minY, crop.y)
-            maxX = maxOf(maxX, crop.x + crop.bitmap.width)
-            maxY = maxOf(maxY, crop.y + crop.bitmap.height)
+        if (effectiveIncludeMargins) {
+            for (crop in beyondInk) {
+                if (crop.bitmap.isRecycled) continue
+                minX = minOf(minX, crop.x)
+                minY = minOf(minY, crop.y)
+                maxX = maxOf(maxX, crop.x + crop.bitmap.width)
+                maxY = maxOf(maxY, crop.y + crop.bitmap.height)
+            }
         }
         val contentW = (maxX - minX).toInt().coerceAtLeast(1)
         val contentH = (maxY - minY).toInt().coerceAtLeast(1)
         // The annotation layer of the page is wider than the page (the margin
-        // on both sides): it is the sheet of the export, and the page sits
-        // centred in it - so the writing on the layer lines up with the
-        // document.
+        // on both sides): when includeMargins is true it is the sheet of the export
+        // with the page centred in it; when false it is cropped to the page box.
         val layer = annotationLayer
-        val outW = if (layer != null) layer.width.coerceAtLeast(contentW) else contentW
-        val outH = if (layer != null) layer.height.coerceAtLeast(contentH) else contentH
+        val pageAspect = PdfPageGeometry.aspect(
+            w.toFloat(),
+            h.toFloat(),
+            ContinuousPageGeometry.defaultRatio(pageType)
+        )
+        val layerCrop = layer?.let {
+            MarginExportMath.cropRect(
+                layerWidth = it.width,
+                layerHeight = it.height,
+                pageAspect = pageAspect,
+                margin = margin,
+                includeMargins = effectiveIncludeMargins
+            )
+        }
+        val expandForLayer = effectiveIncludeMargins
+        val sheetW = if (layerCrop != null) {
+            layerCrop.outputWidth
+        } else {
+            (w * (1f + 2f * margin)).roundToInt().coerceAtLeast(w)
+        }
+        val sheetH = if (layerCrop != null) {
+            layerCrop.outputHeight
+        } else {
+            h
+        }
+        val outW = if (expandForLayer) {
+            sheetW.coerceAtLeast(contentW)
+        } else {
+            contentW
+        }
+        val outH = if (expandForLayer) {
+            sheetH.coerceAtLeast(contentH)
+        } else {
+            contentH
+        }
         val out = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(out)
         canvas.drawColor(Color.WHITE)
@@ -813,16 +1223,20 @@ object ExportManager {
         var pageTop = (outH - contentH) / 2f
         var pageWidth = w.toFloat()
         var pageHeight = h.toFloat()
-        if (layer != null && layer.height > 0 && h > 0) {
-            pageWidth = (layer.height.toFloat() * w / h).coerceAtMost(layer.width.toFloat())
-            pageHeight = layer.height.toFloat()
-            pageLeft = (layer.width - pageWidth) / 2f
-            pageTop = 0f
+        if (expandForLayer && outH > 0 && h > 0 && contentH > 0) {
+            val fullScale = minOf(
+                outH.toFloat() / contentH.toFloat(),
+                outW.toFloat() / (w.toFloat() * (1f + 2f * margin)).coerceAtLeast(1f)
+            )
+            pageHeight = h.toFloat() * fullScale
+            pageWidth = w.toFloat() * fullScale
+            pageLeft = (outW - pageWidth) / 2f
+            pageTop = -minY * fullScale + (outH - contentH * fullScale) / 2f
         }
         val scaleX = if (w > 0) pageWidth / w else 1f
         val scaleY = if (h > 0) pageHeight / h else 1f
-        val offX = pageLeft - minX * scaleX
-        val offY = pageTop - minY * scaleY
+        val offX = if (expandForLayer) pageLeft else pageLeft - minX * scaleX
+        val offY = if (expandForLayer) pageTop else pageTop - minY * scaleY
         val save = canvas.save()
         canvas.translate(offX, offY)
         canvas.scale(scaleX, scaleY)
@@ -871,17 +1285,57 @@ object ExportManager {
             canvas.restore()
         }
         canvas.restoreToCount(save)
-        // The annotation layer is drawn over the page: the writing of the
-        // user (also the notes in the margin beside the page) is part of the
-        // export.
-        if (layer != null && !layer.isRecycled) {
-            canvas.drawBitmap(layer, 0f, 0f, Paint(Paint.FILTER_BITMAP_FLAG))
+        // The annotation layer is drawn over the page: when includeMargins is
+        // true the full margin sheet is composited; when false only the cropped
+        // page rect is drawn over the page bounds.
+        if (layer != null && !layer.isRecycled && layerCrop != null && layerCrop.width > 0 && layerCrop.height > 0) {
+            val layerDstLeft = if (expandForLayer) {
+                (pageLeft - margin * pageWidth).roundToInt().coerceIn(0, outW)
+            } else {
+                0
+            }
+            val layerDstRight = if (expandForLayer) {
+                (pageLeft + (1f + margin) * pageWidth).roundToInt().coerceIn(layerDstLeft, outW)
+            } else {
+                outW
+            }
+            val layerDstTop = if (expandForLayer) pageTop.roundToInt().coerceIn(0, outH) else 0
+            val layerDstBottom = if (expandForLayer) {
+                (pageTop + pageHeight).roundToInt().coerceIn(layerDstTop, outH)
+            } else {
+                outH
+            }
+            if (!layerCrop.cropped &&
+                layer.width == (layerDstRight - layerDstLeft) &&
+                layer.height == (layerDstBottom - layerDstTop) &&
+                layerDstLeft == 0 &&
+                layerDstTop == 0
+            ) {
+                canvas.drawBitmap(layer, 0f, 0f, Paint(Paint.FILTER_BITMAP_FLAG))
+            } else {
+                val srcRect = Rect(
+                    layerCrop.left,
+                    layerCrop.top,
+                    layerCrop.left + layerCrop.width,
+                    layerCrop.top + layerCrop.height
+                )
+                canvas.drawBitmap(
+                    layer,
+                    srcRect,
+                    Rect(layerDstLeft, layerDstTop, layerDstRight, layerDstBottom),
+                    Paint(Paint.FILTER_BITMAP_FLAG)
+                )
+            }
         }
         return out
     }
 
     fun sanitizeFilename(name: String): String {
-        val cleaned = name.replace(Regex("""[\\/:*?"<>|]"""), "_").trim()
-        return cleaned.ifBlank { "TouchNote" }
+        val cleaned = name
+            .replace(Regex("""[\\/:*?"<>|\u0000-\u001F\u007F]"""), "_")
+            .trim()
+            .take(120)
+            .trim()
+        return if (cleaned.isBlank() || cleaned == "." || cleaned == "..") "TouchNote" else cleaned
     }
 }

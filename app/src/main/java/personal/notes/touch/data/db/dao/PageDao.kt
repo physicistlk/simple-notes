@@ -19,6 +19,9 @@ interface PageDao {
     @Query("SELECT * FROM pages WHERE id = :id LIMIT 1")
     suspend fun getById(id: String): PageEntity?
 
+    @Query("SELECT * FROM pages WHERE noteId = :noteId AND `index` = :index LIMIT 1")
+    suspend fun getPage(noteId: String, index: Int): PageEntity?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(page: PageEntity)
 
@@ -33,6 +36,9 @@ interface PageDao {
 
     @Query("DELETE FROM pages WHERE noteId = :noteId")
     suspend fun deleteForNote(noteId: String)
+
+    @Query("DELETE FROM pages WHERE noteId = :noteId AND `index` >= :fromIndex")
+    suspend fun deleteFromIndex(noteId: String, fromIndex: Int)
 
     /**
      * F-10 vector PDF import: records the source document + page index for

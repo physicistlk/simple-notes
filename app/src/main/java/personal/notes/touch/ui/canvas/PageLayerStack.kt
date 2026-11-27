@@ -34,14 +34,6 @@ class PageLayer(
     /** False when the layer is masked: it is not drawn on the page. */
     var visible: Boolean = true
 ) {
-    override fun equals(other: Any?): Boolean {
-        if (this === other) return true
-        if (other !is PageLayer) return false
-        return index == other.index
-    }
-
-    override fun hashCode(): Int = index.hashCode()
-
     override fun toString(): String = "PageLayer(#$index $name visible=$visible)"
 }
 
@@ -493,7 +485,9 @@ internal object MiniJson {
                 i++
             }
             val text = s.substring(start, i)
-            return text.toDoubleOrNull() ?: throw IllegalStateException("bad number")
+            val d = text.toDoubleOrNull() ?: throw IllegalStateException("bad number")
+            if (!d.isFinite()) throw IllegalStateException("non-finite number")
+            return d
         }
     }
 }
