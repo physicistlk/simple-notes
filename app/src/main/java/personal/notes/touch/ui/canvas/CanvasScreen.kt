@@ -11982,39 +11982,55 @@ internal suspend fun renderContinuousPage(
     desiredWidthPx: Int,
     includeInk: Boolean = true
 ): android.graphics.Bitmap? {
-    val document = pdfDocCache.document(page.pdfSourcePath)
-        ?: return repository.loadPageBitmap(noteId, pageIndex)
-    val size = document.pageSize(page.pdfPageIndex)
-    if (size[0] <= 0f || size[1] <= 0f) return repository.loadPageBitmap(noteId, pageIndex)
-
-    val width = personal.notes.touch.util.PdfRenderPolicy
-        .continuousRenderWidth(size[0], size[1], desiredWidthPx)
-    if (width <= 0) return repository.loadPageBitmap(noteId, pageIndex)
-    val height = (width * size[1] / size[0]).roundToInt().coerceAtLeast(1)
-
-    val composite = try {
-        android.graphics.Bitmap.createBitmap(
-            width, height, android.graphics.Bitmap.Config.ARGB_8888
-        )
-    } catch (e: OutOfMemoryError) {
-        e.printStackTrace()
-        return null
+    val renderCacheKey = if (!includeInk && page.pdfSourcePath.isNotEmpty() && page.pdfPageIndex >= 0) {
+        "${page.pdfSourcePath}#${page.pdfPageIndex}@$desiredWidthPx"
+    } else {
+        null
     }
-    if (!document.renderPageInto(page.pdfPageIndex, composite, width / size[0])) {
-        composite.recycle()
-        return repository.loadPageBitmap(noteId, pageIndex)
+    if (renderCacheKey != null) {
+        pdfDocCache.getRenderedPage(renderCacheKey)?.let { cached ->
+            return cached
+        }
     }
-    if (!includeInk) return composite
+
+    val rendered = pdfDocCache.withDocument(page.pdfSourcePath) { document ->
+        val size = document.pageSize(page.pdfPageIndex)
+        if (size[0] <= 0f || size[1] <= 0f) return@withDocument null
+        val width = personal.notes.touch.util.PdfRenderPolicy
+            .continuousRenderWidth(size[0], size[1], desiredWidthPx)
+        if (width <= 0) return@withDocument null
+        val height = (width * size[1] / size[0]).roundToInt().coerceAtLeast(1)
+        val bmp = try {
+            android.graphics.Bitmap.createBitmap(
+                width, height, android.graphics.Bitmap.Config.ARGB_8888
+            )
+        } catch (e: OutOfMemoryError) {
+            e.printStackTrace()
+            return@withDocument null
+        }
+        if (!document.renderPageInto(page.pdfPageIndex, bmp, width / size[0])) {
+            bmp.recycle()
+            return@withDocument null
+        }
+        bmp
+    } ?: return repository.loadPageBitmap(noteId, pageIndex)
+
+    if (!includeInk) {
+        if (renderCacheKey != null) {
+            pdfDocCache.putRenderedPage(renderCacheKey, rendered)
+        }
+        return rendered
+    }
     val strokes = repository.loadPageStrokes(noteId, pageIndex)
     if (strokes != null && !strokes.isRecycled) {
-        val canvas = android.graphics.Canvas(composite)
+        val canvas = android.graphics.Canvas(rendered)
         val paint = android.graphics.Paint(
             android.graphics.Paint.FILTER_BITMAP_FLAG or
                 android.graphics.Paint.ANTI_ALIAS_FLAG
         )
-        canvas.drawBitmap(strokes, null, android.graphics.Rect(0, 0, width, height), paint)
+        canvas.drawBitmap(strokes, null, android.graphics.Rect(0, 0, rendered.width, rendered.height), paint)
     }
-    return composite
+    return rendered
 }
 
 @Composable

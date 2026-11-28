@@ -7,6 +7,10 @@ import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.RectF
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import personal.notes.touch.data.db.entity.PageEntity
 import personal.notes.touch.data.files.NoteFileStore
@@ -312,6 +316,9 @@ object BitmapUtils {
         return PdfModeReconciliationPolicy.pagePixelSize(pageAspect)
     }
 
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val tileDecodeDispatcher = Dispatchers.IO.limitedParallelism(4)
+
     private fun decodeDownsampledArgb(file: File, targetWidth: Int, targetHeight: Int): Bitmap? {
         return try {
             if (!file.isFile) return null
@@ -326,11 +333,36 @@ object BitmapUtils {
             while ((w / (sample * 2)) >= reqW && (h / (sample * 2)) >= reqH) {
                 sample *= 2
             }
-            val opts = BitmapFactory.Options().apply {
-                inSampleSize = sample
-                inPreferredConfig = Bitmap.Config.ARGB_8888
+            BitmapPool.decodeFileMutableArgb(file, sample)
+        } catch (e: OutOfMemoryError) {
+            e.printStackTrace()
+            null
+        } catch (e: Exception) {
+            e.printStackTrace()
+            null
+        }
+    }
+
+    private fun decodeTileDownsampledWithOrigSize(
+        file: File,
+        targetWidth: Int,
+        targetHeight: Int
+    ): Triple<Bitmap, Int, Int>? {
+        return try {
+            if (!file.isFile) return null
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(file.absolutePath, bounds)
+            val origW = bounds.outWidth
+            val origH = bounds.outHeight
+            if (origW <= 0 || origH <= 0) return null
+            var sample = 1
+            val reqW = targetWidth.coerceAtLeast(1)
+            val reqH = targetHeight.coerceAtLeast(1)
+            while ((origW / (sample * 2)) >= reqW && (origH / (sample * 2)) >= reqH) {
+                sample *= 2
             }
-            BitmapFactory.decodeFile(file.absolutePath, opts)
+            val bmp = BitmapPool.decodeFileMutableArgb(file, sample) ?: return null
+            Triple(bmp, origW, origH)
         } catch (e: OutOfMemoryError) {
             e.printStackTrace()
             null
@@ -349,7 +381,7 @@ object BitmapUtils {
         }
     }
 
-    private fun drawContinuousAnnotationsOntoThumbnail(
+    private suspend fun drawContinuousAnnotationsOntoThumbnail(
         canvas: android.graphics.Canvas,
         fileStore: NoteFileStore,
         noteId: String,
@@ -427,22 +459,32 @@ object BitmapUtils {
             val layerCanvas = android.graphics.Canvas(layerBmp)
 
             if (hasTiles && tilesInfo != null) {
-                for (pos in tilesInfo.positions()) {
-                    val tx = pos.first
-                    val ty = pos.second
-                    val tileFile = fileStore.getAnnotationLayerTileFile(noteId, pageIndex, layer.index, tx, ty)
-                    if (!tileFile.isFile) continue
-                    val tileW = tilesInfo.tileSize.coerceAtLeast(1)
-                    val tileLeft = tx * tileW
-                    val tileTop = ty * tileW
-                    val reqW = ((tileW.toFloat() / layerWidth) * composeWidth).roundToInt().coerceAtLeast(1)
-                    val reqH = ((tileW.toFloat() / layerHeight) * composeHeight).roundToInt().coerceAtLeast(1)
-                    val tileBmp = decodeDownsampledArgb(tileFile, reqW, reqH) ?: continue
+                val tilePositions = tilesInfo.positions()
+                val tileW = tilesInfo.tileSize.coerceAtLeast(1)
+                val reqW = ((tileW.toFloat() / layerWidth) * composeWidth).roundToInt().coerceAtLeast(1)
+                val reqH = ((tileW.toFloat() / layerHeight) * composeHeight).roundToInt().coerceAtLeast(1)
+                val decodedTiles = if (tilePositions.size <= 1) {
+                    tilePositions.mapNotNull { pos ->
+                        val tileFile = fileStore.getAnnotationLayerTileFile(noteId, pageIndex, layer.index, pos.first, pos.second)
+                        val decoded = decodeTileDownsampledWithOrigSize(tileFile, reqW, reqH) ?: return@mapNotNull null
+                        pos to decoded
+                    }
+                } else {
+                    coroutineScope {
+                        tilePositions.map { pos ->
+                            async(tileDecodeDispatcher) {
+                                val tileFile = fileStore.getAnnotationLayerTileFile(noteId, pageIndex, layer.index, pos.first, pos.second)
+                                val decoded = decodeTileDownsampledWithOrigSize(tileFile, reqW, reqH) ?: return@async null
+                                pos to decoded
+                            }
+                        }.awaitAll().filterNotNull()
+                    }
+                }
+                for ((pos, decoded) in decodedTiles) {
+                    val (tileBmp, origW, origH) = decoded
                     if (!tileBmp.isRecycled) {
-                        val srcBounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                        BitmapFactory.decodeFile(tileFile.absolutePath, srcBounds)
-                        val origW = if (srcBounds.outWidth > 0) srcBounds.outWidth else tileBmp.width
-                        val origH = if (srcBounds.outHeight > 0) srcBounds.outHeight else tileBmp.height
+                        val tileLeft = pos.first * tileW
+                        val tileTop = pos.second * tileW
                         val dstTileRect = RectF(
                             tileLeft.toFloat() / layerWidth * composeWidth,
                             tileTop.toFloat() / layerHeight * composeHeight,
@@ -450,7 +492,7 @@ object BitmapUtils {
                             (tileTop + origH).toFloat() / layerHeight * composeHeight
                         )
                         layerCanvas.drawBitmap(tileBmp, null, dstTileRect, paint)
-                        tileBmp.recycle()
+                        BitmapPool.put(tileBmp)
                     }
                 }
             } else if (hasLegacy) {
@@ -462,7 +504,7 @@ object BitmapUtils {
                         RectF(0f, 0f, composeWidth.toFloat(), composeHeight.toFloat()),
                         paint
                     )
-                    legacyBmp.recycle()
+                    BitmapPool.put(legacyBmp)
                 }
             }
 
@@ -749,7 +791,8 @@ object BitmapUtils {
     suspend fun loadBitmapFromFile(file: File): Bitmap? = withContext(Dispatchers.IO) {
         try {
             if (!file.exists()) return@withContext null
-            BitmapFactory.decodeFile(file.absolutePath)?.copy(Bitmap.Config.ARGB_8888, true)
+            BitmapPool.decodeFileMutableArgb(file)
+                ?: BitmapFactory.decodeFile(file.absolutePath)?.copy(Bitmap.Config.ARGB_8888, true)
         } catch (e: Exception) {
             e.printStackTrace()
             null

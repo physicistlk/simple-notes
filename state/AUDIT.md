@@ -136,7 +136,7 @@ Rules for a new finding:
 | `!!` in the sources | **0** (`BLIND-038` resolved; enforced across `app/src`) | `grep -rn --include='*.kt' '!!' app/src \| wc -l` |
 | `runBlocking` in `app/src/main` | **0** | `grep -rn --include='*.kt' 'runBlocking' app/src/main \| wc -l` |
 | Room schema | **v15** in `AppDatabase` and `DatabaseSchemaPolicyTest` (`MIGRATION_14_15` verified against `15.json`) | `DatabaseSchemaPolicyTest` |
-| Unit tests | **701 passing / 2 pre-existing skipped (`PdfImportManagerTest`) / 0 failures (703 total across 63 suites, including 213 `e2e/` tests)** | `./gradlew testDebugUnitTest --rerun-tasks` |
+| Unit tests | **705 passing / 2 pre-existing skipped (`PdfImportManagerTest`) / 0 failures (707 total across 64 suites, including 213 `e2e/` tests)** | `./gradlew testDebugUnitTest --rerun-tasks` |
 | Lint | **0 errors** (39 warnings, 5 informational — 2026-11-15) | `./gradlew lintDebug` |
 | Network | impossible (no permission, no cleartext) | manifest + `aapt2` |
 | Platform backup | **off** (`allowBackup=false` + `fullBackupContent=false` + `data_extraction_rules`) | manifest |

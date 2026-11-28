@@ -14,12 +14,17 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import personal.notes.touch.data.db.entity.PageEntity
 import personal.notes.touch.data.repo.NoteRepository
+import personal.notes.touch.util.BitmapPool
 import personal.notes.touch.util.MarginExportMath
 import personal.notes.touch.util.MarginInkPresence
 import personal.notes.touch.util.PageAspectCache
@@ -769,6 +774,9 @@ class ContinuousInkController(
      * must stay rare: reading it per pointer sample would recompose the page
      * on every movement of the pen.
      */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val tileIoDispatcher = Dispatchers.IO.limitedParallelism(4)
+
     var revision by mutableIntStateOf(0)
         private set
 
@@ -1525,9 +1533,7 @@ class ContinuousInkController(
     private fun pageRatioOf(page: PageEntity, isVector: Boolean): Float {
         if (isVector) {
             val fallback = ContinuousPageGeometry.defaultRatio(pageType)
-            return PageAspectCache.default.getOrLoad(page.pdfSourcePath, page.pdfPageIndex, fallback) {
-                pdfDocCache.document(page.pdfSourcePath)?.pageSize(page.pdfPageIndex)
-            }
+            return PageAspectCache.default.get(page.pdfSourcePath, page.pdfPageIndex) ?: fallback
         }
         return ContinuousPageGeometry.defaultRatio(pageType)
     }
@@ -1618,9 +1624,8 @@ class ContinuousInkController(
                     // A raster page is described by its page image: its size
                     // is the ratio of the page, so the layer is as tall as
                     // the page.
-                    var pageRatio = 0f
                     if (!s.isVector) {
-                        pageRatio = rasterPageRatio(s.pageIndex)
+                        val pageRatio = rasterPageRatio(s.pageIndex)
                         if (pageRatio > 0f) {
                             val size = ContinuousPageGeometry.layerSize(pageType, pageRatio)
                             if (size.width != s.inkWidth || size.height != s.inkHeight) {
@@ -1628,6 +1633,23 @@ class ContinuousInkController(
                                 s.inkHeight = size.height
                                 s.pageRatio = pageRatio
                             }
+                        }
+                    } else if (page.pdfSourcePath.isNotEmpty() && page.pdfPageIndex >= 0) {
+                        val fallback = ContinuousPageGeometry.defaultRatio(pageType)
+                        val pdfRatio = PageAspectCache.default.getOrLoad(
+                            page.pdfSourcePath,
+                            page.pdfPageIndex,
+                            fallback
+                        ) {
+                            pdfDocCache.withDocument(page.pdfSourcePath) { doc ->
+                                doc.pageSize(page.pdfPageIndex)
+                            }
+                        }
+                        if (pdfRatio > 0f && pdfRatio != s.pageRatio) {
+                            val size = ContinuousPageGeometry.layerSize(pageType, pdfRatio)
+                            s.inkWidth = size.width
+                            s.inkHeight = size.height
+                            s.pageRatio = pdfRatio
                         }
                     }
                     // The layer stack of the page: the metadata file names
@@ -1674,7 +1696,7 @@ class ContinuousInkController(
                                 val tile = t.requireTile(tx, ty)
                                 val canvas = Canvas(tile)
                                 canvas.drawBitmap(bitmap, 0f, 0f, null)
-                                bitmap.recycle()
+                                BitmapPool.put(bitmap)
                             }
                             for (tx in 0 until grid.columns) {
                                 for (ty in 0 until grid.rows) {
@@ -2708,33 +2730,56 @@ class ContinuousInkController(
             // bitmap in memory, so this is cheap (no 80 MB allocation, no
             // full-size PNG encode).
             if (store != null) {
-                for (index in store.dirtyTiles()) {
+                val dirtyIndices = store.dirtyTiles().toList()
+                val tileTasks = dirtyIndices.mapNotNull { index ->
                     val tx = store.grid.tileColumn(index)
                     val ty = store.grid.tileRow(index)
-                    if (tx < 0 || ty < 0) continue
-                    val bitmap = store.tile(tx, ty)
-                    if (bitmap != null && !bitmap.isRecycled) {
-                        val ok = withContext(Dispatchers.IO) {
-                            repository.savePageLayerTile(
-                                noteId, s.pageIndex, layer.index, tx, ty, bitmap
-                            )
-                        }
-                        if (!ok) {
-                            s.dirty = true
-                            android.util.Log.w(
-                                "TouchNotes",
-                                "Could not save tile $tx,$ty of layer ${layer.index}"
-                            )
-                        }
-                    } else {
-                        // The tile was released (the eraser emptied it): its
-                        // file must go, or the old writing would come back.
-                        withContext(Dispatchers.IO) {
-                            repository.deletePageLayerTile(
-                                noteId, s.pageIndex, layer.index, tx, ty
-                            )
+                    if (tx < 0 || ty < 0) return@mapNotNull null
+                    Triple(tx, ty, store.tile(tx, ty))
+                }
+                val failedTiles = if (tileTasks.size <= 1) {
+                    tileTasks.filterNot { (tx, ty, bitmap) ->
+                        if (bitmap != null && !bitmap.isRecycled) {
+                            withContext(Dispatchers.IO) {
+                                repository.savePageLayerTile(
+                                    noteId, s.pageIndex, layer.index, tx, ty, bitmap
+                                )
+                            }
+                        } else {
+                            withContext(Dispatchers.IO) {
+                                repository.deletePageLayerTile(
+                                    noteId, s.pageIndex, layer.index, tx, ty
+                                )
+                            }
+                            true
                         }
                     }
+                } else {
+                    coroutineScope {
+                        tileTasks.map { task ->
+                            async(tileIoDispatcher) {
+                                val (tx, ty, bitmap) = task
+                                val ok = if (bitmap != null && !bitmap.isRecycled) {
+                                    repository.savePageLayerTile(
+                                        noteId, s.pageIndex, layer.index, tx, ty, bitmap
+                                    )
+                                } else {
+                                    repository.deletePageLayerTile(
+                                        noteId, s.pageIndex, layer.index, tx, ty
+                                    )
+                                    true
+                                }
+                                if (ok) null else task
+                            }
+                        }.awaitAll().filterNotNull()
+                    }
+                }
+                for ((tx, ty, _) in failedTiles) {
+                    s.dirty = true
+                    android.util.Log.w(
+                        "TouchNotes",
+                        "Could not save tile $tx,$ty of layer ${layer.index}"
+                    )
                 }
                 store.markClean()
             }
@@ -3958,94 +4003,146 @@ class ContinuousInkController(
         val s = getSession(pageIndex) ?: return null
         val store = s.layerTiles[layer]
         val layerOps = s.history.ops.filter { it.layer.index == layer.index }
-        val pageItems = if (s.pageType == "infinite") {
-            InfiniteItemsStore.load(repository.fileStore, noteId)
-                .filter { it.pageIndex == pageIndex && it.layerIndex == layer.index }
-        } else {
-            emptyList()
-        }
-        if (s.pageType == "infinite") {
-            if (layerOps.isEmpty() && pageItems.isEmpty()) return null
-            return try {
-                val width = THUMBNAIL_SIZE
-                val height = THUMBNAIL_SIZE
-                val thumb = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-                val canvas = Canvas(thumb)
-                var minX = Float.MAX_VALUE
-                var minY = Float.MAX_VALUE
-                var maxX = -Float.MAX_VALUE
-                var maxY = -Float.MAX_VALUE
-                var count = 0
-                for (item in pageItems) {
-                    val hw = item.width * 0.55f
-                    val hh = item.height * 0.55f
-                    if (item.centerX - hw < minX) minX = item.centerX - hw
-                    if (item.centerX + hw > maxX) maxX = item.centerX + hw
-                    if (item.centerY - hh < minY) minY = item.centerY - hh
-                    if (item.centerY + hh > maxY) maxY = item.centerY + hh
-                    count++
-                }
-                for (op in layerOps) {
-                    if (op is InkOp.Stroke) {
-                        for (p in op.stroke.points) {
-                            val px = p.x * 2160f
-                            val py = p.y * 2160f
-                            if (px < minX) minX = px
-                            if (px > maxX) maxX = px
-                            if (py < minY) minY = py
-                            if (py > maxY) maxY = py
-                            count++
-                        }
-                    }
-                }
-                if (count > 0 && minX <= maxX && minY <= maxY) {
-                    val spanW = (maxX - minX).coerceAtLeast(100f)
-                    val spanH = (maxY - minY).coerceAtLeast(100f)
-                    val pad = 12f
-                    val sc = kotlin.math.min((width - pad * 2f) / spanW, (height - pad * 2f) / spanH)
-                    canvas.save()
-                    canvas.translate(
-                        width / 2f - (minX + maxX) / 2f * sc,
-                        height / 2f - (minY + maxY) / 2f * sc
-                    )
-                    canvas.scale(sc, sc)
-                    val itemPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
-                    val dst = RectF()
+        val isInfinitePage = s.pageType == "infinite"
+        val layerRectSnapshot = s.layerRectInBox
+        val fallbackInkW = s.inkWidth.coerceAtLeast(1)
+        val fallbackInkH = s.inkHeight.coerceAtLeast(1)
+        return withContext(Dispatchers.IO) {
+            val pageItems = if (isInfinitePage) {
+                InfiniteItemsStore.load(repository.fileStore, noteId)
+                    .filter { it.pageIndex == pageIndex && it.layerIndex == layer.index }
+            } else {
+                emptyList()
+            }
+            if (isInfinitePage) {
+                if (layerOps.isEmpty() && pageItems.isEmpty()) return@withContext null
+                return@withContext try {
+                    val width = THUMBNAIL_SIZE
+                    val height = THUMBNAIL_SIZE
+                    val thumb = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                    val canvas = Canvas(thumb)
+                    var minX = Float.MAX_VALUE
+                    var minY = Float.MAX_VALUE
+                    var maxX = -Float.MAX_VALUE
+                    var maxY = -Float.MAX_VALUE
+                    var count = 0
                     for (item in pageItems) {
-                        val bmp = when (item) {
-                            is InfiniteCanvasItem.ImageItem -> {
-                                val f = repository.fileStore.getNoteAsset(noteId, item.fileName)
-                                if (f != null && f.exists()) {
-                                    personal.notes.touch.util.BitmapUtils.loadThumbnail(f, 120, 120)
-                                } else null
-                            }
-                            is InfiniteCanvasItem.PdfPageItem -> {
-                                val f = repository.fileStore.getNoteAsset(noteId, item.pdfFileName)
-                                if (f != null && f.exists()) {
-                                    val doc = personal.notes.touch.util.PdfiumDocument.open(f)
-                                    try {
-                                        doc?.renderPage(item.pdfPageIndex, 120, 160)
-                                    } finally {
-                                        doc?.close()
-                                    }
-                                } else null
-                            }
-                        }
-                        if (bmp != null && !bmp.isRecycled) {
-                            val sv = canvas.save()
-                            canvas.translate(item.centerX, item.centerY)
-                            if (item.rotationDeg != 0f) canvas.rotate(item.rotationDeg)
-                            if (item.flipHorizontal) canvas.scale(-1f, 1f)
-                            dst.set(-item.width / 2f, -item.height / 2f, item.width / 2f, item.height / 2f)
-                            canvas.drawBitmap(bmp, null, dst, itemPaint)
-                            bmp.recycle()
-                            canvas.restoreToCount(sv)
-                        }
+                        val hw = item.width * 0.55f
+                        val hh = item.height * 0.55f
+                        if (item.centerX - hw < minX) minX = item.centerX - hw
+                        if (item.centerX + hw > maxX) maxX = item.centerX + hw
+                        if (item.centerY - hh < minY) minY = item.centerY - hh
+                        if (item.centerY + hh > maxY) maxY = item.centerY + hh
+                        count++
                     }
                     for (op in layerOps) {
-                        if (op is InkOp.Stroke) drawInfiniteOpStroke(canvas, op)
+                        if (op is InkOp.Stroke) {
+                            for (p in op.stroke.points) {
+                                val px = p.x * 2160f
+                                val py = p.y * 2160f
+                                if (px < minX) minX = px
+                                if (px > maxX) maxX = px
+                                if (py < minY) minY = py
+                                if (py > maxY) maxY = py
+                                count++
+                            }
+                        }
                     }
-                    canvas.restore()
+                    if (count > 0 && minX <= maxX && minY <= maxY) {
+                        val spanW = (maxX - minX).coerceAtLeast(100f)
+                        val spanH = (maxY - minY).coerceAtLeast(100f)
+                        val pad = 12f
+                        val sc = kotlin.math.min((width - pad * 2f) / spanW, (height - pad * 2f) / spanH)
+                        canvas.save()
+                        canvas.translate(
+                            width / 2f - (minX + maxX) / 2f * sc,
+                            height / 2f - (minY + maxY) / 2f * sc
+                        )
+                        canvas.scale(sc, sc)
+                        val itemPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
+                        val dst = RectF()
+                        val decodedItems = if (pageItems.size <= 1) {
+                            pageItems.map { item -> item to decodeInfiniteItemThumb(item) }
+                        } else {
+                            coroutineScope {
+                                pageItems.map { item ->
+                                    async(tileIoDispatcher) {
+                                        item to decodeInfiniteItemThumb(item)
+                                    }
+                                }.awaitAll()
+                            }
+                        }
+                        for ((item, bmp) in decodedItems) {
+                            if (bmp != null && !bmp.isRecycled) {
+                                val sv = canvas.save()
+                                canvas.translate(item.centerX, item.centerY)
+                                if (item.rotationDeg != 0f) canvas.rotate(item.rotationDeg)
+                                if (item.flipHorizontal) canvas.scale(-1f, 1f)
+                                dst.set(-item.width / 2f, -item.height / 2f, item.width / 2f, item.height / 2f)
+                                canvas.drawBitmap(bmp, null, dst, itemPaint)
+                                bmp.recycle()
+                                canvas.restoreToCount(sv)
+                            }
+                        }
+                        for (op in layerOps) {
+                            if (op is InkOp.Stroke) drawInfiniteOpStroke(canvas, op)
+                        }
+                        canvas.restore()
+                    }
+                    thumb
+                } catch (e: Throwable) {
+                    e.printStackTrace()
+                    null
+                }
+            }
+            val grid = store?.grid
+            val hasTiles = store != null && grid != null && grid.width > 0 && grid.height > 0 && store.existingTiles().isNotEmpty()
+            if (!hasTiles && layerOps.isEmpty()) return@withContext null
+            try {
+                val layerW = if (grid != null && grid.width > 0) grid.width else fallbackInkW
+                val layerH = if (grid != null && grid.height > 0) grid.height else fallbackInkH
+                val width = THUMBNAIL_SIZE
+                val height = (width * layerH.toFloat() / layerW).roundToInt().coerceAtLeast(1)
+                val thumb = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                val canvas = Canvas(thumb)
+                val paint = Paint(Paint.FILTER_BITMAP_FLAG)
+                if (hasTiles && store != null && grid != null) {
+                    for (index in store.existingTiles()) {
+                        val tx = grid.tileColumn(index)
+                        val ty = grid.tileRow(index)
+                        if (tx < 0 || ty < 0) continue
+                        val bitmap = store.tile(tx, ty) ?: continue
+                        if (bitmap.isRecycled) continue
+                        val left = grid.tileLeft(tx)
+                        val top = grid.tileTop(ty)
+                        val right = left + grid.tileWidth(tx)
+                        val bottom = top + grid.tileHeight(ty)
+                        canvas.drawBitmap(
+                            bitmap,
+                            Rect(0, 0, grid.tileWidth(tx), grid.tileHeight(ty)),
+                            RectF(
+                                left / grid.width.toFloat() * width,
+                                top / grid.height.toFloat() * height,
+                                right / grid.width.toFloat() * width,
+                                bottom / grid.height.toFloat() * height
+                            ),
+                            paint
+                        )
+                    }
+                }
+                if (layerOps.isNotEmpty()) {
+                    if (!layerRectSnapshot.empty) {
+                        val sx = width.toFloat() / layerRectSnapshot.width
+                        val sy = height.toFloat() / layerRectSnapshot.height
+                        for (op in layerOps) {
+                            if (op is InkOp.Stroke) {
+                                val save = canvas.save()
+                                canvas.translate(-layerRectSnapshot.left * sx, -layerRectSnapshot.top * sy)
+                                drawStroke(canvas, op.stroke, sx, sy, preview = false)
+                                canvas.restoreToCount(save)
+                            }
+                        }
+                    }
                 }
                 thumb
             } catch (e: Throwable) {
@@ -4053,62 +4150,27 @@ class ContinuousInkController(
                 null
             }
         }
-        val grid = store?.grid
-        val hasTiles = store != null && grid != null && grid.width > 0 && grid.height > 0 && store.existingTiles().isNotEmpty()
-        if (!hasTiles && layerOps.isEmpty()) return null
-        return try {
-            val layerW = if (grid != null && grid.width > 0) grid.width else s.inkWidth.coerceAtLeast(1)
-            val layerH = if (grid != null && grid.height > 0) grid.height else s.inkHeight.coerceAtLeast(1)
-            val width = THUMBNAIL_SIZE
-            val height = (width * layerH.toFloat() / layerW).roundToInt().coerceAtLeast(1)
-            val thumb = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-            val canvas = Canvas(thumb)
-            val paint = Paint(Paint.FILTER_BITMAP_FLAG)
-            if (hasTiles && store != null && grid != null) {
-                for (index in store.existingTiles()) {
-                    val tx = grid.tileColumn(index)
-                    val ty = grid.tileRow(index)
-                    if (tx < 0 || ty < 0) continue
-                    val bitmap = store.tile(tx, ty) ?: continue
-                    if (bitmap.isRecycled) continue
-                    val left = grid.tileLeft(tx)
-                    val top = grid.tileTop(ty)
-                    val right = left + grid.tileWidth(tx)
-                    val bottom = top + grid.tileHeight(ty)
-                    canvas.drawBitmap(
-                        bitmap,
-                        // The source is the tile itself (its own pixels), the
-                        // destination is its place in the small picture.
-                        Rect(0, 0, grid.tileWidth(tx), grid.tileHeight(ty)),
-                        RectF(
-                            left / grid.width.toFloat() * width,
-                            top / grid.height.toFloat() * height,
-                            right / grid.width.toFloat() * width,
-                            bottom / grid.height.toFloat() * height
-                        ),
-                        paint
-                    )
-                }
+    }
+
+    private suspend fun decodeInfiniteItemThumb(item: InfiniteCanvasItem): Bitmap? {
+        return when (item) {
+            is InfiniteCanvasItem.ImageItem -> {
+                val f = repository.fileStore.getNoteAsset(noteId, item.fileName)
+                if (f != null && f.exists()) {
+                    personal.notes.touch.util.BitmapUtils.loadThumbnail(f, 120, 120)
+                } else null
             }
-            if (layerOps.isNotEmpty()) {
-                val rect = s.layerRectInBox
-                if (!rect.empty) {
-                    val sx = width.toFloat() / rect.width
-                    val sy = height.toFloat() / rect.height
-                    for (op in layerOps) {
-                        if (op is InkOp.Stroke) {
-                            val save = canvas.save()
-                            canvas.translate(-rect.left * sx, -rect.top * sy)
-                            drawStroke(canvas, op.stroke, sx, sy, preview = false)
-                            canvas.restoreToCount(save)
-                        }
+            is InfiniteCanvasItem.PdfPageItem -> {
+                val f = repository.fileStore.getNoteAsset(noteId, item.pdfFileName)
+                if (f != null && f.exists()) {
+                    val doc = personal.notes.touch.util.PdfiumDocument.open(f)
+                    try {
+                        doc?.renderPage(item.pdfPageIndex, 120, 160)
+                    } finally {
+                        doc?.close()
                     }
-                }
+                } else null
             }
-            thumb
-        } catch (e: Throwable) {
-            e.printStackTrace()
-            null
         }
     }
 
@@ -5151,10 +5213,18 @@ class ContinuousInkController(
         val layerSpanFactor = 1f + 2f * margin
         val composeWidth = (targetWidth * layerSpanFactor).roundToInt().coerceAtLeast(1)
 
-        val composedLayers = mutableListOf<Bitmap>()
-        for (layer in visibleLayers) {
-            val bmp = composeDisplayLayer(pageIndex, layer, composeWidth, page = page)
-            if (bmp != null) composedLayers.add(bmp)
+        val composedLayers = if (visibleLayers.size <= 1) {
+            visibleLayers.mapNotNull { layer ->
+                composeDisplayLayer(pageIndex, layer, composeWidth, page = page)
+            }
+        } else {
+            coroutineScope {
+                visibleLayers.map { layer ->
+                    async(tileIoDispatcher) {
+                        composeDisplayLayer(pageIndex, layer, composeWidth, page = page)
+                    }
+                }.awaitAll().filterNotNull()
+            }
         }
         if (composedLayers.isEmpty()) return@withContext null
 
@@ -5262,7 +5332,7 @@ class ContinuousInkController(
                 (top + bitmap.height).toFloat() / layerHeight * displayHeight
             )
             canvas.drawBitmap(bitmap, srcRect, dstRect, paint)
-            bitmap.recycle()
+            BitmapPool.put(bitmap)
         }
         // Draw the ops (the strokes and the erases as vectors).
         if (!ops.isNullOrEmpty()) {
@@ -5373,9 +5443,22 @@ class ContinuousInkController(
             val metaFile = repository.fileStore.getAnnotationMetaFile(noteId, pageIndex)
             val text = if (metaFile.exists()) metaFile.readText() else null
             val stack = text?.let { PageLayerMeta.decode(it) } ?: PageLayerStack.base()
-            for (layer in stack.layers) {
-                if (!layer.visible) continue
-                result[layer.index] = composeDisplayLayer(pageIndex, layer, displayWidthPx, page = page)
+            val visibleLayers = stack.layers.filter { it.visible }
+            if (visibleLayers.size <= 1) {
+                for (layer in visibleLayers) {
+                    result[layer.index] = composeDisplayLayer(pageIndex, layer, displayWidthPx, page = page)
+                }
+            } else {
+                val composed = coroutineScope {
+                    visibleLayers.map { layer ->
+                        async(tileIoDispatcher) {
+                            layer.index to composeDisplayLayer(pageIndex, layer, displayWidthPx, page = page)
+                        }
+                    }.awaitAll()
+                }
+                for ((idx, bmp) in composed) {
+                    result[idx] = bmp
+                }
             }
         } catch (e: Exception) {
             e.printStackTrace()

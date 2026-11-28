@@ -2,6 +2,10 @@ package personal.notes.touch.data.repo
 
 import androidx.room.withTransaction
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
@@ -1093,6 +1097,9 @@ class NoteRepository(
      * A layer without tile information (a legacy layer) has no tiles: the
      * answer is empty and the layer is read from its full-size PNG.
      */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val tileDecodeDispatcher = Dispatchers.IO.limitedParallelism(4)
+
     suspend fun loadPageLayerTiles(
         noteId: String,
         pageIndex: Int,
@@ -1100,15 +1107,29 @@ class NoteRepository(
         meta: personal.notes.touch.ui.canvas.PageLayerMeta.LayerTilesInfo?
     ): List<Pair<Pair<Int, Int>, android.graphics.Bitmap>> = withContext(Dispatchers.IO) {
         val info = meta ?: return@withContext emptyList()
-        val out = mutableListOf<Pair<Pair<Int, Int>, android.graphics.Bitmap>>()
-        for (position in info.positions()) {
+        val positions = info.positions()
+        if (positions.isEmpty()) return@withContext emptyList()
+        if (positions.size == 1) {
+            val pos = positions[0]
             val file = fileStore.getAnnotationLayerTileFile(
-                noteId, pageIndex, layerIndex, position.first, position.second
+                noteId, pageIndex, layerIndex, pos.first, pos.second
             )
-            val bitmap = personal.notes.touch.util.BitmapUtils.loadBitmapFromFile(file) ?: continue
-            out.add(Pair(position, bitmap))
+            val bitmap = personal.notes.touch.util.BitmapUtils.loadBitmapFromFile(file)
+                ?: return@withContext emptyList()
+            return@withContext listOf(Pair(pos, bitmap))
         }
-        out
+        coroutineScope {
+            positions.map { position ->
+                async(tileDecodeDispatcher) {
+                    val file = fileStore.getAnnotationLayerTileFile(
+                        noteId, pageIndex, layerIndex, position.first, position.second
+                    )
+                    val bitmap = personal.notes.touch.util.BitmapUtils.loadBitmapFromFile(file)
+                        ?: return@async null
+                    Pair(position, bitmap)
+                }
+            }.awaitAll().filterNotNull()
+        }
     }
 
     internal suspend fun savePageLayerOps(
